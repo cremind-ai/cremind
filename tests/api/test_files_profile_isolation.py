@@ -103,3 +103,42 @@ def test_a_traversal_out_of_a_private_directory_is_still_refused(system_dir: Pat
         str(system_dir), "shared", "..", "admin", "exports", "cremind-javis-config.md",
     )
     assert files_api._is_inside_allowed(os.path.realpath(sneaky), None, "bob") is False
+
+
+# ── User Document Search's index ───────────────────────────────────────────
+
+
+def _index(system_dir: Path) -> Path:
+    d = system_dir / "storage" / "userdocs" / "0f6c2a9e-uid-of-alice"
+    d.mkdir(parents=True)
+    (d / "index.db").write_bytes(b"SQLite format 3\0 alice's extracted document text")
+    return d
+
+
+def test_no_profile_can_read_the_userdocs_index_through_the_file_routes(system_dir: Path) -> None:
+    """Every profile's index (the text of its files) sits under one directory
+    of the system folder, which the file routes otherwise serve. Nobody gets
+    it there — not another profile, not its owner, not admin: the index is
+    read only through the profile-scoped /api/userdocs routes."""
+    d = _index(system_dir)
+    target = os.path.realpath(d / "index.db")
+    for who in ("bob", "admin", "alice"):
+        assert files_api._is_inside_allowed(target, None, who) is False
+        assert files_api._is_inside_allowed(os.path.realpath(d), None, who) is False
+    assert files_api._safe_resolve("storage/userdocs/0f6c2a9e-uid-of-alice/index.db", "admin") is None
+    assert files_api._safe_resolve("storage/userdocs", "bob") is None
+    sneaky = os.path.join(str(system_dir), "shared", "..", "storage", "userdocs", d.name, "index.db")
+    assert files_api._is_inside_allowed(os.path.realpath(sneaky), None, "bob") is False
+
+
+def test_the_agents_file_tool_refuses_the_userdocs_index(system_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A profile whose working directory is the system folder (the built-in
+    setup profile's default) must not reach another profile's index by a
+    relative path."""
+    from app.tools.builtin import system_file
+
+    d = _index(system_dir)
+    with pytest.raises(ValueError, match="internal index"):
+        system_file._safe_resolve(str(system_dir), f"storage/userdocs/{d.name}/index.db")
+    # The rest of the system folder is unaffected.
+    assert system_file._safe_resolve(str(system_dir), "shared") == os.path.realpath(system_dir / "shared")

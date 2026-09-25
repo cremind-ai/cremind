@@ -4,7 +4,8 @@ Mirrors Settings → My Documents: turn indexing of your own files on or off,
 choose the folder, manage exclude rules, and watch sync progress. `admin`
 subcommands mirror the gate on the Vector Embedding page. `search`, `find`,
 `read` and `cite` query the index the way the agent does (documented
-separately, in `[cli]cremind userdocs search.md`).
+separately, in `[cli]cremind userdocs search.md`), and `research` runs the
+agent's deep-research jobs (in `[cli]cremind userdocs research.md`).
 
 Changes that would remove indexed content (moving the folder, adding excludes
 that drop files, deleting the index) are refused with a plan of what would go.
@@ -42,9 +43,15 @@ deletions_app = typer.Typer(
     help="Confirm or reject a held mass deletion (many files vanished at once).",
     no_args_is_help=True,
 )
+research_app = typer.Typer(
+    name="research",
+    help="Deep research over your documents: analyze a question with verified quotes, or compile a folder.",
+    no_args_is_help=True,
+)
 userdocs_app.add_typer(excludes_app, name="excludes")
 userdocs_app.add_typer(admin_app, name="admin")
 userdocs_app.add_typer(deletions_app, name="deletions")
+userdocs_app.add_typer(research_app, name="research")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -650,7 +657,7 @@ def userdocs_search(
     top_k: Optional[int] = typer.Option(None, "--top-k", help="Results per page (default 8)."),
     thorough: bool = typer.Option(False, "--thorough", help="Restore accents, translate, and rerank with a model."),
 ) -> None:
-    """Search inside your indexed files; every passage comes with a [ud:…] citation token."""
+    """Search inside your indexed files; every passage comes with a \\[ud:…] citation token."""
     _query(ctx, "search", {
         "query": query,
         "filters": _filters(folder=folder, types=types, date_from=date_from, date_to=date_to,
@@ -685,7 +692,7 @@ def userdocs_find(
 @graceful_errors
 def userdocs_read(
     ctx: typer.Context,
-    file: str = typer.Argument(..., help="A [ud:…] token, file id, path inside the indexed folder, or name."),
+    file: str = typer.Argument(..., help="A \\[ud:…] token, file id, path inside the indexed folder, or name."),
     pages: Optional[str] = typer.Option(None, "--pages", help="PDF pages, e.g. 3-5."),
     lines: Optional[str] = typer.Option(None, "--lines", help="Line range, e.g. 40-80."),
     section: Optional[str] = typer.Option(None, "--section", help="A heading or a legal reference ('Điều 203')."),
@@ -702,9 +709,9 @@ def userdocs_read(
 @graceful_errors
 def userdocs_cite(
     ctx: typer.Context,
-    token: str = typer.Argument(..., help="A citation token such as [ud:k7m2xq9a#3f9c2e1b] (quote it in the shell)."),
+    token: str = typer.Argument(..., help="A citation token such as \\[ud:k7m2xq9a#3f9c2e1b] (quote it in the shell)."),
 ) -> None:
-    """Show where a [ud:…] citation points: the file, the location in it, and the cited text."""
+    """Show where a \\[ud:…] citation points: the file, the location in it, and the cited text."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -1052,3 +1059,371 @@ def admin_set(
         _handle_known_errors(e)
         raise
     _print(ctx, out.get("policy") or out)
+
+
+# ── research ───────────────────────────────────────────────────────────────
+#
+# Deep-research jobs (the agent's `user_documents__research`) run on the
+# server; these commands start, follow, answer and cancel them through
+# /api/userdocs/research. The printed text is what the agent reads, whole.
+# The statuses mirror app.userdocs.research.types, which is not imported
+# here: the CLI stays free of server modules.
+
+_RESEARCH_ACTIVE = frozenset({"queued", "planning", "running"})
+_RESEARCH_WAITING = frozenset({"needs_clarification", "needs_confirmation", "interrupted"})
+_RESEARCH_DONE = frozenset({"complete", "partial"})
+# Seconds each --follow poll asks the server to hold the request open (the
+# server caps it), and the least time between polls, so a server that
+# answers at once is not hammered.
+_FOLLOW_WAIT = 20.0
+_FOLLOW_MIN_INTERVAL = 1.0
+
+
+def research_exit_code(status: str) -> int:
+    """0 finished (complete/partial) or still running; 2 waiting for you (a
+    question, a confirmation, or a resume after a server restart); 1 failed,
+    cancelled, or anything unrecognised."""
+    if status in _RESEARCH_DONE or status in _RESEARCH_ACTIVE:
+        return 0
+    if status in _RESEARCH_WAITING:
+        return 2
+    return 1
+
+
+def research_progress_line(job: dict[str, Any]) -> str:
+    """One human line for a job's progress (`--follow` prints one per change)."""
+    prog = job.get("progress") or {}
+    parts = [f"{job.get('job_id') or '?'}: {job.get('status') or '?'}"]
+    phase = prog.get("phase") or job.get("phase")
+    if phase:
+        parts.append(str(phase))
+    if prog.get("total"):
+        parts.append(f"{prog.get('done') or 0}/{prog['total']}")
+    steps = prog.get("steps") or []
+    if steps and isinstance(steps[-1], dict) and steps[-1].get("label"):
+        parts.append(str(steps[-1]["label"]))
+    used = int(job.get("tokens_in") or 0) + int(job.get("tokens_out") or 0)
+    if used and job.get("budget"):
+        parts.append(f"{used:,}/{int(job['budget']):,} tokens")
+    return " · ".join(parts)
+
+
+def _progress_key(job: dict[str, Any]) -> tuple[Any, ...]:
+    # Token counts move on every poll; only a new phase, count or step is news.
+    prog = job.get("progress") or {}
+    steps = prog.get("steps") or []
+    last = steps[-1] if steps and isinstance(steps[-1], dict) else {}
+    return (job.get("status"), prog.get("phase") or job.get("phase"), prog.get("done"), prog.get("total"),
+            last.get("id"), last.get("label"))
+
+
+def parse_answers(values: Optional[list[str]]) -> dict[str, Any]:
+    """``--answer KEY=VALUE`` flags → the answers object. ``true``/``false``
+    become booleans (``confirm=true``); everything else stays a string, file
+    ids included. Exits 1 on a flag without ``=``."""
+    out: dict[str, Any] = {}
+    for raw in values or []:
+        key, sep, value = str(raw).partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key:
+            typer.echo(f"--answer takes KEY=VALUE (got {raw!r})", err=True)
+            raise typer.Exit(code=1)
+        low = value.lower()
+        out[key] = True if low == "true" else False if low == "false" else value
+    return out
+
+
+def _research_scope(folders: Optional[list[str]], files: Optional[list[str]]) -> Optional[dict[str, Any]]:
+    scope: dict[str, Any] = {}
+    if folders:
+        scope["folder"] = list(folders)
+    if files:
+        scope["file_ids"] = list(files)
+    return scope or None
+
+
+def _research_run(
+    ctx: typer.Context,
+    action: Any,
+    *,
+    timeout: float = 60.0,
+    following: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Run ``action(client)``; research errors print their message (and, for
+    a busy profile, how to follow or cancel the running job) and exit 1."""
+    import asyncio
+
+    from app.cli.client._base import APIError, Client
+    from app.cli.config import Config
+
+    cfg: Config = ctx.obj["cfg"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg, timeout=timeout) as client:
+            return await action(client)
+
+    try:
+        return asyncio.run(_run())
+    except KeyboardInterrupt:
+        jid = (following or {}).get("job_id")
+        again = f" — `cremind userdocs research status {jid} --follow` picks it up again" if jid else ""
+        sys.stderr.write(f"Stopped following; the job keeps running on the server{again}.\n")
+        raise typer.Exit(code=130)
+    except APIError as e:
+        detail = _api_detail(e)
+        if detail and detail.get("message"):
+            sys.stderr.write(f"{detail['message']}\n")
+            if detail.get("error") == "ResearchBusy" and detail.get("job_id"):
+                jid = detail["job_id"]
+                sys.stderr.write(f"Follow it: cremind userdocs research status {jid} --follow\n"
+                                 f"Cancel it: cremind userdocs research cancel {jid}\n")
+            raise typer.Exit(code=1) from e
+        raise
+
+
+async def _research_follow(
+    client: Any,
+    out: dict[str, Any],
+    *,
+    page: Optional[int] = None,
+    following: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Long-poll the job until it finishes or stops to ask, printing a
+    progress line to stderr whenever it moves. Returns the last answer."""
+    import asyncio
+    import time as _time
+
+    from app.cli.client.userdocs import research_get
+
+    last: Optional[tuple[Any, ...]] = None
+    while True:
+        job = out.get("job") or {}
+        if following is not None and job.get("job_id"):
+            following["job_id"] = job["job_id"]
+        key = _progress_key(job)
+        if key != last:
+            sys.stderr.write(research_progress_line(job) + "\n")
+            sys.stderr.flush()
+            last = key
+        if (job.get("status") or "") not in _RESEARCH_ACTIVE or not job.get("job_id"):
+            return out
+        started = _time.monotonic()
+        out = await research_get(client, job["job_id"], page=page, wait=_FOLLOW_WAIT)
+        spare = _FOLLOW_MIN_INTERVAL - (_time.monotonic() - started)
+        if spare > 0:
+            await asyncio.sleep(spare)
+
+
+def _research_hint(job: dict[str, Any], pages: Any) -> None:
+    """What to run next, on stderr. The text itself is written for the agent
+    (it says "call user_documents__research"); this is the terminal's copy."""
+    jid = job.get("job_id") or "JOB"
+    status = job.get("status") or ""
+    if status in _RESEARCH_ACTIVE:
+        sys.stderr.write(f"Still running. Follow it: cremind userdocs research status {jid} --follow\n")
+    elif status == "interrupted":
+        sys.stderr.write(f"The server restarted during this job. Resume it: "
+                         f"cremind userdocs research continue {jid} --follow\n")
+    elif status in _RESEARCH_WAITING:
+        clar = (job.get("dossier") or {}).get("clarification") or {}
+        keys = clar.get("answer_keys") or {}
+        flags = " ".join(f"--answer {k}=..." for k in keys) or "--answer KEY=VALUE"
+        sys.stderr.write(f"Answer it: cremind userdocs research continue {jid} {flags} --follow\n")
+        for k, meaning in keys.items():
+            sys.stderr.write(f"  {k}: {meaning}\n")
+    elif status in _RESEARCH_DONE and isinstance(pages, int) and pages > 1:
+        sys.stderr.write(f"The dossier has {pages} pages: cremind userdocs research status {jid} "
+                         f"--page N, or --all-pages\n")
+
+
+def _research_emit(ctx: typer.Context, out: dict[str, Any]) -> None:
+    """Print the job's text (or, with --json, the whole answer) and exit with
+    the job's status code."""
+    from app.cli.output import OutputMode, print_json
+
+    mode: OutputMode = ctx.obj["mode"]
+    job = out.get("job") or {}
+    texts = out.get("texts")
+    if mode.json:
+        print_json(out)
+    else:
+        if isinstance(texts, list):
+            total = len(texts)
+            for n, text in enumerate(texts, start=1):
+                if n > 1:
+                    sys.stdout.write(f"\n── page {n} of {total} ──\n")
+                sys.stdout.write(str(text).rstrip("\n") + "\n")
+        else:
+            sys.stdout.write(str(out.get("text") or "").rstrip("\n") + "\n")
+        _research_hint(job, None if isinstance(texts, list) else out.get("pages"))
+    raise typer.Exit(code=research_exit_code(job.get("status") or ""))
+
+
+@research_app.command("run")
+@graceful_errors
+def research_run_cmd(
+    ctx: typer.Context,
+    question: str = typer.Argument(..., help="What the research should answer, in your own words (any language)."),
+    mode: Optional[str] = typer.Option(
+        None, "--mode",
+        help="analyze (default): answer a question from verified quotes | compile: read every file in scope "
+             "and build one table.",
+    ),
+    domain: Optional[str] = typer.Option(
+        None, "--domain",
+        help="general (default) | legal (chooses the edition of each law, may ask) | financial.",
+    ),
+    folder: Optional[list[str]] = typer.Option(
+        None, "--folder", help="Research these folders (the case, the reports; repeatable)."),
+    file: Optional[list[str]] = typer.Option(
+        None, "--file", help="Research these files: file ids or citation tokens, ud:… (repeatable)."),
+    reference_folder: Optional[list[str]] = typer.Option(
+        None, "--reference-folder", help="Where the law, policy or standard lives (analyze; repeatable)."),
+    reference_file: Optional[list[str]] = typer.Option(
+        None, "--reference-file", help="A reference file id or citation token (analyze; repeatable)."),
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Wait for the result, printing progress; exits 0, 2 or 1 by outcome."),
+    wait: Optional[int] = typer.Option(
+        None, "--wait", help="Seconds the start request may wait for the job (the server caps it)."),
+) -> None:
+    """Start a research job: analyze a question with verified quotes, or compile a folder into a table."""
+    body: dict[str, Any] = {
+        "question": question,
+        "mode": mode,
+        "domain": domain,
+        "scope": _research_scope(folder, file),
+        "reference_scope": _research_scope(reference_folder, reference_file),
+        "wait": wait or None,
+    }
+    following: dict[str, str] = {}
+
+    async def action(client: Any) -> dict[str, Any]:
+        from app.cli.client.userdocs import research_start
+
+        out = await research_start(client, body)
+        job = out.get("job") or {}
+        following["job_id"] = str(job.get("job_id") or "")
+        sys.stderr.write(f"Research job {job.get('job_id')} started "
+                         f"({job.get('mode') or mode or 'analyze'}/{job.get('domain') or domain or 'general'}).\n")
+        if follow:
+            out = await _research_follow(client, out, following=following)
+        return out
+
+    out = _research_run(ctx, action, timeout=max(60.0, float(wait or 0) + 30.0), following=following)
+    _research_emit(ctx, out)
+
+
+@research_app.command("status")
+@graceful_errors
+def research_status_cmd(
+    ctx: typer.Context,
+    job_id: str = typer.Argument(..., help="The job id (`research list` shows them)."),
+    page: Optional[int] = typer.Option(None, "--page", help="Dossier page of a finished job (default 1: the summary)."),
+    all_pages: bool = typer.Option(False, "--all-pages", help="Print every page of the dossier."),
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Wait until the job finishes or asks something, printing progress."),
+) -> None:
+    """Show a research job: its progress, the question it asked, or its result."""
+    if all_pages and page is not None:
+        typer.echo("--page and --all-pages are exclusive", err=True)
+        raise typer.Exit(code=1)
+    following = {"job_id": job_id}
+
+    async def action(client: Any) -> dict[str, Any]:
+        from app.cli.client.userdocs import research_get
+
+        out = await research_get(client, job_id, page=page)
+        if follow:
+            out = await _research_follow(client, out, page=page, following=following)
+        if all_pages:
+            texts = [out.get("text") or ""]
+            for n in range(2, int(out.get("pages") or 1) + 1):
+                texts.append((await research_get(client, job_id, page=n)).get("text") or "")
+            out = {"job": out.get("job"), "pages": out.get("pages"), "texts": texts}
+        return out
+
+    _research_emit(ctx, _research_run(ctx, action, following=following))
+
+
+@research_app.command("continue")
+@graceful_errors
+def research_continue_cmd(
+    ctx: typer.Context,
+    job_id: str = typer.Argument(..., help="The job that asked (or was interrupted)."),
+    answer: Optional[list[str]] = typer.Option(
+        None, "--answer", "-a",
+        help="KEY=VALUE answering the job's question (repeatable), e.g. edition=k7m2xq9a or confirm=true.",
+    ),
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Wait for the result, printing progress; exits 0, 2 or 1 by outcome."),
+) -> None:
+    """Answer what a research job asked, or resume one the server restart interrupted."""
+    answers = parse_answers(answer)
+    following = {"job_id": job_id}
+
+    async def action(client: Any) -> dict[str, Any]:
+        from app.cli.client.userdocs import research_continue
+
+        out = await research_continue(client, job_id, answers=answers or None)
+        if follow:
+            out = await _research_follow(client, out, following=following)
+        return out
+
+    _research_emit(ctx, _research_run(ctx, action, following=following))
+
+
+@research_app.command("cancel")
+@graceful_errors
+def research_cancel_cmd(
+    ctx: typer.Context,
+    job_id: str = typer.Argument(..., help="The job to stop."),
+) -> None:
+    """Stop a research job; what it found so far stays readable with `status`."""
+    from app.cli.output import OutputMode, print_json
+
+    async def action(client: Any) -> dict[str, Any]:
+        from app.cli.client.userdocs import research_cancel
+
+        return await research_cancel(client, job_id)
+
+    out = _research_run(ctx, action)
+    mode: OutputMode = ctx.obj["mode"]
+    if mode.json:
+        print_json(out)
+    else:
+        sys.stdout.write(str(out.get("text") or "").rstrip("\n") + "\n")
+
+
+@research_app.command("list")
+@graceful_errors
+def research_list_cmd(
+    ctx: typer.Context,
+    limit: int = typer.Option(20, "--limit", help="How many recent jobs (at most 50)."),
+) -> None:
+    """This profile's recent research jobs, newest first."""
+    import datetime as _dt
+
+    from app.cli.output import OutputMode, print_json
+
+    async def action(client: Any) -> dict[str, Any]:
+        from app.cli.client.userdocs import research_list
+
+        return await research_list(client, limit=limit)
+
+    out = _research_run(ctx, action)
+    mode: OutputMode = ctx.obj["mode"]
+    if mode.json:
+        print_json(out)
+        return
+    jobs = out.get("jobs") or []
+    if not jobs:
+        sys.stdout.write("(no research jobs)\n")
+    for j in jobs:
+        created = j.get("created_at")
+        when = _dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d %H:%M") if created else ""
+        question = " ".join(str(j.get("question") or "").split())
+        if len(question) > 70:
+            question = question[:69] + "…"
+        kind = f"{j.get('mode', '')}/{j.get('domain', '')}"
+        sys.stdout.write(f"{j.get('job_id', ''):12}  {j.get('status', ''):19}  {kind:17}  {when:16}  {question}\n")

@@ -54,6 +54,33 @@ def test_fuzzy_tolerates_a_dropped_word():
     assert r.canonical.endswith("Tòa án nhân dân giải quyết")
 
 
+def test_a_substituted_word_is_a_mismatch_however_close_the_characters():
+    # "do Tòa án … giải quyết" (the court decides) quoted as "do UBND …"
+    # (the People's Committee decides): ~0.93 similar, the opposite authority.
+    quote = "Tranh chấp đất đai mà đương sự có Giấy chứng nhận thì do UBND nhân dân giải quyết"
+    assert verify_quote(quote, [SRC]).status == MISMATCH
+    # A word the source does not have, inside the quote.
+    added = "Tranh chấp đất đai mà đương sự có Giấy chứng nhận thì do Tòa án nhân dân tối cao giải quyết"
+    assert verify_quote(added, [SRC]).status == MISMATCH
+
+
+def test_dropping_a_negation_or_exception_word_is_a_mismatch():
+    src = "Người sử dụng đất không được chuyển nhượng quyền sử dụng đất trong thời hạn thuê, trừ trường hợp luật có quy định khác."
+    ok = "Người sử dụng đất không được chuyển nhượng quyền sử dụng đất trong thời hạn thuê"
+    assert verify_quote(ok, [src]).status == EXACT
+    flipped = "Người sử dụng đất được chuyển nhượng quyền sử dụng đất trong thời hạn thuê"
+    assert verify_quote(flipped, [src]).status == MISMATCH
+    en = "The supplier shall not deliver the goods within 30 days of the order date."
+    assert verify_quote("The supplier shall deliver the goods within 30 days of the order date", [en]).status == MISMATCH
+
+
+def test_a_typo_inside_a_word_is_still_fuzzy():
+    quote = "The supplier shall deliver the goods withn 30 days of the order date"
+    r = verify_quote(quote, [EN])
+    assert r.status == FUZZY
+    assert r.canonical == "The supplier shall deliver the goods within 30 days of the order date"
+
+
 def test_a_changed_number_is_a_mismatch():
     quote = "Tòa án nhân dân giải quyết theo Luật số 45/2014/QH13, có hiệu lực từ ngày 01/7/2014"
     r = verify_quote(quote, [SRC])

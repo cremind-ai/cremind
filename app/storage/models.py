@@ -52,6 +52,9 @@ Tables
                         an answer's tokens can be checked against what was
                         really issued. UNIQUE(conversation_id, token)
                         (FK profile CASCADE, FK conversation CASCADE)
+- userdoc_research_jobs : deep-research jobs over the user's documents — the
+                        question, the checkpoint, the dossier, and the delivery
+                        counters (FK profile CASCADE, FK conversation CASCADE)
 """
 
 import uuid
@@ -1151,4 +1154,81 @@ class UserDocCitationModel(Base):
         UniqueConstraint("conversation_id", "token", name="uq_userdoc_citations_conv_token"),
         # Lookups go by (profile, cite_id); it also serves the profile cascade.
         Index("ix_userdoc_citations_profile_cite", "profile", "cite_id"),
+    )
+
+
+class UserDocResearchJobModel(Base):
+    """One deep-research job over a profile's documents (see
+    :mod:`app.userdocs.research`).
+
+    The row is the job's durable half: what was asked, where the pipeline is
+    (``state``, its own checkpoint), what it found so far (``dossier``), and
+    what it cost. The running half — the asyncio task, the live progress — is
+    in memory and dies with the process; ``state`` is what lets
+    ``continue_job`` pick the job up again after a restart or after the user
+    answered a clarification, without redoing the files already read.
+
+    **Delivery is a counter pair, not a timestamp.** A job can become
+    deliverable more than once (it asks a question, is answered, then
+    finishes), so every transition into a state the user must hear about bumps
+    ``rev``, and whoever shows that state claims it by raising
+    ``delivered_rev`` to ``rev`` in one conditional UPDATE. Exactly one of the
+    tool's own reply, a REST read, the turn-end hook and the boot sweep wins
+    each ``rev``.
+
+    ``conversation_id`` is NULL for jobs started over REST/CLI: they have no
+    conversation to report back to. Deleting the conversation deletes the job.
+    """
+
+    __tablename__ = "userdoc_research_jobs"
+
+    # uuid4().hex[:12] — short enough to type in the CLI.
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True,
+    )
+    # The stream run that started (or last continued) the job.
+    run_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # queued | planning | running | needs_clarification | needs_confirmation |
+    # interrupted | complete | partial | failed | cancelled
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    phase: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # compile | analyze
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    # legal | financial | general
+    domain: Mapped[str] = mapped_column(String(16), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    reference_scope: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # What the user answered to the job's clarifications, merged across turns.
+    answers: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # The pipeline's checkpoint (its own keys).
+    state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    dossier: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # high | low
+    model_group: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    budget: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    # Seconds the job has run, summed over every resume (the time limit is
+    # on this, not on the wall clock: time spent waiting for an answer is free).
+    elapsed_s: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default=text("0"))
+    rev: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    delivered_rev: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        # The job list (newest first per profile), the retention prune, and
+        # the profile cascade.
+        Index("ix_userdoc_research_jobs_profile_created", "profile", "created_at"),
+        # The turn-end delivery hook and the conversation cascade.
+        Index("ix_userdoc_research_jobs_conversation", "conversation_id"),
     )

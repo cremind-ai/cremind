@@ -44,6 +44,10 @@ export interface ConversationStreamEvent {
     | 'plan_decision'
     | 'todos'
     | 'agent_activity'
+    // A User Documents research job's live snapshot (the Research activity
+    // panel): full-snapshot semantics like `agent_activity`, published from
+    // the job's own task, so frames keep coming after the turn has ended.
+    | 'research_activity'
     // The answer's User Documents citations, checked against what the tools
     // issued: `{citations: {v, items, unverified}, assistant_id}`. Published
     // when the answer is saved, so it attaches to the finishing bubble and

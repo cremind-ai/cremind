@@ -1,6 +1,6 @@
 """User Documents built-in tool: the agent's way into the user's own files.
 
-Three leaves over the per-profile index that User Document Search keeps in
+Four leaves over the per-profile index that User Document Search keeps in
 sync (see :mod:`app.userdocs`), exposed as ``user_documents__<leaf>``:
 
 - ``find_files`` — files, folders and projects by name, type, date, folder
@@ -8,7 +8,13 @@ sync (see :mod:`app.userdocs`), exposed as ``user_documents__<leaf>``:
 - ``search`` — passages by meaning and by keyword (hybrid retrieval, fused),
   grouped by file, by folder or not at all;
 - ``read`` — the text of one file, by pages, lines, section ("Điều 203"),
-  sheet, rows, slide, or around a phrase or a passage token.
+  sheet, rows, slide, or around a phrase or a passage token; and the pages
+  of a research dossier (``file="research:<job id>"``);
+- ``research`` — deep research as a background job (:mod:`app.userdocs.research`):
+  a verified analysis of a legal, financial or compliance question, or an
+  exhaustive compilation of a folder. The call waits a while for the job and
+  returns its state; a job still running comes back PRELIMINARY, and the
+  agent calls again with ``continue_job``.
 
 Every passage is printed with a citation token (``[ud:<file>#<chunk>]``) and
 every token printed is registered for the conversation
@@ -30,6 +36,7 @@ asked, and answers "not available, because …" rather than raising.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -45,12 +52,17 @@ TOOL_ID = "user_documents"
 LEAF_FIND = "find_files"
 LEAF_SEARCH = "search"
 LEAF_READ = "read"
-# Deep research (PR6) will register as a fourth leaf of this group; the agent
-# guidance mentions it only when a leaf of this name is registered.
+# Deep research: the agent guidance switches to "legal/financial questions
+# MUST go through research" when a leaf of this name is registered.
 LEAF_RESEARCH = "research"
+# ``read`` with ``file="research:<job id>"`` reads a research dossier's pages.
+RESEARCH_REF_PREFIX = "research:"
 
 DEFAULT_TOP_K = 8
 MAX_TOP_K = 30
+# How long a cancel waits for the job to settle before reporting.
+CANCEL_WAIT_S = 10.0
+_MAX_ANSWERS = 20
 
 
 class Var:
@@ -66,8 +78,10 @@ TOOL_CONFIG: ToolConfig = {
         "Searches the user's OWN files indexed by User Document Search — their "
         "documents, notes, reports, spreadsheets, photos and project folders — "
         "by meaning, keyword, date, type and folder, reads any part of a file, "
-        "and returns [ud:…] citation tokens to cite in the answer. Not for "
-        "Cremind's own documentation (use documentation search for that)."
+        "runs deep research over them (verified legal/financial analysis, "
+        "exhaustive folder compilations), and returns [ud:…] citation tokens "
+        "to cite in the answer. Not for Cremind's own documentation (use "
+        "documentation search for that)."
     ),
     # On by default; it only appears for a profile that turned User Document
     # Search on, where the conversation's origin is allowed (see gate.py).
@@ -254,7 +268,8 @@ class UserDocumentsReadTool(BuiltInTool):
         "properties": {
             "file": {"type": "string",
                      "description": "A [ud:…] token (a passage token opens around that passage), a file id, "
-                                    "a path inside the indexed folder, or a file name."},
+                                    "a path inside the indexed folder, or a file name; or research:<job id> "
+                                    "for a page of a research dossier (with page)."},
             "pages": {"type": "string", "description": "PDF pages, e.g. \"3\" or \"3-5\"."},
             "lines": {"type": "string", "description": "Line range in a text file, e.g. \"40-80\"."},
             "section": {"type": "string",
@@ -276,6 +291,57 @@ class UserDocumentsReadTool(BuiltInTool):
         return await _tool_result(LEAF_READ, arguments)
 
 
+def _scope_schema(description: str) -> Dict[str, Any]:
+    return {**FILTERS_SCHEMA, "description": description}
+
+
+class UserDocumentsResearchTool(BuiltInTool):
+    name: str = LEAF_RESEARCH
+    description: str = (
+        "Deep research over the user's own files, run as a background job. mode=analyze answers a "
+        "legal, financial or compliance question: reads the case files in full, finds the governing "
+        "provisions in the reference files from several angles, picks the edition of each law in force, "
+        "and verifies every quote. mode=compile reads EVERY file in scope and builds one table (with a "
+        "CSV), conflicts kept side by side. Returns a dossier with coverage (what was read, what was not "
+        "and why) and [ud:…] tokens. A job takes minutes: a PRELIMINARY result means call again with "
+        "continue_job; a question for the user is answered with continue_job and answers."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string",
+                         "description": "The research question or compile request, in the user's words (starts "
+                                        "a new job)."},
+            "mode": {"type": "string", "enum": ["compile", "analyze"],
+                     "description": "analyze (default): answer a question with verified evidence. compile: read "
+                                    "every file in scope and extract one table."},
+            "domain": {"type": "string", "enum": ["legal", "financial", "general"],
+                       "description": "legal: choose law editions explicitly, cite articles/clauses. "
+                                      "financial: figures and periods. general (default)."},
+            "scope": _scope_schema("The primary files: the case, the client's folder, the folder to compile. "
+                                   "Default: every indexed file."),
+            "reference_scope": _scope_schema("analyze only: where the authorities are — the laws, policies, "
+                                             "standards (e.g. {\"folder\": [\"Luat\"]}). Default: the whole "
+                                             "index."),
+            "continue_job": {"type": "string",
+                             "description": "The job id of an earlier call: get its current state (waits a while "
+                                            "if it is still running), answer its question, cancel it, or read a "
+                                            "page of its dossier."},
+            "answers": {"type": "object",
+                        "description": "With continue_job: the user's answers, keyed by the answer keys the job "
+                                       "printed, e.g. {\"edition\": \"k7m2xq9a\"} or {\"confirm\": true}. Values "
+                                       "are strings, booleans or numbers."},
+            "cancel": {"type": "boolean", "description": "With continue_job: cancel the job."},
+            "page": {"type": "integer", "minimum": 1,
+                     "description": "With continue_job: a page of a finished job's dossier (default 1)."},
+        },
+        "additionalProperties": False,
+    }
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        return await _tool_result(LEAF_RESEARCH, arguments)
+
+
 # ── execution (shared with the REST query API) ─────────────────────────────
 
 
@@ -290,7 +356,7 @@ class LeafResult:
     token_usage: dict[str, int] | None = None
     # {"error": code, "message": …, …} when the leaf could not answer.
     error: dict[str, Any] | None = None
-    # unavailable | invalid | not_found — lets the API choose a status code.
+    # unavailable | invalid | not_found | busy — lets the API choose a status code.
     error_kind: str | None = None
 
 
@@ -329,14 +395,26 @@ async def execute(
     llm: Any = None,
     variables: Optional[Dict[str, Any]] = None,
     budgeted: bool = True,
+    context_id: Optional[str] = None,
 ) -> LeafResult:
     """Run one leaf for ``profile``. Every blocking step (index reads, the
     query embedding, rendering) runs in a worker thread. "Not available",
     a bad filter and an unknown file come back as ``LeafResult.error``;
     store and embedder failures degrade the search mode instead of raising
-    (see :mod:`app.userdocs.query.engine`)."""
+    (see :mod:`app.userdocs.query.engine`).
+
+    ``research`` and ``read`` of a ``research:<id>`` dossier are answered
+    by the job layer before the index is opened: a job's state is in the
+    main database, and cancelling a job must work even while the index is
+    not. ``context_id`` ties a new job to its conversation."""
     from app.userdocs.query import FilterError, ReadError, open_engine
     from app.userdocs.query import render as R
+
+    if leaf == LEAF_RESEARCH:
+        return await _research(profile, args, context_id=context_id, variables=variables or {},
+                               budgeted=budgeted)
+    if leaf == LEAF_READ and str(args.get("file") or "").strip().lower().startswith(RESEARCH_REF_PREFIX):
+        return await _research_page(profile, args, budgeted=budgeted)
 
     access = await asyncio.to_thread(open_engine, profile)
     if access.engine is None:
@@ -436,13 +514,185 @@ async def _search(engine: Any, profile: str, args: Dict[str, Any], *, llm: Any, 
                       token_usage=usage or None)
 
 
+# ── research ───────────────────────────────────────────────────────────────
+
+
+async def _sync(fn: Any, *args: Any) -> Any:
+    """A job-layer call that may touch the database, off the loop. Awaits
+    the result too, should the job layer answer with a coroutine."""
+    result = await asyncio.to_thread(fn, *args)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _answers(raw: Any) -> Dict[str, Any]:
+    """The agent's ``answers``: string keys, scalar values, bounded — what
+    the job layer can merge into a checkpoint without surprises."""
+    from app.userdocs.research.errors import InvalidRequest
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise InvalidRequest("`answers` must be an object keyed by the answer keys the job printed.")
+    out: Dict[str, Any] = {}
+    for key, value in list(raw.items())[:_MAX_ANSWERS]:
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            out[str(key)[:64]] = value
+        elif isinstance(value, str):
+            out[str(key)[:64]] = value.strip()[:500]
+        elif value is None:
+            continue
+        else:
+            raise InvalidRequest(f"answers[{key!r}] must be a string, a boolean or a number.")
+    return out
+
+
+def _scope(raw: Any, name: str) -> Optional[Dict[str, Any]]:
+    """A scope filter checked now, so a typo is an immediate observation
+    rather than a job that fails a minute later."""
+    from app.userdocs.query import parse_filters
+    from app.userdocs.research.errors import InvalidRequest
+
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, dict):
+        raise InvalidRequest(f"`{name}` must be a filters object.")
+    parse_filters(raw)
+    return dict(raw)
+
+
+def _research_error(err: Any) -> LeafResult:
+    from app.userdocs.query import render as R
+
+    kind = {
+        "JobNotFound": "not_found",
+        "InvalidRequest": "invalid",
+        "UserDocumentsUnavailable": "unavailable",
+        "ResearchBusy": "busy",
+    }.get(getattr(err, "code", ""), "invalid")
+    text = ""
+    if kind == "unavailable":
+        text = R.render_status(err.message, code=err.extra.get("status_code") or err.extra.get("status"))
+    return LeafResult(text=text, error=err.to_dict(), error_kind=kind)
+
+
+async def _research(profile: str, args: Dict[str, Any], *, context_id: Optional[str], variables: Dict[str, Any],
+                    budgeted: bool) -> LeafResult:
+    """Start, poll, answer, cancel or page a research job, then render it.
+
+    Every wait is on the job's own completion event (``wait_job``), never on
+    its task, so this call timing out or being cancelled never stops the
+    job; it keeps running and the next call (or the delivery turn) picks it
+    up."""
+    from app.userdocs.query import FilterError
+    from app.userdocs.research import jobs
+    from app.userdocs.research.context import ResearchSpec
+    from app.userdocs.research.errors import InvalidRequest, ResearchError
+    from app.userdocs.research.types import ACTIVE, DOMAIN_GENERAL, MODE_ANALYZE
+    from app.utils.task_context import current_task_id_var
+
+    job_id = _str(args.get("continue_job"))
+    page = _int(args.get("page"), 1, 1, 10_000)
+    try:
+        if job_id:
+            if args.get("cancel"):
+                view = await jobs.cancel_job(profile=profile, job_id=job_id)
+                if view.status in ACTIVE:
+                    view = await jobs.wait_job(profile=profile, job_id=job_id,
+                                               timeout=min(jobs.wait_cap(), CANCEL_WAIT_S))
+            else:
+                view = await jobs.continue_job(profile=profile, job_id=job_id, answers=_answers(args.get("answers")),
+                                               variables=variables, collect=True)
+                if view.status in ACTIVE:
+                    view = await jobs.wait_job(profile=profile, job_id=job_id, timeout=jobs.wait_cap(),
+                                               collect=True)
+        else:
+            if args.get("cancel"):
+                raise InvalidRequest("`cancel` needs `continue_job`: the id of the job to cancel.")
+            question = _str(args.get("question"))
+            if not question:
+                raise InvalidRequest("Pass `question` to start a research job, or `continue_job` with the id of "
+                                     "an earlier one.")
+            spec = ResearchSpec(
+                question=question,
+                mode=_str(args.get("mode")) or MODE_ANALYZE,
+                domain=_str(args.get("domain")) or DOMAIN_GENERAL,
+                scope=_scope(args.get("scope"), "scope"),
+                reference_scope=_scope(args.get("reference_scope"), "reference_scope"),
+            )
+            conversation_id = await _sync(jobs.resolve_conversation_id, profile, context_id) if context_id else None
+            # ``collect``: this call shows the outcome to the agent (and claims
+            # it), so the job must not also report it as an injected turn.
+            view = await jobs.start_job(profile=profile, spec=spec, conversation_id=conversation_id,
+                                        run_id=current_task_id_var.get(), variables=variables, collect=True)
+            if view.status in ACTIVE:
+                view = await jobs.wait_job(profile=profile, job_id=view.job_id, timeout=jobs.wait_cap(),
+                                           collect=True)
+    except ResearchError as err:
+        return _research_error(err)
+    except FilterError as exc:
+        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid")
+    return await _render_research(profile, view, page=page, budgeted=budgeted)
+
+
+async def _research_page(profile: str, args: Dict[str, Any], *, budgeted: bool) -> LeafResult:
+    """``read`` of ``research:<job id>``: a page of the job's dossier (or its
+    current state, when it is not settled yet)."""
+    from app.userdocs.research import jobs
+    from app.userdocs.research.errors import InvalidRequest, ResearchError
+
+    ref = str(args.get("file") or "").strip()
+    job_id = ref[len(RESEARCH_REF_PREFIX):].strip()
+    try:
+        if not job_id:
+            raise InvalidRequest("Name the job: file=\"research:<job id>\".")
+        view = await _sync(jobs.get_job, profile, job_id)
+    except ResearchError as err:
+        return _research_error(err)
+    return await _render_research(profile, view, page=_int(args.get("page"), 1, 1, 10_000), budgeted=budgeted)
+
+
+async def _index_db(profile: str) -> Any:
+    """The profile's index, for resolving the tokens a dossier prints; None
+    when it cannot be opened (the page is still shown, its tokens are then
+    not registered)."""
+    from app.userdocs.query import open_engine
+
+    try:
+        access = await asyncio.to_thread(open_engine, profile)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[userdocs] research: index not available for {profile}: {exc}")
+        return None
+    return access.engine.db if access.engine is not None else None
+
+
+async def _render_research(profile: str, view: Any, *, page: int, budgeted: bool) -> LeafResult:
+    from app.userdocs.research import jobs
+    from app.userdocs.research.render import render_job
+    from app.userdocs.research.types import FINAL, WAITING
+
+    db = await _index_db(profile)
+    rendered = await asyncio.to_thread(
+        lambda: render_job(view, ctx=render_context(profile, budgeted=budgeted), db=db, page=page))
+    if view.status in FINAL or view.status in WAITING:
+        # The caller is about to see this state: claim its delivery, so no
+        # extra turn is injected to present it again.
+        try:
+            await _sync(jobs.mark_collected, profile, view.job_id)
+        except Exception as exc:  # noqa: BLE001 — delivery bookkeeping never fails the answer
+            logger.warning(f"[userdocs] research: could not mark job {view.job_id} collected: {exc}")
+    return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files,
+                      token_usage=None)
+
+
 async def _tool_result(leaf: str, arguments: Dict[str, Any]) -> BuiltInToolResult:
     profile = arguments.get("_profile") or "admin"
     context_id = arguments.get("_context_id")
     args = {k: v for k, v in arguments.items() if not k.startswith("_")}
     try:
         result = await execute(leaf, profile, args, llm=arguments.get("_llm"),
-                               variables=arguments.get("_variables") or {})
+                               variables=arguments.get("_variables") or {}, context_id=context_id)
     except Exception as exc:  # noqa: BLE001 — a search failure is an observation, not a crash
         logger.exception(f"[userdocs] {leaf} failed for {profile}")
         return BuiltInToolResult(structured_content={
@@ -473,5 +723,7 @@ async def _issue(profile: str, context_id: Optional[str], citations: list[Any]) 
 
 
 def get_tools(config: dict) -> list[BuiltInTool]:
-    """The three leaves; research joins them in a later release."""
-    return [UserDocumentsFindFilesTool(), UserDocumentsSearchTool(), UserDocumentsReadTool()]
+    """The four leaves. Registering ``research`` is also what switches the
+    agent guidance to "legal/financial questions MUST go through research"."""
+    return [UserDocumentsFindFilesTool(), UserDocumentsSearchTool(), UserDocumentsReadTool(),
+            UserDocumentsResearchTool()]

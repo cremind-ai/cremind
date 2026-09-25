@@ -241,7 +241,7 @@ def _fuzzy(nq: str, src: _Source, start: int) -> tuple[float, int, int, bool] | 
         ratio = sm.ratio()
         ok = ratio >= limit and _same_digits(nq, win) and not (
             src.has_marks and _diacritics_only_difference(sm, nq, win)
-        )
+        ) and not _changes_words(nq, win)
         cand = (ratio, s, e, ok)
         # An acceptable window beats a better-scoring unacceptable one.
         if best is None or (ok, ratio) > (best[3], best[0]):
@@ -292,6 +292,58 @@ def _diacritics_only_difference(sm: difflib.SequenceMatcher, a: str, b: str) -> 
         x, y = a[i1:i2], b[j1:j2]
         if x and y and x != y and _strip_marks(x) == _strip_marks(y):
             return True
+    return False
+
+
+# Two words closer than this are the same word misspelled; further apart,
+# one word was put in place of another.
+_SAME_WORD_RATIO = 0.75
+# Words whose omission reverses or narrows what a passage says. A quote may
+# leave source words out ("Tòa án nhân dân giải quyết" → "Tòa án giải
+# quyết"), but never one of these ("không được chuyển nhượng" → "được chuyển
+# nhượng"). Compared in match-normalised (casefolded) form.
+_MEANING_WORDS = frozenset({
+    # Vietnamese: not / not yet / never / forbidden / except / only / unless
+    "không", "chưa", "chẳng", "chớ", "đừng", "cấm", "trừ", "ngoại", "chỉ", "nếu", "miễn",
+    # English
+    "not", "no", "never", "nor", "neither", "cannot", "except", "excluding", "unless", "without",
+    "only", "if", "provided", "notwithstanding",
+})
+
+
+def _changes_words(quote: str, window: str) -> bool:
+    """True when the quote differs from the source window by a *word*, not a
+    spelling: a word replaced by another ("do Tòa án giải quyết" quoted as
+    "do UBND giải quyết"), a word the source does not have, or a dropped
+    negation/exception/restriction word (see ``_MEANING_WORDS``). Those
+    change what the passage says, however similar the characters are.
+    Typos inside a word, and ordinary words left out, do not. Words at the
+    very edges of the window are its slack, not the quote's."""
+    qw, ww = quote.split(), window.split()
+    sm = difflib.SequenceMatcher(None, qw, ww, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        at_edge = (i1 == 0 and j1 == 0) or (i2 == len(qw) and j2 == len(ww))
+        if tag == "delete":
+            # Words in the quote the source does not have.
+            if not at_edge:
+                return True
+            continue
+        if tag == "insert":
+            # Source words the quote left out.
+            if not at_edge and any(w.strip(".,;:!?()\"'") in _MEANING_WORDS for w in ww[j1:j2]):
+                return True
+            continue
+        a, b = qw[i1:i2], ww[j1:j2]
+        if len(a) != len(b):
+            # "khởikiện" vs "khởi kiện": a split or joined word is still a typo.
+            if difflib.SequenceMatcher(None, "".join(a), "".join(b)).ratio() < _SAME_WORD_RATIO:
+                return True
+            continue
+        for x, y in zip(a, b):
+            if difflib.SequenceMatcher(None, x, y).ratio() < _SAME_WORD_RATIO:
+                return True
     return False
 
 

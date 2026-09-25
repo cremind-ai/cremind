@@ -298,6 +298,29 @@ def get_conversation_routes(
         from app.agent import agent_activity
         return JSONResponse({"activity": agent_activity.get_snapshot(conversation_id)})
 
+    async def handle_get_research_activity(request: Request) -> JSONResponse:
+        """Return the live Research-activity snapshot for a conversation, if any.
+
+        The reload counterpart of the ``research_activity`` stream frames, for
+        the same case as the agent activity above: a saved message whose
+        ``research_activity`` says ``running`` is either a job still working
+        in this process (non-null here) or one a restart cut short (null —
+        the UI shows it as interrupted; ``continue_job`` resumes it).
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        conversation_id = request.path_params["conversation_id"]
+        conv = await conversation_storage.get_conversation(conversation_id)
+        if not conv:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        if conv.get("profile") != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        from app.userdocs.research import activity as research_activity
+        return JSONResponse({"activity": research_activity.get_snapshot(conversation_id)})
+
     async def handle_get_memory(request: Request) -> JSONResponse:
         """Return this conversation's running summary (short-term) + long-term memory.
 
@@ -1083,6 +1106,11 @@ def get_conversation_routes(
         Route(
             "/api/conversations/{conversation_id}/agent-activity",
             endpoint=handle_get_agent_activity,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/conversations/{conversation_id}/research-activity",
+            endpoint=handle_get_research_activity,
             methods=["GET"],
         ),
         Route(

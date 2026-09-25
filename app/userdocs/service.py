@@ -266,6 +266,7 @@ class UserDocsService:
             rt = self.runtime(cmd[1], create=True)
             if rt is not None:
                 rt.configure()
+            _stop_research_if_off(cmd[1])
         elif name == "configure_all":
             from app.storage.userdocs_storage import get_userdocs_storage
 
@@ -276,6 +277,7 @@ class UserDocsService:
                 rt = self.runtime(p, create=True)
                 if rt is not None:
                     rt.configure()
+                _stop_research_if_off(p)
         elif name == "purge":
             self._purge(cmd[1], cmd[2])
         elif name == "after_estimate":
@@ -499,6 +501,7 @@ class UserDocsService:
         storage.delete_captions(profile)
         storage.delete_vision_usage(profile)
         _purge_citations(profile)
+        _purge_research(profile)
         logger.info(f"[userdocs] {profile}: index deleted")
         new_rt = self.runtime(profile, create=True)
         if new_rt is not None:
@@ -891,10 +894,12 @@ def forget_profile(profile: str, uid: str | None) -> None:
     """A profile was deleted: stop its runtime and delete its index and
     collections. The index is keyed by the profile's uuid, so a profile
     re-created under the same name could never read it anyway — this only
-    gives the space back."""
+    gives the space back. Its research jobs' rows went with the profile row;
+    their running tasks and artifacts go here."""
     from app.userdocs import vector_sync
     from app.userdocs.index import index_dir
 
+    _purge_research(profile)
     svc = get_service()
     if svc is not None:
         with svc._lock:
@@ -924,9 +929,40 @@ def _purge_citations(profile: str) -> None:
         logger.exception(f"[userdocs] {profile}: could not delete the citation registry")
 
 
+def _purge_research(profile: str) -> None:
+    """Research jobs are part of purge set P too: a dossier quotes the index
+    it was built from. Stops the profile's running jobs (they notice their
+    row is gone and end without a word), deletes the rows and the artifacts.
+    Best-effort, like the citation purge."""
+    try:
+        from app.userdocs.research.jobs import purge_profile
+
+        purge_profile(profile)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[userdocs] {profile}: could not delete the research jobs")
+
+
+def _stop_research_if_off(profile: str) -> None:
+    """Settings changed: if the profile can no longer use User Document
+    Search (turned off, or no longer allowed by the admin), stop its running
+    research job. Jobs waiting for an answer stay; continuing one needs the
+    feature back on. Costs nothing unless a job is running."""
+    try:
+        from app.userdocs.research import jobs as research_jobs
+
+        if not research_jobs.has_live_run(profile):
+            return
+        snapshot = uds_state.build_snapshot(profile)
+        if snapshot.get("allowed") and snapshot.get("enabled") and snapshot.get("tool_mode") != "hidden":
+            return
+        research_jobs.signal_cancel(profile, "User Document Search was turned off")
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[userdocs] {profile}: could not stop research after a settings change")
+
+
 def clean_profile(profile: str) -> dict[str, Any]:
     """The "User documents" clean-data component: delete the index, captions,
-    quota counters and settings — never the user's files."""
+    quota counters, research jobs and settings — never the user's files."""
     from app.storage.userdocs_storage import get_userdocs_storage
 
     storage = get_userdocs_storage()

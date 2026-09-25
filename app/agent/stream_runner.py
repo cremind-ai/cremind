@@ -1118,6 +1118,20 @@ async def run_agent_to_bus(
                 "agent_activity": activity_snapshot,
             }
 
+        # Research activity (a user_documents research job): the same, for its
+        # own panel. A job outlives the turn that started it, so finish()
+        # patches the persisted message later (see set_persist_target below).
+        try:
+            from app.userdocs.research import activity as research_activity
+            research_snapshot = research_activity.get_snapshot(conversation_id)
+        except Exception:  # noqa: BLE001
+            research_snapshot = None
+        if research_snapshot:
+            agent_message_metadata = {
+                **(agent_message_metadata or {}),
+                "research_activity": research_snapshot,
+            }
+
         # Where mid-turn messages cut the visible flow. One persisted turn, but
         # the UI renders it as the same sequence of bubbles the user watched
         # arrive — without this a reload collapses the whole turn back into one.
@@ -1222,6 +1236,12 @@ async def run_agent_to_bus(
             try:
                 from app.agent import agent_activity
                 agent_activity.set_persist_target(conversation_id, assistant_msg_id)
+            except Exception:  # noqa: BLE001
+                pass
+        if research_snapshot and assistant_msg_id:
+            try:
+                from app.userdocs.research import activity as research_activity
+                research_activity.set_persist_target(conversation_id, assistant_msg_id)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1545,6 +1565,23 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "stream_runner: turn-end user-message flush failed for "
+                    f"{conversation_id}"
+                )
+
+        # Turn-end reconciliation, part 1b: document research. A job that
+        # finished (or stopped to ask) while this turn ran, and that the turn
+        # did not collect itself, reports now as its own turn. After the unbind,
+        # so the job's own delivery and this hook race only on the job's
+        # one-shot claim. Free for a conversation no job reported to.
+        if not event_run:
+            try:
+                from app.userdocs.research import jobs as research_jobs
+                await research_jobs.on_turn_end(
+                    conversation_id=conversation_id, profile=profile,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "stream_runner: turn-end research delivery failed for "
                     f"{conversation_id}"
                 )
 

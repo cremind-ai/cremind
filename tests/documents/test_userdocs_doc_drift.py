@@ -1,12 +1,13 @@
-"""Doc/code drift pin for `[cli]cremind userdocs.md` and
-`[cli]cremind userdocs search.md`.
+"""Doc/code drift pin for `[cli]cremind userdocs.md`,
+`[cli]cremind userdocs search.md` and `[cli]cremind userdocs research.md`.
 
 CLAUDE.md mandates that a CLI command and its bundled doc move in lockstep.
 This walks the nested Typer groups (`userdocs`, `userdocs excludes`,
-`userdocs admin`) so a new subcommand or flag cannot land undocumented. The
-query subcommands (`search`, `find`, `read`, `cite`) live in their own doc —
-one reference per question a user asks ("set it up" vs "search my files"),
-each small enough to be delivered whole.
+`userdocs admin`, `userdocs research`) so a new subcommand or flag cannot
+land undocumented. The query subcommands (`search`, `find`, `read`, `cite`)
+and the research jobs (`research …`) live in their own docs — one reference
+per question a user asks ("set it up" vs "search my files" vs "research this
+folder"), each small enough to be delivered whole.
 
 The ``description`` is the only text embedded into ``documentation_search``,
 so it must carry what users actually ask ("search my files", "index my
@@ -26,9 +27,13 @@ pytest.importorskip("typer")
 BUNDLED = Path(__file__).resolve().parents[2] / "app" / "documents" / "bundled"
 DOC = BUNDLED / "[cli]cremind userdocs.md"
 SEARCH_DOC = BUNDLED / "[cli]cremind userdocs search.md"
+RESEARCH_DOC = BUNDLED / "[cli]cremind userdocs research.md"
 
 # Documented in SEARCH_DOC instead of DOC.
 SEARCH_COMMANDS = frozenset({"search", "find", "read", "cite"})
+# Every command of this group is documented in RESEARCH_DOC.
+RESEARCH_GROUP = "research"
+RESEARCH_COMMANDS = frozenset({"run", "status", "continue", "cancel", "list"})
 
 
 def _doc_text(doc: Path = DOC) -> str:
@@ -49,7 +54,7 @@ def _walk(app, prefix: str):
         yield from _walk(group.typer_instance, f"{prefix} {group.name}")
 
 
-@pytest.mark.parametrize("doc", [DOC, SEARCH_DOC], ids=lambda d: d.name)
+@pytest.mark.parametrize("doc", [DOC, SEARCH_DOC, RESEARCH_DOC], ids=lambda d: d.name)
 def test_frontmatter_is_well_formed(doc):
     lines = _doc_text(doc).splitlines()
     assert lines[0] == "---"
@@ -67,8 +72,13 @@ def test_the_description_carries_what_users_ask():
     assert "not for cremind's own documentation" in description
 
 
-def _in_search_doc(path: str) -> bool:
-    return path.split(" ")[2] in SEARCH_COMMANDS and path.count(" ") == 2
+def _doc_for(path: str) -> Path:
+    parts = path.split(" ")
+    if parts[2] == RESEARCH_GROUP:
+        return RESEARCH_DOC
+    if parts[2] in SEARCH_COMMANDS and len(parts) == 3:
+        return SEARCH_DOC
+    return DOC
 
 
 def test_every_subcommand_and_flag_is_documented():
@@ -76,11 +86,11 @@ def test_every_subcommand_and_flag_is_documented():
 
     from app.cli.commands.userdocs import userdocs_app
 
-    texts = {False: _doc_text(), True: _doc_text(SEARCH_DOC)}
+    texts = {doc: _doc_text(doc) for doc in (DOC, SEARCH_DOC, RESEARCH_DOC)}
     seen = []
     for path, callback in _walk(userdocs_app, "cremind userdocs"):
         seen.append(path)
-        text = texts[_in_search_doc(path)]
+        text = texts[_doc_for(path)]
         assert path in text, f"subcommand `{path}` is undocumented"
         for param in inspect.signature(callback).parameters.values():
             default = param.default
@@ -92,6 +102,24 @@ def test_every_subcommand_and_flag_is_documented():
                         assert flag in text, f"flag {flag} of `{path}` is undocumented"
     assert "cremind userdocs status" in seen
     assert {f"cremind userdocs {c}" for c in SEARCH_COMMANDS} <= set(seen)
+    assert {f"cremind userdocs research {c}" for c in RESEARCH_COMMANDS} <= set(seen)
+
+
+def test_the_research_doc_carries_what_users_ask():
+    """Retrieval must tell research apart from a quick search ("compile the
+    MKT-report folder", "analyze ABC's dispute under the land law"), and the
+    body must teach the parts a script cannot guess."""
+    description = _description(RESEARCH_DOC).lower()
+    for keyword in ("own", "research", "compile", "analy", "legal", "edition", "coverage",
+                    "citation", "--follow", "not for cremind's own documentation"):
+        assert keyword in description, f"research doc description never mentions {keyword!r}"
+    text = _doc_text(RESEARCH_DOC)
+    # Exit codes, answering a clarification, and the chat/tool boundary.
+    assert "| 2 |" in text and "needs_clarification" in text and "interrupted" in text
+    assert "--answer edition=" in text and "confirm=true" in text
+    assert "user_documents__research" in text
+    # The main doc points to it.
+    assert "cremind userdocs research" in _doc_text()
 
 
 def test_the_search_doc_carries_what_users_ask():

@@ -1904,6 +1904,21 @@ async def main(
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to sweep undelivered event results")
 
+            # 12b. Document research jobs the restart cut short: mark them
+            #      interrupted and report every result still owed to its
+            #      conversation. After step 11 for the same reason as 12, and
+            #      after 7h, whose engine the reports are rendered from. In the
+            #      background: rendering opens a profile's document index, which
+            #      must never hold up boot.
+            try:
+                from app.userdocs.research import jobs as research_jobs
+
+                research_jobs.spawn(
+                    research_jobs.boot_recover(), name="userdocs-research-boot",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start research job recovery")
+
             try:
                 _db_backend = get_database_provider().name
             except Exception:  # noqa: BLE001

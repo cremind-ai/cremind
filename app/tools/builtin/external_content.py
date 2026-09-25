@@ -12,6 +12,8 @@ forwarded email or a shared spreadsheet can carry text aimed at the agent.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 import secrets
 from typing import Optional
@@ -64,6 +66,8 @@ def wrap_web_content(content: Optional[str], *, source: str = "web_search") -> s
 
 _DOC_START = "USER_DOCUMENT_CONTENT"
 _DOC_END = "END_USER_DOCUMENT_CONTENT"
+# Keys the document marker ids; never leaves the process.
+_DOC_MARKER_KEY = secrets.token_bytes(32)
 
 _DOC_NOTICE = (
     "The block below is content from the user's own files (names, paths and "
@@ -86,7 +90,14 @@ def wrap_document_content(content: Optional[str], *, source: str = "user_documen
         return content or ""
     sanitized = _DOC_MARKER_SPOOF_RE.sub("[MARKER_REMOVED]", content)
     sanitized = _MARKER_SPOOF_RE.sub("[MARKER_REMOVED]", sanitized)
-    marker_id = secrets.token_hex(8)
+    # Keyed on the content with a per-process secret: as unguessable to the
+    # document as a random id (it cannot forge its own end marker without the
+    # secret), but the same text always wraps to the same bytes. Results are
+    # sized and paged by measuring wrapped text, and a random id — whose hex
+    # tokenizes differently each time — made the same result measure (and
+    # page) differently from one call to the next.
+    marker_id = hmac.new(_DOC_MARKER_KEY, f"{source}\0{sanitized}".encode("utf-8"),
+                         hashlib.sha256).hexdigest()[:16]
     return (
         f"{_DOC_NOTICE}\n"
         f'<<<{_DOC_START} id="{marker_id}" source="{source}">>>\n'

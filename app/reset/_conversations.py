@@ -84,6 +84,14 @@ async def cleanup_conversation_dependents(
         task_result_inbox.discard(conversation_id)
     except Exception:  # noqa: BLE001
         logger.debug("task inbox discard failed during conv clean", exc_info=True)
+    try:
+        # The conversation's Research activity panel lives in memory; its
+        # research job row goes with the conversation (FK cascade), and a job
+        # still running stops quietly at its next save.
+        from app.userdocs.research import activity as research_activity
+        research_activity.clear(conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("research activity clear failed during conv clean", exc_info=True)
     # Remove any saved Plan-mode files for this conversation (best-effort).
     try:
         from app.utils.plans_dir import remove_conversation_plans

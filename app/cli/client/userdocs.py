@@ -12,11 +12,17 @@ recognise:
 
 `query/{find|search|read}` run the agent's search leaves and answer with the
 text the agent would read; `citations/resolve` looks citation tokens up.
+
+`research` starts, follows, answers and cancels deep-research jobs. Every
+answer carries `job` (the job view) and `text` (what the agent would read);
+`wait` holds a request open up to the server's cap while the job runs, so
+keep the client's timeout above it.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
+from urllib.parse import quote
 
 from app.cli.client._base import Client
 
@@ -113,4 +119,52 @@ async def resolve_citations(
     if conversation_id:
         body["conversation_id"] = conversation_id
     resp = await client.post_json("/api/userdocs/citations/resolve", body)
+    return resp if isinstance(resp, dict) else {}
+
+
+def _research_path(job_id: str, suffix: str = "") -> str:
+    return f"/api/userdocs/research/{quote(job_id, safe='')}{suffix}"
+
+
+async def research_start(client: Client, body: dict[str, Any]) -> dict[str, Any]:
+    """``body``: ``question``, and optionally ``mode`` (analyze | compile),
+    ``domain`` (general | legal | financial), ``scope`` / ``reference_scope``
+    (filter objects, as the agent's tool takes them) and ``wait`` (seconds)."""
+    clean = {k: v for k, v in body.items() if v is not None}
+    resp = await client.post_json("/api/userdocs/research", clean)
+    return resp if isinstance(resp, dict) else {}
+
+
+async def research_list(client: Client, *, limit: int = 20) -> dict[str, Any]:
+    resp = await client.get_json("/api/userdocs/research", params={"limit": limit})
+    return resp if isinstance(resp, dict) else {}
+
+
+async def research_get(
+    client: Client, job_id: str, *, page: Optional[int] = None, wait: Optional[float] = None,
+) -> dict[str, Any]:
+    """The job, its text (dossier page ``page`` once finished) and ``pages``."""
+    params: dict[str, Any] = {}
+    if page is not None:
+        params["page"] = page
+    if wait:
+        params["wait"] = wait
+    resp = await client.get_json(_research_path(job_id), params=params or None)
+    return resp if isinstance(resp, dict) else {}
+
+
+async def research_continue(
+    client: Client, job_id: str, *, answers: Optional[dict[str, Any]] = None, wait: Optional[float] = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    if answers:
+        body["answers"] = answers
+    if wait:
+        body["wait"] = wait
+    resp = await client.post_json(_research_path(job_id, "/continue"), body)
+    return resp if isinstance(resp, dict) else {}
+
+
+async def research_cancel(client: Client, job_id: str) -> dict[str, Any]:
+    resp = await client.post_json(_research_path(job_id, "/cancel"), {})
     return resp if isinstance(resp, dict) else {}

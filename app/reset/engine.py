@@ -348,10 +348,19 @@ async def _clean_documents(profile: str, deps: Deps) -> dict[str, bool]:
 
 
 async def _clean_user_documents(profile: str, deps: Deps) -> dict[str, Any]:
-    """Delete the profile's document index, vectors, captions and settings.
-    The indexed folder and every file in it are left untouched."""
+    """Delete the profile's document index, vectors, captions, research jobs
+    and settings. The indexed folder and every file in it are left untouched.
+
+    A running research job is stopped (and waited for) first, so it is not
+    still writing a checkpoint or an artifact while its rows and files go."""
     from app.userdocs.service import clean_profile
 
+    try:
+        from app.userdocs.research.jobs import cancel_profile_jobs
+
+        await cancel_profile_jobs(profile, "the profile's document data was cleaned")
+    except Exception:  # noqa: BLE001 — the purge below stops them regardless
+        logger.exception(f"clean: could not stop research jobs for profile={profile}")
     return await asyncio.to_thread(clean_profile, profile)
 
 

@@ -122,6 +122,57 @@ export async function fetchAgentActivity(
   }
 }
 
+/**
+ * Fetch the live Research-activity snapshot for a conversation (a User
+ * Documents research job). Returns the snapshot while the job's panel is held
+ * in memory, or null when it is gone (the server restarted, or the
+ * conversation was cleared). Used only to disambiguate a persisted "running"
+ * snapshot on reload; never throws (returns null on any error).
+ */
+export async function fetchResearchActivity(
+  agentUrl: string, authToken: string, conversationId: string,
+): Promise<any | null> {
+  try {
+    const base = resolveBaseUrl(agentUrl);
+    const res = await fetch(
+      `${base}/api/conversations/${encodeURIComponent(conversationId)}/research-activity`,
+      { headers: authHeaders(authToken) },
+    );
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body?.activity ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cancel a User Documents research job. The job acts on the caller's own
+ * profile (the server takes it from the Bearer token). Resolves once the
+ * server accepted the cancel; the panel settles when the `research_activity`
+ * frame for the cancelled job arrives. Throws with the server's message when
+ * the cancel was refused (e.g. the job is not this profile's).
+ */
+export async function cancelResearchJob(
+  agentUrl: string, authToken: string, jobId: string,
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/userdocs/research/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+    headers: authHeaders(authToken),
+  });
+  if (!res.ok) {
+    let message = res.statusText;
+    try {
+      const body = await res.json();
+      message = body?.message || body?.error || message;
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(`Could not cancel the research job: ${message}`);
+  }
+}
+
 export async function deleteConversation(
   agentUrl: string, authToken: string, conversationId: string,
 ): Promise<void> {

@@ -597,8 +597,8 @@ def test_the_agent_offers_the_tool_and_its_rules_in_the_web_ui(monkeypatch):
     for fn in ("user_documents__find_files", "user_documents__search", "user_documents__read"):
         assert f"`{fn}`" in prompt
     assert "[ud:…]" in prompt and "±1 day" in prompt
-    # No research leaf yet: legal questions are sent to read, research is not named.
-    assert "user_documents__research" not in prompt
+    # The research leaf is registered: legal/financial questions are sent to it.
+    assert "`user_documents__research`" in prompt and "continue_job" in prompt
     # The user's files come first in the verify-before-answering guidance.
     assert prompt.index("`user_documents__search`") < prompt.index("`documentation_search__search_documentation`")
     assert agent._build_instruction() == prompt  # byte-stable within the run

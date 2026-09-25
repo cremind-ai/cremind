@@ -18,6 +18,7 @@ import {
   updateConversationTitle as apiUpdateConversationTitle,
   updateConversationId as apiUpdateConversationId,
   fetchAgentActivity,
+  fetchResearchActivity,
 } from '../services/conversationApi';
 import type { MessageRecord } from '../services/conversationApi';
 import type { ChatMode } from '../constants/chatModes';
@@ -450,6 +451,84 @@ export interface AgentActivityState extends AgentActivitySnapshot {
   updateSeq: number;
 }
 
+// ── Research activity (User Documents deep research) ──────────────────────
+// Live state of the conversation's research job, rendered in the floating
+// Research activity panel: the question, phase, progress, latest steps and
+// tokens against the budget. Published from the job's own task, so frames
+// keep arriving after the turn that started it has ended. For the user's
+// eyes only — the agent reads the job through its tool.
+export type ResearchActivityStatus =
+  | 'queued' | 'planning' | 'running'
+  | 'needs_clarification' | 'needs_confirmation'
+  | 'complete' | 'partial' | 'failed' | 'cancelled' | 'interrupted';
+
+/** Statuses in which the job is still working (anything else is settled). */
+export const RESEARCH_WORKING_STATUSES: readonly string[] = ['queued', 'planning', 'running'];
+
+export interface ResearchActivityStep {
+  id: string;
+  ts: number;
+  kind: string;
+  label: string;
+  detail?: string | null;
+  status?: 'running' | 'done' | 'failed' | 'stopped' | null;
+}
+
+export interface ResearchActivitySnapshot {
+  job_id: string;
+  conversation_id?: string | null;
+  status: ResearchActivityStatus;
+  title: string;
+  mode: 'compile' | 'analyze' | string;
+  phase?: string | null;
+  started_at: number;
+  updated_at: number;
+  progress?: { done: number; total: number } | null;
+  steps: ResearchActivityStep[];
+  total_steps: number;
+  usage?: { tokens_in: number; tokens_out: number; budget: number } | null;
+  summary?: string | null;
+  error?: string | null;
+}
+
+export interface ResearchActivityState extends ResearchActivitySnapshot {
+  changedIds: string[];
+  updateSeq: number;
+}
+
+/**
+ * Whether `snap` is older than what the panel already shows: an earlier
+ * snapshot of the same job (SSE replay after a reconnect), or a snapshot of
+ * an earlier job. Snapshots are whole states, so the newer one simply wins.
+ */
+export function isStaleResearchSnapshot(
+  prev: ResearchActivitySnapshot | null | undefined,
+  snap: ResearchActivitySnapshot,
+): boolean {
+  if (!prev) return false;
+  if (prev.job_id === snap.job_id) return (snap.updated_at ?? 0) < (prev.updated_at ?? 0);
+  return (snap.started_at ?? 0) < (prev.started_at ?? 0);
+}
+
+function researchState(
+  snap: ResearchActivitySnapshot,
+  prev: ResearchActivityState | null | undefined,
+): ResearchActivityState {
+  const steps: ResearchActivityStep[] = Array.isArray(snap.steps) ? snap.steps : [];
+  const prevById = new Map(
+    (prev && prev.job_id === snap.job_id ? prev.steps : []).map(s => [s.id, s]),
+  );
+  const changedIds = prev
+    ? steps
+      .filter(s => {
+        const p = prevById.get(s.id);
+        return !p || p.status !== s.status || p.detail !== s.detail;
+      })
+      .map(s => s.id)
+    : [];
+  return { ...snap, steps, changedIds, updateSeq: (prev?.updateSeq ?? 0) + 1 };
+}
+
 interface ChatState {
   messagesByConversation: Record<string, ChatMessage[]>;
   runtimes: Record<string, ConversationRuntime>;
@@ -463,6 +542,8 @@ interface ChatState {
   todosByConversation: Record<string, TodoState | null>;
   /** Coding sub-agent (Claude Code / future Codex) live activity per conversation. */
   agentActivityByConversation: Record<string, AgentActivityState | null>;
+  /** User Documents research job live activity per conversation. */
+  researchActivityByConversation: Record<string, ResearchActivityState | null>;
   agentCard: AgentCard | null;
   agentName: string;
   isConnected: boolean;
@@ -508,6 +589,7 @@ export const useChatStore = defineStore('chat', {
     pendingPlanByConversation: {},
     todosByConversation: {},
     agentActivityByConversation: {},
+    researchActivityByConversation: {},
     agentCard: null,
     agentName: 'Agent',
     isConnected: false,
@@ -570,6 +652,11 @@ export const useChatStore = defineStore('chat', {
     activeAgentActivity(state): AgentActivityState | null {
       if (!state.activeConversationId) return null;
       return state.agentActivityByConversation[state.activeConversationId] ?? null;
+    },
+    /** Research job activity for the active conversation, or null. */
+    activeResearchActivity(state): ResearchActivityState | null {
+      if (!state.activeConversationId) return null;
+      return state.researchActivityByConversation[state.activeConversationId] ?? null;
     },
     /**
      * Map of conversationId -> isStreaming, used by the sidebar to show
@@ -1080,6 +1167,62 @@ export const useChatStore = defineStore('chat', {
       this.agentActivityByConversation[conversationId] = null;
     },
 
+    /**
+     * Restore the Research activity panel after a reload from the newest
+     * message carrying `metadata.research_activity`. A saved snapshot that
+     * says the job is still working is checked against the server: a live
+     * snapshot is adopted (later frames keep it fresh); none means a restart
+     * cut the job short, so the panel shows 'interrupted' — the agent resumes
+     * it with continue_job. Panel-only — never touches message bubbles.
+     */
+    restoreResearchActivityState(conversationId: string, messages: MessageRecord[]) {
+      this.researchActivityByConversation[conversationId] = null;
+      if (!messages || !messages.length) return;
+
+      let snap: ResearchActivitySnapshot | null = null;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const ra = (messages[i]?.metadata?.research_activity ?? null) as any;
+        if (ra && typeof ra === 'object' && ra.job_id) {
+          snap = ra as ResearchActivitySnapshot;
+          break;
+        }
+      }
+      if (!snap) return;
+      const saved = snap;
+      this.researchActivityByConversation[conversationId] = {
+        ...researchState(saved, null),
+        updateSeq: 0,
+      };
+      if (!RESEARCH_WORKING_STATUSES.includes(saved.status)) return;
+
+      const settingsStore = useSettingsStore();
+      fetchResearchActivity(settingsStore.agentUrl, settingsStore.authToken, conversationId)
+        .then(live => {
+          const current = this.researchActivityByConversation[conversationId];
+          // Act only if the panel still shows the saved job and no live frame
+          // has moved it on meanwhile.
+          if (!current || current.job_id !== saved.job_id || current.updated_at !== saved.updated_at) return;
+          if (live && live.job_id && !isStaleResearchSnapshot(current, live as ResearchActivitySnapshot)) {
+            this.researchActivityByConversation[conversationId] =
+              researchState(live as ResearchActivitySnapshot, current);
+          } else {
+            // Nothing live, or only an older job: the saved one is gone.
+            this.researchActivityByConversation[conversationId] = {
+              ...current,
+              status: 'interrupted',
+              updateSeq: current.updateSeq + 1,
+            };
+          }
+        })
+        .catch(() => {});
+    },
+
+    /** Dismiss (close) the Research activity panel for a conversation. */
+    dismissResearchActivity(conversationId: string) {
+      if (!conversationId) return;
+      this.researchActivityByConversation[conversationId] = null;
+    },
+
     // ── stream lifecycle (ref-counted) ────────────────────────────────
 
     /**
@@ -1251,6 +1394,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
       this.agentActivityByConversation = {};
+      this.researchActivityByConversation = {};
       useTodoPanelsStore().closeAll();
       this.error = null;
 
@@ -1371,6 +1515,7 @@ export const useChatStore = defineStore('chat', {
           // dropped on `complete`).
           this.restorePlanModeState(id, messages);
           this.restoreAgentActivityState(id, messages);
+          this.restoreResearchActivityState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -1413,6 +1558,7 @@ export const useChatStore = defineStore('chat', {
             backfillLegacyTotals(splitMidTurnSegments(messages, this.mapBackendMessage));
           this.restorePlanModeState(id, messages);
           this.restoreAgentActivityState(id, messages);
+          this.restoreResearchActivityState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -1850,6 +1996,20 @@ export const useChatStore = defineStore('chat', {
             changedIds,
             updateSeq: (prev?.updateSeq ?? 0) + 1,
           };
+          return;
+        }
+
+        case 'research_activity': {
+          // A research job's full snapshot. Panel-only (return before
+          // ensureAssistant) and accepted outside a turn: the job outlives
+          // the call that started it. A frame naming another conversation, or
+          // older than what the panel shows (a replay), changes nothing.
+          const snap = data as ResearchActivitySnapshot;
+          if (!snap || !snap.job_id) return;
+          if (snap.conversation_id && snap.conversation_id !== conversationId) return;
+          const prev = this.researchActivityByConversation[conversationId];
+          if (isStaleResearchSnapshot(prev, snap)) return;
+          this.researchActivityByConversation[conversationId] = researchState(snap, prev);
           return;
         }
 
@@ -2293,6 +2453,7 @@ export const useChatStore = defineStore('chat', {
       delete this.pendingPlanByConversation[id];
       delete this.todosByConversation[id];
       delete this.agentActivityByConversation[id];
+      delete this.researchActivityByConversation[id];
       useTodoPanelsStore().closeForConversation(id);
       const settingsStore = useSettingsStore();
       if (settingsStore.profileId) {
@@ -2362,6 +2523,7 @@ export const useChatStore = defineStore('chat', {
         this.pendingPlanByConversation,
         this.todosByConversation,
         this.agentActivityByConversation,
+        this.researchActivityByConversation,
       ] as Record<string, unknown>[]) {
         if (oldId in map) {
           map[newId] = map[oldId];
@@ -2411,6 +2573,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
       this.agentActivityByConversation = {};
+      this.researchActivityByConversation = {};
       useTodoPanelsStore().closeAll();
       this.error = null;
     },

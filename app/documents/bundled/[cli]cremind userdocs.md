@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN files with User Document Search via `cremind userdocs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Not for Cremind's own documentation (that is documentation_search)."
+description: "Search the user's OWN files with User Document Search via `cremind userdocs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind userdocs research`. Not for Cremind's own documentation (that is documentation_search)."
 ---
 
 # `cremind userdocs` — User Document Search
@@ -11,7 +11,10 @@ cite back to the exact page or lines. It mirrors **Settings → My Documents**.
 
 It is separate from `documentation_search`, which only covers Cremind's own
 manual. Searching and reading the index from the terminal (`search`, `find`,
-`read`, `cite`) is documented in **`cremind userdocs search`**.
+`read`, `cite`) is documented in **`cremind userdocs search`**; deep research
+jobs over many files (`research run|status|continue|cancel|list` — compile a
+folder into one table, or a legal or financial analysis with verified quotes)
+in **`cremind userdocs research`**.
 
 Two levels of switch:
 
