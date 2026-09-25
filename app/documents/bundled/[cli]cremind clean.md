@@ -1,5 +1,5 @@
 ---
-description: "Wipe, purge, clear or reset ONE profile's data — pick components to delete (conversations, memory, uploads, usage/cost records, running background processes, schedules, watchers, skill-events, channels, LLM keys, OAuth tokens, tools/MCP, skills, documents, browser login, app settings) or run a preset: `working` clears runtime data but keeps config, `factory` also strips credentials and customization back to a fresh-provisioned baseline. Scoped to the token's own profile and irreversible; distinct from `cremind backup restore` (whole-system) and `cremind conv delete-all` (conversations only)."
+description: "Wipe, purge, clear or reset ONE profile's data — pick components to delete (conversations, memory, uploads, usage/cost records, running background processes, schedules, watchers, skill-events, channels, LLM keys, OAuth tokens, tools/MCP, skills, documents, the User Document Search index, browser login, app settings) or run a preset: `working` clears runtime data but keeps config, `factory` also strips credentials and customization back to a fresh-provisioned baseline. Scoped to the token's own profile and irreversible; distinct from `cremind backup restore` (whole-system) and `cremind conv delete-all` (conversations only)."
 ---
 
 # `cremind clean` — Reset one profile's data
@@ -49,6 +49,7 @@ The last two columns show which preset includes each one.
 | | `--tool-configs` | Tools/MCP registrations + their configs | ❌ | ✅ |
 | | `--skills` | Reset persona + skills to shipped defaults | ❌ | ✅ |
 | | `--documents` | Documents + their embeddings | ❌ | ✅ |
+| | `--user-documents` | User Document Search index, captions and settings (your files are not touched) | ❌ | ✅ |
 | | `--browser-login` | Saved browser login state | ❌ | ✅ |
 | | `--app-settings` | Reset app settings (`user_config`) to defaults | ❌ | ✅ |
 
@@ -91,6 +92,7 @@ cremind clean components [--<component> ...] [--all] [--yes]
 | `--tool-configs` | Tools/MCP + their configs. |
 | `--skills` | Reset persona + skills to shipped defaults. |
 | `--documents` | Documents + their embeddings. |
+| `--user-documents` | User Document Search index, captions and settings. The indexed folder and your files are never touched. |
 | `--browser-login` | Saved browser login state. |
 | `--app-settings` | Reset app settings to defaults. |
 | `--all` | Select every component (equivalent to `factory`). |

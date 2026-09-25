@@ -347,6 +347,14 @@ async def _clean_documents(profile: str, deps: Deps) -> dict[str, bool]:
     return detail
 
 
+async def _clean_user_documents(profile: str, deps: Deps) -> dict[str, Any]:
+    """Delete the profile's document index, vectors, captions and settings.
+    The indexed folder and every file in it are left untouched."""
+    from app.userdocs.service import clean_profile
+
+    return await asyncio.to_thread(clean_profile, profile)
+
+
 async def _clean_browser_login(profile: str, deps: Deps) -> dict[str, bool]:
     try:
         from app.tools.builtin.browser import _profile_default_user_data_dir, _sessions
@@ -403,6 +411,7 @@ _ORDER: tuple[tuple[str, Any], ...] = (
     ("oauth_tokens", _clean_oauth_tokens),
     ("skills", _clean_skills),
     ("documents", _clean_documents),
+    ("user_documents", _clean_user_documents),
     ("browser_login", _clean_browser_login),
     ("uploads", _clean_uploads),
     ("plans", _clean_plans),

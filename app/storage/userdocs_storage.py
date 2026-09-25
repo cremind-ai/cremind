@@ -129,6 +129,29 @@ class UserDocsStorage(SyncStorageBase):
             )
         return result.rowcount > 0
 
+    def profile_uid(self, profile: str) -> str | None:
+        """The profile's immutable uuid (``profiles.id``).
+
+        The index file and vector collections are keyed by this, not by the
+        name, so a profile deleted and re-created under the same name starts
+        with an empty index instead of inheriting the old one.
+        """
+        from app.storage.models import ProfileModel
+
+        t = ProfileModel.__table__
+        with self._engine.connect() as conn:
+            row = conn.execute(select(t.c.id).where(t.c.name == profile)).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def profile_uids(self) -> dict[str, str]:
+        """``{uid: name}`` for every live profile — the garbage collector's
+        list of index directories and collections that must be kept."""
+        from app.storage.models import ProfileModel
+
+        t = ProfileModel.__table__
+        with self._engine.connect() as conn:
+            return {str(r[0]): str(r[1]) for r in conn.execute(select(t.c.id, t.c.name)).fetchall() if r[0]}
+
     # ── caption cache ─────────────────────────────────────────────────────
 
     def get_caption(self, profile: str, sha256: str) -> dict[str, Any] | None:

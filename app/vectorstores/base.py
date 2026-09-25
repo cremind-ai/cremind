@@ -1,6 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Optional, Protocol, TypedDict, Union, runtime_checkable
+from typing import (
+    TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Protocol, Tuple, TypedDict, Union,
+    runtime_checkable,
+)
 import uuid
+
+if TYPE_CHECKING:
+    from app.userdocs.vectors import VectorFilter
 
 
 @runtime_checkable
@@ -158,6 +164,82 @@ class VectorStoreBase(ABC):
         """Create a uuid."""
         return str(uuid.uuid4()).replace("-", "")
 
+    # ── Pre-embedded primitives (User Document Search) ─────────────────────
+    #
+    # Deliberately NOT abstract: an adapter that lacks them must still
+    # construct, because ``VectorStore(...)`` failing with a TypeError would
+    # take the whole embedding subsystem down — and with it documentation
+    # search, memory and every chat turn. Only the userdocs engine calls these,
+    # and it treats NotImplementedError as "vector search unavailable".
+    #
+    # Contract shared by every implementation:
+    # - ids are the caller's integer ids; vectors are passed in, never
+    #   computed here.
+    # - Nothing here drops or recreates a collection, and only
+    #   ``ensure_collection`` creates one — after ``list_collections()`` (which
+    #   raises when the store is unreachable) confirmed it missing. Never
+    #   ``collection_exists`` (turns an outage into "missing") nor
+    #   ``create_named_collection`` (drop-and-recreate).
+    # - Every other method raises on a missing collection instead of quietly
+    #   creating one (a Chroma collection created by accident would be L2).
+    # - Errors are raised as the adapter's ``VectorStoreException`` subclass
+    #   carrying the store's own message (e.g. "No space left on device"), with
+    #   no internal retry: the caller owns backoff and the storage governor
+    #   needs to see ENOSPC.
+
+    def ensure_collection(
+        self,
+        name: str,
+        dim: int,
+        *,
+        payload_indexes: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create ``name`` (cosine, ``dim``) if it is confirmed missing.
+
+        Returns ``"present"`` or ``"created"``; raises when existence cannot
+        be established. ``payload_indexes`` maps field → ``"integer"`` |
+        ``"keyword"`` (backends without payload indexes ignore it).
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support ensure_collection")
+
+    def upsert_vectors(
+        self,
+        name: str,
+        ids: List[int],
+        vectors: List[List[float]],
+        payloads: List[Dict[str, Any]],
+    ) -> None:
+        """Insert or replace points; returns once they are durable."""
+        raise NotImplementedError(f"{type(self).__name__} does not support upsert_vectors")
+
+    def retrieve_vectors(self, name: str, ids: List[int]) -> Dict[int, List[float]]:
+        """The stored vectors of ``ids``; ids with no point are left out."""
+        raise NotImplementedError(f"{type(self).__name__} does not support retrieve_vectors")
+
+    def delete_ids(self, name: str, ids: List[int]) -> None:
+        """Delete points by id; ids with no point are ignored."""
+        raise NotImplementedError(f"{type(self).__name__} does not support delete_ids")
+
+    def scroll_ids(
+        self, name: str, offset: Any = None, limit: int = 1000,
+    ) -> Tuple[List[int], Any]:
+        """One page of point ids and the offset of the next page (None at the end)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support scroll_ids")
+
+    def count(self, name: str) -> int:
+        """Exact number of points in ``name``."""
+        raise NotImplementedError(f"{type(self).__name__} does not support count")
+
+    def query_vectors(
+        self,
+        name: str,
+        vector: List[float],
+        k: int,
+        filt: Optional["VectorFilter"] = None,
+    ) -> List[Tuple[int, float]]:
+        """``(id, cosine similarity)`` of the ``k`` nearest points, best first."""
+        raise NotImplementedError(f"{type(self).__name__} does not support query_vectors")
+
 
 class VectorStore(VectorStoreBase):
     def __init__(
@@ -313,3 +395,47 @@ class VectorStore(VectorStoreBase):
         points: List[StoredPoint],
     ) -> None:
         self._client.add_points(collection_name=collection_name, points=points)
+
+    # Forwarded explicitly: without these the wrapper would inherit the base
+    # defaults and raise NotImplementedError even over a capable adapter.
+
+    def ensure_collection(
+        self,
+        name: str,
+        dim: int,
+        *,
+        payload_indexes: Optional[Dict[str, str]] = None,
+    ) -> str:
+        return self._client.ensure_collection(name, dim, payload_indexes=payload_indexes)
+
+    def upsert_vectors(
+        self,
+        name: str,
+        ids: List[int],
+        vectors: List[List[float]],
+        payloads: List[Dict[str, Any]],
+    ) -> None:
+        self._client.upsert_vectors(name, ids, vectors, payloads)
+
+    def retrieve_vectors(self, name: str, ids: List[int]) -> Dict[int, List[float]]:
+        return self._client.retrieve_vectors(name, ids)
+
+    def delete_ids(self, name: str, ids: List[int]) -> None:
+        self._client.delete_ids(name, ids)
+
+    def scroll_ids(
+        self, name: str, offset: Any = None, limit: int = 1000,
+    ) -> Tuple[List[int], Any]:
+        return self._client.scroll_ids(name, offset=offset, limit=limit)
+
+    def count(self, name: str) -> int:
+        return self._client.count(name)
+
+    def query_vectors(
+        self,
+        name: str,
+        vector: List[float],
+        k: int,
+        filt: Optional["VectorFilter"] = None,
+    ) -> List[Tuple[int, float]]:
+        return self._client.query_vectors(name, vector, k, filt)

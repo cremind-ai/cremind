@@ -200,6 +200,15 @@ def get_profile_routes(
             return JSONResponse(
                 {"error": "The admin profile cannot be deleted."}, status_code=403,
             )
+        # The document index is keyed by the profile's uuid, which the delete
+        # below removes with the row — read it first so the index can be found.
+        userdocs_uid = None
+        try:
+            from app.storage.userdocs_storage import get_userdocs_storage
+
+            userdocs_uid = await asyncio.to_thread(get_userdocs_storage().profile_uid, profile_name)
+        except Exception:  # noqa: BLE001 — never block the delete
+            logger.debug(f"Could not read the uuid of profile '{profile_name}'", exc_info=True)
         try:
             # Cascade FKs handle profile_tools / tool_configs / conversations / messages
             success = await conversation_storage.delete_profile(profile_name)
@@ -259,6 +268,17 @@ def get_profile_routes(
                 logger.exception(
                     f"Could not remove the coding-CLI logins for deleted profile "
                     f"'{profile_name}'"
+                )
+
+            # User Document Search: settings rows cascade with the profile, but
+            # its index file and vector collections live outside the database.
+            try:
+                from app.userdocs.service import forget_profile
+
+                await asyncio.to_thread(forget_profile, profile_name, userdocs_uid)
+            except Exception:  # noqa: BLE001 — never block the delete
+                logger.exception(
+                    f"Could not remove the document index of deleted profile '{profile_name}'"
                 )
 
             # Group memberships cascade away with the profile row, but the

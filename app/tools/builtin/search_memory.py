@@ -12,6 +12,7 @@ the query) and the DB queue otherwise. Writing happens via the
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict
 
@@ -81,7 +82,11 @@ class SearchMemoryTool(BuiltInTool):
             embedding=embedding_state.embedding, vector_store=embedding_state.vector_store,
         )
         if memory_vectorstore.vector_long_term_available(shim):
-            rows = memory_vectorstore.retrieve_long_term(
+            # Off the event loop: this embeds the query synchronously, and the
+            # shared embedder serialises model calls behind a lock that a User
+            # Document Search batch may be holding.
+            rows = await asyncio.to_thread(
+                memory_vectorstore.retrieve_long_term,
                 agent=shim, profile=profile, query_text=query, limit=_DEFAULT_LIMIT,
             )
             return [r["content"] for r in rows if r.get("content")]

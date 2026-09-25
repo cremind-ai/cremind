@@ -367,6 +367,33 @@ def _browse(profile: str, admin: bool, raw: Optional[str], hidden: bool) -> JSON
     })
 
 
+# ── engine access ──────────────────────────────────────────────────────────
+
+
+async def _engine_call(fn, *, status: int = 200) -> JSONResponse:
+    """Run ``fn(service)`` in a worker thread and map the engine's errors.
+
+    The engine is synchronous (it owns SQLite files and worker threads), so
+    every call leaves the event loop. ``EngineError`` carries its own HTTP
+    status and error code; a missing engine means the server started without
+    one (feature never allowed, or startup failed) and is reported as such.
+    """
+    from app.userdocs.errors import EngineError
+    from app.userdocs.service import get_service
+
+    svc = get_service()
+    if svc is None:
+        return JSONResponse(
+            {"error": "EngineNotRunning", "message": "User Document Search is not running on this server."},
+            status_code=503,
+        )
+    try:
+        result = await asyncio.to_thread(fn, svc)
+    except EngineError as exc:
+        return JSONResponse(exc.to_dict(), status_code=exc.status)
+    return JSONResponse(result, status_code=status)
+
+
 # ── routes ─────────────────────────────────────────────────────────────────
 
 
@@ -497,7 +524,92 @@ def get_userdocs_routes() -> List[Route]:
         hidden = request.query_params.get("hidden") in ("1", "true")
         return await asyncio.to_thread(_browse, _profile(request), is_admin(request), raw, hidden)
 
+    # ── engine-backed routes ───────────────────────────────────────────────
+
+    async def handle_control(request: Request) -> JSONResponse:
+        """``{action: start|pause|resume|rescan|reindex|retry_failed|rebuild|
+        confirm_deletions|reject_deletions|confirm_root_change, targets?,
+        reextract?, confirm?}`` → 202 with the fresh snapshot."""
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        body = await _json_body(request)
+        action = str(body.get("action") or "")
+        # Only the known parameters travel on: anything else in the body
+        # (a "profile", say) is dropped, never a way to aim at another profile.
+        params = {k: body[k] for k in ("targets", "reextract", "confirm") if k in body}
+        return await _engine_call(
+            lambda svc: svc.control(_profile(request), action, **params), status=202,
+        )
+
+    async def handle_files(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        q = request.query_params
+        try:
+            limit = max(1, min(500, int(q.get("limit") or 100)))
+            after_id = int(q.get("after_id")) if q.get("after_id") else None
+        except ValueError:
+            return JSONResponse({"error": "ValidationFailed", "details": {"limit": "must be a number"}}, status_code=400)
+        after = (q.get("after_path") or "", after_id) if after_id is not None else None
+        return await _engine_call(lambda svc: svc.list_files(
+            _profile(request),
+            status=q.get("status") or None,
+            kind=q.get("kind") or None,
+            source=q.get("source") or None,
+            q=q.get("q") or None,
+            after=after,
+            limit=limit,
+        ))
+
+    async def handle_file_detail(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        fid = request.path_params.get("fid") or ""
+        return await _engine_call(lambda svc: svc.file_detail(_profile(request), fid))
+
+    async def handle_activity(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        q = request.query_params
+        try:
+            before = int(q.get("before")) if q.get("before") else None
+            limit = max(1, min(200, int(q.get("limit") or 50)))
+        except ValueError:
+            return JSONResponse({"error": "ValidationFailed", "details": {"before": "must be a number"}}, status_code=400)
+        return await _engine_call(lambda svc: svc.activity(_profile(request), before_id=before, limit=limit))
+
+    async def handle_estimate_get(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        return await _engine_call(lambda svc: svc.get_estimate(_profile(request)))
+
+    async def handle_estimate_post(request: Request) -> JSONResponse:
+        """Start a stat-only walk that counts what a (first) sync would do.
+        Runs as a background task with progress frames; poll GET for the result."""
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        return await _engine_call(lambda svc: svc.start_estimate(_profile(request)), status=202)
+
+    async def handle_storage(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        return await _engine_call(lambda svc: svc.storage(_profile(request)))
+
     return [
+        Route("/api/userdocs/control", handle_control, methods=["POST"]),
+        Route("/api/userdocs/files", handle_files, methods=["GET"]),
+        Route("/api/userdocs/files/{fid}", handle_file_detail, methods=["GET"]),
+        Route("/api/userdocs/activity", handle_activity, methods=["GET"]),
+        Route("/api/userdocs/estimate", handle_estimate_get, methods=["GET"]),
+        Route("/api/userdocs/estimate", handle_estimate_post, methods=["POST"]),
+        Route("/api/userdocs/storage", handle_storage, methods=["GET"]),
         Route("/api/userdocs/admin", handle_admin_get, methods=["GET"]),
         Route("/api/userdocs/admin", handle_admin_put, methods=["PUT"]),
         Route("/api/userdocs/status", handle_status, methods=["GET"]),

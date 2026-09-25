@@ -396,6 +396,14 @@ SHUTDOWN_TIMEOUT_S = 8.0
 async def _do_shutdown() -> None:
     """The actual cleanup body. Module-level so tests can patch it."""
     try:
+        # First, and bounded: it kills extractor children and stops folder
+        # watchers. Its threads are daemons, so a slow join only costs budget.
+        from app.userdocs.service import stop_service
+
+        await asyncio.to_thread(stop_service, 1.5)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping User Document Search during shutdown")
+    try:
         from app.events import get_uploads_cleanup_manager
 
         get_uploads_cleanup_manager().stop()
@@ -1735,6 +1743,18 @@ async def main(
                 get_uploads_cleanup_manager().start(loop)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start uploads cleanup manager")
+
+            # 7h. User Document Search. Starting it costs a few idle threads;
+            # every profile's runtime is decided by its own settings and the
+            # admin gate, so it starts even when nobody uses the feature yet
+            # (turning it on later must not need a restart). Its boot catch-up
+            # runs on its own threads — never here, never on the event loop.
+            try:
+                from app.userdocs.service import start_service
+
+                start_service()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start User Document Search")
 
             # 8. Build the real agent executor and the post-setup callback.
             agent_executor = CremindAgentExecutor(

@@ -145,6 +145,44 @@ Credential folders (`.ssh`, `.aws`, `.kube`, `.gnupg`, Cremind's system folder)
 are always excluded, and secret-looking files (`.env`, `*.pem`, `id_rsa`, …)
 are never read — these cannot be overridden.
 
+### Sync control
+
+```bash
+cremind userdocs start                 # begin a large first sync after `estimate`
+cremind userdocs pause                 # stop syncing; the index stays searchable
+cremind userdocs resume                # continue; changes made meanwhile are picked up
+cremind userdocs rescan                # walk the whole folder now
+cremind userdocs reindex PATH|FID ...  # re-read these files/folders first
+cremind userdocs retry [--file-id FID] # retry failed files (all, or one per --file-id)
+cremind userdocs rebuild [--reextract] [--yes]
+cremind userdocs deletions confirm     # remove held vanished files from the index
+cremind userdocs deletions reject      # keep them (hidden, re-checked for 14 days)
+```
+
+`rebuild` re-embeds everything from the stored text (`--reextract` also
+re-reads every file) — rarely needed. When many files vanish at once (an
+unplugged drive, a renamed folder) nothing is deleted: they are hidden from
+search until you run `deletions confirm` (remove them) or `deletions reject`
+(keep them; they are re-checked on every scan for 14 days).
+
+### Inspecting the index
+
+```bash
+cremind userdocs files [--status S] [--kind K] [--query TEXT] [--limit N] [--all]
+cremind userdocs activity [--limit N]
+cremind userdocs estimate [--wait]
+cremind userdocs storage
+```
+
+`files --status error` lists files that failed and why (`encrypted`,
+`timeout`, `too_large`, `permission_denied`, …); `metadata_only` files are
+indexed by name, type, size and dates only (executables, archives, media,
+secret-looking files). `activity` shows what changed, e.g. "report.docx — 3 of
+128 chunks re-embedded": only the edited parts of a document are re-embedded.
+`estimate` counts what a full sync would do (files by type, images to caption,
+index size, time). `storage` shows index size against the budget and free disk
+space; syncing pauses before the disk fills (deletions and search keep working).
+
 ### `cremind userdocs admin get`
 
 **Purpose.** Show the server-wide gate, budgets, and which profiles use the

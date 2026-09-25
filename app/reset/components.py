@@ -31,6 +31,9 @@ COMPONENTS: tuple[str, ...] = (
     "tool_configs",
     "skills",
     "documents",
+    # User Document Search: the index of the user's own files (and its
+    # settings, captions, quota). Never the files themselves.
+    "user_documents",
     "browser_login",
     "app_settings",
 )

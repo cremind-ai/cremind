@@ -1,5 +1,5 @@
 import socket
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import chromadb
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -7,7 +7,11 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from app.config.settings import BaseConfig
 from app.constants.status import Status
 from app.lib.exception import VectorStoreException
+from app.utils.logger import logger
 from .base import EmbeddingProvider, StoredPoint, VectorStoreBase
+
+if TYPE_CHECKING:
+    from app.userdocs.vectors import VectorFilter
 
 
 class ChromaException(VectorStoreException):
@@ -109,9 +113,37 @@ def _coerce_id(raw_id: Any) -> Union[int, str]:
     return raw_id
 
 
+# Points per request for the pre-embedded primitives, well under Chroma's
+# max batch size (a few thousand for the SQLite-backed store).
+_UD_BATCH = 256
+
+
+def _collection_space(col: Any) -> Optional[str]:
+    """The distance function a Chroma collection was created with, if known."""
+    try:
+        conf = getattr(col, "configuration", None)
+        hnsw = conf.get("hnsw") if isinstance(conf, dict) else None
+        if isinstance(hnsw, dict) and hnsw.get("space"):
+            return str(hnsw["space"])
+    except Exception:  # noqa: BLE001 — older clients have no configuration
+        pass
+    md = getattr(col, "metadata", None) or {}
+    space = md.get("hnsw:space") if isinstance(md, dict) else None
+    return str(space) if space else None
+
+
+def _ud_metadata(payload: Optional[dict]) -> Optional[dict]:
+    """A userdocs payload as Chroma metadata. Chroma rejects an empty dict,
+    so a payload with nothing in it is sent as ``None``."""
+    md = {k: v for k, v in (payload or {}).items() if v is not None}
+    return _coerce_metadata(md) or None
+
+
 class ChromaClient(VectorStoreBase):
-    def __init__(self, size: int):
-        self._client = _build_chroma_client()
+    def __init__(self, size: int, client: Any = None):
+        # ``client`` injects a ready chromadb client (tests use an ephemeral
+        # or tmp-dir persistent one); production builds one from config.
+        self._client = client if client is not None else _build_chroma_client()
         self.size = size
         self._text_key = chroma_text_key
 
@@ -444,4 +476,191 @@ class ChromaClient(VectorStoreBase):
             payload["id"] = _coerce_id(raw_id)
             payload["score"] = score
             out.append(payload)
+        return out
+
+    # ── Pre-embedded primitives (User Document Search) ──────────────────────
+    #
+    # Contract in VectorStoreBase. Two Chroma-specific rules:
+    # - Writes resolve the collection with ``get_collection``, NEVER
+    #   ``get_or_create_collection`` (which ``_safe_upsert`` uses): after the
+    #   store is wiped, get-or-create would silently make a fresh collection
+    #   with Chroma's default L2 space and every later score would be wrong.
+    # - No tenacity retries, so a "No space left on device" reaches the
+    #   storage governor with its message intact.
+
+    @staticmethod
+    def _err(e: Exception) -> ChromaException:
+        return ChromaException(Status.VECTOR_STORE_ERROR, str(e))
+
+    def _get(self, name: str):
+        try:
+            return self._client.get_collection(name=name)
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+
+    def ensure_collection(
+        self,
+        name: str,
+        dim: int,
+        *,
+        payload_indexes: Optional[Dict[str, str]] = None,
+    ) -> str:
+        # Chroma fixes the dimension on the first insert and indexes every
+        # metadata key itself, so ``dim`` and ``payload_indexes`` need no call.
+        names = self.list_collections()  # raises ChromaException when unreachable
+        if name in names:
+            space = _collection_space(self._get(name))
+            if space and space != "cosine":
+                # Not recreated here (that would drop data); the scores it
+                # returns are not cosine similarities, so say so loudly.
+                logger.warning(
+                    f"[vectorstore] Chroma collection {name!r} uses {space!r}, "
+                    f"not cosine; its similarity scores will be off"
+                )
+            return "present"
+        try:
+            self._client.get_or_create_collection(
+                name=name, metadata={"hnsw:space": "cosine"},
+            )
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        return "created"
+
+    def upsert_vectors(
+        self,
+        name: str,
+        ids: List[int],
+        vectors: List[List[float]],
+        payloads: List[Dict[str, Any]],
+    ) -> None:
+        if not (len(ids) == len(vectors) == len(payloads)):
+            raise ValueError(
+                f"upsert_vectors: {len(ids)} ids, {len(vectors)} vectors, "
+                f"{len(payloads)} payloads"
+            )
+        if not ids:
+            return
+        col = self._get(name)
+        for i in range(0, len(ids), _UD_BATCH):
+            try:
+                col.upsert(
+                    ids=[str(int(x)) for x in ids[i:i + _UD_BATCH]],
+                    embeddings=[
+                        v if isinstance(v, list) else [float(x) for x in v]
+                        for v in vectors[i:i + _UD_BATCH]
+                    ],
+                    metadatas=[_ud_metadata(p) for p in payloads[i:i + _UD_BATCH]],
+                )
+            except Exception as e:  # noqa: BLE001
+                raise self._err(e) from e
+
+    def retrieve_vectors(self, name: str, ids: List[int]) -> Dict[int, List[float]]:
+        out: Dict[int, List[float]] = {}
+        if not ids:
+            return out
+        col = self._get(name)
+        for i in range(0, len(ids), _UD_BATCH):
+            try:
+                res = col.get(
+                    ids=[str(int(x)) for x in ids[i:i + _UD_BATCH]],
+                    include=["embeddings"],
+                )
+            except Exception as e:  # noqa: BLE001
+                raise self._err(e) from e
+            got_ids = res.get("ids") or []
+            # An ndarray: never test it for truthiness.
+            embeddings = res.get("embeddings")
+            if embeddings is None:
+                continue
+            for raw_id, emb in zip(got_ids, embeddings):
+                pid = _coerce_id(raw_id)
+                if isinstance(pid, int) and emb is not None:
+                    out[pid] = [float(x) for x in emb]
+        return out
+
+    def delete_ids(self, name: str, ids: List[int]) -> None:
+        if not ids:
+            return
+        col = self._get(name)
+        for i in range(0, len(ids), 1000):
+            try:
+                col.delete(ids=[str(int(x)) for x in ids[i:i + 1000]])
+            except Exception as e:  # noqa: BLE001
+                raise self._err(e) from e
+
+    def scroll_ids(
+        self, name: str, offset: Any = None, limit: int = 1000,
+    ) -> Tuple[List[int], Any]:
+        # Chroma pages by position, so the offset is an int. A delete between
+        # two pages shifts later rows back and a scan can skip a few ids — fine
+        # for garbage collection, which runs again later.
+        start = int(offset or 0)
+        limit = max(1, int(limit))
+        col = self._get(name)
+        try:
+            res = col.get(limit=limit, offset=start, include=[])
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        raw = res.get("ids") or []
+        ids = [pid for pid in (_coerce_id(r) for r in raw) if isinstance(pid, int)]
+        next_offset = start + len(raw) if len(raw) >= limit else None
+        return ids, next_offset
+
+    def count(self, name: str) -> int:
+        col = self._get(name)
+        try:
+            return int(col.count())
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+
+    @staticmethod
+    def _ud_where(filt: Optional["VectorFilter"]) -> Optional[dict]:
+        if filt is None:
+            return None
+        clauses: List[dict] = []
+        for key, op, value in filt.conditions():
+            if op == "in":
+                clauses.append({key: {"$in": list(value)}})
+            elif op == "range":
+                lo, hi = value
+                clauses.append({key: {"$gte": lo}})
+                clauses.append({key: {"$lte": hi}})
+            else:  # pragma: no cover — VectorFilter emits only the two above
+                raise ValueError(f"unsupported filter op {op!r}")
+        if not clauses:
+            return None
+        # Chroma wants exactly one operator per where dict.
+        return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+    def query_vectors(
+        self,
+        name: str,
+        vector: List[float],
+        k: int,
+        filt: Optional["VectorFilter"] = None,
+    ) -> List[Tuple[int, float]]:
+        if k <= 0 or (filt is not None and filt.matches_nothing):
+            return []
+        col = self._get(name)
+        kwargs: Dict[str, Any] = {
+            "query_embeddings": [list(vector)],
+            "n_results": int(k),
+            "include": ["distances"],
+        }
+        where = self._ud_where(filt)
+        if where is not None:
+            kwargs["where"] = where
+        try:
+            res = col.query(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        ids = (res.get("ids") or [[]])[0]
+        distances = res.get("distances")
+        distances = distances[0] if distances is not None and len(distances) else []
+        out: List[Tuple[int, float]] = []
+        for raw_id, dist in zip(ids, distances):
+            pid = _coerce_id(raw_id)
+            if isinstance(pid, int) and dist is not None:
+                # Cosine distance → cosine similarity (Qdrant's orientation).
+                out.append((pid, 1.0 - float(dist)))
         return out

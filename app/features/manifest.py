@@ -153,14 +153,15 @@ FEATURES: dict[str, Feature] = {
 
     # ── User Document Search (indexing the user's own files) ────────────────
     # Rides on the ``documents`` extra (markitdown[all] brings pdfplumber,
-    # pypdfium2, openpyxl, python-pptx, olefile) plus its own: pathspec for
-    # .cremindignore, Pillow for EXIF (only transitive until now), and
-    # pillow-heif so iPhone HEIC photos are not silently metadata-only.
+    # pypdfium2, openpyxl, python-pptx, olefile, xlrd) plus its own: Pillow for
+    # EXIF (only transitive until now) and pillow-heif so iPhone HEIC photos are
+    # not silently metadata-only. (.cremindignore matching is built in; see
+    # app/userdocs/discovery/ignore.py for why it is not pathspec.)
     # Hot-installable: every import happens inside the extractor subprocess.
     "userdocs": Feature(
         key="userdocs",
         extras=("documents", "userdocs"),
-        probes=("markitdown", "pdfplumber", "pathspec", "PIL", "pillow_heif"),
+        probes=("markitdown", "pdfplumber", "PIL", "pillow_heif"),
     ),
 
     # ── Postgres back-end (alternative to bundled SQLite) ───────────────────

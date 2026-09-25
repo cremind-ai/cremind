@@ -47,6 +47,7 @@ _COMPONENTS: list[tuple[str, str]] = [
     ("tool_configs", "--tool-configs"),
     ("skills", "--skills"),
     ("documents", "--documents"),
+    ("user_documents", "--user-documents"),
     ("browser_login", "--browser-login"),
     ("app_settings", "--app-settings"),
 ]
@@ -125,6 +126,10 @@ def clean_components(
     tool_configs: bool = typer.Option(False, "--tool-configs", help="Tools/MCP + their configs."),
     skills: bool = typer.Option(False, "--skills", help="Reset persona + skills to shipped defaults."),
     documents: bool = typer.Option(False, "--documents", help="Documents + their embeddings."),
+    user_documents: bool = typer.Option(
+        False, "--user-documents",
+        help="User Document Search index + settings (your files are not touched).",
+    ),
     browser_login: bool = typer.Option(False, "--browser-login", help="Saved browser login state."),
     app_settings: bool = typer.Option(False, "--app-settings", help="Reset app settings to defaults."),
     all_: bool = typer.Option(False, "--all", help="Select every component (same as factory reset)."),
@@ -139,6 +144,7 @@ def clean_components(
         "skill_events": skill_events, "channels": channels,
         "llm_config": llm_config, "oauth_tokens": oauth_tokens,
         "tool_configs": tool_configs, "skills": skills, "documents": documents,
+        "user_documents": user_documents,
         "browser_login": browser_login, "app_settings": app_settings,
     }
     if all_:

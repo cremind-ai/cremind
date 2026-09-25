@@ -1,0 +1,1220 @@
+"""One profile's User Document Search engine: its index, its folder, its sync.
+
+A :class:`ProfileRuntime` is created by :mod:`app.userdocs.service` for every
+profile that has the feature switched on, and owns:
+
+- the profile's index file (:class:`~app.userdocs.index.IndexDB`),
+- the folder watcher (or the polling schedule when watching cannot work),
+- full scans (boot catch-up, periodic reconcile, after a burst of events),
+- the per-file pipeline — fingerprint → extract → chunk → diff → write.
+
+Vectors are deliberately *not* written here. The pipeline stores chunks with
+``vec_gen = NULL`` and the service's embedding loop fills them in
+(:mod:`app.userdocs.vector_sync`). One code path therefore serves a normal
+edit, a backlog after the vector store was down, and a full re-embed after the
+embedding model changed — and the keyword index is current the moment a file
+is written, whatever the vector store is doing.
+
+Threading: :meth:`configure`, :meth:`drain_watch_paths` and the periodic work
+run on the service's maintenance thread; :meth:`run_scan` and
+:meth:`run_estimate` on its scan executor; :meth:`process` on the pipeline
+workers (several files of one profile may be in flight at once — never the
+same file, the service excludes in-flight ids). Everything a thread touches
+here is either the index (which serialises its own writes) or guarded by
+``self.lock``.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import os
+import threading
+import time
+from typing import Any, Iterable
+
+from app.userdocs import settings as uds
+from app.userdocs import state as uds_state
+from app.userdocs import types as t
+from app.userdocs.progress import SyncProgress
+from app.utils.logger import logger
+
+SOURCE = uds.SOURCE_LOCAL
+
+# Work priorities (lower is more urgent). P0 is reserved for "the agent is
+# reading this file right now" (PR4).
+P_INTERACTIVE = 0
+P_LIVE = 1        # an edit the watcher just saw
+P_BULK = 2        # first sync, reconcile
+P_UPGRADE = 3     # moves, extractor/chunker upgrades, deferred work
+
+# A watcher delete is only a tombstone for this long, so a delete+create pair
+# that the watcher delivered in separate batches (a slow move, an editor's
+# save-by-rename) can still find the old chunks and reuse their vectors.
+TOMBSTONE_GRACE_S = 120.0
+# Rows the user chose to keep after a mass deletion stay hidden and re-checked
+# this long before they are finally removed.
+MISSING_KEEP_S = 14 * 86400
+# A first sync this small starts without asking.
+FIRST_SYNC_AUTO = {"files": 2000, "bytes": 500 * 1024 * 1024, "images": 100}
+# More deletes than this within the burst window are handed to a full scan,
+# whose root guard decides whether it is a real deletion or an unmounted disk.
+DELETE_BURST_LIMIT = 500
+# Retry schedule for files that failed to extract.
+BACKOFF_S = (60.0, 300.0, 900.0, 3600.0, 6 * 3600.0)
+MAX_ATTEMPTS = len(BACKOFF_S)
+NATIVE_RECONCILE_S = 6 * 3600.0
+
+
+def _now() -> float:
+    return time.time()
+
+
+def iso_local(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    try:
+        return _dt.datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def ts_from_iso(value: Any) -> float | None:
+    """Epoch seconds for an ISO date/time from document or EXIF metadata.
+    A naive value is read as local time (EXIF has no zone unless the camera
+    wrote OffsetTimeOriginal, which the extractor folds in)."""
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip().replace("Z", "+00:00")
+    try:
+        d = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            d = _dt.datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    try:
+        return d.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _norm(path: str | None) -> str:
+    return os.path.normcase(os.path.normpath(path)) if path else ""
+
+
+def _parent_rel(rel: str) -> str:
+    return rel.rsplit("/", 1)[0] if "/" in rel else ""
+
+
+def chunks_from_rows(rows: Iterable[dict[str, Any]]) -> list[t.Chunk]:
+    """Rebuild :class:`~app.userdocs.types.Chunk` objects from stored rows —
+    for re-carding a file whose content did not change (a move, a touched
+    mtime) and for copying an identical file, without extracting again."""
+    out: list[t.Chunk] = []
+    for r in rows:
+        out.append(t.Chunk(
+            ordinal=int(r.get("ordinal") or 0),
+            ctype=r.get("ctype") or t.CTYPE_BODY,
+            heading=r.get("heading") or "",
+            text=r.get("text") or "",
+            text_hash=r.get("text_hash") or "",
+            occ=int(r.get("occ") or 0),
+            section_key=r.get("section_key"),
+            locator=dict(r.get("locator") or {}),
+            refs=list(r.get("refs") or []),
+            token_est=int(r.get("token_est") or 0),
+            folded=r.get("folded"),
+        ))
+    out.sort(key=lambda c: c.ordinal)
+    return out
+
+
+class ProfileRuntime:
+    def __init__(self, service: Any, profile: str, uid: str):
+        self.service = service
+        self.profile = profile
+        self.uid = uid
+        self.lock = threading.RLock()
+        self.progress = SyncProgress(profile, publish=uds_state.publish_snapshot)
+        self.db: Any = None
+
+        self.settings: dict[str, Any] = {}
+        self.root: str | None = None
+        self.matcher: Any = None
+        self.watcher: Any = None
+        self.watch_mode: str | None = None
+        self.watch_reason: str | None = None
+
+        self.active = False            # configured and allowed to sync
+        self.paused_user = False
+        self.hold: dict[str, Any] | None = None       # {reason, detail}
+        self.suspended: str | None = None
+        self.confirmation: dict[str, Any] | None = None
+        self.level = "ok"              # governor level, a governor.Level value
+        self.estimate: dict[str, Any] | None = None
+
+        self.scanning = False
+        self.estimating = False
+        self.scan_requested: str | None = None
+        self.next_scan_at = 0.0
+        self.last_scan_s = 0.0
+        self.last_vector_check = 0.0
+
+        self.in_flight: set[int] = set()
+        self.pending_vector_deletes: list[int] = []
+        self._pending_changed: set[str] = set()
+        self._pending_removed: set[str] = set()
+        self._folder_cache: dict[str, int] = {}
+        self.stop_event = threading.Event()
+
+        from app.userdocs.discovery.guard import DeleteBurst, RootGuard
+
+        self.guard = RootGuard()
+        self.delete_burst = DeleteBurst()
+
+    # ── index file ─────────────────────────────────────────────────────────
+
+    def ensure_db(self):
+        """Open (or create, or rebuild) this profile's index file."""
+        with self.lock:
+            if self.db is not None and not self.db.closed:
+                return self.db
+            from app.userdocs.index import (
+                IndexCorrupt,
+                IndexDB,
+                IndexIncompatible,
+                index_path,
+                rebuild_file,
+            )
+
+            path = index_path(self.uid)
+            try:
+                self.db = IndexDB.open(path, profile_uid=self.uid)
+            except (IndexIncompatible, IndexCorrupt) as exc:
+                logger.warning(f"[userdocs] {self.profile}: index unusable ({exc}); rebuilding it")
+                rebuild_file(path)
+                self.db = IndexDB.open(path, profile_uid=self.uid)
+                self.db.add_activity(
+                    "rebuilt", "The index file was unusable and has been rebuilt from your files.",
+                    source=SOURCE, level="warning",
+                )
+            return self.db
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self._stop_watching()
+        self.progress.close()
+        with self.lock:
+            if self.db is not None:
+                try:
+                    self.db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.db = None
+
+    # ── configuration ──────────────────────────────────────────────────────
+
+    def configure(self) -> None:
+        """Bring the runtime in line with the saved settings and the admin gate.
+
+        Called after every settings save, admin-gate change and embedding
+        transition, and at boot. Idempotent: it only starts or stops what
+        actually changed.
+        """
+        from app.storage.userdocs_storage import get_userdocs_storage
+
+        storage = get_userdocs_storage()
+        row = storage.get_source(self.profile, SOURCE) or {}
+        policy = uds.read_admin_policy()
+        ok, reason = uds.feature_effective(policy)
+        self.settings = row
+
+        if not row.get("enabled"):
+            self._deactivate("disabled", None)
+            return
+        if not ok:
+            self._deactivate("suspended", "admin_gate" if reason == "admin_gate_off" else "embedding_off")
+            return
+
+        db = self.ensure_db()
+        self.suspended = None
+        self.paused_user = bool(db.get_source_state(SOURCE).get("paused_user"))
+
+        custom = row.get("root_mode") == uds.ROOT_CUSTOM
+        check = uds.validate_root(row.get("root_path") if custom else None, is_admin=self.profile == "admin")
+        if not check.ok:
+            self._set_hold("root_invalid", {"code": check.code, "message": check.message, "root": check.path})
+            return
+        stored = row.get("root_path")
+        if not custom and stored and _norm(check.path) != _norm(stored):
+            # The server-wide working directory moved under an inherited root.
+            # Nobody asked this profile, so nothing moves until it confirms.
+            self._set_hold("pending_root_change", {"from": stored, "to": check.path})
+            self._set_confirmation({"kind": "root_change", "from": stored, "to": check.path,
+                                    "files": db.count_by_status(SOURCE).get("indexed", 0)})
+            return
+
+        new_root = check.path
+        identity = db.get_source_state(SOURCE).get("root_identity") or {}
+        old_root = identity.get("realpath") if isinstance(identity, dict) else None
+        if old_root and _norm(old_root) != _norm(new_root):
+            self._rebase(old_root, new_root)
+
+        from app.userdocs.discovery.ignore import IgnoreMatcher
+
+        opts = uds.normalize_options(row.get("options"))
+        with self.lock:
+            root_changed = _norm(self.root) != _norm(new_root)
+            self.root = new_root
+            self.matcher = IgnoreMatcher(
+                new_root,
+                excludes=uds.normalize_excludes(row.get("excludes")),
+                locked_excludes=check.locked_excludes,
+                system_dir=uds.system_dir(),
+            )
+            self.hold = None
+            if self.confirmation and self.confirmation.get("kind") in ("root_change",):
+                self.confirmation = None
+        self.progress.set_source(SOURCE, root=new_root)
+
+        if not row.get("first_sync_confirmed_at"):
+            est = self.estimate if (self.estimate and self.estimate.get("root") == new_root) else None
+            if est is None or est.get("state") != "done":
+                self.service.submit_estimate(self)
+                self._publish_state()
+                return
+            if self._estimate_is_small(est):
+                storage.upsert_source(self.profile, SOURCE, first_sync_confirmed_at=_now() * 1000)
+            else:
+                self._set_confirmation({"kind": "first_sync", "estimate": est})
+                return
+
+        if self.paused_user:
+            self._stop_watching()
+            self.active = True
+            self._publish_state()
+            return
+
+        self.active = True
+        if root_changed or self.watcher is None and self.watch_mode != "poll":
+            self._stop_watching()
+            self._start_watching(opts)
+        self.request_scan("configure")
+
+    def _deactivate(self, state: str, reason: str | None) -> None:
+        self.active = False
+        self._stop_watching()
+        with self.lock:
+            self.suspended = reason if state == "suspended" else None
+            if state == "disabled" and self.db is not None:
+                # Disabled but kept: close the file; it reopens on enable.
+                try:
+                    self.db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.db = None
+        self.progress.set_state(state, reason)
+
+    def _set_hold(self, reason: str, detail: dict[str, Any] | None) -> None:
+        with self.lock:
+            self.hold = {"reason": reason, "detail": detail or {}}
+        self._stop_watching()
+        if self.db is not None:
+            self.db.update_source_state(SOURCE, state="hold", reason=reason, detail=detail or {}, hold_since=_now())
+        self._publish_state()
+
+    def _set_confirmation(self, confirmation: dict[str, Any] | None) -> None:
+        with self.lock:
+            self.confirmation = confirmation
+        self.progress.set_confirmation(confirmation)
+        self._publish_state()
+
+    def _estimate_is_small(self, est: dict[str, Any]) -> bool:
+        return (
+            int(est.get("files") or 0) <= FIRST_SYNC_AUTO["files"]
+            and int(est.get("bytes") or 0) <= FIRST_SYNC_AUTO["bytes"]
+            and int(est.get("images_to_caption") or 0) <= FIRST_SYNC_AUTO["images"]
+        )
+
+    def _rebase(self, old_root: str, new_root: str) -> None:
+        """The user moved the folder (already confirmed). Rows whose file is
+        still inside the new folder keep their chunks and vectors under a new
+        relative path; the rest leave the index."""
+        from app.userdocs.discovery.walker import path_hash
+
+        db = self.ensure_db()
+        manifest = db.load_manifest(SOURCE)
+        drop: list[int] = []
+        moved = 0
+        for row in manifest.values():
+            abs_old = os.path.join(old_root, *row.rel_path.split("/"))
+            if uds.is_inside(abs_old, new_root):
+                rel = os.path.relpath(abs_old, new_root).replace(os.sep, "/")
+                if db.update_file(row.id, rel_path=rel, path_hash=path_hash(rel), folder_id=None):
+                    moved += 1
+                db.mark_dirty([row.id], priority=P_UPGRADE)
+            else:
+                drop.append(row.id)
+        self.purge_file_ids(drop)
+        folder_ids = list(db.folder_ids(SOURCE).values())
+        if folder_ids:
+            self.queue_vector_deletes(db.delete_folders(folder_ids))
+        self._folder_cache.clear()
+        db.update_source_state(SOURCE, root_identity={"realpath": new_root})
+        db.add_activity(
+            "root_changed",
+            f"Indexed folder changed to {new_root}: {moved} files kept, {len(drop)} removed.",
+            source=SOURCE, detail={"from": old_root, "to": new_root, "kept": moved, "removed": len(drop)},
+        )
+
+    # ── watching ───────────────────────────────────────────────────────────
+
+    def _start_watching(self, opts: dict[str, Any]) -> None:
+        from app.userdocs.deploy_env import choose_watch_mode
+        from app.userdocs.discovery.watcher import SourceWatcher, WatcherStartError
+
+        dirs_needed = int((self.estimate or {}).get("dirs") or 0)
+        mode, why = choose_watch_mode(self.root, (opts.get("observer") or {}).get("mode") or "auto", dirs_needed)
+        watcher = None
+        if mode == "native":
+            watcher = SourceWatcher(self.root, self.matcher, self.on_watch_paths)
+            try:
+                watcher.start()
+            except WatcherStartError as exc:
+                logger.warning(f"[userdocs] {self.profile}: watching {self.root} failed ({exc}); polling instead")
+                watcher, mode, why = None, "poll", exc.reason
+        with self.lock:
+            self.watcher = watcher
+            self.watch_mode = mode
+            self.watch_reason = why
+        self.progress.set_source(SOURCE, watch=mode, watch_reason=why)
+
+    def _stop_watching(self) -> None:
+        with self.lock:
+            watcher, self.watcher = self.watcher, None
+        if watcher is not None:
+            try:
+                watcher.stop(timeout=0.3)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def on_watch_paths(self, changed: set[str], removed: set[str]) -> None:
+        """Watcher thread: only record the paths; the maintenance thread
+        applies them (see :meth:`drain_watch_paths`)."""
+        with self.lock:
+            self._pending_changed |= set(changed)
+            self._pending_removed |= set(removed)
+        self.service.wake()
+
+    def has_pending_paths(self) -> bool:
+        with self.lock:
+            return bool(self._pending_changed or self._pending_removed)
+
+    def drain_watch_paths(self) -> None:
+        """Turn the watcher's settled paths into index rows (maintenance thread).
+
+        A deleted file becomes a tombstone rather than disappearing, and a
+        delete and create in one batch with the same size, mtime and inode is
+        a move: the row keeps its chunks and vectors and only its card is
+        refreshed.
+        """
+        from app.userdocs.discovery.ignore import SKIP
+        from app.userdocs.discovery.hashing import fs_path
+        from app.userdocs.discovery.walker import fit_i63, path_hash
+        from app.userdocs.discovery.watcher import ROOT_RESCAN
+        from app.userdocs.textnorm import fold
+
+        with self.lock:
+            changed, removed = self._pending_changed, self._pending_removed
+            self._pending_changed, self._pending_removed = set(), set()
+        if not self.active or self.hold or self.db is None or self.root is None:
+            return
+        db = self.db
+
+        if ROOT_RESCAN in changed or any(p.endswith("/") for p in changed):
+            # A new folder, a moved folder, or an ignore file changed: a scan
+            # settles it (and its move matching covers moved folders).
+            self.request_scan("watch")
+            changed = {p for p in changed if p != ROOT_RESCAN and not p.endswith("/")}
+
+        gone: dict[int, dict[str, Any]] = {}
+        for p in removed:
+            for r in db.files_under(SOURCE, p.rstrip("/")):
+                if r.get("status") != "tombstone":
+                    gone[int(r["id"])] = r
+        if gone and self.delete_burst.record(len(gone)) > DELETE_BURST_LIMIT:
+            self.request_scan("delete_burst")
+            return
+
+        now = _now()
+        touched = 0
+        # A move can arrive as a delete in one batch and a create in the next
+        # (slow renames, save-by-rename editors), so recent tombstones are
+        # move candidates too — that is what their grace period is for.
+        candidates: dict[int, dict[str, Any]] = {int(r["id"]): r for r in gone.values()}
+        if changed:
+            for r in db.list_files(status="tombstone", source=SOURCE, limit=500):
+                candidates.setdefault(int(r["id"]), r)
+
+        def _same_file(g: dict[str, Any], fp: dict[str, Any]) -> bool:
+            if (g.get("size"), g.get("mtime_ns")) != (fp["size"], fp["mtime_ns"]):
+                return False
+            # Windows' DirEntry.stat() reports inode 0 while os.stat() reports
+            # the real file id, so an inode only counts when both sides know it.
+            return not (g.get("ino") and fp["ino"]) or int(g["ino"]) == int(fp["ino"])
+
+        for rel in sorted(changed):
+            abs_path = os.path.join(self.root, *rel.split("/"))
+            if self.matcher.classify(rel, abs_path) == SKIP:
+                row = db.file_by_path(SOURCE, path_hash(rel))
+                if row is not None:
+                    gone[int(row["id"])] = row
+                continue
+            try:
+                st = os.stat(fs_path(abs_path), follow_symlinks=False)
+            except OSError:
+                continue
+            fp = {
+                "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns), "mtime": float(st.st_mtime),
+                "ino": fit_i63(st.st_ino), "dev": fit_i63(st.st_dev),
+            }
+            ph = path_hash(rel)
+            row = db.file_by_path(SOURCE, ph)
+            if row is None:
+                twin = next((g for g in candidates.values() if _same_file(g, fp)), None)
+                folder_id = self.folder_id_for(_parent_rel(rel))
+                name = rel.rsplit("/", 1)[-1]
+                if twin is not None:
+                    candidates.pop(int(twin["id"]), None)
+                    gone.pop(int(twin["id"]), None)
+                    db.update_file(int(twin["id"]), rel_path=rel, path_hash=ph, name=name,
+                                   name_folded=fold(name), folder_id=folder_id, deleted_at=None,
+                                   status="dirty" if twin.get("status") == "tombstone" else twin.get("status"),
+                                   **fp)
+                    db.mark_dirty([int(twin["id"])], priority=P_LIVE)
+                else:
+                    try:
+                        db.insert_file(SOURCE, rel, ph, name=name, name_folded=fold(name),
+                                       ext=os.path.splitext(name)[1].lower(), folder_id=folder_id,
+                                       status="dirty", priority=P_LIVE, birthtime=_birthtime(st), **fp)
+                    except Exception as exc:  # noqa: BLE001 — a racing scan inserted it
+                        logger.debug(f"[userdocs] insert {rel} skipped: {exc}")
+                touched += 1
+            elif (
+                (row.get("size"), row.get("mtime_ns")) != (fp["size"], fp["mtime_ns"])
+                or row.get("status") in ("tombstone", "missing", "deferred")
+            ):
+                db.update_file(int(row["id"]), deleted_at=None, missing_since=None, **fp)
+                db.mark_dirty([int(row["id"])], priority=P_LIVE)
+                touched += 1
+
+        for r in gone.values():
+            db.update_file(int(r["id"]), status="tombstone", deleted_at=now)
+        if touched or gone:
+            self.service.wake()
+
+    # ── folders ────────────────────────────────────────────────────────────
+
+    def folder_id_for(self, rel_dir: str) -> int | None:
+        """The folder row for ``rel_dir`` (``""`` = the root, which has none),
+        creating the chain of parent rows on the way."""
+        if not rel_dir or self.db is None:
+            return None
+        cached = self._folder_cache.get(rel_dir)
+        if cached is not None:
+            return cached
+        from app.userdocs.discovery.walker import path_hash
+        from app.userdocs.textnorm import fold
+
+        parent = self.folder_id_for(_parent_rel(rel_dir))
+        name = rel_dir.rsplit("/", 1)[-1]
+        fid = self.db.upsert_folder(
+            SOURCE, rel_dir, path_hash(rel_dir),
+            name=name, name_folded=fold(name), parent_id=parent,
+            depth=rel_dir.count("/") + 1, status="live", updated_at=_now(),
+        )
+        if len(self._folder_cache) > 50_000:
+            self._folder_cache.clear()
+        self._folder_cache[rel_dir] = fid
+        return fid
+
+    # ── scans ──────────────────────────────────────────────────────────────
+
+    def request_scan(self, reason: str) -> None:
+        with self.lock:
+            self.scan_requested = self.scan_requested or reason
+        self.service.wake()
+
+    def scan_due(self, now: float) -> bool:
+        if not self.active or self.hold or self.paused_user or self.scanning or self.confirmation:
+            return False
+        return bool(self.scan_requested) or (self.next_scan_at and now >= self.next_scan_at)
+
+    def run_scan(self) -> None:
+        """A full reconcile of the folder against the index (scan executor)."""
+        from app.userdocs.discovery.guard import RootGuard
+        from app.userdocs.discovery.hashing import sha256_file
+        from app.userdocs.discovery.scan import scan_diff
+
+        with self.lock:
+            if self.scanning:
+                return
+            self.scanning = True
+            reason = self.scan_requested or "reconcile"
+            self.scan_requested = None
+        started = time.monotonic()
+        try:
+            if not self.active or self.root is None or self.db is None:
+                return
+            db = self.db
+            self.progress.set_state("scanning", None)
+            manifest = db.load_manifest(SOURCE)
+            identity = db.get_source_state(SOURCE).get("root_identity")
+            from app.userdocs.deploy_env import docker_root_status
+
+            bind_expected = bool(docker_root_status(self.root).get("bind_expected"))
+            verdict = self.guard.check_root(
+                self.root, manifest_count=len(manifest),
+                root_identity=identity if isinstance(identity, dict) else None,
+                docker_bind_expected=bind_expected,
+            )
+            if not verdict.ok:
+                self._set_hold("root_unavailable", {"why": verdict.reason, **(verdict.detail or {})})
+                db.add_activity("held", f"Folder unavailable ({verdict.reason}); nothing was removed.",
+                                source=SOURCE, level="warning")
+                return
+            with self.lock:
+                if self.hold and self.hold.get("reason") == "root_unavailable":
+                    self.hold = None
+
+            def _progress(n: int) -> None:
+                self.progress.set_phase(f"scanning ({n} files seen)")
+
+            result = scan_diff(
+                self.root, self.matcher, manifest,
+                hasher=sha256_file, stop=self.stop_event, on_progress=_progress,
+            )
+            if result.stopped:
+                return
+            if verdict.reason and self.guard.device_change_holds(len(result.missing), max(1, len(manifest))):
+                self._set_hold("root_unavailable", {"why": "device_changed", **(verdict.detail or {})})
+                return
+            self._apply_scan(result, total=len(manifest))
+            db.update_source_state(
+                SOURCE, root_identity=RootGuard.identity_of(self.root),
+                last_scan_finished_at=_now(), last_scan_s=time.monotonic() - started,
+            )
+            if result.truncated:
+                db.add_activity("limit_reached", "The folder has more files than can be indexed; "
+                                "the rest were skipped. Add exclusions to narrow it down.",
+                                source=SOURCE, level="warning")
+            logger.info(
+                f"[userdocs] {self.profile}: scan ({reason}) new={len(result.new)} "
+                f"changed={len(result.changed)} moved={len(result.moves)} missing={len(result.missing)} "
+                f"excluded={len(result.excluded)} in {time.monotonic() - started:.1f}s"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"[userdocs] {self.profile}: scan failed")
+            if self.db is not None:
+                self.db.add_activity("error", f"Scan failed: {exc}", source=SOURCE, level="error")
+        finally:
+            elapsed = time.monotonic() - started
+            with self.lock:
+                self.scanning = False
+                self.last_scan_s = elapsed
+                interval = (
+                    min(900.0, max(30.0, 10 * elapsed)) if self.watch_mode == "poll" else NATIVE_RECONCILE_S
+                )
+                self.next_scan_at = _now() + interval
+            self.progress.set_phase(None)
+            self.refresh_totals()
+            self._publish_state()
+            self.service.wake()
+
+    def _apply_scan(self, result: Any, *, total: int) -> None:
+        from app.userdocs.discovery.walker import path_hash
+        from app.userdocs.textnorm import fold
+
+        db = self.db
+        now = _now()
+        self._folder_cache.clear()
+        seen_folders: set[int] = set()
+        for d in result.dirs:
+            fid = self.folder_id_for(d.rel_path)
+            if fid is not None:
+                seen_folders.add(fid)
+
+        def _fp(e: t.FsEntry) -> dict[str, Any]:
+            return {
+                "size": int(e.size), "mtime_ns": int(e.mtime_ns), "mtime": e.mtime_ns / 1e9,
+                "ino": int(e.ino), "dev": int(e.dev), "birthtime": e.birthtime,
+            }
+
+        for row, e in result.moves:
+            name = e.rel_path.rsplit("/", 1)[-1]
+            db.update_file(row.id, rel_path=e.rel_path, path_hash=path_hash(e.rel_path), name=name,
+                           name_folded=fold(name), folder_id=self.folder_id_for(_parent_rel(e.rel_path)),
+                           missing_since=None, **_fp(e))
+            db.mark_dirty([row.id], priority=P_UPGRADE)
+
+        changed_ids: list[int] = []
+        for row, e in result.changed:
+            db.update_file(row.id, missing_since=None, deleted_at=None, **_fp(e))
+            changed_ids.append(row.id)
+        if changed_ids:
+            db.mark_dirty(changed_ids, priority=P_BULK)
+
+        for row, e in result.returned:
+            db.update_file(row.id, status="indexed", missing_since=None, **_fp(e))
+
+        # Newest first, so a first sync makes recent work searchable soonest.
+        for e in sorted(result.new, key=lambda x: -x.mtime_ns):
+            name = e.rel_path.rsplit("/", 1)[-1]
+            try:
+                db.insert_file(
+                    SOURCE, e.rel_path, path_hash(e.rel_path),
+                    name=name, name_folded=fold(name), ext=os.path.splitext(name)[1].lower(),
+                    folder_id=self.folder_id_for(_parent_rel(e.rel_path)),
+                    status="dirty", priority=P_BULK, **_fp(e),
+                )
+            except Exception as exc:  # noqa: BLE001 — a watcher event inserted it first
+                logger.debug(f"[userdocs] scan insert {e.rel_path} skipped: {exc}")
+
+        if result.excluded:
+            self.purge_file_ids([r.id for r in result.excluded])
+
+        missing = [r for r in result.missing if r.status != "missing"]
+        if missing:
+            bulk = self.guard.check_bulk(len(missing), max(1, total))
+            if bulk:
+                for r in missing:
+                    db.update_file(r.id, status="missing", missing_since=now)
+                self._set_confirmation({"kind": "mass_delete", "missing": len(missing), "total": total})
+                db.add_activity(
+                    "held", f"{len(missing)} of {total} files disappeared at once. They are hidden "
+                    "from search until you confirm or reject removing them.",
+                    source=SOURCE, level="warning", detail={"missing": len(missing), "total": total},
+                )
+            else:
+                self.purge_file_ids([r.id for r in missing])
+                if missing:
+                    db.add_activity("removed", f"Removed {len(missing)} deleted files from the index.",
+                                    source=SOURCE, detail={"files": len(missing)})
+
+        # Kept-after-a-mass-delete rows that stayed gone long enough.
+        expired = [
+            int(r["id"]) for r in db.list_files(status="missing", source=SOURCE, limit=5000)
+            if r.get("missing_since") and now - float(r["missing_since"]) > MISSING_KEEP_S
+        ]
+        self.purge_file_ids(expired)
+
+        if not result.truncated:
+            stale = [fid for fid in db.folder_ids(SOURCE).values() if fid not in seen_folders]
+            if stale:
+                self.queue_vector_deletes(db.delete_folders(stale))
+        db.refresh_folder_stats(SOURCE)
+        self.refresh_project_cards(seen_folders)
+
+    # ── projects ───────────────────────────────────────────────────────────
+
+    def refresh_project_cards(self, folder_ids: Iterable[int], *, limit: int = 2000) -> None:
+        """Maintain a searchable card for every folder that looks like a
+        project (README, pyproject, package.json, .git, or several source
+        files of one language) — what "the robot project folder I worked on
+        last year" is answered from."""
+        from app.userdocs.chunking import diff_chunks, make_folder_card
+        from app.userdocs.discovery.projects import detect_project
+
+        db = self.db
+        done = 0
+        for fid in folder_ids:
+            if done >= limit or self.stop_event.is_set():
+                break
+            folder = db.get_folder(fid)
+            if not folder:
+                continue
+            files, subs = db.names_in_folder(fid)
+            abs_dir = os.path.join(self.root, *folder["rel_path"].split("/"))
+            try:
+                meta = detect_project(abs_dir, files + subs)
+            except Exception:  # noqa: BLE001
+                meta = None
+            if not meta:
+                if folder.get("is_project"):
+                    db.upsert_folder(SOURCE, folder["rel_path"], folder["path_hash"], is_project=0,
+                                     project_meta=None, card_hash=None)
+                    diff = diff_chunks(db.folder_chunks(fid), [])
+                    db.apply_chunks(file_id=None, folder_id=fid, source=SOURCE, diff=diff)
+                    self.queue_vector_deletes(diff.remove)
+                continue
+            under = db.files_under(SOURCE, folder["rel_path"], statuses=("indexed", "metadata_only", "dirty"))
+            mtimes = [float(r["mtime"]) for r in under if r.get("mtime")]
+            readme_head = None
+            if meta.get("readme"):
+                readme_head = _read_head(os.path.join(abs_dir, meta["readme"]))
+            card = make_folder_card(
+                name=folder.get("name") or folder["rel_path"],
+                rel_path=folder["rel_path"],
+                file_count=len(under),
+                languages=meta.get("languages") or {},
+                markers=meta.get("markers") or [],
+                deps=meta.get("deps") or [],
+                readme_head=readme_head,
+                top_files=sorted(files)[:15],
+                activity_min_iso=iso_local(min(mtimes)) if mtimes else None,
+                activity_max_iso=iso_local(max(mtimes)) if mtimes else None,
+                git_last_commit_iso=iso_local(meta.get("git_last_commit_at")),
+            )
+            if folder.get("card_hash") == card.text_hash:
+                continue
+            diff = diff_chunks(db.folder_chunks(fid), [card])
+            db.apply_chunks(file_id=None, folder_id=fid, source=SOURCE, diff=diff)
+            self.queue_vector_deletes(diff.remove)
+            db.upsert_folder(SOURCE, folder["rel_path"], folder["path_hash"], is_project=1,
+                             project_meta=meta, card_hash=card.text_hash,
+                             git_last_commit_at=meta.get("git_last_commit_at"))
+            done += 1
+        if done:
+            self.service.wake_embedder()
+
+    # ── the per-file pipeline ──────────────────────────────────────────────
+
+    def process(self, row: dict[str, Any]) -> None:
+        """Index one dirty file (pipeline worker thread)."""
+        fid = int(row["id"])
+        rel = row["rel_path"]
+        name = row.get("name") or rel.rsplit("/", 1)[-1]
+        self.progress.file_started(fid, name=name, rel_path=rel, stage="read")
+        try:
+            outcome, message, reason = self._process(row)
+        except Exception as exc:  # noqa: BLE001 — one bad file never stops the queue
+            logger.exception(f"[userdocs] {self.profile}: indexing {rel} failed")
+            outcome, message, reason = "failed", f"{name}: {exc}", "internal_error"
+            self._mark_failed(row, reason, str(exc))
+        self.progress.file_finished(fid, outcome, name=name, rel_path=rel, message=message,
+                                    reason=reason, fid=row.get("cite_id"))
+        if outcome not in ("unchanged",) and self.db is not None:
+            level = "error" if outcome == "failed" else "info"
+            self.db.add_activity(outcome, message, source=SOURCE, level=level, file_id=fid, rel_path=rel)
+
+    def _mark_failed(self, row: dict[str, Any], reason: str, error: str | None) -> None:
+        if self.db is None:
+            return
+        attempts = int(row.get("attempts") or 0) + 1
+        nxt = _now() + BACKOFF_S[min(attempts, MAX_ATTEMPTS) - 1] if attempts < MAX_ATTEMPTS else None
+        self.db.update_file(int(row["id"]), if_queued_at=row.get("queued_at"), status="error",
+                            status_reason=reason, error=(error or "")[:2000], attempts=attempts,
+                            next_attempt_at=nxt)
+
+    def _process(self, row: dict[str, Any]) -> tuple[str, str, str | None]:
+        from app.userdocs import governor as gov
+        from app.userdocs.chunking import CHUNKER_VERSION, chunk_blocks, detect_legal_meta, diff_chunks, looks_legal
+        from app.userdocs.chunking import make_file_card
+        from app.userdocs.discovery.hashing import QUICK_HASH_MIN_SIZE, fs_path, is_placeholder, quick_hash, sha256_file
+        from app.userdocs.discovery.ignore import METADATA_ONLY, SKIP
+        from app.userdocs.extract import EXTRACTOR_VERSION
+        from app.userdocs.kinds import guess_kind
+
+        db = self.db
+        if db is None or self.root is None:
+            raise RuntimeError("runtime is not configured")
+        fid = int(row["id"])
+        rel = row["rel_path"]
+        name = row.get("name") or rel.rsplit("/", 1)[-1]
+        abs_path = os.path.join(self.root, *rel.split("/"))
+
+        try:
+            st = os.stat(fs_path(abs_path), follow_symlinks=False)
+        except FileNotFoundError:
+            db.update_file(fid, if_queued_at=row.get("queued_at"), status="tombstone", deleted_at=_now())
+            return "removed", f"{name} was deleted", None
+        except PermissionError as exc:
+            self._mark_failed(row, "permission_denied", str(exc))
+            return "failed", f"{name}: permission denied", "permission_denied"
+
+        disposition = self.matcher.classify(rel, abs_path)
+        if disposition == SKIP:
+            self.purge_file_ids([fid])
+            return "removed", f"{name} is now excluded", None
+
+        is_dir = os.path.isdir(abs_path)
+        placeholder = False
+        try:
+            placeholder = is_placeholder(name, st)
+        except Exception:  # noqa: BLE001
+            pass
+
+        mime = None
+        if is_dir:
+            kind, content_allowed = t.KIND_BUNDLE, False
+        elif placeholder or disposition == METADATA_ONLY:
+            kind, content_allowed = guess_kind(name), False
+        else:
+            from app.userdocs.extract.detect import detect_file
+
+            kind, mime = detect_file(fs_path(abs_path))
+            content_allowed = kind not in t.METADATA_ONLY_KINDS
+
+        fingerprint = {
+            "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns), "mtime": float(st.st_mtime),
+        }
+        sha: str | None = None
+        hash_kind: str | None = None
+        if not is_dir and not placeholder and disposition != METADATA_ONLY:
+            self.progress.file_stage(fid, "hash")
+            if content_allowed or st.st_size < QUICK_HASH_MIN_SIZE:
+                sha, hash_kind = sha256_file(fs_path(abs_path), stop=self.stop_event), "full"
+            else:
+                sha, hash_kind = quick_hash(fs_path(abs_path), int(st.st_size)), "quick"
+            if sha is None and self.stop_event.is_set():
+                return "skipped", f"{name}: stopped", None
+
+        versions_current = (
+            row.get("extractor_version") == EXTRACTOR_VERSION and row.get("chunker_version") == CHUNKER_VERSION
+        )
+        existing = db.get_chunks(fid)
+        content_unchanged = bool(
+            sha and sha == row.get("sha256") and versions_current
+            and row.get("status") in ("indexed", "metadata_only") and existing
+        )
+
+        doc_meta: dict[str, Any] = dict(row.get("doc_meta") or {}) if content_unchanged else {}
+        exif: dict[str, Any] | None = row.get("exif") if content_unchanged else None
+        image: dict[str, Any] | None = None
+        body: list[t.Chunk] = []
+        status, reason, error = ("indexed" if content_allowed else "metadata_only"), None, None
+        if not content_allowed:
+            reason = "placeholder" if placeholder else ("secret" if disposition == METADATA_ONLY else kind)
+        caption_state = row.get("caption_state")
+
+        if content_unchanged:
+            rows = db.chunk_rows([c.id for c in existing])
+            body = chunks_from_rows(r for r in rows if r.get("ctype") != t.CTYPE_FILE_CARD)
+            status, reason = row.get("status") or status, row.get("status_reason")
+        elif content_allowed:
+            op = "add_content" if not row.get("sha256") else gov.classify_edit(
+                int(st.st_size) - int(row.get("size") or 0))
+            try:
+                level = gov.Level(self.level)
+            except ValueError:
+                level = gov.Level.OK
+            if not gov.Governor.allows(level, op):
+                db.update_file(fid, if_queued_at=row.get("queued_at"), status="deferred",
+                               status_reason=str(self.level), **fingerprint)
+                return "skipped", f"{name}: waiting for storage space", "deferred"
+            twin = next(
+                (f for f in (db.files_by_sha(sha) if sha else [])
+                 if int(f["id"]) != fid and f.get("status") == "indexed"
+                 and f.get("extractor_version") == EXTRACTOR_VERSION
+                 and f.get("chunker_version") == CHUNKER_VERSION),
+                None,
+            )
+            if twin is not None:
+                twin_rows = db.chunk_rows([c.id for c in db.get_chunks(int(twin["id"]))])
+                body = chunks_from_rows(r for r in twin_rows if r.get("ctype") != t.CTYPE_FILE_CARD)
+                doc_meta = dict(twin.get("doc_meta") or {})
+                exif = twin.get("exif")
+                caption_state = twin.get("caption_state")
+            else:
+                self.progress.file_stage(fid, "extract")
+                result = self.service.extract(t.ExtractRequest(
+                    name=name, kind=kind, path=fs_path(abs_path),
+                    limits=self.service.extract_limits(),
+                ), size=int(st.st_size))
+                doc_meta = dict(result.doc_meta or {})
+                exif = result.exif
+                image = result.image
+                if result.status in (t.EXTRACT_OK, t.EXTRACT_PARTIAL):
+                    self.progress.file_stage(fid, "chunk")
+                    legal = looks_legal(result.blocks)
+                    body = chunk_blocks(result.blocks, legal=legal)
+                    if legal:
+                        meta = detect_legal_meta(result.blocks)
+                        if meta:
+                            doc_meta["legal"] = meta
+                    if result.status == t.EXTRACT_PARTIAL:
+                        reason = f"partial:{result.reason}"
+                    if result.ocr_pages:
+                        doc_meta["scanned_pages"] = [p.get("page") for p in result.ocr_pages]
+                elif result.status == t.EXTRACT_METADATA_ONLY:
+                    status, reason = "metadata_only", result.reason
+                elif result.reason == "awaiting_extractor":
+                    status, reason = "awaiting_extractor", (doc_meta.get("missing") or "extractor")
+                else:
+                    status, reason, error = "error", result.reason or "corrupt", doc_meta.get("error")
+                if kind == t.KIND_IMAGE:
+                    # Captions come from the Specialized Vision Model, which a
+                    # later stage adds; until then an image is found by its
+                    # name, folder, date and camera.
+                    caption_state = caption_state if caption_state == "done" else "awaiting_vision"
+
+        taken_ts = ts_from_iso((exif or {}).get("taken_at"))
+        created_ts = ts_from_iso(doc_meta.get("created"))
+        camera = " ".join(x for x in ((exif or {}).get("make"), (exif or {}).get("model")) if x) or None
+        summary = body[0].text if body else None
+        card = make_file_card(
+            name=name, rel_path=rel, kind=kind, size=int(st.st_size),
+            mtime_iso=iso_local(st.st_mtime) or "",
+            title=doc_meta.get("title"), author=doc_meta.get("author"),
+            created_iso=iso_local(created_ts), taken_iso=iso_local(taken_ts), camera=camera,
+            summary_text=summary,
+            extra={"status": "metadata only (content not read)"} if not content_allowed else None,
+        )
+        new_chunks = [card] + body
+        diff = diff_chunks(existing, new_chunks)
+
+        fields: dict[str, Any] = {
+            "kind": kind, "mime": mime, "sha256": sha, "hash_kind": hash_kind,
+            "doc_meta": doc_meta or None, "exif": exif,
+            "is_camera_photo": 1 if (image or {}).get("is_camera_photo") or (camera and taken_ts) else 0,
+            "taken_at": taken_ts, "doc_created_at": created_ts,
+            "extractor_version": EXTRACTOR_VERSION, "chunker_version": CHUNKER_VERSION,
+            "caption_state": caption_state,
+            **fingerprint,
+        }
+        self.progress.file_stage(fid, "index", {"done": 0, "total": len(diff.add)})
+        try:
+            db.apply_chunks(file_id=fid, folder_id=row.get("folder_id"), source=SOURCE, diff=diff,
+                            file_fields=fields)
+        except LookupError:
+            return "skipped", f"{name} changed while it was being indexed", None
+        self.queue_vector_deletes(diff.remove)
+
+        now = _now()
+        if status == "error":
+            attempts = int(row.get("attempts") or 0) + 1
+            nxt = now + BACKOFF_S[min(attempts, MAX_ATTEMPTS) - 1] if attempts < MAX_ATTEMPTS else None
+            db.update_file(fid, if_queued_at=row.get("queued_at"), status="error", status_reason=reason,
+                           error=(error or "")[:2000], attempts=attempts, next_attempt_at=nxt)
+        else:
+            db.update_file(fid, if_queued_at=row.get("queued_at"), status=status, status_reason=reason,
+                           error=None, attempts=0, next_attempt_at=None, indexed_at=now)
+        self.service.wake_embedder()
+
+        total = len(new_chunks)
+        if status == "error":
+            return "failed", f"{name}: could not be read ({reason})", reason
+        if content_unchanged:
+            if not diff.add:
+                return "unchanged", f"{name} is unchanged", None
+            return "moved", f"{name}: location or details updated", None
+        if not row.get("sha256"):
+            if status == "metadata_only":
+                return "metadata_only", f"{name} indexed by name and details only ({reason})", reason
+            return "added", f"{name} indexed ({total} chunks)", None
+        return "updated", f"{name} — {len(diff.add)} of {total} chunks re-embedded", None
+
+    # ── removal ────────────────────────────────────────────────────────────
+
+    def queue_vector_deletes(self, chunk_ids: Iterable[int]) -> None:
+        ids = [int(i) for i in chunk_ids]
+        if not ids:
+            return
+        with self.lock:
+            self.pending_vector_deletes.extend(ids)
+        self.service.wake_embedder()
+
+    def take_vector_deletes(self) -> list[int]:
+        with self.lock:
+            ids, self.pending_vector_deletes = self.pending_vector_deletes, []
+        return ids
+
+    def purge_file_ids(self, file_ids: Iterable[int]) -> int:
+        n = 0
+        if self.db is None:
+            return 0
+        for fid in list(file_ids):
+            try:
+                self.queue_vector_deletes(self.db.delete_file(int(fid)))
+                n += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[userdocs] purge {fid} failed: {exc}")
+        return n
+
+    def purge_tombstones(self, now: float) -> int:
+        if self.db is None:
+            return 0
+        expired = [
+            int(r["id"]) for r in self.db.list_files(status="tombstone", source=SOURCE, limit=5000)
+            if not r.get("deleted_at") or now - float(r["deleted_at"]) >= TOMBSTONE_GRACE_S
+        ]
+        n = self.purge_file_ids(expired)
+        if n:
+            self.db.add_activity("removed", f"Removed {n} deleted file{'s' if n != 1 else ''} from the index.",
+                                 source=SOURCE, detail={"files": n})
+            self.refresh_totals()
+        return n
+
+    # ── confirmations ──────────────────────────────────────────────────────
+
+    def confirm_deletions(self) -> int:
+        if self.db is None:
+            return 0
+        ids = [int(r["id"]) for r in self.db.list_files(status="missing", source=SOURCE, limit=1_000_000)]
+        n = self.purge_file_ids(ids)
+        self._set_confirmation(None)
+        self.db.add_activity("removed", f"Removed {n} vanished files from the index (confirmed).",
+                             source=SOURCE, detail={"files": n})
+        self.refresh_totals()
+        return n
+
+    def reject_deletions(self) -> None:
+        self._set_confirmation(None)
+        if self.db is not None:
+            self.db.add_activity("kept", "Kept the vanished files; they stay hidden and are re-checked "
+                                 "on every scan for 14 days.", source=SOURCE)
+
+    # ── estimate ───────────────────────────────────────────────────────────
+
+    def run_estimate(self) -> dict[str, Any]:
+        """Stat-only walk: what a full sync would cost (scan executor)."""
+        from app.userdocs import governor as gov
+        from app.userdocs.discovery.ignore import IgnoreMatcher, METADATA_ONLY
+        from app.userdocs.discovery.walker import walk
+        from app.userdocs.kinds import guess_kind
+
+        row = self.settings or {}
+        custom = row.get("root_mode") == uds.ROOT_CUSTOM
+        check = uds.validate_root(row.get("root_path") if custom else None, is_admin=self.profile == "admin")
+        est: dict[str, Any] = {"state": "running", "root": check.path, "started_at": _now() * 1000}
+        with self.lock:
+            self.estimate = est
+            self.estimating = True
+        self.progress.set_state("estimating", None)
+        try:
+            if not check.ok:
+                est.update(state="error", error=check.message)
+                return est
+            matcher = IgnoreMatcher(
+                check.path, excludes=uds.normalize_excludes(row.get("excludes")),
+                locked_excludes=check.locked_excludes, system_dir=uds.system_dir(),
+            )
+            by_kind: dict[str, int] = {}
+            files = dirs = total_bytes = chunks = images = placeholders = 0
+            opts = uds.normalize_options(row.get("options"))
+            min_bytes = int(opts["caption"]["min_kb"]) * 1024
+            for e in walk(check.path, matcher, stop=self.stop_event):
+                if e.is_dir:
+                    dirs += 1
+                    if dirs % 500 == 0:
+                        self.progress.set_phase(f"estimating ({files} files)")
+                    continue
+                files += 1
+                total_bytes += int(e.size)
+                kind = guess_kind(e.rel_path.rsplit("/", 1)[-1])
+                by_kind[kind] = by_kind.get(kind, 0) + 1
+                if e.placeholder:
+                    placeholders += 1
+                if e.disposition == METADATA_ONLY or kind in t.METADATA_ONLY_KINDS or e.placeholder:
+                    chunks += 1
+                    continue
+                if kind == t.KIND_IMAGE and e.size >= min_bytes:
+                    images += 1
+                chunks += gov.estimate_chunks(kind, int(e.size)) + 1
+            backend = _vector_backend()
+            size = gov.estimate_bytes(chunks, backend=backend)
+            est.update(
+                state="done", files=files, dirs=dirs, bytes=total_bytes, by_kind=by_kind,
+                images_to_caption=images, placeholders=placeholders, chunks=chunks,
+                index_bytes=size["total"], seconds=int(files * 0.05 + chunks / 25),
+                finished_at=_now() * 1000,
+            )
+            if self.stop_event.is_set():
+                est["state"] = "stopped"
+            return est
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"[userdocs] {self.profile}: estimate failed")
+            est.update(state="error", error=str(exc))
+            return est
+        finally:
+            with self.lock:
+                self.estimating = False
+            self.progress.set_phase(None)
+            if self.db is not None:
+                try:
+                    self.db.update_source_state(SOURCE, estimate=est)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    # ── snapshot ───────────────────────────────────────────────────────────
+
+    def refresh_totals(self) -> None:
+        if self.db is None:
+            return
+        try:
+            self.progress.set_totals(self.db.count_by_status(SOURCE))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def pending_count(self) -> int:
+        stages = self.progress.stages
+        return int(stages.get("dirty", 0))
+
+    def _publish_state(self) -> None:
+        state, reason = self.effective_state()
+        self.progress.set_state(state, reason, (self.hold or {}).get("detail") if self.hold else None)
+
+    def effective_state(self) -> tuple[str, str | None]:
+        """Precedence: hold > confirmation > user pause > storage pause >
+        re-embed > scanning/estimating > indexing > idle."""
+        if self.suspended:
+            return "suspended", self.suspended
+        if not self.active and not self.settings.get("enabled"):
+            return "disabled", None
+        if self.hold:
+            return "hold", self.hold.get("reason")
+        if self.confirmation:
+            return "awaiting_confirmation", self.confirmation.get("kind")
+        if self.estimating:
+            return "estimating", None
+        if self.paused_user:
+            return "paused", "user"
+        if self.level in ("budget", "disk_low", "disk_critical"):
+            return "paused", self.level
+        if self.scanning:
+            return "scanning", None
+        reembed = self.progress.reembed
+        if reembed.get("total") and reembed.get("done", 0) < reembed.get("total", 0):
+            return "reembedding", None
+        if self.pending_count() > 0 or self.in_flight:
+            return "indexing", None
+        return "idle", None
+
+    def runtime_snapshot(self) -> dict[str, Any]:
+        state, reason = self.effective_state()
+        snap = self.progress.snapshot()
+        snap["state"], snap["reason"] = state, reason
+        if self.hold:
+            snap["detail"] = self.hold.get("detail")
+        snap["confirmation"] = self.confirmation
+        snap["watch"] = {"mode": self.watch_mode, "reason": self.watch_reason}
+        coverage = snap.get("vector_coverage_pct")
+        snap["tool_mode"] = "normal" if coverage in (None, 100.0) else "partial"
+        return snap
+
+
+def _birthtime(st: os.stat_result) -> float | None:
+    bt = getattr(st, "st_birthtime", None)
+    if bt:
+        return float(bt)
+    if os.name == "nt":
+        return float(st.st_ctime)  # creation time on Windows
+    return None
+
+
+def _read_head(path: str, limit: int = 2000) -> str | None:
+    try:
+        from app.userdocs.discovery.hashing import read_text_head
+
+        return read_text_head(path, limit)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _vector_backend() -> str:
+    try:
+        from app.config.settings import BaseConfig
+
+        return "chroma" if (BaseConfig.get_vectorstore_provider() or "").lower() == "chroma" else "qdrant"
+    except Exception:  # noqa: BLE001
+        return "qdrant"

@@ -54,6 +54,7 @@ the user's request more broadly.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import importlib.util
 import json
@@ -390,7 +391,13 @@ async def run_doc_search(
         return _no_result()
 
     try:
-        hits = service.search(query=query, profile=profile, limit=top_k, scopes=scopes)
+        # Off the event loop: ``search`` embeds the query synchronously, and
+        # the shared embedder serialises model calls behind a lock that a
+        # User Document Search batch may be holding. Waiting for it here
+        # would stall every other request on the loop.
+        hits = await asyncio.to_thread(
+            service.search, query=query, profile=profile, limit=top_k, scopes=scopes,
+        )
         logger.debug(f"vector search hits: {hits}")
     except Exception:  # noqa: BLE001
         logger.exception(f"{tag} vector search failed")

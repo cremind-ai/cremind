@@ -83,6 +83,7 @@ export const CLEAN_GROUPS: CleanGroup[] = [
       { key: 'tool_configs', label: 'Tools / MCP & their configs' },
       { key: 'skills', label: 'Persona & skills (reset to defaults)' },
       { key: 'documents', label: 'Documents + embeddings' },
+      { key: 'user_documents', label: 'My Documents index (your files are kept)' },
       { key: 'browser_login', label: 'Browser login state' },
       { key: 'app_settings', label: 'App settings (reset to defaults)' },
     ],

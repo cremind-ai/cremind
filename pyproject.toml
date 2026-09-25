@@ -128,9 +128,9 @@ codex = ["openai-codex>=0.154.0,<0.155"]
 # Document ingestion (markitdown converts office/pdf, pandas for tabular).
 documents = ["markitdown[all]>=0.1.0", "pandas>=3.0.1"]
 
-# User Document Search, on top of `documents`: .cremindignore matching, EXIF
+# User Document Search, on top of `documents`: EXIF
 # (Pillow was only transitive before), and HEIC decoding for iPhone photos.
-userdocs = ["pathspec>=0.12", "pillow>=10.0", "pillow-heif>=0.18"]
+userdocs = ["pillow>=10.0", "pillow-heif>=0.18"]
 
 # OpenAI tokenizer — used for prompt-size accounting by every OpenAI-family
 # LLM provider, plus the system_file built-in tool.
@@ -168,7 +168,6 @@ all = [
     "openai-codex>=0.154.0,<0.155",
     "markitdown[all]>=0.1.0",
     "pandas>=3.0.1",
-    "pathspec>=0.12",
     "pillow>=10.0",
     "pillow-heif>=0.18",
     "tiktoken>=0.12.0",
