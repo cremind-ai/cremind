@@ -48,6 +48,10 @@ Tables
                         (FK profile CASCADE)
 - userdoc_vision_usage : per-profile, per-local-day captioning counters behind
                         the daily cap (FK profile CASCADE)
+- userdoc_citations   : every citation token a User Documents tool printed, so
+                        an answer's tokens can be checked against what was
+                        really issued. UNIQUE(conversation_id, token)
+                        (FK profile CASCADE, FK conversation CASCADE)
 """
 
 import uuid
@@ -1090,3 +1094,61 @@ class UserDocVisionUsageModel(Base):
     captions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     ocr_pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+
+
+class UserDocCitationModel(Base):
+    """One citation token a User Documents tool printed in one conversation.
+
+    The registry is what makes a citation *verifiable*: when an answer is
+    saved, every ``[ud:…]`` token in it is looked up here, so a token the model
+    invented, altered or carried over from another conversation is flagged
+    instead of rendered as a trustworthy source (see
+    :mod:`app.userdocs.citations`).
+
+    Each row is also a **snapshot** of what the token pointed at when it was
+    issued — path, locator, a short snippet. The index it points into is
+    derived data that is rebuilt, edited and purged; the snapshot is what an
+    old answer can still show once the chunk it quoted has changed ("stale")
+    or the file is gone ("removed").
+
+    ``ref_id`` is the file/folder row id inside the profile's *index* file, a
+    different database, so it carries no foreign key. ``conversation_id`` is
+    NULL only on the A2A path, where a first message's conversation row does
+    not exist yet while its tools run (bound at finalization).
+    """
+
+    __tablename__ = "userdoc_citations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True,
+    )
+    # Canonical form, "[ud:<cite_id>]" or "[ud:<cite_id>#<c8>]" (22 chars max).
+    token: Mapped[str] = mapped_column(String(32), nullable=False)
+    cite_id: Mapped[str] = mapped_column(String(8), nullable=False)
+    # file | folder
+    target: Mapped[str] = mapped_column(String(8), nullable=False, default="file")
+    ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    text_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # local | drive — purge set D deletes the drive rows.
+    source_kind: Mapped[str] = mapped_column(String(8), nullable=False, default="local")
+    locator: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    label: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    rel_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # At most 800 characters of the chunk as it read when issued.
+    snippet: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # find_files | search | read | research
+    leaf: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    web_link: Mapped[str | None] = mapped_column(Text, nullable=True)
+    issued_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        # One row per token per conversation: re-printing a token (the same
+        # search twice) is a no-op, not a second row.
+        UniqueConstraint("conversation_id", "token", name="uq_userdoc_citations_conv_token"),
+        # Lookups go by (profile, cite_id); it also serves the profile cascade.
+        Index("ix_userdoc_citations_profile_cite", "profile", "cite_id"),
+    )

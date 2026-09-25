@@ -34,6 +34,7 @@ import { useTodoPanelsStore, livePanelKey } from './todoPanels';
 import { normalizeTodos, allTodosCompleted } from '../utils/todos';
 import { splitMidTurnSegments } from '../utils/midTurnSplit';
 import { backfillLegacyTotals } from '../utils/latencyLabels';
+import { normalizeCitationsMeta, type CitationsMeta } from '../utils/citations';
 import {
   attachResultToSteps,
   terminalAttachmentFromFrame,
@@ -222,6 +223,11 @@ export interface ChatMessage {
   // live on `complete`. Absent on turns that never drove a todo list.
   planTodos?: TodoItem[];
   planStage?: 'executing' | 'completed';
+  // The answer's User Documents citations as the server verified them when it
+  // was saved (`metadata.citations`, or the live `citations` frame). Absent on
+  // answers that cite nothing and on older ones — the bubble resolves those on
+  // demand (stores/citations.ts).
+  citations?: CitationsMeta;
 }
 
 export interface ObservationPart {
@@ -1901,6 +1907,46 @@ export const useChatStore = defineStore('chat', {
           this.compactionByConversation[conversationId] = null;
           return;
 
+        case 'citations': {
+          // The answer's citations, verified when it was saved. Attach-only:
+          // it arrives as a turn finishes, so it must never open a bubble of
+          // its own the way ensureAssistant would.
+          const meta = normalizeCitationsMeta(data.citations);
+          if (!meta) return;
+          const assistantId =
+            typeof data.assistant_id === 'string' && data.assistant_id ? data.assistant_id : null;
+          // By persisted id first: `complete` records it as `backendId` (the
+          // live bubble keeps its optimistic `id`), and a bubble loaded from
+          // history carries it as `id`.
+          let target: ChatMessage | null = null;
+          if (assistantId) {
+            for (let i = bucket.length - 1; i >= 0; i--) {
+              const m = bucket[i];
+              if (m.role === 'assistant' && (m.backendId === assistantId || m.id === assistantId)) {
+                target = m;
+                break;
+              }
+            }
+          }
+          // Then the bubble still streaming — the usual case, since the frame
+          // is published before `complete` hands out the persisted id.
+          if (!target) target = findAssistant();
+          // Without an id to go by, a frame that lands after `complete` belongs
+          // to the answer that just finished: the newest assistant bubble. With
+          // an id that matched nothing, it is some other answer — drop it
+          // rather than badge the wrong bubble; a reload reads it from metadata.
+          if (!target && !assistantId) {
+            for (let i = bucket.length - 1; i >= 0; i--) {
+              if (bucket[i].role === 'assistant') {
+                target = bucket[i];
+                break;
+              }
+            }
+          }
+          if (target) target.citations = meta;
+          return;
+        }
+
         case 'complete': {
           const message = findAssistant();
           if (message) {
@@ -2194,6 +2240,9 @@ export const useChatStore = defineStore('chat', {
         // stamps live in this tab's memory and are gone.
         latency: msg.role === 'agent'
           ? latencyFromServer((msg.metadata as any)?.latency)
+          : undefined,
+        citations: msg.role === 'agent'
+          ? normalizeCitationsMeta((msg.metadata as any)?.citations)
           : undefined,
       };
     },

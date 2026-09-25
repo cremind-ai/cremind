@@ -29,6 +29,8 @@ from app.api.tokens import get_token_routes
 from app.api.usage import get_usage_routes
 from app.api.user_config import get_user_config_routes
 from app.api.userdocs import get_userdocs_routes
+from app.api.userdocs_files import get_userdocs_files_routes
+from app.api.userdocs_query import get_userdocs_query_routes
 
 
 def get_api_routes(
@@ -90,6 +92,10 @@ def get_api_routes(
     routes.extend(get_file_watcher_routes())
     routes.extend(get_calendar_routes(conversation_storage))
     routes.extend(get_drive_routes())
+    # The query and file routes come first: Starlette matches in order, and
+    # /api/userdocs/files/{fid}/text must not be shadowed by /files/{fid}.
+    routes.extend(get_userdocs_query_routes())
+    routes.extend(get_userdocs_files_routes())
     routes.extend(get_userdocs_routes())
     routes.extend(get_google_routes())
     routes.extend(get_admin_stream_routes())

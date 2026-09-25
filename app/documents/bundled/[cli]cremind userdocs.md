@@ -10,7 +10,8 @@ that the agent can search by meaning, by keyword, by date and by folder, and
 cite back to the exact page or lines. It mirrors **Settings → My Documents**.
 
 It is separate from `documentation_search`, which only covers Cremind's own
-manual.
+manual. Searching and reading the index from the terminal (`search`, `find`,
+`read`, `cite`) is documented in **`cremind userdocs search`**.
 
 Two levels of switch:
 

@@ -428,6 +428,23 @@ class CremindAgentExecutor(AgentExecutor):
                 # re-render terminal chips (see mapBackendMessage on the UI side).
                 persist_parts = (collected_file_parts or []) + collected_terminal_parts or None
 
+                # User Document Search citations, as on the stream-runner
+                # path. ``context_id`` binds registrations a first message's
+                # tools made before this conversation row existed.
+                agent_metadata = None
+                if "ud:" in final_response_text.lower():
+                    try:
+                        from app.userdocs.citations import finalize_citations
+
+                        citations_meta = await asyncio.to_thread(
+                            finalize_citations, profile, conversation_id,
+                            final_response_text, context_id=context_id,
+                        )
+                        if citations_meta:
+                            agent_metadata = {"citations": citations_meta}
+                    except Exception:  # noqa: BLE001
+                        logger.exception(f"Citation check failed for conversation {conversation_id}")
+
                 await self.conversation_storage.add_message(
                     conversation_id=conversation_id,
                     role="agent",
@@ -436,6 +453,7 @@ class CremindAgentExecutor(AgentExecutor):
                     thinking_steps=collected_thinking_steps if collected_thinking_steps else None,
                     llm_messages=collected_llm_messages,
                     token_usage=token_usage_data,
+                    metadata=agent_metadata,
                 )
 
                 # Update conversation title from first user message if still default

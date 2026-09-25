@@ -250,10 +250,12 @@ def test_search_tool_classes_resolve():
     # these resolve to the wrong set (or drop one), failing loudly here.
     from app.tools.builtin.documentation_search import DocumentationSearchTool
     from app.tools.builtin.search_memory import SearchMemoryTool
+    from app.tools.builtin.user_documents import UserDocumentsSearchTool
     from app.tools.builtin.web_search import WebSearchTool
 
     local, web = ra._search_tool_classes()
-    assert local == [DocumentationSearchTool, SearchMemoryTool]
+    # The user's own files first (only named when the gate kept the tool).
+    assert local == [UserDocumentsSearchTool, DocumentationSearchTool, SearchMemoryTool]
     assert web is WebSearchTool
 
 

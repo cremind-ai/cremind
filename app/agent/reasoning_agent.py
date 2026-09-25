@@ -131,7 +131,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}{builtin_tools_guidance}{skills_guidance}{search_guidance}{coding_delegation_guidance}
+{reasoning_guidance}{builtin_tools_guidance}{user_documents_guidance}{skills_guidance}{search_guidance}{coding_delegation_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -774,6 +774,14 @@ def _search_tool_classes():
     """
     local = []
     web = None
+    # The user's own files first: when User Document Search is on for this
+    # run, "verify before you answer" should reach for them before Cremind's
+    # manual. Absent (gated off) it names nothing, like any disabled tool.
+    try:
+        from app.tools.builtin.user_documents import UserDocumentsSearchTool
+        local.append(UserDocumentsSearchTool)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from app.tools.builtin.documentation_search import DocumentationSearchTool
         local.append(DocumentationSearchTool)
@@ -1151,6 +1159,83 @@ def _build_builtin_tools_guidance(tools) -> str:
         "then call one of its listed functions."
     )
     return "\n" + header + "\n" + "\n".join(lines) + "\n"
+
+
+def _build_user_documents_guidance(tools) -> str:
+    """How to use the user's own files: which functions, dates, citations.
+
+    Present ONLY when the ``user_documents`` group survived this run's gate
+    (User Document Search allowed, turned on, and permitted for this
+    conversation's origin), so every other profile's prompt stays
+    byte-identical. Built from the run's enabled tool set only — leaf names
+    from the group's static ``skills``, never from per-step state — so it is
+    byte-stable within a run, like the blocks around it.
+
+    The citation rules are what make the answer verifiable: every token the
+    tools print is registered, and the saved answer's tokens are checked
+    against that registry, so an invented or edited token shows up as
+    unverified. The research sentence names ``research`` only when that leaf
+    is registered; until then legal/financial questions are sent to ``read``.
+    """
+    group = next((t for t in tools if getattr(t, "config_name", None) == "user_documents"), None)
+    if group is None:
+        return ""
+    leaves = [s.name for s in getattr(group, "skills", [])]
+
+    def fn(leaf: str) -> str:
+        return f"`{make_leaf_name(group.tool_id, leaf)}`"
+
+    own = [fn(leaf) for leaf in ("find_files", "search", "read") if leaf in leaves]
+    if not own:
+        return ""
+
+    # Sibling tools are named through their own classes (matched to the live
+    # group by defining module), as in ``_build_search_guidance``, so a
+    # rename re-derives here instead of drifting.
+    group_by_stem = {getattr(t, "config_name", None): t for t in tools if getattr(t, "config_name", None)}
+
+    def sibling(module: str, cls_name: str) -> Optional[str]:
+        group_ = group_by_stem.get(module)
+        if group_ is None:
+            return None
+        try:
+            import importlib
+
+            mod = importlib.import_module(f"app.tools.builtin.{module}")
+            return make_leaf_name(group_.tool_id, getattr(mod, cls_name).name)
+        except Exception:  # noqa: BLE001 — a missing sibling is simply not named
+            return None
+
+    doc_fn = sibling("documentation_search", "DocumentationSearchTool")
+    not_these = (
+        f"not `{doc_fn}` (Cremind's own manual) and not the file-system tools"
+        if doc_fn else "not the file-system tools"
+    )
+    time_fn = sibling("current_time", "GetCurrentTimeTool")
+    when = f"with `{time_fn}` first" if time_fn else "against today's date first"
+    read = fn("read") if "read" in leaves else "the read function"
+    if "research" in leaves:
+        research = (
+            f"Legal, financial or compliance questions, and requests to compile everything in a "
+            f"folder, MUST go through {fn('research')} — never conclude from snippets; if it "
+            "reports status 'running', call it again with continue_job before answering."
+        )
+    else:
+        research = (
+            "For legal, financial or compliance questions, read the relevant sections in full "
+            f"with {read} before answering — never conclude from snippets alone."
+        )
+    body = (
+        "USER DOCUMENTS — THE USER'S OWN FILES: " + ", ".join(own) + " search and read the files "
+        "the user indexed with User Document Search (their own documents, notes, reports, "
+        f"spreadsheets, photos and project folders). Use them — {not_these} — whenever the user "
+        "refers to their own files or what those files say. Resolve relative dates (\"2 days "
+        f"ago\", \"last year\") to calendar dates {when}, and widen a fuzzy date by ±1 day. "
+        "Cite every claim taken from these results by copying the [ud:…] token printed next to "
+        "its passage exactly, right after the claim; never invent or alter a token. Quote only "
+        "text that appears in the results, in quotation marks, followed by its token. " + research
+    )
+    return "\n" + body + "\n"
 
 
 def _build_skills_guidance(tools) -> str:
@@ -1564,6 +1649,11 @@ class ReasoningAgent:
     # ``_build_instruction`` calls from tripping on a missing attribute.
     _builtin_tools_guidance: str = ""
 
+    # User Documents block; ``__init__`` recomputes it (empty unless the
+    # user_documents tool survived this run's gate). Same class-level-default
+    # rationale as above.
+    _user_documents_guidance: str = ""
+
     # Skills catalogue block (what a skill is + the enabled skill ids); ``__init__``
     # recomputes it from the run's enabled tools (empty unless a skill is on).
     # Class-level default keeps ``__new__`` construction (tests) and direct
@@ -1818,6 +1908,17 @@ class ReasoningAgent:
         from app.groups.index import has_group_membership
         if self._group_chat or not has_group_membership(profile):
             tools = [t for t in tools if t.tool_id != "send_group_message"]
+        # ``user_documents`` searches the profile's own files. Offered only when
+        # the admin allowed User Document Search, the profile turned it on, and
+        # this conversation's origin is one the profile permits (web UI / CLI /
+        # its own automations by default; channels and rooms only when opted
+        # in — an answer there reaches other people). Conversation-constant
+        # and read from cheap state once, so the tools block stays byte-stable
+        # like the gates above. Skipped entirely when the tool is not enabled.
+        if any(t.tool_id == "user_documents" for t in tools):
+            from app.userdocs.gate import userdocs_tool_available
+            if not userdocs_tool_available(profile, message_origin):
+                tools = [t for t in tools if t.tool_id != "user_documents"]
         # A maintenance turn is not allowed to speak to anyone. Withheld rather
         # than refused at dispatch because the gate directly above states the
         # invariant plainly and a fold slips underneath it: a fold on a seat has
@@ -1846,6 +1947,9 @@ class ReasoningAgent:
         # that declares an authored description; empty otherwise. Static for the
         # run (group-level), so the system prompt stays byte-identical per step.
         self._builtin_tools_guidance = _build_builtin_tools_guidance(self._tools)
+        # User Documents rules (functions, dates, citations) — only when the
+        # gate above kept the tool; empty otherwise. Static for the run.
+        self._user_documents_guidance = _build_user_documents_guidance(self._tools)
         # Skills catalogue — what a skill IS (an instruction bundle that must be
         # loaded before it can be relied on) plus the enabled skill ids. Same
         # enabled-set-only contract as the block above, so it is static for the
@@ -2102,6 +2206,7 @@ class ReasoningAgent:
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
             builtin_tools_guidance=self._builtin_tools_guidance,
+            user_documents_guidance=getattr(self, "_user_documents_guidance", ""),
             # ``getattr`` (like the coding block below) tolerates the skeleton
             # agents tests build via ``__new__``, which never run ``__init__``.
             skills_guidance=getattr(self, "_skills_guidance", ""),

@@ -510,6 +510,8 @@ class ProfileRuntime:
 
         for r in gone.values():
             db.update_file(int(r["id"]), status="tombstone", deleted_at=now)
+        if touched:
+            self.note_queued(touched, "changes")
         if touched or gone:
             self.service.wake()
 
@@ -679,6 +681,10 @@ class ProfileRuntime:
                 )
             except Exception as exc:  # noqa: BLE001 — a watcher event inserted it first
                 logger.debug(f"[userdocs] scan insert {e.rel_path} skipped: {exc}")
+
+        queued = len(result.new) + len(result.changed) + len(result.moves)
+        if queued:
+            self.note_queued(queued, "sync" if total else "initial_sync")
 
         if result.excluded:
             self.purge_file_ids([r.id for r in result.excluded])
@@ -1145,6 +1151,26 @@ class ProfileRuntime:
             self.progress.set_totals(self.db.count_by_status(SOURCE))
         except Exception:  # noqa: BLE001
             pass
+
+    def note_queued(self, n: int, label: str) -> None:
+        """Count newly queued files into the visible batch (for "3,120/12,840
+        files · ~30 min left"); a batch opens on the first and closes when
+        the queue drains (:meth:`maybe_end_batch`)."""
+        if self.progress.batch.get("label"):
+            self.progress.add_to_batch(n)
+        else:
+            self.progress.begin_batch(label, n)
+
+    def maybe_end_batch(self) -> None:
+        if not self.progress.batch.get("label"):
+            return
+        with self.lock:
+            busy = bool(self.in_flight) or self.scanning
+        if busy or self.db is None:
+            return
+        counts = self.db.count_by_status(SOURCE)
+        if not counts.get("dirty"):
+            self.progress.end_batch()
 
     def pending_count(self) -> int:
         stages = self.progress.stages

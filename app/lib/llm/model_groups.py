@@ -179,7 +179,8 @@ class ModelGroupManager:
 
         ``documentation_search`` — its relevance judge is a frugal LLM-as-judge, so
         it runs on the ``low`` (low-performance) model, which itself falls back to
-        the single model when unset.
+        the single model when unset. ``user_documents`` likewise, for its thorough
+        mode's query variants and rerank.
 
         Every other tool uses the single configured model. ``tool_name`` may be a
         module name or a slug — both contain the relevant substring for that tool.
@@ -204,6 +205,11 @@ class ModelGroupManager:
         # exactly the cheap auxiliary task the low-performance group exists for.
         # Falls back to the single model when ``low`` is unset.
         if "documentation_search" in name:
+            return self.create_llm_for_group("low", profile=profile)
+        # User Documents' thorough mode (restoring accents, translating the
+        # query, reranking the top 30) is the same kind of cheap auxiliary
+        # step. Its deep research picks its own group (RESEARCH_MODEL_GROUP).
+        if "user_documents" in name:
             return self.create_llm_for_group("low", profile=profile)
         return self.create_llm_for_model(profile=profile)
 

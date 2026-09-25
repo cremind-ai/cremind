@@ -9,6 +9,9 @@ recognise:
   request with `confirm` set to apply it.
 - **409 FeatureNotInstalled** — allowing the feature needs optional extras;
   install them with `cremind features install userdocs`.
+
+`query/{find|search|read}` run the agent's search leaves and answer with the
+text the agent would read; `citations/resolve` looks citation tokens up.
 """
 
 from __future__ import annotations
@@ -90,3 +93,24 @@ async def get_storage(client: Client) -> dict[str, Any]:
 
 def userdocs_stream_path() -> str:
     return "/api/userdocs/stream"
+
+
+async def query(client: Client, leaf: str, body: dict[str, Any]) -> dict[str, Any]:
+    """``leaf`` is ``find``, ``search`` or ``read``; ``body`` takes the same
+    arguments as the agent's ``user_documents__*`` functions. The answer
+    carries ``text`` (what the agent would read) plus the structured result."""
+    clean = {k: v for k, v in body.items() if v is not None}
+    resp = await client.post_json(f"/api/userdocs/query/{leaf}", clean)
+    return resp if isinstance(resp, dict) else {}
+
+
+async def resolve_citations(
+    client: Client, tokens: list[str], *, conversation_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve ``[ud:…]`` tokens to their file, location and snippet. With a
+    conversation id, each is also checked against what the tools issued there."""
+    body: dict[str, Any] = {"tokens": tokens}
+    if conversation_id:
+        body["conversation_id"] = conversation_id
+    resp = await client.post_json("/api/userdocs/citations/resolve", body)
+    return resp if isinstance(resp, dict) else {}

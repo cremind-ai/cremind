@@ -44,6 +44,12 @@ export interface ConversationStreamEvent {
     | 'plan_decision'
     | 'todos'
     | 'agent_activity'
+    // The answer's User Documents citations, checked against what the tools
+    // issued: `{citations: {v, items, unverified}, assistant_id}`. Published
+    // when the answer is saved, so it attaches to the finishing bubble and
+    // never opens one. The multiplexer forwards conversation-event frames of
+    // any type, so this needed no change in profileEventsStream.ts.
+    | 'citations'
     | 'complete'
     | 'error'
     | 'cwd';

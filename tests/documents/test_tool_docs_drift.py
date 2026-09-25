@@ -30,6 +30,7 @@ DOC_MAP = {
     "gg_places": "[tool]google places",
     "weather": "[tool]accuweather weather",
     "documentation_search": "[tool]documentation search",
+    "user_documents": "[tool]user documents",
 }
 
 

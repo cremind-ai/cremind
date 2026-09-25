@@ -1835,6 +1835,108 @@ class IndexDB:
             r[0] for r in self._read("SELECT id FROM chunks WHERE id > ? ORDER BY id LIMIT ?", (int(after_id), int(limit)))
         ]
 
+    # ── Query-engine reads ─────────────────────────────────────────────────
+    #
+    # Read-only helpers for :mod:`app.userdocs.query`. They run on the
+    # thread-local ``query_only`` readers, so a search can never write and
+    # never queues behind the sync engine's writer.
+
+    def read_sql(self, sql: str, params: Sequence[Any] = (), *, table: str | None = None) -> list[dict[str, Any]]:
+        """Rows of one read-only statement as dicts, with ``table``'s JSON
+        columns decoded.
+
+        For the query engine's filter and catalog SQL, which is composed from
+        constant fragments with every user value bound as a parameter. The
+        reader connection is ``query_only``, so a statement that tried to
+        write would fail rather than change the index."""
+        rows = self._read(sql, params)
+        if table is None:
+            return [dict(r) for r in rows]
+        return [_decode(table, r) for r in rows]  # type: ignore[misc]
+
+    def files_by_ids(self, ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+        """``{id: file row}`` for the ids that still exist, any status."""
+        out: dict[int, dict[str, Any]] = {}
+        for batch in _batches(_unique_ints(ids)):
+            for r in self._read(f"SELECT * FROM files WHERE id IN ({_qmarks(len(batch))})", batch):
+                out[int(r["id"])] = _decode("files", r)  # type: ignore[assignment]
+        return out
+
+    def folders_by_ids(self, ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+        """``{id: folder row}`` for the ids that still exist."""
+        out: dict[int, dict[str, Any]] = {}
+        for batch in _batches(_unique_ints(ids)):
+            for r in self._read(f"SELECT * FROM folders WHERE id IN ({_qmarks(len(batch))})", batch):
+                out[int(r["id"])] = _decode("folders", r)  # type: ignore[assignment]
+        return out
+
+    def folders_brief(self) -> list[dict[str, Any]]:
+        """Every folder's identity and dates, without its project metadata —
+        what folder-name resolution and folder grouping need, for all
+        folders in one read."""
+        rows = self._read(
+            "SELECT id, cite_id, source, parent_id, rel_path, name, name_folded, depth, is_project, "
+            "status, file_count, min_mtime, max_mtime, git_last_commit_at FROM folders"
+        )
+        return [dict(r) for r in rows]
+
+    def chunks_of_file(self, file_id: int) -> list[dict[str, Any]]:
+        """Every chunk of a file (card included), full rows, in reading
+        order — what the reader reassembles the text from."""
+        rows = self._read(
+            "SELECT * FROM chunks WHERE file_id = ? ORDER BY ordinal, id", (int(file_id),)
+        )
+        return [_decode("chunks", r) for r in rows]  # type: ignore[misc]
+
+    def fts_search_ctype(self, match: str, ctype: str, *, limit: int = 60) -> list[tuple[int, float]]:
+        """:meth:`fts_search` restricted to one chunk type.
+
+        Cards are how the catalog matches a file or folder by what it *is*
+        rather than by every paragraph in it — and a folder card has no
+        ``file_id``, so the file-restricted variant can never reach one."""
+        if self._lexical != sch.LEXICAL_FTS5:
+            raise RuntimeError("this index has no full-text table (lexical='like'); use like_search")
+        rank = f"bm25({sch.FTS_TABLE}, 0.3, 1.0, 0.8)"
+        try:
+            rows = self._read(
+                f"SELECT {sch.FTS_TABLE}.rowid, {rank} AS s FROM {sch.FTS_TABLE} "
+                f"JOIN chunks c ON c.id = {sch.FTS_TABLE}.rowid "
+                f"WHERE {sch.FTS_TABLE} MATCH ? AND c.ctype = ? ORDER BY s LIMIT ?",
+                (match, ctype, int(limit)),
+            )
+        except sqlite3.OperationalError as exc:
+            raise ValueError(f"full-text query rejected: {exc}") from exc
+        return [(int(r[0]), -float(r[1])) for r in rows]
+
+    def query_overview(self) -> dict[str, int]:
+        """The counts a search result's header reports, in one pass over
+        ``files``: searchable files, files still waiting to be (re)indexed,
+        images waiting for a caption, and files that could not be read."""
+        row = self._read_one(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN status NOT IN ('missing', 'tombstone') THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN status IN ('dirty', 'deferred') THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN kind = 'image' AND caption_state IN ('awaiting_vision', 'over_cap') "
+            "  AND status NOT IN ('missing', 'tombstone') THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) "
+            "FROM files"
+        )
+        visible, pending, captions, errors = (int(v or 0) for v in (row or (0, 0, 0, 0)))
+        return {"files": visible, "pending": pending, "awaiting_captions": captions, "unreadable": errors}
+
+    def vector_coverage(self, gen: int) -> tuple[int, int]:
+        """(chunks with a vector in generation ``gen``, all chunks)."""
+        with_vec = self._read_one("SELECT COUNT(*) FROM chunks WHERE vec_gen = ?", (int(gen),))
+        total = self._read_one("SELECT COUNT(*) FROM chunks")
+        return int(with_vec[0] if with_vec else 0), int(total[0] if total else 0)
+
+    def min_first_seen(self, source: str) -> float | None:
+        """When the source's first scan found its oldest-known file — the
+        start of the first sync, after which ``first_seen_at`` means "the file
+        appeared" rather than "the index was built"."""
+        row = self._read_one("SELECT MIN(first_seen_at) FROM files WHERE source = ?", (source,))
+        return float(row[0]) if row and row[0] is not None else None
+
     # ── Maintenance ────────────────────────────────────────────────────────
 
     def _pragma_int(self, name: str) -> int:

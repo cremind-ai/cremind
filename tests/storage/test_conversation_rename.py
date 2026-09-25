@@ -44,6 +44,7 @@ from app.storage.models import (  # noqa: E402
     ScheduleEventSubscriptionModel,
     SkillEventSubscriptionModel,
     UsageRecordModel,
+    UserDocCitationModel,
 )
 
 _TABLES = (
@@ -58,6 +59,7 @@ _TABLES = (
     "schedule_event_subscriptions",
     "event_runs",
     "channel_groups",
+    "userdoc_citations",
 )
 
 # Every table that FK-references conversations.id — the rename must move all of
@@ -74,6 +76,7 @@ _CHILD_MODELS = (
     ScheduleEventSubscriptionModel,
     EventRunModel,
     ChannelGroupModel,
+    UserDocCitationModel,
 )
 
 _OLD = "c1-old"
@@ -146,6 +149,13 @@ async def _seed(store: ConversationStorage) -> None:
             platform_chat_id="-1001", status="approved",
             discovered_via="message", conversation_id=_OLD,
             created_at=now, updated_at=now,
+        ))
+        # A citation the conversation's tools issued (User Document Search).
+        s.add(UserDocCitationModel(
+            id="udc1", profile="admin", conversation_id=_OLD,
+            token="[ud:k7m2xq9a]", cite_id="k7m2xq9a", target="file",
+            source_kind="local", label="", rel_path="a.txt", snippet="",
+            leaf="search", issued_at=now,
         ))
 
 

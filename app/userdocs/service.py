@@ -341,6 +341,7 @@ class UserDocsService:
                     rt.in_flight.discard(int(row["id"]))
                 if not rt.in_flight:
                     rt.refresh_totals()
+                    rt.maybe_end_batch()
 
     # ── embedder ───────────────────────────────────────────────────────────
 
@@ -492,6 +493,7 @@ class UserDocsService:
         shutil.rmtree(index_dir(rt.uid), ignore_errors=True)
         storage.delete_captions(profile)
         storage.delete_vision_usage(profile)
+        _purge_citations(profile)
         logger.info(f"[userdocs] {profile}: index deleted")
         new_rt = self.runtime(profile, create=True)
         if new_rt is not None:
@@ -800,6 +802,7 @@ def _file_view(r: dict[str, Any]) -> dict[str, Any]:
         "kind": r.get("kind"), "status": r.get("status"), "status_reason": r.get("status_reason"),
         "size": r.get("size"), "modified": _ms(r.get("mtime")), "indexed_at": _ms(r.get("indexed_at")),
         "chunks": r.get("chunk_count"), "caption_state": r.get("caption_state"),
+        "source": r.get("source"), "web_link": r.get("drive_web_link"),
     }
 
 
@@ -852,6 +855,19 @@ def forget_profile(profile: str, uid: str | None) -> None:
     shutil.rmtree(index_dir(uid), ignore_errors=True)
 
 
+def _purge_citations(profile: str) -> None:
+    """The citation registry is part of purge set P: a deleted index leaves no
+    token that could still be "verified" against it. Answers keep their own
+    ``metadata.citations`` snapshots. Best-effort — the index is already gone,
+    and a leftover row only means an old token reads as issued-but-removed."""
+    from app.userdocs.citations import purge_profile
+
+    try:
+        purge_profile(profile)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[userdocs] {profile}: could not delete the citation registry")
+
+
 def clean_profile(profile: str) -> dict[str, Any]:
     """The "User documents" clean-data component: delete the index, captions,
     quota counters and settings — never the user's files."""
@@ -862,6 +878,7 @@ def clean_profile(profile: str) -> dict[str, Any]:
     forget_profile(profile, uid)
     captions = storage.delete_captions(profile)
     storage.delete_vision_usage(profile)
+    _purge_citations(profile)
     removed = 0
     for kind in uds.SOURCE_KINDS:
         removed += 1 if storage.delete_source(profile, kind) else 0

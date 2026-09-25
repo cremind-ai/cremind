@@ -1,0 +1,373 @@
+{
+  "_comment": "Shared by ui/tests/citation-grammar.test.mjs and tests/userdocs/test_cite_ui_parity.py: the tolerant citation grammar and first-appearance numbering, which the web UI (ui/src/utils/citations.ts) must reproduce from app/userdocs/cite.py exactly. Offsets are code points in Python and UTF-16 units in JS, so keep every case inside the BMP.",
+  "cases": [
+    {
+      "name": "chunk and file tokens",
+      "text": "See [ud:k7m2xq9a#3f9c2e1b] and the whole file [ud:k7m2xq9a].",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 4,
+          "end": 26
+        },
+        {
+          "token": "[ud:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 46,
+          "end": 59
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[ud:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "full-width brackets",
+      "text": "Theo 【ud:k7m2xq9a#3f9c2e1b】 thì…",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 27
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "spaces inside the bracket",
+      "text": "Quoted [ ud: k7m2xq9a#3f9c2e1b ] here.",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 7,
+          "end": 32
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "upper case is canonicalised",
+      "text": "Shouted [UD:K7M2XQ9A#3F9C2E1B] and mixed [Ud:k7M2xq9A].",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 8,
+          "end": 30
+        },
+        {
+          "token": "[ud:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 41,
+          "end": 54
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[ud:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "several tokens in one bracket",
+      "text": "Both [ud:k7m2xq9a#3f9c2e1b; ud:p4r8st0v#0a1b2c3d] agree.",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 49
+        },
+        {
+          "token": "[ud:p4r8st0v#0a1b2c3d]",
+          "cite_id": "p4r8st0v",
+          "c8": "0a1b2c3d",
+          "start": 5,
+          "end": 49
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[ud:p4r8st0v#0a1b2c3d]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "comma separated, newline inside",
+      "text": "Both [ud:k7m2xq9a#3f9c2e1b,\nud:p4r8st0v] agree.",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 40
+        },
+        {
+          "token": "[ud:p4r8st0v]",
+          "cite_id": "p4r8st0v",
+          "c8": null,
+          "start": 5,
+          "end": 40
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[ud:p4r8st0v]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "trailing separator",
+      "text": "Odd [ud:k7m2xq9a; ] but fine.",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 4,
+          "end": 19
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "mixed bracket kinds",
+      "text": "Mixed [ud:k7m2xq9a#3f9c2e1b】 close.",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 6,
+          "end": 28
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "numbering is by first appearance",
+      "text": "A [ud:bbbbbbbb] B [ud:aaaaaaaa#00000000] C [ud:bbbbbbbb] D [ud:cccccccc; ud:aaaaaaaa#00000000]",
+      "tokens": [
+        {
+          "token": "[ud:bbbbbbbb]",
+          "cite_id": "bbbbbbbb",
+          "c8": null,
+          "start": 2,
+          "end": 15
+        },
+        {
+          "token": "[ud:aaaaaaaa#00000000]",
+          "cite_id": "aaaaaaaa",
+          "c8": "00000000",
+          "start": 18,
+          "end": 40
+        },
+        {
+          "token": "[ud:bbbbbbbb]",
+          "cite_id": "bbbbbbbb",
+          "c8": null,
+          "start": 43,
+          "end": 56
+        },
+        {
+          "token": "[ud:cccccccc]",
+          "cite_id": "cccccccc",
+          "c8": null,
+          "start": 59,
+          "end": 94
+        },
+        {
+          "token": "[ud:aaaaaaaa#00000000]",
+          "cite_id": "aaaaaaaa",
+          "c8": "00000000",
+          "start": 59,
+          "end": 94
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:bbbbbbbb]",
+          1
+        ],
+        [
+          "[ud:aaaaaaaa#00000000]",
+          2
+        ],
+        [
+          "[ud:cccccccc]",
+          3
+        ]
+      ]
+    },
+    {
+      "name": "inside a code span still counts",
+      "text": "`[ud:k7m2xq9a]` then [ud:p4r8st0v]",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 1,
+          "end": 14
+        },
+        {
+          "token": "[ud:p4r8st0v]",
+          "cite_id": "p4r8st0v",
+          "c8": null,
+          "start": 21,
+          "end": 34
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a]",
+          1
+        ],
+        [
+          "[ud:p4r8st0v]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "letters outside the alphabet parse (and fail verification later)",
+      "text": "Bad [ud:ILOUilou]",
+      "tokens": [
+        {
+          "token": "[ud:ilouilou]",
+          "cite_id": "ilouilou",
+          "c8": null,
+          "start": 4,
+          "end": 17
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:ilouilou]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "Vietnamese text before the token",
+      "text": "Điều 12, khoản 2 [ud:k7m2xq9a#3f9c2e1b]",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 17,
+          "end": 39
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "markup is not a token",
+      "text": "[ud:<script>] and [ud:<img src=x onerror=alert(1)>]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "too short / too long / bad hash",
+      "text": "[ud:short] [ud:k7m2xq9ab] [ud:k7m2xq9a#zzzzzzzz] [ud:k7m2xq9a#3f9c2e1]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "no brackets, no token",
+      "text": "ud:k7m2xq9a alone",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "the neutralised document form is not a token",
+      "text": "[ud：k7m2xq9a#3f9c2e1b]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "empty",
+      "text": "",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "unicode look-alikes are not letters (long s)",
+      "text": "[ud:ſkkkkkkk] then [ud:k7m2xq9a]",
+      "tokens": [
+        {
+          "token": "[ud:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 19,
+          "end": 32
+        }
+      ],
+      "numbers": [
+        [
+          "[ud:k7m2xq9a]",
+          1
+        ]
+      ]
+    }
+  ]
+}

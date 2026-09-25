@@ -2,7 +2,9 @@
 
 Mirrors Settings → My Documents: turn indexing of your own files on or off,
 choose the folder, manage exclude rules, and watch sync progress. `admin`
-subcommands mirror the gate on the Vector Embedding page.
+subcommands mirror the gate on the Vector Embedding page. `search`, `find`,
+`read` and `cite` query the index the way the agent does (documented
+separately, in `[cli]cremind userdocs search.md`).
 
 Changes that would remove indexed content (moving the folder, adding excludes
 that drop files, deleting the index) are refused with a plan of what would go.
@@ -568,6 +570,182 @@ def userdocs_storage(ctx: typer.Context) -> None:
             return await get_storage(client)
 
     _print(ctx, asyncio.run(_run()))
+
+
+# ── search / find / read / cite ────────────────────────────────────────────
+#
+# The same leaves the agent calls (`user_documents__search` / `__find_files` /
+# `__read`), for a person at a terminal: the printed text is exactly what the
+# agent reads (untrusted file content inside its data block), but not cut to
+# the agent's tool-result budget.
+
+
+def _filters(
+    *,
+    folder: Optional[list[str]] = None,
+    types: Optional[list[str]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    date_field: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    out: dict[str, Any] = {}
+    if folder:
+        out["folder"] = list(folder)
+    if types:
+        out["types"] = list(types)
+    if date_from:
+        out["date_from"] = date_from
+    if date_to:
+        out["date_to"] = date_to
+    if date_field:
+        out["date_field"] = date_field
+    return out or None
+
+
+def _query(ctx: typer.Context, leaf: str, body: dict[str, Any]) -> None:
+    """POST a query and print its text (or the whole result with --json)."""
+    import asyncio
+
+    from app.cli.client._base import APIError, Client
+    from app.cli.client.userdocs import query
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await query(client, leaf, body)
+
+    try:
+        out = asyncio.run(_run())
+    except APIError as e:
+        detail = _api_detail(e)
+        if detail and detail.get("message"):
+            sys.stderr.write(f"{detail['message']}\n")
+            for cand in detail.get("candidates") or []:
+                sys.stderr.write(f"  {cand}\n")
+            raise typer.Exit(code=1) from e
+        raise
+    if mode.json:
+        print_json(out)
+    else:
+        sys.stdout.write((out.get("text") or "") + "\n")
+
+
+@userdocs_app.command("search")
+@graceful_errors
+def userdocs_search(
+    ctx: typer.Context,
+    query: str = typer.Argument(..., help="What to look for, in your own words."),
+    folder: Optional[list[str]] = typer.Option(None, "--folder", help="Only inside this folder (repeatable)."),
+    types: Optional[list[str]] = typer.Option(
+        None, "--type", help="document, pdf, word, spreadsheet, presentation, text, code, image, … (repeatable)."),
+    date_from: Optional[str] = typer.Option(None, "--from", help="First day, YYYY-MM-DD (or YYYY-MM, YYYY)."),
+    date_to: Optional[str] = typer.Option(None, "--to", help="Last day, inclusive."),
+    date_field: Optional[str] = typer.Option(None, "--date-field", help="any (default) | modified | created | taken"),
+    group_by: Optional[str] = typer.Option(None, "--group-by", help="file (default) | folder | chunk"),
+    top_k: Optional[int] = typer.Option(None, "--top-k", help="Results per page (default 8)."),
+    thorough: bool = typer.Option(False, "--thorough", help="Restore accents, translate, and rerank with a model."),
+) -> None:
+    """Search inside your indexed files; every passage comes with a [ud:…] citation token."""
+    _query(ctx, "search", {
+        "query": query,
+        "filters": _filters(folder=folder, types=types, date_from=date_from, date_to=date_to,
+                            date_field=date_field),
+        "group_by": group_by, "top_k": top_k, "thorough": thorough or None,
+    })
+
+
+@userdocs_app.command("find")
+@graceful_errors
+def userdocs_find(
+    ctx: typer.Context,
+    query: Optional[str] = typer.Argument(None, help="What the file or folder is called or is about."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="file (default) | folder | project"),
+    folder: Optional[list[str]] = typer.Option(None, "--folder", help="Only inside this folder (repeatable)."),
+    types: Optional[list[str]] = typer.Option(None, "--type", help="File type (repeatable)."),
+    date_from: Optional[str] = typer.Option(None, "--from", help="First day, YYYY-MM-DD (or YYYY-MM, YYYY)."),
+    date_to: Optional[str] = typer.Option(None, "--to", help="Last day, inclusive."),
+    sort: Optional[str] = typer.Option(
+        None, "--sort", help="relevance | newest | oldest | name | largest | smallest"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Results per page (default 20)."),
+) -> None:
+    """Find files, folders or projects by name, type, date or topic."""
+    _query(ctx, "find", {
+        "query": query, "kind": kind,
+        "filters": _filters(folder=folder, types=types, date_from=date_from, date_to=date_to),
+        "sort": sort, "limit": limit,
+    })
+
+
+@userdocs_app.command("read")
+@graceful_errors
+def userdocs_read(
+    ctx: typer.Context,
+    file: str = typer.Argument(..., help="A [ud:…] token, file id, path inside the indexed folder, or name."),
+    pages: Optional[str] = typer.Option(None, "--pages", help="PDF pages, e.g. 3-5."),
+    lines: Optional[str] = typer.Option(None, "--lines", help="Line range, e.g. 40-80."),
+    section: Optional[str] = typer.Option(None, "--section", help="A heading or a legal reference ('Điều 203')."),
+    sheet: Optional[str] = typer.Option(None, "--sheet", help="Spreadsheet sheet name."),
+    slide: Optional[str] = typer.Option(None, "--slide", help="Slide number or range."),
+) -> None:
+    """Print an indexed file's text (or part of it), each passage with its citation token."""
+    _query(ctx, "read", {
+        "file": file, "pages": pages, "lines": lines, "section": section, "sheet": sheet, "slide": slide,
+    })
+
+
+@userdocs_app.command("cite")
+@graceful_errors
+def userdocs_cite(
+    ctx: typer.Context,
+    token: str = typer.Argument(..., help="A citation token such as [ud:k7m2xq9a#3f9c2e1b] (quote it in the shell)."),
+) -> None:
+    """Show where a [ud:…] citation points: the file, the location in it, and the cited text."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.userdocs import resolve_citations
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+    from app.userdocs.cite import normalize_token, parse_tokens
+
+    raw = token.strip()
+    parsed = parse_tokens(raw if raw.startswith(("[", "【")) else f"[{raw}]")
+    if not parsed:
+        typer.echo("not a citation token — expected [ud:<8 chars>] or [ud:<8 chars>#<8 hex>]", err=True)
+        raise typer.Exit(code=1)
+    canonical = normalize_token(parsed[0]["cite_id"], parsed[0]["c8"])
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await resolve_citations(client, [canonical])
+
+    out = asyncio.run(_run())
+    item = (out.get("items") or {}).get(canonical)
+    if mode.json:
+        print_json(item if item is not None else out)
+        return
+    if not item:
+        sys.stdout.write(f"{canonical}: not found in this profile's index\n")
+        raise typer.Exit(code=1)
+    f = item.get("file") or {}
+    where = item.get("locator_label") or ""
+    sys.stdout.write(f"{canonical} · {item.get('status', '?')}\n")
+    sys.stdout.write(f"  file: {f.get('name') or ''} ({f.get('rel_path') or ''})\n")
+    if where:
+        sys.stdout.write(f"  where: {where}\n")
+    if f.get("web_link"):
+        sys.stdout.write(f"  link: {f['web_link']}\n")
+    if item.get("snippet"):
+        sys.stdout.write("  text: " + " ".join(str(item["snippet"]).split()) + "\n")
 
 
 # ── excludes ───────────────────────────────────────────────────────────────

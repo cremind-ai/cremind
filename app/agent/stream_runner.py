@@ -1131,6 +1131,29 @@ async def run_agent_to_bus(
                 "run_id": run_id,
             }
 
+        # User Document Search citations: verify every "[ud:…]" token in the
+        # answer against what the tools actually issued, before the row is
+        # written, so the verdict is part of the persisted message. The text
+        # is never edited, and an answer that cites nothing costs a substring
+        # test. Best-effort: a failed check saves the message without it.
+        citations_meta: Dict[str, Any] | None = None
+        if "ud:" in final_text.lower():
+            try:
+                from app.userdocs.citations import finalize_citations
+
+                citations_meta = await asyncio.to_thread(
+                    finalize_citations, profile, conversation_id, final_text,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"stream_runner: citation check failed for {conversation_id}"
+                )
+            if citations_meta:
+                agent_message_metadata = {
+                    **(agent_message_metadata or {}),
+                    "citations": citations_meta,
+                }
+
         assistant_msg_id: Optional[str] = None
         try:
             assistant_msg = await conversation_storage.add_message(
@@ -1150,6 +1173,20 @@ async def run_agent_to_bus(
             logger.exception(
                 f"stream_runner: failed to persist assistant message for {conversation_id}"
             )
+
+        # The same verdict, live: the web UI swaps its streamed tokens for
+        # checked chips, and the CLI prints its "Sources:" footer. Sent before
+        # 'complete' so a client that stops listening there still gets it.
+        if citations_meta:
+            try:
+                await bus.publish(conversation_id, "citations", {
+                    "citations": citations_meta,
+                    "assistant_id": assistant_msg_id,
+                })
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"stream_runner: failed to publish citations for {conversation_id}"
+                )
 
         # 5. Commit the user messages this turn absorbed mid-flight. Gated on the
         #    trace: ``collected_llm_messages`` is only set by the agent's terminal

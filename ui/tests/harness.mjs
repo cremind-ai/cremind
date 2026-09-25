@@ -33,6 +33,25 @@ const STUBS = {
         },
       }
     }
+    // The chat store's per-conversation stream: tests deliver frames with
+    // globalThis.__conversationSubscribers[<conversation id>][i](event).
+    export function subscribeConversation(agentUrl, token, conversationId, onEvent) {
+      const subs = (globalThis.__conversationSubscribers ||= {})
+      ;(subs[conversationId] ||= []).push(onEvent)
+      return { close() {} }
+    }
+    const idle = () => ({ close() {} })
+    export const subscribeConversationsList = idle
+    export const subscribeNotifications = idle
+    export const subscribeSettingsState = idle
+    export const subscribeProcesses = idle
+    export const subscribeEmbeddingState = idle
+  `,
+  // The real router imports every view (.vue files esbuild cannot load); the
+  // stores only ever call push() on it.
+  './router': `
+    export default { push() {}, replace() {}, currentRoute: { value: {} } }
+    export function withinJustUpdatedGrace() { return false }
   `,
 }
 
@@ -60,6 +79,10 @@ async function bundle(entry) {
         setup(builder) {
           builder.onResolve({ filter: /profileEventsStream$/ }, args => ({
             path: './profileEventsStream', namespace: 'stub', pluginData: args.path,
+          }))
+          // `../router`, `./router` — not the `vue-router` package.
+          builder.onResolve({ filter: /^\.{1,2}\/(\.\.\/)*router$/ }, args => ({
+            path: './router', namespace: 'stub', pluginData: args.path,
           }))
           builder.onLoad({ filter: /.*/, namespace: 'stub' }, args => ({
             contents: STUBS[args.path], loader: 'js',

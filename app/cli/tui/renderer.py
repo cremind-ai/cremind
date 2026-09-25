@@ -11,11 +11,15 @@ non-TUI rendering paths if needed.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.cli.client._sse import Event
 from app.cli.plan_render import plan_hint_lines, questions_lines, todos_lines
+# Dependency-free on purpose (the CLI must not import the server): the same
+# token grammar and numbering the web UI and the channels use.
+from app.userdocs.cite import parse_tokens
 
 
 # ── ANSI palette (256-color, matching the Go lipgloss palette) ───────────
@@ -81,15 +85,163 @@ class RenderedLine:
     body: str  # ANSI-styled string
 
 
-def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
+# ── User Document Search citations ───────────────────────────────────────
+
+# What an unfinished citation can look like at the end of a streamed chunk:
+# "[", "[u", "[ud", "[ud:k7m2", "[ud:k7m2xq9a#3f", "[ud:a…; ud:b…".
+_PARTIAL_CITATION_RE = re.compile(r"[\[【]\s*(?:u(?:d(?:\s*:[\s0-9a-z#;,:]*)?)?)?", re.IGNORECASE)
+_CITATION_STATUS_NOTE = {
+    "removed": " (no longer available)",
+    "unissued": " (unverified)",
+    "stale": " (unverified)",
+}
+
+
+class CitationInlineFilter:
+    """Rewrites the answer's ``[ud:…]`` citation tokens to ``[1]``, ``[2]`` as
+    the text streams in, and renders the turn's "Sources:" footer.
+
+    A token arrives split across stream chunks ("…see [ud:k7m2" + "xq9a#3f9c2e1b]"),
+    so a chunk's tail that could still become a token is held back — at most
+    :data:`HOLD_MAX` characters after the ``[``, so a stray bracket never stalls
+    the text for long — and joined with the next chunk. Numbers follow first
+    appearance over the whole turn, which is exactly how the server, the web
+    UI and the channels number them, so "[2]" here is "[2]" everywhere.
+
+    Stateful per turn: :meth:`reset` at the end of each one.
+    """
+
+    HOLD_MAX = 32
+
+    def __init__(self) -> None:
+        self._held = ""
+        self._numbers: dict[str, int] = {}
+
+    def feed(self, chunk: str) -> str:
+        """The part of ``chunk`` (plus anything held) that is safe to show."""
+        buf = self._held + (chunk or "")
+        cut = self._hold_from(buf)
+        self._held = buf[cut:]
+        return self._rewrite(buf[:cut])
+
+    def flush(self) -> str:
+        """Release whatever is held (the stream ended mid-bracket)."""
+        out, self._held = self._held, ""
+        return self._rewrite(out)
+
+    def reset(self) -> None:
+        self._held = ""
+        self._numbers = {}
+
+    def _hold_from(self, buf: str) -> int:
+        i = max(buf.rfind("["), buf.rfind("【"))
+        if i < 0 or len(buf) - i > self.HOLD_MAX:
+            return len(buf)
+        tail = buf[i:]
+        if "]" in tail or "】" in tail:
+            return len(buf)
+        return i if _PARTIAL_CITATION_RE.fullmatch(tail) else len(buf)
+
+    def _rewrite(self, text: str) -> str:
+        if not text or "ud:" not in text.lower():
+            return text
+        parsed = parse_tokens(text)
+        groups: dict[tuple[int, int], list[str]] = {}
+        for p in parsed:
+            self._numbers.setdefault(p["token"], len(self._numbers) + 1)
+            toks = groups.setdefault((p["start"], p["end"]), [])
+            if p["token"] not in toks:
+                toks.append(p["token"])
+        for (start, end), toks in sorted(groups.items(), reverse=True):
+            text = text[:start] + "".join(f"[{self._numbers[t]}]" for t in toks) + text[end:]
+        return text
+
+    def footer_lines(self, payload: Any) -> list[str]:
+        """``["Sources:", "[1] report.pdf · p. 3 · Clients/ABC", …]`` from a
+        ``citations`` event payload; ``[]`` when it lists nothing."""
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        rows: list[tuple[int, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            n = self._numbers.get(str(item.get("token") or "")) or item.get("n")
+            if not isinstance(n, int):
+                continue
+            status = str(item.get("status") or "")
+            f = item.get("file") if isinstance(item.get("file"), dict) else {}
+            if status == "invalid" or not f:
+                rows.append((n, f"[{n}] unknown source (not verified)"))
+                continue
+            parts = [str(f.get("name") or "source")]
+            if item.get("locator_label"):
+                parts.append(str(item["locator_label"]))
+            rel = str(f.get("rel_path") or "").rstrip("/")
+            if "/" in rel:
+                parts.append(rel.rsplit("/", 1)[0])
+            if f.get("web_link"):
+                parts.append(str(f["web_link"]))
+            line = f"[{n}] " + " · ".join(parts) + _CITATION_STATUS_NOTE.get(status, "")
+            if item.get("quote_status") == "mismatch":
+                line += " (quote does not match the source)"
+            rows.append((n, line))
+        if not rows:
+            return []
+        return ["Sources:"] + [line for _, line in sorted(rows)]
+
+
+# The chat TUI renders one conversation per process, so by default every call
+# shares that session's filter. Pass another (or None to switch rewriting off)
+# when rendering several streams at once.
+_SESSION_CITATIONS = CitationInlineFilter()
+
+
+def format_event(
+    event: Event,
+    theme: Theme,
+    citations: Optional[CitationInlineFilter] = _SESSION_CITATIONS,
+) -> Optional[RenderedLine]:
     """Translate one SSE event into a renderable line, or None to skip.
 
-    Mirrors `formatEvent` in events.go.
+    Mirrors `formatEvent` in events.go. ``citations`` rewrites User Document
+    Search tokens in the streamed answer and renders its "Sources:" footer.
     """
     data: dict[str, Any] = {}
     if isinstance(event.data, dict):
         data = event.data.get("data") if isinstance(event.data.get("data"), dict) else {}
 
+    t = theme
+
+    if citations is not None:
+        if event.type == "citations":
+            # Arrives once per turn, after the answer and before "complete".
+            # A "text" line, so the TUI appends it to the answer it belongs to.
+            held = citations.flush()
+            lines = citations.footer_lines(data.get("citations"))
+            body = t.style(t.assist_msg, held) if held else ""
+            if lines:
+                body += "\n\n" + t.style(t.dim, "\n".join(lines))
+            return RenderedLine("text", body) if body else None
+        if event.type in ("complete", "error", "run_started"):
+            # A turn boundary: numbering starts again with the next answer.
+            # ("run_started" too, for a turn that ended without a terminal
+            # frame reaching us.) Anything still held is released first.
+            held = citations.flush()
+            citations.reset()
+            line = _format_event(event, theme, data)
+            if not held:
+                return line
+            if line is None:
+                return RenderedLine("text", t.style(t.assist_msg, held))
+            return RenderedLine(line.kind, t.style(t.assist_msg, held) + "\n" + line.body)
+        if event.type == "text":
+            token = citations.feed(str(data.get("token") or data.get("text") or ""))
+            return RenderedLine("text", t.style(t.assist_msg, token)) if token else None
+    return _format_event(event, theme, data)
+
+
+def _format_event(event: Event, theme: Theme, data: dict[str, Any]) -> Optional[RenderedLine]:
     t = theme
 
     if event.type == "ready":
