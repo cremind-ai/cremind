@@ -347,11 +347,17 @@ async def _compose_up(compose_file: str, env_file: str, service: str) -> None:
     explicit env (see :func:`_compose_env`) so that file is not overruled
     by this container's own environment.
     """
+    if service == "cremind":
+        # Run from inside the cremind container, relative bind sources
+        # (./documents, ./) resolve against /opt/cremind-compose, not the
+        # host bundle: recreating the app service from here would drop the
+        # user's Documents mount. Only sidecars are ever brought up here.
+        raise ProvisionError("refusing to recreate the cremind service from inside its own container")
     cmd = [
         "docker", "compose",
         "-f", compose_file,
         "--env-file", env_file,
-        "up", "-d", service,
+        "up", "-d", "--no-deps", service,
     ]
     logger.info(f"[docker-provisioner] running: {' '.join(cmd)}")
     proc = await asyncio.create_subprocess_exec(

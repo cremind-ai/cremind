@@ -13,6 +13,10 @@ those roots, transient and rebuildable content is pruned:
   ``tool_configs`` rows; exec_shell stdout dirs are process scratch
 - browser-profile Chromium caches are recreatable (login state — cookies,
   Local Storage — is kept)
+- ``storage/userdocs`` (User Document Search index files, rebuilt from the
+  user's own folder) and ``.cache`` (downloaded embedding models) are pruned
+  by name as well: a profile may be *called* ``storage``, and its tree then
+  starts where these live
 
 Pure functions only — no ``app.*`` imports — so this is trivially unit-testable
 and safe to import from the offline CLI.
@@ -38,6 +42,20 @@ _BROWSER_CACHE_DIRS = frozenset(
 
 # <profile>/tools/builtin/exec_shell/stdout/** — process scratch.
 _EXEC_SHELL_STDOUT = ("tools", "builtin", "exec_shell", "stdout")
+
+# Top-level trees of the system dir that are never user data. The include
+# list alone keeps them out only while no profile shares their first
+# component: profile names are ``[a-z0-9_-]+``, so a profile named
+# ``storage`` makes the walk start at ``<SYSTEM_DIR>/storage/``. Each is a
+# path prefix from the system dir; everything under it is pruned.
+_TOP_LEVEL_EXCLUDES: tuple[tuple[str, ...], ...] = (
+    # User Document Search index files (can reach gigabytes); a restore
+    # re-indexes the user's folder instead.
+    ("storage", "userdocs"),
+    # HF_HOME / SENTENCE_TRANSFORMERS_HOME in the container image: embedding
+    # models, downloaded again on first use.
+    (".cache",),
+)
 
 
 def long_path(p: str) -> str:
@@ -88,6 +106,9 @@ def is_excluded(rel_posix: str, *, is_dir: bool) -> bool:
     if not parts:
         return False
     name = parts[-1]
+
+    if any(tuple(parts[: len(prefix)]) == prefix for prefix in _TOP_LEVEL_EXCLUDES):
+        return True
 
     # Global directory prunes at any depth.
     if any(comp in _GLOBAL_EXCLUDE_DIRS for comp in parts):

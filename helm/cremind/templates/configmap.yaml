@@ -109,6 +109,37 @@ data:
          omits them. */}}
   CLAUDE_CONFIG_DIR: {{ printf "%s/coding-cli/claude" .Values.cremind.systemDir | quote }}
   CODEX_HOME: {{ printf "%s/coding-cli/codex" .Values.cremind.systemDir | quote }}
+  {{- /* The local embedding models sentence-transformers downloads on first
+         use (hundreds of MB each). The image parks them under
+         /root/.cremind/.cache, which is only on the system PVC while systemDir
+         keeps its default; derived here like the two above, a custom systemDir
+         takes them along instead of leaving them in the pod filesystem, where
+         every rollout would download them again. */}}
+  HF_HOME: {{ printf "%s/.cache/huggingface" .Values.cremind.systemDir | quote }}
+  SENTENCE_TRANSFORMERS_HOME: {{ printf "%s/.cache/sentence-transformers" .Values.cremind.systemDir | quote }}
+  {{- /* Volume sizes for User Document Search's storage governor. From inside
+         this pod, statvfs sees the system PVC and nothing of a database or a
+         vector store running in another pod, so the chart states the sizes of
+         the ones it runs itself: only for an enabled subchart, and only when
+         that subchart creates the claim at that size (not with persistence
+         off or an existingClaim of unknown size). With both vector subcharts
+         enabled the app may use either, so neither size is claimed.
+         Everything is read through dig + default: `helm upgrade
+         --reuse-values` renders these templates against the PREVIOUS
+         chart's values.yaml, which predates the explicit sizes. */}}
+  {{- $postgresql := .Values.postgresql | default dict }}
+  {{- if and (dig "enabled" false $postgresql) (dig "primary" "persistence" "enabled" true $postgresql) (not (dig "primary" "persistence" "existingClaim" "" $postgresql)) }}
+  CREMIND_DB_CAPACITY: {{ dig "primary" "persistence" "size" "" $postgresql | default "8Gi" | quote }}
+  {{- end }}
+  {{- $qdrant := .Values.qdrant | default dict }}
+  {{- $chromadb := .Values.chromadb | default dict }}
+  {{- $qdrantOn := dig "enabled" false $qdrant }}
+  {{- $chromadbOn := dig "enabled" false $chromadb }}
+  {{- if and $qdrantOn (not $chromadbOn) }}
+  CREMIND_VECTORSTORE_CAPACITY: {{ dig "persistence" "size" "" $qdrant | default "10Gi" | quote }}
+  {{- else if and $chromadbOn (not $qdrantOn) (dig "chromadb" "isPersistent" true $chromadb) }}
+  CREMIND_VECTORSTORE_CAPACITY: {{ dig "chromadb" "data" "volumeSize" "" $chromadb | default "1Gi" | quote }}
+  {{- end }}
   {{- /* Boot-default timezone for the scheduler/clock. Blank → the image OS
          zone (UTC). A per-profile system.timezone override wins over this. */ -}}
   {{- if .Values.cremind.timezone }}

@@ -56,7 +56,7 @@ import {
   type UserDocsSourceKind,
   type UserDocsStorageInfo,
 } from '../services/userdocsApi';
-import { formatBytes, formatCount, stateBanner, type BannerActionId } from '../utils/userdocsView';
+import { dockerWarning, formatBytes, formatCount, stateBanner, type BannerActionId } from '../utils/userdocsView';
 import DriveIndexingSection from '../components/userdocs/DriveIndexingSection.vue';
 import UserDocsStatePanel from '../components/userdocs/UserDocsStatePanel.vue';
 import RootFolderPicker from '../components/userdocs/RootFolderPicker.vue';
@@ -111,6 +111,10 @@ const banner = computed(() => {
     driveEnabled: driveEnabled.value,
   });
 });
+
+/** The documents folder dies with the container (an install from before the
+ *  bind mount). Shown under the state banner; it blocks nothing. */
+const containerWarning = computed(() => dockerWarning(snapshot.value));
 
 const pausedByUser = computed(() =>
   snapshot.value?.state === 'paused' && snapshot.value.reason === 'user');
@@ -790,6 +794,7 @@ function goBack() {
 
         <template v-else>
           <UserDocsStatePanel :banner="banner" :busy="acting || togglingEnabled" @action="onBannerAction" />
+          <UserDocsStatePanel v-if="containerWarning" :banner="containerWarning" />
 
           <!-- On / off -->
           <section class="ud-card">

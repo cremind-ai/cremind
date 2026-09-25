@@ -31,6 +31,22 @@
 #                               --unattended, this flag wins, else the
 #                               previous install's password is kept, else one
 #                               is generated and printed at the end.
+#   --documents-dir PATH        (Docker mode) The folder on this machine the
+#                               container sees as /root/Documents: document
+#                               search indexes it and the agent works there.
+#                               Created if missing. A leading ~ is expanded
+#                               and a relative path is made absolute; $, #,
+#                               double quotes and leading/trailing whitespace
+#                               are refused (compose's .env would mangle
+#                               them). Default: $CREMIND_DOCUMENTS_DIR, else
+#                               the previous install's folder, else
+#                               ~/Documents. Interactive installs ask.
+#   --documents-access rw|ro    (Docker mode) Mount that folder read-write
+#                               (default; the agent's file tools change your
+#                               real files) or read-only (the agent cannot
+#                               save there, and its default working folder is
+#                               read-only). Default: $CREMIND_DOCUMENTS_ACCESS,
+#                               else the previous install's choice, else rw.
 #   --mode docker|native|kubernetes
 #                               Skip the mode prompt. ``--docker``,
 #                               ``--native`` and ``--kubernetes`` are aliases.
@@ -236,6 +252,15 @@ PREV_VNC_PASSWORD=""
 # passes through `sed s|__VNC_PASSWORD__|...|g` below, an unquoted compose
 # .env, and a TOML basic string in credentials.toml.
 VNC_PASSWORD_RE='^[A-Za-z0-9@%_+=:,.-]{6,8}$'
+# Docker mode only: the host folder mounted at /root/Documents, and "rw" /
+# "ro" for how. From --documents-dir / --documents-access, else
+# $CREMIND_DOCUMENTS_DIR / $CREMIND_DOCUMENTS_ACCESS, else the TUI / fallback
+# prompt. Named like the TUI's output keys on purpose — the TUI echoes a
+# forwarded value back, so sourcing its file keeps a flag — and NOT like
+# CREMIND_HOST_DOCUMENTS / DOCUMENTS_DIR, which the docker branch resolves
+# itself from these plus the previous install and the default.
+DOCUMENTS_DIR_INPUT=""
+DOCUMENTS_ACCESS_INPUT=""
 # TLS on the public origin, from --ssl. SSL_MODE holds the flag's raw value
 # until the ── ssl mode ── block resolves it (fresh installs default to
 # plain HTTP); SSL_EXPLICIT records whether the operator actually asked,
@@ -351,6 +376,10 @@ while [ $# -gt 0 ]; do
         --no-desktop)             DESKTOP_UI=0; shift ;;
         --vnc-password)           VNC_PASSWORD_INPUT="$2"; shift 2 ;;
         --vnc-password=*)         VNC_PASSWORD_INPUT="${1#*=}"; shift ;;
+        --documents-dir)          DOCUMENTS_DIR_INPUT="$2"; shift 2 ;;
+        --documents-dir=*)        DOCUMENTS_DIR_INPUT="${1#*=}"; shift ;;
+        --documents-access)       DOCUMENTS_ACCESS_INPUT="$2"; shift 2 ;;
+        --documents-access=*)     DOCUMENTS_ACCESS_INPUT="${1#*=}"; shift ;;
         --listen-host)            CUSTOM_listen_host="$2"; shift 2 ;;
         --listen-host=*)          CUSTOM_listen_host="${1#*=}"; shift ;;
         --public-url)             CUSTOM_public_url="$2"; shift 2 ;;
@@ -856,6 +885,83 @@ if [ -n "$VNC_PASSWORD_INPUT" ] \
     exit 2
 fi
 
+# The one rule for a Docker documents folder, mirrored in install.ps1
+# (Resolve-DocumentsDir) and app/installer/tui.py.
+#
+# documents_dir_normalize RAW → exit 0 with the absolute path on stdout, or
+# exit 1 with the reason RAW cannot be used on stdout (one channel, so a
+# caller captures either with a single ``$(...)``).
+#
+# The path is appended UNQUOTED to docker/.env as CREMIND_HOST_DOCUMENTS, and
+# compose's .env parser expands $, reads # as a comment, treats " as quoting
+# and trims surrounding whitespace. Escaping would have to match that parser
+# exactly, so those are refused instead — naming the character, because a
+# "valid path" error for a real folder is baffling otherwise. Apostrophes and
+# inner spaces are fine unquoted. The checks run on the RESULT too, since
+# $HOME or $PWD can carry the same characters.
+documents_dir_normalize() {
+    local raw="$1" path home="${HOME:-}" nl=$'\n' cr=$'\r'
+    if [ -z "$raw" ]; then
+        printf '%s' "it is empty"; return 1
+    fi
+    case "$raw" in
+        [[:space:]]*|*[[:space:]])
+            printf '%s' "it starts or ends with whitespace, which docker compose would drop"; return 1 ;;
+    esac
+    case "$raw" in
+        "~"|"~/"*)
+            if [ -z "$home" ]; then
+                printf '%s' "\$HOME is not set, so ~ cannot be expanded"; return 1
+            fi
+            if [ "$raw" = "~" ]; then path="$home"; else path="${home%/}/${raw#\~/}"; fi
+            ;;
+        "~"*)  printf '%s' "~user paths are not supported; write the full path"; return 1 ;;
+        /*)    path="$raw" ;;
+        *)     path="${PWD%/}/$raw" ;;
+    esac
+    case "$path" in
+        /*) ;;
+        *)  printf '%s' "it does not resolve to an absolute path"; return 1 ;;
+    esac
+    case "$path" in
+        *'$'*)             printf '%s' "it contains \$, which docker compose would expand as a variable"; return 1 ;;
+        *'#'*)             printf '%s' "it contains #, which docker compose would read as the start of a comment"; return 1 ;;
+        *'"'*)             printf '%s' "it contains a double quote (\"), which docker compose would read as quoting"; return 1 ;;
+        *"$nl"*|*"$cr"*)   printf '%s' "it contains a line break"; return 1 ;;
+    esac
+    while [ "$path" != "/" ] && [ "${path%/}" != "$path" ]; do
+        path="${path%/}"
+    done
+    printf '%s' "$path"
+}
+
+# --documents-dir / --documents-access, else the environment. Checked now, in
+# every mode, like --vnc-password above: an unattended install must fail on a
+# folder it cannot mount rather than write a .env compose misreads. The
+# normalized value is what the TUI is handed, so it sees an absolute path.
+DOCUMENTS_DIR_SOURCE="--documents-dir"
+if [ -z "$DOCUMENTS_DIR_INPUT" ] && [ -n "${CREMIND_DOCUMENTS_DIR:-}" ]; then
+    DOCUMENTS_DIR_INPUT="$CREMIND_DOCUMENTS_DIR"
+    DOCUMENTS_DIR_SOURCE="CREMIND_DOCUMENTS_DIR"
+fi
+if [ -n "$DOCUMENTS_DIR_INPUT" ]; then
+    if ! _docs_out="$(documents_dir_normalize "$DOCUMENTS_DIR_INPUT")"; then
+        err "Invalid $DOCUMENTS_DIR_SOURCE '$DOCUMENTS_DIR_INPUT': $_docs_out"
+        exit 2
+    fi
+    DOCUMENTS_DIR_INPUT="$_docs_out"
+    unset _docs_out
+fi
+DOCUMENTS_ACCESS_SOURCE="--documents-access"
+if [ -z "$DOCUMENTS_ACCESS_INPUT" ] && [ -n "${CREMIND_DOCUMENTS_ACCESS:-}" ]; then
+    DOCUMENTS_ACCESS_INPUT="$CREMIND_DOCUMENTS_ACCESS"
+    DOCUMENTS_ACCESS_SOURCE="CREMIND_DOCUMENTS_ACCESS"
+fi
+case "$DOCUMENTS_ACCESS_INPUT" in
+    ""|rw|ro) ;;
+    *) err "Invalid $DOCUMENTS_ACCESS_SOURCE: $DOCUMENTS_ACCESS_INPUT (must be rw or ro)"; exit 2 ;;
+esac
+
 # Kubernetes flag shapes. Checked here, before anything reaches helm: a bad
 # namespace or release name is a template error several minutes into an
 # install otherwise, and a yes/no field silently taking "true" would quietly
@@ -982,6 +1088,13 @@ IN_CONTAINER=0
 if [ -f /.dockerenv ] || [ -f /run/.containerenv ] \
         || (grep -qE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null); then
     IN_CONTAINER=1
+fi
+# WSL, where ~/Documents is the distro's Linux home rather than the Windows
+# Documents folder a user usually means. Only used to print the catalog's
+# wsl_note next to the documents-folder question.
+IS_WSL=0
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    IS_WSL=1
 fi
 
 # Kubernetes has no host to bind — the chart sets HOST and APP_URL on the pod
@@ -1506,6 +1619,43 @@ read_prev_vnc_password() {
 
 read_prev_vnc_password
 
+# The documents folder and access a previous Docker install recorded in the
+# same file, read here for the same reason: the TUI and the fallback prompt
+# offer them as the default, and an unattended re-run keeps them. A recorded
+# folder that no longer passes documents_dir_normalize (hand-edited) is
+# dropped with a warning rather than failing a re-install over it.
+PREV_DOCUMENTS_DIR=""
+PREV_DOCUMENTS_ACCESS=""
+read_prev_documents() {
+    local prev_env="$CREMIND_INSTALL_DIR/docker/.env" prev_dir prev_ro out
+    [ -f "$prev_env" ] || return 0
+    prev_dir="$(sed -n 's/^CREMIND_HOST_DOCUMENTS=//p' "$prev_env" | head -n 1 | tr -d '\r')"
+    prev_ro="$(sed -n 's/^CREMIND_DOCUMENTS_READ_ONLY=//p' "$prev_env" | head -n 1 | tr -d '\r')"
+    if [ -n "$prev_dir" ]; then
+        if out="$(documents_dir_normalize "$prev_dir")"; then
+            PREV_DOCUMENTS_DIR="$out"
+        else
+            warn "Ignoring the previous documents folder '$prev_dir': $out"
+        fi
+    fi
+    case "$prev_ro" in
+        true)  PREV_DOCUMENTS_ACCESS="ro" ;;
+        false) PREV_DOCUMENTS_ACCESS="rw" ;;
+    esac
+}
+
+read_prev_documents
+
+# What the documents folder is when nobody says otherwise: the previous
+# install's, else ~/Documents. Empty only when $HOME itself holds a character
+# the .env cannot carry — the docker branch then leaves CREMIND_HOST_DOCUMENTS
+# unset and compose falls back to a folder inside the bundle. Handed to the
+# TUI as --documents-default, which only prefills: it never counts as an answer.
+DOCUMENTS_DEFAULT="$PREV_DOCUMENTS_DIR"
+if [ -z "$DOCUMENTS_DEFAULT" ]; then
+    DOCUMENTS_DEFAULT="$(documents_dir_normalize "${HOME:-}/Documents")" || DOCUMENTS_DEFAULT=""
+fi
+
 # ── previous kubernetes release ───────────────────────────────────────────
 #
 # A kubernetes install records what it did in k8s/release.env so a re-run can
@@ -1622,6 +1772,9 @@ tui_run_bootstrap() {
             --desktop "$DESKTOP_UI" \
             --vnc-password "$VNC_PASSWORD_INPUT" \
             --vnc-password-set "$vnc_pw_preset" \
+            --documents-dir "$DOCUMENTS_DIR_INPUT" \
+            --documents-access "$DOCUMENTS_ACCESS_INPUT" \
+            --documents-default "$DOCUMENTS_DEFAULT" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -1648,6 +1801,9 @@ tui_run_bootstrap() {
             --desktop "$DESKTOP_UI" \
             --vnc-password "$VNC_PASSWORD_INPUT" \
             --vnc-password-set "$vnc_pw_preset" \
+            --documents-dir "$DOCUMENTS_DIR_INPUT" \
+            --documents-access "$DOCUMENTS_ACCESS_INPUT" \
+            --documents-default "$DOCUMENTS_DEFAULT" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -2057,6 +2213,137 @@ if { [ "$MODE" = "docker" ] || [ "$MODE" = "kubernetes" ]; } && [ "$DESKTOP_UI" 
         warn "No VNC password entered; generating one and printing it at the end."
     fi
     unset vnc_pw vnc_pw2 vnc_tries
+fi
+
+# ── documents folder (docker mode only) ───────────────────────────────────
+#
+# The host folder the container sees as /root/Documents — what User Document
+# Search indexes and where the agent works by default. Without the bind it
+# lives on the container's own layer and vanishes whenever compose recreates
+# the container. Kubernetes never gets here: the chart's persistence.work
+# volume is mounted at the same path.
+#
+# Precedence: --documents-dir → $CREMIND_DOCUMENTS_DIR (both folded into
+# DOCUMENTS_DIR_INPUT and validated up front) → the TUI's or the prompt's
+# answer → the previous install's folder → ~/Documents. Access runs the same
+# chain from --documents-access / $CREMIND_DOCUMENTS_ACCESS, default rw. Each
+# question is asked only when its value is still open and someone can answer
+# (not --unattended, a /dev/tty to read), the same gate as the VNC prompt.
+DOCUMENTS_DIR=""
+DOCUMENTS_READ_ONLY="false"
+if [ "$MODE" = "docker" ]; then
+    if [ -z "$DOCUMENTS_DIR_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+        echo
+        printf '%s%s%s\n' "$BOLD" "$DOCKER_DOCUMENTS_PROMPT" "$RESET"
+        [ -n "$DOCKER_DOCUMENTS_HINT" ] && printf '  %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_HINT" "$RESET"
+        if [ "$IS_WSL" -eq 1 ] && [ -n "$DOCKER_DOCUMENTS_WSL_NOTE" ]; then
+            printf '  %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_WSL_NOTE" "$RESET"
+        fi
+        # Bounded for the same reason as the VNC loop: a tty that only returns
+        # EOF would re-read forever. Giving up keeps the default.
+        docs_tries=0
+        while [ "$docs_tries" -lt 5 ]; do
+            docs_tries=$((docs_tries + 1))
+            read -r -p "  [$DOCUMENTS_DEFAULT]: " docs_ans </dev/tty || docs_ans=""
+            [ -z "$docs_ans" ] && docs_ans="$DOCUMENTS_DEFAULT"
+            if [ -z "$docs_ans" ]; then
+                warn "Type the full path of a folder."
+                continue
+            fi
+            if docs_out="$(documents_dir_normalize "$docs_ans")"; then
+                DOCUMENTS_DIR_INPUT="$docs_out"
+                break
+            fi
+            warn "That folder can't be used: $docs_out"
+        done
+        unset docs_ans docs_out docs_tries
+    fi
+
+    docs_access_default="${PREV_DOCUMENTS_ACCESS:-rw}"
+    if [ -z "$DOCUMENTS_ACCESS_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+        echo
+        printf '%s%s%s\n' "$BOLD" "$DOCKER_DOCUMENTS_ACCESS_PROMPT" "$RESET"
+        printf '  1) %s\n' "$DOCKER_DOCUMENTS_RW_LABEL"
+        printf '     %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_RW_DISCLOSURE" "$RESET"
+        printf '  2) %s\n' "$DOCKER_DOCUMENTS_RO_LABEL"
+        printf '     %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_RO_DISCLOSURE" "$RESET"
+        docs_choice_default=1
+        [ "$docs_access_default" = "ro" ] && docs_choice_default=2
+        docs_tries=0
+        while [ "$docs_tries" -lt 5 ]; do
+            docs_tries=$((docs_tries + 1))
+            read -r -p "Choose [1-2] [$docs_choice_default]: " docs_ans </dev/tty || docs_ans=""
+            case "${docs_ans:-$docs_choice_default}" in
+                1|rw) DOCUMENTS_ACCESS_INPUT="rw"; break ;;
+                2|ro) DOCUMENTS_ACCESS_INPUT="ro"; break ;;
+                *)    warn "Please choose 1 or 2." ;;
+            esac
+        done
+        unset docs_ans docs_tries docs_choice_default
+    fi
+
+    # A value that came back from the TUI is normalized again here: the TUI
+    # writes the path as typed.
+    if [ -n "$DOCUMENTS_DIR_INPUT" ]; then
+        if ! DOCUMENTS_DIR="$(documents_dir_normalize "$DOCUMENTS_DIR_INPUT")"; then
+            err "Invalid documents folder '$DOCUMENTS_DIR_INPUT': $DOCUMENTS_DIR"
+            exit 2
+        fi
+    else
+        DOCUMENTS_DIR="$DOCUMENTS_DEFAULT"
+    fi
+    case "${DOCUMENTS_ACCESS_INPUT:-$docs_access_default}" in
+        ro) DOCUMENTS_READ_ONLY="true" ;;
+        *)  DOCUMENTS_READ_ONLY="false" ;;
+    esac
+    unset docs_access_default
+
+    if [ -z "$DOCUMENTS_DIR" ]; then
+        warn "No usable documents folder (your home path holds a character the compose .env cannot carry)."
+        warn "Documents will live in $CREMIND_INSTALL_DIR/docker/documents, which an uninstall deletes; pass --documents-dir to choose another."
+    else
+        # Created as the user running this script, so the folder (at least)
+        # is theirs — compose would otherwise create a missing one as root.
+        # An installer that itself runs in a container would only create it
+        # inside that container, where the Docker daemon never looks.
+        if [ "$IN_CONTAINER" -eq 1 ]; then
+            info "This installer runs inside a container, so it did not create $DOCUMENTS_DIR; Docker creates it on the Docker host if it is missing."
+        elif [ ! -d "$DOCUMENTS_DIR" ]; then
+            if ! mkdir -p "$DOCUMENTS_DIR" 2>/dev/null; then
+                err "Could not create the documents folder $DOCUMENTS_DIR."
+                err "Create it yourself, or choose another with --documents-dir PATH."
+                exit 2
+            fi
+            ok "Created $DOCUMENTS_DIR"
+        fi
+        if [ "$DOCUMENTS_READ_ONLY" = "true" ]; then
+            ok "Documents folder: $DOCUMENTS_DIR (read-only)"
+        else
+            ok "Documents folder: $DOCUMENTS_DIR (read-write)"
+        fi
+    fi
+    case "$(uname -s)" in
+        Darwin)
+            [ -n "$DOCKER_DOCUMENTS_MACOS_PRIVACY_NOTE" ] && info "$DOCKER_DOCUMENTS_MACOS_PRIVACY_NOTE"
+            ;;
+        Linux)
+            if [ "$DOCUMENTS_READ_ONLY" = "false" ] && [ -n "$DOCKER_DOCUMENTS_LINUX_OWNER_NOTE" ]; then
+                info "$DOCKER_DOCUMENTS_LINUX_OWNER_NOTE"
+            fi
+            ;;
+    esac
+    # Repeated after the answer for the runs that never saw the prompt (TUI,
+    # --unattended) — unless the folder already is a Windows drive.
+    if [ "$IS_WSL" -eq 1 ] && [ -n "$DOCKER_DOCUMENTS_WSL_NOTE" ]; then
+        case "$DOCUMENTS_DIR" in
+            /mnt/*) ;;
+            *) info "$DOCKER_DOCUMENTS_WSL_NOTE" ;;
+        esac
+    fi
+elif [ -n "$DOCUMENTS_DIR_INPUT" ] || [ -n "$DOCUMENTS_ACCESS_INPUT" ]; then
+    # Only the Docker bundle mounts a documents folder: native installs use
+    # your real ~/Documents directly, Kubernetes the chart's work volume.
+    info "The documents-folder setting applies to Docker installs only; ignoring it for $MODE."
 fi
 
 # ── kubernetes questions ──────────────────────────────────────────────────
@@ -3767,6 +4054,22 @@ EOF
     elif [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
         printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >>"$DOCKER_DIR/.env"
     fi
+    # The documents folder resolved in ── documents folder ── above, which
+    # compose binds at /root/Documents. Appended with printf, never sed'd into a
+    # placeholder: a folder name may hold | or &, which a sed replacement would
+    # eat. Unquoted is safe because documents_dir_normalize refused everything
+    # compose's .env parser treats specially. Left out when there is no usable
+    # folder, so compose falls back to the bundle's own ./documents.
+    # CREMIND_COMPOSE_HOST_DIR tells the app where this bundle lives on the
+    # host, for the instructions it shows; skipped if the path is not .env-safe.
+    if [ -n "$DOCUMENTS_DIR" ]; then
+        printf 'CREMIND_HOST_DOCUMENTS=%s\n' "$DOCUMENTS_DIR" >>"$DOCKER_DIR/.env"
+    fi
+    printf 'CREMIND_DOCUMENTS_READ_ONLY=%s\n' "$DOCUMENTS_READ_ONLY" >>"$DOCKER_DIR/.env"
+    if compose_host_dir="$(documents_dir_normalize "$DOCKER_DIR")"; then
+        printf 'CREMIND_COMPOSE_HOST_DIR=%s\n' "$compose_host_dir" >>"$DOCKER_DIR/.env"
+    fi
+    unset compose_host_dir
     chmod 600 "$DOCKER_DIR/.env"
 
     # Dev channel: emit a docker-compose.override.yml that points the
@@ -3803,6 +4106,17 @@ EOF
         warn "Ignoring INSTALL_MODE=$INSTALL_MODE from the environment: this is a Docker install."
     fi
     unset INSTALL_MODE
+    # Same shadowing for the documents keys: an exported CREMIND_HOST_DOCUMENTS
+    # would mount one folder now and the .env's another on the next plain
+    # ``docker compose up -d``. The installer's own inputs are
+    # CREMIND_DOCUMENTS_DIR / CREMIND_DOCUMENTS_ACCESS, already folded in.
+    for _doc_key in CREMIND_HOST_DOCUMENTS CREMIND_DOCUMENTS_READ_ONLY CREMIND_COMPOSE_HOST_DIR; do
+        if [ -n "$(printenv "$_doc_key" 2>/dev/null || true)" ]; then
+            warn "Ignoring $_doc_key from the environment: $DOCKER_DIR/.env holds the installer's value."
+        fi
+        unset "$_doc_key"
+    done
+    unset _doc_key
 
     # Per-channel pull / build strategy:
     #   production / test → pull the pre-built image from Docker Hub
@@ -3995,6 +4309,12 @@ EOF
   ${BOLD}VNC password${RESET} (saved to $DOCKER_DIR/.env):
     $(grep '^VNC_PASSWORD=' "$DOCKER_DIR/.env" | cut -d= -f2-)
 EOF
+        fi
+        if [ -n "$DOCUMENTS_DIR" ]; then
+            if [ "$DOCUMENTS_READ_ONLY" = "true" ]; then docs_how="read-only"; else docs_how="read-write"; fi
+            printf '  %sDocuments%s:  %s (%s, /root/Documents in the container)\n' \
+                "$BOLD" "$RESET" "$DOCUMENTS_DIR" "$docs_how"
+            unset docs_how
         fi
         cat <<EOF
 

@@ -191,6 +191,27 @@ export interface UserDocsDriveView {
 }
 
 /**
+ * Whether the indexed folder outlives the container (`snapshot.docker`, the
+ * runtime's `docker_view()` over `deploy_env.docker_root_status`). Read once
+ * per configure; null while the local folder is off.
+ */
+export interface UserDocsDockerStatus {
+  in_container: boolean;
+  /** The container is a Kubernetes pod: the fix is the chart's work volume. */
+  kubernetes: boolean;
+  /** False: the folder is only a directory in the container's own layer.
+   *  Null: unknown (not Linux, no mountinfo). */
+  root_mounted: boolean | null;
+  persistent?: boolean | null;
+  fstype?: string | null;
+  /** The compose file bind-mounts a host folder there (`CREMIND_DOCUMENTS_BIND=1`);
+   *  a missing mount is then the `root_unavailable(bind_missing)` hold instead. */
+  bind_expected: boolean;
+  /** The compose `volumes:` line that mounts a host folder there. */
+  snippet: string | null;
+}
+
+/**
  * The one snapshot every surface reads (`app/userdocs/state.py`). Each frame
  * replaces the previous one outright. Everything after `sources` is only
  * present while the sync engine runs for the profile.
@@ -226,6 +247,8 @@ export interface UserDocsSnapshot {
   confirmation?: UserDocsConfirmation | null;
   engine_sources?: Record<string, { root?: string; watch?: string | null; watch_reason?: string | null }>;
   watch?: { mode: string | null; reason: string | null };
+  /** The container under the local folder (see `dockerWarning`). */
+  docker?: UserDocsDockerStatus | null;
   /** Google Drive, reported separately from the local folder's state. */
   drive?: UserDocsDriveView | null;
 }

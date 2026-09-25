@@ -185,6 +185,9 @@ def docker_root_status(root: str) -> dict:
     Keys:
 
     - ``in_container`` — see :func:`in_container`.
+    - ``kubernetes`` — the container is a pod (:func:`in_kubernetes`). There
+      the fix for an unmounted root is the chart's work volume, not a
+      compose line, so the UI words it differently.
     - ``root_mounted`` — ``False`` when the longest-prefix mount of ``root``
       is ``/`` itself, i.e. the folder is just a directory in the container's
       own overlay layer (the legacy-compose case). ``None`` when unknown (not
@@ -212,6 +215,7 @@ def docker_root_status(root: str) -> dict:
     hint = (os.environ.get("CREMIND_HOST_DOCUMENTS_HINT") or "").strip() or None
     return {
         "in_container": container,
+        "kubernetes": container and in_kubernetes(),
         "root_mounted": mounted,
         "persistent": persistent,
         "fstype": mount.fstype if mount else None,

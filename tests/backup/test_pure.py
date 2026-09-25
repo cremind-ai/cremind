@@ -16,7 +16,7 @@ from app.backup.paths import (
     relocate_path,
     transform_row,
 )
-from app.backup.rules import is_excluded
+from app.backup.rules import is_excluded, iter_backup_files
 
 
 def _win_manifest() -> Manifest:
@@ -139,6 +139,54 @@ def test_rules_include_real_content():
     assert not is_excluded("admin/documents/note.md", is_dir=False)
     # A "Cache" dir outside a browser-profile tree is NOT pruned.
     assert not is_excluded("admin/documents/Cache", is_dir=True)
+
+
+def _touch(base: Path, rel: str) -> None:
+    path = base.joinpath(*rel.split("/"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x")
+
+
+def test_rules_exclude_the_userdocs_index_and_model_cache_by_name():
+    assert is_excluded("storage/userdocs", is_dir=True)
+    assert is_excluded("storage/userdocs/k7m2/index.db", is_dir=False)
+    assert is_excluded(".cache", is_dir=True)
+    assert is_excluded(".cache/huggingface/hub/models--x/blobs/abc", is_dir=False)
+    # Only at the top: a profile's own folders with these names are its data.
+    assert not is_excluded("storage", is_dir=True)
+    assert not is_excluded("storage/userdocs.md", is_dir=False)
+    assert not is_excluded("admin/storage/userdocs/notes.md", is_dir=False)
+    assert not is_excluded("admin/.cache/keep.txt", is_dir=False)
+
+
+def test_iter_backup_files_never_walks_the_index_or_the_model_cache(tmp_path: Path):
+    """The index and the model cache stay out even when a profile named
+    ``storage`` makes the walk start where the index lives — while the rest
+    of that profile's files are backed up as usual."""
+    for rel in (
+        "storage/userdocs/k7m2/index.db",
+        "storage/userdocs/k7m2/index.db-wal",
+        "storage/userdocs/tmp/extract-1/page.png",
+        ".cache/huggingface/hub/models--intfloat--multilingual-e5/blobs/abc",
+        ".cache/sentence-transformers/model/config.json",
+        "admin/PERSONA.md",
+        "admin/.cache/keep.txt",
+        "storage/PERSONA.md",
+        "storage/skills/notes/SKILL.md",
+    ):
+        _touch(tmp_path, rel)
+
+    backed_up = {rel for _, rel in iter_backup_files(str(tmp_path), ["admin", "storage"])}
+    assert backed_up == {
+        "admin/PERSONA.md",
+        "admin/.cache/keep.txt",
+        "storage/PERSONA.md",
+        "storage/skills/notes/SKILL.md",
+    }
+    # Without that profile nothing under storage/ is walked at all.
+    assert {rel for _, rel in iter_backup_files(str(tmp_path), ["admin"])} == {
+        "admin/PERSONA.md", "admin/.cache/keep.txt",
+    }
 
 
 # ── encryption envelope ─────────────────────────────────────────────────────

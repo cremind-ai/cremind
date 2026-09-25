@@ -1027,13 +1027,17 @@ def test_vnc_password_rides_the_output_file_under_its_own_key(tmp_path) -> None:
     assert "\nVNC_PASSWORD=" not in body
 
 
-def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> None:
+def test_run_with_all_values_prepopulated(
+    loaded_catalog: catalog.Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """End-to-end: every screen short-circuits, run() returns to confirm.
 
     The confirm screen still opens a dialog. To avoid driving it we
     monkey-patch the screen list to drop it — this verifies the runner
     walks the screen sequence cleanly when nothing prompts.
     """
+    for name in ("_radio", "_text", "_message"):
+        monkeypatch.setattr(tui, name, lambda **_k: pytest.fail("opened a dialog"))
     state = TuiResult(
         channel="production",
         version_spec="0.2.1",
@@ -1041,6 +1045,8 @@ def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> No
         mode="docker",
         desktop="1",
         vnc_password="abc123",
+        documents_dir="/home/ann/My Documents",
+        documents_access="ro",
         ssl_choice="none",
     )
     # Strip the confirm screen so the test doesn't open a dialog.
@@ -1062,6 +1068,9 @@ def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> No
     assert result.version_spec == "0.2.1"
     assert result.deployment == "local"
     assert result.mode == "docker"
+    # Flag values are echoed back untouched: the shell already resolved them.
+    assert result.documents_dir == "/home/ann/My Documents"
+    assert result.documents_access == "ro"
 
 
 def test_run_kubernetes_with_all_values_prepopulated(
@@ -1112,6 +1121,9 @@ def test_run_kubernetes_with_all_values_prepopulated(
     # The deployment questions never ran, so their slots stay empty.
     assert result.deployment == ""
     assert result.custom_listen_host == ""
+    # Nor did the documents folder: Kubernetes uses the chart's work volume.
+    assert result.documents_dir == ""
+    assert result.documents_access == ""
 
 
 @pytest.mark.parametrize("mode", ["none", "auto", "after-setup"])

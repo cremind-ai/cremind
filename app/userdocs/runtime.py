@@ -162,6 +162,9 @@ class ProfileRuntime:
         self.watcher: Any = None
         self.watch_mode: str | None = None
         self.watch_reason: str | None = None
+        # (root, deploy_env.docker_root_status(root)): read by configure, served
+        # by the snapshot — see _refresh_docker_status.
+        self._docker_status: tuple[str, dict[str, Any] | None] | None = None
 
         self.active = False            # configured and allowed to sync
         self.paused_user = False
@@ -322,6 +325,7 @@ class ProfileRuntime:
             if self.confirmation and self.confirmation.get("kind") in ("root_change",):
                 self.confirmation = None
         self.progress.set_source(SOURCE, root=new_root)
+        self._refresh_docker_status(new_root)
 
         if not row.get("first_sync_confirmed_at"):
             est = self.estimate if (self.estimate and self.estimate.get("root") == new_root) else None
@@ -438,6 +442,51 @@ class ProfileRuntime:
             f"Indexed folder changed to {new_root}: {moved} files kept, {len(drop)} removed.",
             source=SOURCE, detail={"from": old_root, "to": new_root, "kept": moved, "removed": len(drop)},
         )
+
+    # ── the container underneath ───────────────────────────────────────────
+
+    def _refresh_docker_status(self, root: str) -> None:
+        """Whether ``root`` is a real host folder or just a directory in the
+        container's own layer (:func:`~app.userdocs.deploy_env.docker_root_status`).
+
+        Read here, on the maintenance thread, rather than by the snapshot:
+        snapshots are built on every progress frame and from request threads,
+        and resolving the path can stall on a hung network mount. Once per
+        configure is enough, because a container's mounts do not change while
+        it runs — fixing a missing one recreates the container, which restarts
+        this process. A failed probe is recorded as unknown, never raised.
+        """
+        try:
+            from app.userdocs.deploy_env import docker_root_status
+
+            status: dict[str, Any] | None = docker_root_status(root)
+        except Exception as exc:  # noqa: BLE001 — a probe must never stop configure
+            logger.debug(f"[userdocs] {self.profile}: checking the container mount of {root} failed: {exc}")
+            status = None
+        self._docker_status = (root, status)
+
+    def docker_view(self) -> dict[str, Any] | None:
+        """The snapshot's ``docker`` block: whether the indexed folder would
+        outlive the container. ``None`` while the local folder is off, or
+        before configure has checked the current root. The UI and
+        ``cremind userdocs status`` warn when ``in_container`` and
+        ``root_mounted is False`` and not ``bind_expected`` — an install whose
+        compose file predates the documents bind mount (with the bind
+        expected, the root guard holds the folder instead)."""
+        cached = self._docker_status
+        root = self.root
+        if not self.local_on() or not root or cached is None or cached[0] != root or not cached[1]:
+            return None
+        status = cached[1]
+        return {
+            "in_container": bool(status.get("in_container")),
+            "kubernetes": bool(status.get("kubernetes")),
+            "root_mounted": status.get("root_mounted"),
+            "persistent": status.get("persistent"),
+            "fstype": status.get("fstype"),
+            "bind_expected": bool(status.get("bind_expected")),
+            "snippet": status.get("snippet"),
+        }
 
     # ── watching ───────────────────────────────────────────────────────────
 
@@ -1733,6 +1782,7 @@ class ProfileRuntime:
             snap["detail"] = self.hold.get("detail")
         snap["confirmation"] = self.confirmation
         snap["watch"] = {"mode": self.watch_mode, "reason": self.watch_reason}
+        snap["docker"] = self.docker_view()
         coverage = snap.get("vector_coverage_pct")
         snap["tool_mode"] = "normal" if coverage in (None, 100.0) else "partial"
         try:

@@ -14,6 +14,7 @@ import { load } from './harness.mjs'
 const {
   stateBanner, reasonLabel, formatBytes, formatEta, formatCount, formatDuration, effectLabel,
   chipTooltip, stageLabel, statusLabel, visionStatus, visionQuota, captionStateLabel,
+  dockerWarning, HELM_WORK_VOLUME_FLAG,
 } = await load('src/utils/userdocsView.ts')
 
 function snap(overrides = {}) {
@@ -178,6 +179,60 @@ test('an unknown hold reason still reassures and offers a re-check', () => {
   const b = check(stateBanner(snap({ state: 'hold', reason: 'something_new', detail: {} })))
   assert.match(b.body, /Nothing has been deleted/)
   assert.deepEqual(ids(b), ['rescan'])
+})
+
+// ── the container underneath (an install from before the bind mount) ────────
+
+const LEGACY_DOCKER = {
+  in_container: true, kubernetes: false, root_mounted: false, persistent: false, fstype: 'overlay',
+  bind_expected: false, snippet: '- "~/Documents:/root/Documents"',
+}
+
+test('dockerWarning: a folder in the container layer gets the compose line and the installer', () => {
+  const b = check(dockerWarning(snap({ docker: LEGACY_DOCKER })))
+  assert.equal(b.tone, 'warning')
+  assert.match(b.body, /inside the container and is lost when it is recreated/)
+  assert.match(b.body, /re-run the installer \(your data is kept\)/)
+  assert.match(b.body, /docker-compose\.yml/)
+  assert.match(b.body, /copy out any you need first/)
+  assert.doesNotMatch(b.body, /persistence\.work/)
+  assert.equal(b.snippet, '- "~/Documents:/root/Documents"')
+  assert.deepEqual(ids(b), [])
+  assert.equal(b.busy, false)
+})
+
+test('dockerWarning is separate: the state banner is the same with or without it', () => {
+  for (const state of [{ state: 'idle' }, { state: 'indexing' }, { state: 'paused', reason: 'user' }]) {
+    assert.deepEqual(stateBanner(snap({ ...state, docker: LEGACY_DOCKER })), stateBanner(snap(state)))
+  }
+  assert.equal(stateBanner(snap({ docker: LEGACY_DOCKER })).title, 'Up to date')
+})
+
+test('dockerWarning in a pod suggests the chart\'s work volume, not compose', () => {
+  const b = check(dockerWarning(snap({ docker: { ...LEGACY_DOCKER, kubernetes: true } })))
+  assert.match(b.body, /inside the pod and is lost when the pod restarts/)
+  assert.match(b.body, /work volume/)
+  assert.doesNotMatch(b.body, /docker-compose|installer/)
+  assert.equal(b.snippet, HELM_WORK_VOLUME_FLAG)
+  assert.equal(HELM_WORK_VOLUME_FLAG, '--set persistence.work.enabled=true')
+})
+
+test('dockerWarning stays quiet unless the folder is known to be in the container layer', () => {
+  assert.equal(dockerWarning(null), null)
+  assert.equal(dockerWarning(snap()), null) // no docker block (older server, folder off)
+  assert.equal(dockerWarning(snap({ docker: null })), null)
+  assert.equal(dockerWarning(snap({ docker: { ...LEGACY_DOCKER, in_container: false } })), null)
+  assert.equal(dockerWarning(snap({ docker: { ...LEGACY_DOCKER, root_mounted: true } })), null)
+  // Unknown (no mountinfo) is not a warning.
+  assert.equal(dockerWarning(snap({ docker: { ...LEGACY_DOCKER, root_mounted: null } })), null)
+  // A compose file that mounts the folder: a missing mount is the bind_missing hold instead.
+  assert.equal(dockerWarning(snap({ docker: { ...LEGACY_DOCKER, bind_expected: true } })), null)
+})
+
+test('dockerWarning without a snippet still says what to do', () => {
+  const b = check(dockerWarning(snap({ docker: { ...LEGACY_DOCKER, snippet: null } })))
+  assert.equal(b.snippet, null)
+  assert.match(b.body, /re-run the installer/)
 })
 
 // ── confirmations ───────────────────────────────────────────────────────────

@@ -675,6 +675,50 @@ export function stateBanner(
   }
 }
 
+// ── the container underneath ───────────────────────────────────────────────
+
+/** The Helm flag that gives a pod's documents folder a volume of its own. */
+export const HELM_WORK_VOLUME_FLAG = '--set persistence.work.enabled=true';
+
+const COPY_OUT_FIRST = 'Files already in the folder are not carried over, so copy out any you need first.';
+
+/**
+ * A warning shown beside the state banner, never instead of it: the indexed
+ * folder is only a directory inside the container, so it and everything the
+ * agent saved there vanish when the container is recreated. That is an
+ * install from before the installer mounted a host folder there; syncing
+ * itself works, which is why this does not block anything. With the bind
+ * mount expected (`bind_expected`) a missing one is a hold instead — the
+ * `root_unavailable(bind_missing)` banner — so it is not repeated here.
+ *
+ * In Kubernetes the fix is the chart's work volume, not a compose line.
+ * `cremind userdocs status` prints the same warning as one line.
+ */
+export function dockerWarning(snap: UserDocsSnapshot | null | undefined): StateBanner | null {
+  const docker = snap?.docker;
+  if (!docker?.in_container || docker.root_mounted !== false || docker.bind_expected) return null;
+  if (docker.kubernetes) {
+    return banner(
+      'warning',
+      'Your documents folder is not on a persistent volume',
+      'Your documents folder is inside the pod and is lost when the pod restarts — turn on the chart\'s '
+        + 'work volume with the flag below and upgrade the release (persistence.work.mountPath must be '
+        + `this folder). ${COPY_OUT_FIRST}`,
+      [],
+      { snippet: HELM_WORK_VOLUME_FLAG },
+    );
+  }
+  return banner(
+    'warning',
+    'Your documents folder lives only inside the container',
+    'Your documents folder is inside the container and is lost when it is recreated — re-run the '
+      + 'installer (your data is kept) or add the line below to the cremind service\'s volumes: in '
+      + `docker-compose.yml, then run docker compose up -d. ${COPY_OUT_FIRST}`,
+    [],
+    { snippet: typeof docker.snippet === 'string' && docker.snippet ? docker.snippet : null },
+  );
+}
+
 // ── image descriptions (the Specialized Vision Model) ─────────────────────
 
 /** A file row's image-description state, for the file table; null when

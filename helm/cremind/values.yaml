@@ -85,7 +85,9 @@ cremind:
   # -> CREMIND_SYSTEM_DIR (PVC mount; image default). Also the root of the
   # coding CLIs' sign-in: the chart derives CLAUDE_CONFIG_DIR and CODEX_HOME
   # from it (<systemDir>/coding-cli/{claude,codex}) so a `claude auth login`
-  # or `codex login` survives a rollout instead of dying with the pod.
+  # or `codex login` survives a rollout instead of dying with the pod. The
+  # local embedding models' download cache moves with it the same way
+  # (HF_HOME / SENTENCE_TRANSFORMERS_HOME -> <systemDir>/.cache/...).
   systemDir: /root/.cremind
   # Timezone -> CREMIND_TIMEZONE: the boot default wall-clock zone the scheduler
   # fires time-based events in and the agent reports for "what time is it". The
@@ -197,6 +199,9 @@ cremind:
 # Three volumes keep the pod's important data across restarts/reschedules:
 #   system: CREMIND_SYSTEM_DIR (/root/.cremind) — bootstrap.toml, tokens/,
 #           per-profile state (PERSONA.md, skills/, browser-profile/), backups.
+#           With User Document Search on, also its index (storage/userdocs/)
+#           and the local embedding models (.cache/, about 1 GB per model):
+#           size it 8Gi or more for document search.
 #   venv:   /opt/cremind/venv — Python deps the Setup Wizard installs at runtime
 #           (LLM SDKs, embeddings). Without it a restart reverts to the thin
 #           baseline and the agent loses its LLM SDK until re-setup.
@@ -439,11 +444,25 @@ postgresql:
       enabled: false
       whenScaled: Retain
       whenDeleted: Retain
+    # The data volume's size: the subchart's own default, stated here because
+    # the chart also hands it to the app (CREMIND_DB_CAPACITY) so User Document
+    # Search's storage governor knows how much room the database has. Pick it
+    # before the first install. A StatefulSet's claim template is immutable,
+    # so changing this on an existing release fails the upgrade; grow the PVC
+    # itself instead (needs a StorageClass with allowVolumeExpansion).
+    persistence:
+      size: 8Gi
 
 ## @section Bundled Qdrant (subchart) — OFF by default (embeddings off)
 qdrant:
   enabled: false
   fullnameOverride: cremind-qdrant
+  # The vector volume's size (the subchart's default), also handed to the app
+  # as CREMIND_VECTORSTORE_CAPACITY for User Document Search's storage
+  # governor. The same StatefulSet caveat as postgresql above applies: pick it
+  # before the first install.
+  persistence:
+    size: 10Gi
 
 ## @section Bundled ChromaDB (subchart) — OFF by default (embeddings off)
 chromadb:

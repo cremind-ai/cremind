@@ -71,6 +71,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="1 if a previous install already has a VNC password, which makes "
              "an empty answer mean 'keep the existing one'.",
     )
+    # Docker documents folder. --documents-dir / --documents-access are values
+    # (non-empty skips that step and is echoed back); --documents-default is
+    # context only: what the shell would use unasked, shown as the prefill.
+    p.add_argument(
+        "--documents-dir",
+        default="",
+        dest="documents_dir",
+        help="Host folder mounted at /root/Documents (Docker); empty = ask.",
+    )
+    p.add_argument(
+        "--documents-access",
+        default="",
+        choices=["", "rw", "ro"],
+        dest="documents_access",
+        help="How that folder is mounted: rw or ro; empty = ask.",
+    )
+    p.add_argument(
+        "--documents-default",
+        default="",
+        dest="documents_default",
+        help="The folder to prefill when asking; never written back.",
+    )
     p.add_argument("--version", default="", dest="version_spec")
     p.add_argument("--host", default="", dest="app_host")
     p.add_argument("--listen-host", default="", dest="custom_listen_host")
@@ -168,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
         ssl_choice=args.ssl,
         desktop=args.desktop,
         vnc_password=args.vnc_password,
+        documents_dir=args.documents_dir,
+        documents_access=args.documents_access,
         custom_listen_host=args.custom_listen_host,
         custom_public_url=args.custom_public_url,
         custom_allowed_origins=args.custom_allowed_origins,
@@ -196,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             ssl_inherited=args.ssl_inherited == "1",
             native_env=args.native_env,
             docker_env=args.docker_env,
+            documents_default=args.documents_default,
         )
     except KeyboardInterrupt:
         _write_cancel_marker(args.output)

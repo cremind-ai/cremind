@@ -215,6 +215,30 @@ def summarize_snapshot(snap: dict[str, Any]) -> str:
     return " · ".join(parts)
 
 
+def docker_warning(snap: dict[str, Any]) -> Optional[str]:
+    """The one-line warning for a documents folder that is only a directory
+    inside the container (the snapshot's ``docker`` block): an install from
+    before the installer mounted a host folder there. Everything in it goes
+    when the container is recreated. The web UI shows the same warning
+    (``dockerWarning`` in ui/src/utils/userdocsView.ts); with the bind mount
+    expected, a missing one is the ``root_unavailable`` hold instead."""
+    docker = snap.get("docker")
+    if not isinstance(docker, dict) or not docker.get("in_container"):
+        return None
+    if docker.get("root_mounted") is not False or docker.get("bind_expected"):
+        return None
+    if docker.get("kubernetes"):
+        return ("warning: your documents folder is inside the pod and is lost when the pod restarts "
+                "(copy out any files you need) — turn on the chart's work volume: upgrade the release "
+                "with --set persistence.work.enabled=true")
+    fix = "re-run the installer (your data is kept)"
+    snippet = docker.get("snippet")
+    if isinstance(snippet, str) and snippet:
+        fix += f" or add this under the cremind service's volumes in docker-compose.yml: {snippet}"
+    return ("warning: your documents folder is inside the container and is lost when it is recreated "
+            f"(copy out any files you need) — {fix}")
+
+
 def _when(ts: Any) -> str:
     """An epoch timestamp (seconds or milliseconds) as local 'YYYY-MM-DD HH:MM'."""
     import datetime as _dt
@@ -305,6 +329,7 @@ def userdocs_status(
 
     if follow:
         async def _tail() -> None:
+            warned = False
             async with Client(cfg) as client:
                 async for event in client.stream(userdocs_stream_path()):
                     if event.event != "userdocs":
@@ -314,6 +339,11 @@ def userdocs_status(
                     else:
                         sys.stdout.write(summarize_snapshot(event.data) + "\n")
                         sys.stdout.flush()
+                        warning = None if warned else docker_warning(event.data)
+                        if warning:
+                            # Once: the mount cannot change while the server runs.
+                            sys.stderr.write(warning + "\n")
+                            warned = True
 
         try:
             asyncio.run(_tail())
@@ -327,9 +357,12 @@ def userdocs_status(
 
     out = asyncio.run(_run())
     if mode.json:
-        _print(ctx, out)
+        _print(ctx, out)  # the docker block is in the snapshot itself
     else:
         sys.stdout.write(summarize_snapshot(out) + "\n")
+        warning = docker_warning(out)
+        if warning:
+            sys.stderr.write(warning + "\n")
 
 
 @userdocs_app.command("settings")

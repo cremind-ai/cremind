@@ -174,6 +174,41 @@ prompt = "Choose a password for the VNC Desktop"
 hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password."
 
 
+# ── Docker documents folder ────────────────────────────────────────────────
+# Asked only when the install mode is Docker, after [vnc_password]: which
+# folder on this machine the container sees as /root/Documents — the folder
+# User Document Search indexes and the agent's default working folder — and
+# whether the container may write to it. Without a bind mount that folder
+# lives on the container's own layer and is lost whenever the container is
+# recreated. Kubernetes never asks: the chart's persistence.work volume is
+# mounted there instead.
+#
+# The folder is written UNQUOTED into docker/.env (CREMIND_HOST_DOCUMENTS),
+# whose compose parser expands $, starts a comment at #, and treats " as a
+# quote — so every front-end refuses those characters, and leading or
+# trailing whitespace, rather than escaping them. The default is the
+# previous install's folder, else ~/Documents (on Windows, the Documents
+# folder Windows reports, which follows OneDrive redirection).
+#
+# Non-interactive installs (--unattended, no TTY) never prompt: they take
+# --documents-dir / -DocumentsDir, else $CREMIND_DOCUMENTS_DIR, else the
+# previous install's folder, else the default; access likewise from
+# --documents-access / $CREMIND_DOCUMENTS_ACCESS, else the previous choice,
+# else read-write. The *_note keys are printed only on the platform they name.
+
+[docker_documents]
+prompt             = "Which folder should Cremind use as your Documents folder?"
+hint               = "The container sees it as /root/Documents: document search indexes it, and the agent reads and saves files there by default. It is created if it does not exist. The path cannot contain $, # or double quotes."
+access_prompt      = "Can Cremind change files in this folder?"
+rw_label           = "Read-write"
+rw_disclosure      = "The agent's file tools write to your real folder: files it creates, edits or deletes there change on this machine."
+ro_label           = "Read-only"
+ro_disclosure      = "Cremind can read and search the folder, but the agent cannot save files there, and its default working folder is read-only."
+linux_owner_note   = "On Linux the container runs as root, so files the agent creates in this folder are owned by root on the host (sudo chown -R $USER <folder> takes them back)."
+macos_privacy_note = "macOS will ask whether Docker may access your Documents folder. Allow it: if you deny it, the folder looks empty inside the container and nothing is indexed."
+wsl_note           = "Inside WSL, ~/Documents is your Linux home, not your Windows Documents folder. For the Windows one, use /mnt/c/Users/<you>/Documents."
+
+
 # ── Kubernetes prompts ─────────────────────────────────────────────────────
 # Asked only when the install mode is kubernetes, in this order: context,
 # namespace, (desktop / VNC password / HTTPS — shared with the Docker mode),

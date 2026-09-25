@@ -136,6 +136,22 @@
     console this flag wins, else the previous install's password is kept, else
     one is generated and printed at the end.
 
+.PARAMETER DocumentsDir
+    (Docker mode) The folder on this machine the container sees as
+    /root/Documents: document search indexes it and the agent works there.
+    Created if missing. A leading ~ is expanded, a relative path is made
+    absolute, and the path is written with forward slashes; $, #, double
+    quotes and leading/trailing whitespace are refused (compose's .env would
+    mangle them). Default: $env:CREMIND_DOCUMENTS_DIR, else the previous
+    install's folder, else your Documents folder as Windows reports it (which
+    follows OneDrive redirection). Interactive installs ask.
+
+.PARAMETER DocumentsAccess
+    (Docker mode) 'rw' or 'ro'. Mount that folder read-write (default; the
+    agent's file tools change your real files) or read-only (the agent cannot
+    save there, and its default working folder is read-only). Default:
+    $env:CREMIND_DOCUMENTS_ACCESS, else the previous install's choice, else rw.
+
 .PARAMETER BootService
     Register a Scheduled Task that starts Cremind at logon and restarts it if
     it stops. Default: on for native installs, which is also what makes the
@@ -247,6 +263,13 @@ param(
     # / no console — keep the previous install's password, else generate one.
     # 6-8 characters from [A-Za-z0-9@%_+=:,.-]; see $VncPasswordRe below.
     [string] $VncPassword = '',
+    # Docker mode only: the host folder mounted at /root/Documents, and how.
+    # Empty = $env:CREMIND_DOCUMENTS_DIR / _ACCESS, else ask, else the previous
+    # install's value, else the default. Both are TUI output keys too (read
+    # back by the whitelist in Invoke-InstallerTuiBootstrap), which is why
+    # the ValidateSet on the access matters.
+    [string] $DocumentsDir = '',
+    [ValidateSet('','rw','ro')] [string] $DocumentsAccess = '',
     # Register a logon Scheduled Task that starts and supervises the server?
     # Neither set = on for native installs, unless a previous install opted
     # out. Setting both is an error. See the ── boot service ── section.
@@ -1046,6 +1069,88 @@ if ($VncPassword -and $VncPassword -notmatch $VncPasswordRe) {
 # runs so an empty answer can mean "keep that one" instead of rotating it.
 $PrevVncPassword = ''
 
+# The one rule for a Docker documents folder, mirrored in install.sh
+# (documents_dir_normalize) and app/installer/tui.py.
+#
+# Resolve-DocumentsDir RAW → an object whose Path is RAW as an absolute path
+# with forward slashes, or whose Problem says why RAW cannot be used.
+#
+# The path is appended UNQUOTED to docker\.env as CREMIND_HOST_DOCUMENTS, and
+# compose's .env parser expands $, reads # as a comment, treats " as quoting
+# and trims surrounding whitespace. Escaping would have to match that parser
+# exactly, so those are refused instead — naming the character, because a
+# "valid path" error for a real folder is baffling otherwise. Apostrophes and
+# inner spaces are fine unquoted. The checks run on the RESULT too, since
+# $HOME or the current location can carry the same characters. Forward
+# slashes because the same value is read by the Linux compose CLI inside the
+# container, where a backslash is just a character.
+function Resolve-DocumentsDir {
+    param([AllowEmptyString()][string] $Raw)
+    $charProblem = {
+        param([string] $Text)
+        if ($Text.Contains('$')) { return 'it contains $, which docker compose would expand as a variable' }
+        if ($Text.Contains('#')) { return 'it contains #, which docker compose would read as the start of a comment' }
+        if ($Text.Contains('"')) { return 'it contains a double quote ("), which docker compose would read as quoting' }
+        if ($Text.Contains("`n") -or $Text.Contains("`r")) { return 'it contains a line break' }
+        return ''
+    }
+    $fail = { param([string] $Why) [pscustomobject]@{ Path = ''; Problem = $Why } }
+    if (-not $Raw) { return (& $fail 'it is empty') }
+    if ($Raw -match '^\s' -or $Raw -match '\s$') {
+        return (& $fail 'it starts or ends with whitespace, which docker compose would drop')
+    }
+    if ($Raw.StartsWith('~') -and $Raw -ne '~' -and $Raw -notmatch '^~[\\/]') {
+        return (& $fail '~user paths are not supported; write the full path')
+    }
+    $problem = & $charProblem $Raw
+    if ($problem) { return (& $fail $problem) }
+    $path = $Raw
+    if ($path -eq '~') {
+        $path = $HOME
+    } elseif ($path -match '^~[\\/]') {
+        $path = Join-Path $HOME $path.Substring(2)
+    }
+    try {
+        $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path)
+    } catch {
+        return (& $fail "it is not a usable path ($($_.Exception.Message))")
+    }
+    $path = $path -replace '\\', '/'
+    $problem = & $charProblem $path
+    if ($problem) { return (& $fail $problem) }
+    while ($path.Length -gt 1 -and $path.EndsWith('/') -and $path -notmatch '^[A-Za-z]:/$') {
+        $path = $path.Substring(0, $path.Length - 1)
+    }
+    return [pscustomobject]@{ Path = $path; Problem = '' }
+}
+
+# -DocumentsDir / -DocumentsAccess, else the environment. Checked now, in every
+# mode, like -VncPassword above: an unattended install must fail on a folder
+# it cannot mount rather than write a .env compose misreads. The normalized
+# value is what the TUI is handed, so it sees an absolute path.
+$DocumentsDirSource = '-DocumentsDir'
+if (-not $DocumentsDir -and $env:CREMIND_DOCUMENTS_DIR) {
+    $DocumentsDir = $env:CREMIND_DOCUMENTS_DIR
+    $DocumentsDirSource = 'CREMIND_DOCUMENTS_DIR'
+}
+if ($DocumentsDir) {
+    $docsCheck = Resolve-DocumentsDir $DocumentsDir
+    if ($docsCheck.Problem) {
+        Write-Err2 "Invalid $DocumentsDirSource '$DocumentsDir': $($docsCheck.Problem)"
+        exit 2
+    }
+    $DocumentsDir = $docsCheck.Path
+}
+if (-not $DocumentsAccess -and $env:CREMIND_DOCUMENTS_ACCESS) {
+    if ($env:CREMIND_DOCUMENTS_ACCESS -notin @('rw', 'ro')) {
+        Write-Err2 "Invalid CREMIND_DOCUMENTS_ACCESS: $($env:CREMIND_DOCUMENTS_ACCESS) (must be rw or ro)"
+        exit 2
+    }
+    $DocumentsAccess = $env:CREMIND_DOCUMENTS_ACCESS
+}
+# ValidateSet and -in both ignore case; the TUI's argparse does not.
+$DocumentsAccess = $DocumentsAccess.ToLowerInvariant()
+
 if ($BootService -and $NoBootService) {
     Write-Err2 "-BootService and -NoBootService are mutually exclusive"
     exit 2
@@ -1614,6 +1719,49 @@ if (Test-Path -LiteralPath $prevVncEnv) {
     }
 }
 
+# The documents folder and access a previous Docker install recorded in the
+# same file, read here for the same reason: the TUI and the fallback prompt
+# offer them as the default, and an unattended re-run keeps them. A recorded
+# folder that no longer passes Resolve-DocumentsDir (hand-edited) is dropped
+# with a warning rather than failing a re-install over it.
+$PrevDocumentsDir = ''
+$PrevDocumentsAccess = ''
+if (Test-Path -LiteralPath $prevVncEnv) {
+    foreach ($line in (Get-Content -LiteralPath $prevVncEnv -Encoding UTF8)) {
+        if (-not $PrevDocumentsDir -and $line -like 'CREMIND_HOST_DOCUMENTS=*') {
+            $prevDocsRaw = $line.Substring('CREMIND_HOST_DOCUMENTS='.Length)
+            if ($prevDocsRaw) {
+                $prevDocs = Resolve-DocumentsDir $prevDocsRaw
+                if ($prevDocs.Problem) {
+                    Write-Warn2 "Ignoring the previous documents folder '$prevDocsRaw': $($prevDocs.Problem)"
+                } else {
+                    $PrevDocumentsDir = $prevDocs.Path
+                }
+            }
+        } elseif (-not $PrevDocumentsAccess -and $line -like 'CREMIND_DOCUMENTS_READ_ONLY=*') {
+            switch ($line.Substring('CREMIND_DOCUMENTS_READ_ONLY='.Length).Trim()) {
+                'true'  { $PrevDocumentsAccess = 'ro' }
+                'false' { $PrevDocumentsAccess = 'rw' }
+            }
+        }
+    }
+}
+
+# What the documents folder is when nobody says otherwise: the previous
+# install's, else the Documents folder Windows reports — which follows OneDrive
+# redirection, unlike $HOME\Documents. Empty only when that path holds a
+# character the .env cannot carry; the docker branch then leaves
+# CREMIND_HOST_DOCUMENTS unset and compose falls back to a folder inside the
+# bundle. Handed to the TUI as --documents-default, which only prefills: it
+# never counts as an answer.
+$DocumentsDefault = $PrevDocumentsDir
+if (-not $DocumentsDefault) {
+    $myDocuments = [Environment]::GetFolderPath('MyDocuments')
+    if (-not $myDocuments) { $myDocuments = Join-Path $HOME 'Documents' }
+    $docsDefaultCheck = Resolve-DocumentsDir $myDocuments
+    if (-not $docsDefaultCheck.Problem) { $DocumentsDefault = $docsDefaultCheck.Path }
+}
+
 # ── TUI bootstrap ─────────────────────────────────────────────────────────
 #
 # Mirror of the install.sh bootstrap: launch the prompt_toolkit TUI for a
@@ -1690,6 +1838,11 @@ function Invoke-InstallerTuiBootstrap {
     # Either previous install counts - the mode is not settled yet, and the
     # text prompt re-points $PrevVncPassword once it is.
     $tuiArgs.Add($(if ($PrevVncPassword -or (Get-PrevK8s 'VNC_PASSWORD')) { '1' } else { '0' }))
+    # Docker documents folder: the two values round-trip like the flags below;
+    # --documents-default is context only (the prefill, never written back).
+    if ($DocumentsDir)     { $tuiArgs.Add('--documents-dir');     $tuiArgs.Add($DocumentsDir) }
+    if ($DocumentsAccess)  { $tuiArgs.Add('--documents-access');  $tuiArgs.Add($DocumentsAccess) }
+    if ($DocumentsDefault) { $tuiArgs.Add('--documents-default'); $tuiArgs.Add($DocumentsDefault) }
     # Kubernetes: capabilities and the probed context list are context-only
     # (the TUI never writes them back); the value flags round-trip, so a flag
     # the operator passed is echoed back instead of being cleared.
@@ -1746,8 +1899,12 @@ function Invoke-InstallerTuiBootstrap {
             if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
                 $k = $Matches[1]
                 $v = $Matches[2]
-                # Strip surrounding single quotes the bash quoter may have added.
-                if ($v -match "^'(.*)'$") { $v = ($Matches[1] -replace "'\\\\''", "'") }
+                # Strip the surrounding single quotes the bash quoter adds, then
+                # undo its only escape: a quote inside the value is written as
+                # '\'' (close, escaped quote, reopen), so John's comes back from
+                # 'John'\''s'. A literal Replace, not -replace: this used to be
+                # a regex that matched '\\'' instead and returned John'\''s.
+                if ($v -match "^'(.*)'$") { $v = $Matches[1].Replace("'\''", "'") }
                 switch ($k) {
                     'CHANNEL'              { if (-not $Channel)        { Set-Variable -Scope Script Channel $v } }
                     'VERSION_SPEC'         { if (-not $Version)        { Set-Variable -Scope Script Version $v } }
@@ -1757,6 +1914,8 @@ function Invoke-InstallerTuiBootstrap {
                     'SSL_CHOICE'           { if (-not $Ssl -and $v -in @('none', 'auto', 'after-setup')) { Set-Variable -Scope Script Ssl $v } }
                     'DESKTOP_UI'           { if (-not $DesktopUi)      { Set-Variable -Scope Script DesktopUi $v } }
                     'VNC_PASSWORD_INPUT'   { if (-not $VncPassword)    { Set-Variable -Scope Script VncPassword $v } }
+                    'DOCUMENTS_DIR_INPUT'  { if (-not $DocumentsDir)   { Set-Variable -Scope Script DocumentsDir $v } }
+                    'DOCUMENTS_ACCESS_INPUT' { if (-not $DocumentsAccess -and $v -in @('rw', 'ro')) { Set-Variable -Scope Script DocumentsAccess $v } }
                     'CUSTOM_listen_host'   { if (-not $ListenHost)     { Set-Variable -Scope Script ListenHost $v } }
                     'CUSTOM_public_url'    { if (-not $PublicUrl)      { Set-Variable -Scope Script PublicUrl $v } }
                     'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
@@ -2119,6 +2278,117 @@ if (($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and $DesktopUi -ne '0' -and
     if (-not $VncPassword -and -not $PrevVncPassword) {
         Write-Warn2 "No VNC password entered; generating one and printing it at the end."
     }
+}
+
+# ── documents folder (docker mode only) ───────────────────────────────────
+#
+# The host folder the container sees as /root/Documents — what User Document
+# Search indexes and where the agent works by default. Without the bind it
+# lives on the container's own layer and vanishes whenever compose recreates
+# the container. Kubernetes never gets here: the chart's persistence.work
+# volume is mounted at the same path.
+#
+# Precedence: -DocumentsDir → $env:CREMIND_DOCUMENTS_DIR (both folded into
+# $DocumentsDir and validated up front) → the TUI's or the prompt's answer →
+# the previous install's folder → the Windows Documents folder. Access runs
+# the same chain from -DocumentsAccess / $env:CREMIND_DOCUMENTS_ACCESS, default
+# rw. Each question is asked only when its value is still open and someone
+# can answer: not -Unattended, an interactive session, a console on stdin.
+$DocumentsHostDir  = ''
+$DocumentsReadOnly = 'false'
+if ($Mode -eq 'docker') {
+    $docsCanAsk = (-not $Unattended) -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    if (-not $DocumentsDir -and $docsCanAsk) {
+        Write-Host ""
+        Write-Host $script:DockerDocuments.Prompt -ForegroundColor White
+        if ($script:DockerDocuments.Hint) {
+            Write-Host ("  $($script:DockerDocuments.Hint)") -ForegroundColor DarkGray
+        }
+        # Bounded for the same reason as the VNC loop: a host whose Read-Host
+        # returns empty without blocking would re-read forever. Giving up
+        # keeps the default.
+        $docsTries = 0
+        while (-not $DocumentsDir -and $docsTries -lt 5) {
+            $docsTries++
+            $docsAns = Read-Host "  [$DocumentsDefault]"
+            if (-not $docsAns) { $docsAns = $DocumentsDefault }
+            if (-not $docsAns) {
+                Write-Warn2 "Type the full path of a folder."
+                continue
+            }
+            $docsCheck = Resolve-DocumentsDir $docsAns
+            if ($docsCheck.Problem) {
+                Write-Warn2 "That folder can't be used: $($docsCheck.Problem)"
+                continue
+            }
+            $DocumentsDir = $docsCheck.Path
+        }
+    }
+
+    $docsAccessDefault = if ($PrevDocumentsAccess) { $PrevDocumentsAccess } else { 'rw' }
+    if (-not $DocumentsAccess -and $docsCanAsk) {
+        Write-Host ""
+        Write-Host $script:DockerDocuments.AccessPrompt -ForegroundColor White
+        Write-Host "  1) $($script:DockerDocuments.RwLabel)"
+        Write-Host "     $($script:DockerDocuments.RwDisclosure)" -ForegroundColor DarkGray
+        Write-Host "  2) $($script:DockerDocuments.RoLabel)"
+        Write-Host "     $($script:DockerDocuments.RoDisclosure)" -ForegroundColor DarkGray
+        $docsChoiceDefault = if ($docsAccessDefault -eq 'ro') { '2' } else { '1' }
+        $docsTries = 0
+        while (-not $DocumentsAccess -and $docsTries -lt 5) {
+            $docsTries++
+            $docsAns = Read-Host "Choose [1-2] [$docsChoiceDefault]"
+            if (-not $docsAns) { $docsAns = $docsChoiceDefault }
+            switch ($docsAns) {
+                { $_ -in @('1', 'rw') } { $DocumentsAccess = 'rw' }
+                { $_ -in @('2', 'ro') } { $DocumentsAccess = 'ro' }
+                default { Write-Warn2 "Please choose 1 or 2." }
+            }
+        }
+    }
+
+    # A value that came back from the TUI is normalized again here: the TUI
+    # writes the path as typed, backslashes and all.
+    if ($DocumentsDir) {
+        $docsCheck = Resolve-DocumentsDir $DocumentsDir
+        if ($docsCheck.Problem) {
+            Write-Err2 "Invalid documents folder '$DocumentsDir': $($docsCheck.Problem)"
+            exit 2
+        }
+        $DocumentsHostDir = $docsCheck.Path
+    } else {
+        $DocumentsHostDir = $DocumentsDefault
+    }
+    $docsAccess = if ($DocumentsAccess) { $DocumentsAccess } else { $docsAccessDefault }
+    $DocumentsReadOnly = if ($docsAccess -eq 'ro') { 'true' } else { 'false' }
+
+    if (-not $DocumentsHostDir) {
+        Write-Warn2 "No usable documents folder (your Documents path holds a character the compose .env cannot carry)."
+        Write-Warn2 "Documents will live in $(Join-Path (Join-Path $CremindInstallDir 'docker') 'documents'), which an uninstall deletes; pass -DocumentsDir to choose another."
+    } else {
+        # Created as the user running this script, so the folder is theirs
+        # rather than something Docker Desktop makes on first mount.
+        # [IO.Directory]::CreateDirectory, not New-Item: Windows PowerShell
+        # 5.1's New-Item has no -LiteralPath, and -Path would read [ ] in a
+        # folder name as a wildcard. It creates every missing parent and is a
+        # no-op for a folder that exists.
+        if (-not (Test-Path -LiteralPath $DocumentsHostDir -PathType Container)) {
+            try {
+                [System.IO.Directory]::CreateDirectory($DocumentsHostDir) | Out-Null
+            } catch {
+                Write-Err2 "Could not create the documents folder ${DocumentsHostDir}: $($_.Exception.Message)"
+                Write-Err2 "Create it yourself, or choose another with -DocumentsDir <path>."
+                exit 2
+            }
+            Write-Ok "Created $DocumentsHostDir"
+        }
+        $docsHow = if ($DocumentsReadOnly -eq 'true') { 'read-only' } else { 'read-write' }
+        Write-Ok "Documents folder: $DocumentsHostDir ($docsHow)"
+    }
+} elseif ($DocumentsDir -or $DocumentsAccess) {
+    # Only the Docker bundle mounts a documents folder: native installs use
+    # your real Documents folder directly, Kubernetes the chart's work volume.
+    Write-Info "The documents-folder setting applies to Docker installs only; ignoring it for $Mode."
 }
 
 # ── kubernetes questions ──────────────────────────────────────────────────
@@ -3815,6 +4085,25 @@ if ($Mode -eq 'docker') {
     } elseif ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
         Add-Content -Path $EnvDocker -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
     }
+    # The documents folder resolved in ── documents folder ── above, which
+    # compose binds at /root/Documents. Appended like the TLS lines, never
+    # -replace'd into a template placeholder: -replace treats its replacement
+    # as a substitution pattern, and a free-text path should reach the file
+    # byte for byte. Unquoted is safe because Resolve-DocumentsDir refused
+    # everything compose's .env parser treats specially, and forward slashes
+    # because the Linux compose CLI inside the container reads it too.
+    # Left out when there is no usable folder, so compose falls back to the
+    # bundle's own ./documents. CREMIND_COMPOSE_HOST_DIR tells the app where
+    # this bundle lives on the host, for the instructions it shows; skipped if
+    # the path is not .env-safe.
+    if ($DocumentsHostDir) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_HOST_DOCUMENTS=$DocumentsHostDir" -Encoding utf8
+    }
+    Add-Content -Path $EnvDocker -Value "CREMIND_DOCUMENTS_READ_ONLY=$DocumentsReadOnly" -Encoding utf8
+    $composeHostDir = Resolve-DocumentsDir $DockerDir
+    if (-not $composeHostDir.Problem) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_COMPOSE_HOST_DIR=$($composeHostDir.Path)" -Encoding utf8
+    }
 
     # Dev channel: emit a docker-compose.override.yml that points the
     # build context at the local checkout, switches the pip install
@@ -3858,6 +4147,16 @@ if ($Mode -eq 'docker') {
         Write-Warn2 "Ignoring INSTALL_MODE=$($env:INSTALL_MODE) from the environment: this is a Docker install."
     }
     Remove-Item Env:INSTALL_MODE -ErrorAction SilentlyContinue
+    # Same shadowing for the documents keys: a CREMIND_HOST_DOCUMENTS in this
+    # session would mount one folder now and the .env's another on the next
+    # plain ``docker compose up -d``. The installer's own inputs are
+    # CREMIND_DOCUMENTS_DIR / CREMIND_DOCUMENTS_ACCESS, already folded in.
+    foreach ($docKey in @('CREMIND_HOST_DOCUMENTS', 'CREMIND_DOCUMENTS_READ_ONLY', 'CREMIND_COMPOSE_HOST_DIR')) {
+        if (Test-Path -LiteralPath "Env:$docKey") {
+            Write-Warn2 "Ignoring $docKey from the environment: $EnvDocker holds the installer's value."
+            Remove-Item -LiteralPath "Env:$docKey" -ErrorAction SilentlyContinue
+        }
+    }
 
     # Per-channel pull / build strategy:
     #   production / test → pull the pre-built image from Docker Hub
@@ -4065,6 +4364,10 @@ Open this URL in your browser to continue setup:
   VNC password (saved to $EnvDocker):
     $StoredVnc
 "@
+        }
+        if ($DocumentsHostDir) {
+            $docsHow = if ($DocumentsReadOnly -eq 'true') { 'read-only' } else { 'read-write' }
+            Write-Host "  Documents   : $DocumentsHostDir ($docsHow, /root/Documents in the container)"
         }
         Write-Host @"
 

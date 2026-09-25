@@ -74,12 +74,13 @@ shows no radio (it's local-only).
 
 1. Detect Docker, ask deployment type (local / server / custom) and host or advanced fields, then ask whether to include the VNC Desktop UI (default yes; `--desktop` / `--no-desktop` skip the prompt). A re-install defaults to the previously-chosen flavor.
 2. Ask for the VNC password *(desktop image only)* — entered twice, 6–8 characters from `[A-Za-z0-9@%_+=:,.-]` (VNC ignores anything past the 8th). Precedence: `--vnc-password` → what you type → the previous install's password → a generated one. Non-interactive runs (`--unattended`, no TTY, the Electron installer) never prompt: they take the flag if given, otherwise keep the previous password, otherwise generate one and print it at the end.
-3. Render [`docker-compose.yml`](templates/docker-compose.yml.tmpl) and an `.env` file (image flavor, ports, app URL, CORS, and — for the desktop image — VNC password) into `~/.cremind/docker/`. For a basic (`--no-desktop`) install the noVNC/VNC port maps and VNC env are stripped. The Setup Wizard later appends to `COMPOSE_PROFILES` as the user activates Docker-mode services; the bundle starts with only the `cremind` container running. The rendered compose file pins `INSTALL_MODE: docker` as a literal rather than interpolating it: Compose resolves `${VAR}` from the shell that runs `docker compose up` *before* the sibling `.env`, so a stray `INSTALL_MODE` in that shell used to be baked into the container.
-4. Per-channel image strategy:
+3. Ask for your **Documents folder** and whether Cremind may change it — see [The Documents folder](#the-documents-folder).
+4. Render [`docker-compose.yml`](templates/docker-compose.yml.tmpl) and an `.env` file (image flavor, ports, app URL, CORS, the Documents folder, and — for the desktop image — VNC password) into `~/.cremind/docker/`. For a basic (`--no-desktop`) install the noVNC/VNC port maps and VNC env are stripped. The Setup Wizard later appends to `COMPOSE_PROFILES` as the user activates Docker-mode services; the bundle starts with only the `cremind` container running. The rendered compose file pins `INSTALL_MODE: docker` as a literal rather than interpolating it: Compose resolves `${VAR}` from the shell that runs `docker compose up` *before* the sibling `.env`, so a stray `INSTALL_MODE` in that shell used to be baked into the container.
+5. Per-channel image strategy:
    - `production` / `test`: resolve the latest version from PyPI / Test PyPI, then `docker compose pull` + `docker compose up -d` (no local build; a missing tag fails hard).
    - `dev`: `docker compose pull --ignore-pull-failures` for sidecars, then `docker compose up -d --build` against the local checkout via `docker-compose.override.yml`.
-5. Wait for `http://<host>:1515/health` to return 200.
-6. Offer to trust the Cremind local CA on this machine (skipped with
+6. Wait for `http://<host>:1515/health` to return 200.
+7. Offer to trust the Cremind local CA on this machine (skipped with
    `--unattended`, or when TLS is off). The CA lives inside the container,
    where the Setup Wizard's one-click trust can't reach your trust store —
    but the installer runs on your machine, so it downloads `/ca.pem` from
@@ -89,7 +90,55 @@ shows no radio (it's local-only).
    install" step shows the manual command, and any *other* device you browse
    from needs that path anyway. A re-install detects the CA is already
    trusted and skips the prompt.
-7. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* When HTTPS was selected (`after-setup`), this stays `http://` — finishing the wizard restarts the container into `https://`.
+8. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* When HTTPS was selected (`after-setup`), this stays `http://` — finishing the wizard restarts the container into `https://`.
+
+### The Documents folder
+
+The container sees one folder of yours as `/root/Documents`: User Document
+Search indexes it, and the agent reads and saves files there by default.
+Without a bind mount that folder would live on the container's own layer and
+disappear whenever the container is recreated (an image upgrade, a
+`docker compose down && up`), so the installer asks for a real one:
+
+- **Which folder.** Default: the previous install's folder, else `~/Documents`
+  (Windows: the Documents folder Windows reports, which follows OneDrive
+  redirection). It is created if missing, as you, before Docker ever sees it.
+  A leading `~` is expanded and a relative path is made absolute; `install.ps1`
+  writes it with forward slashes (`C:/Users/you/Documents`).
+- **Read-write or read-only.** Read-write (default) means the agent's file
+  tools change your real files. Read-only means the agent cannot save there,
+  and its default working folder is read-only.
+
+Precedence for each: `--documents-dir` / `--documents-access` (PowerShell:
+`-DocumentsDir` / `-DocumentsAccess`) → `$CREMIND_DOCUMENTS_DIR` /
+`$CREMIND_DOCUMENTS_ACCESS` → what you answer in the TUI or the prompt → the
+previous install's value → the default. Nothing is asked with `--unattended`,
+without a TTY, or for a value a flag or variable already gave.
+
+The answers are appended to `docker/.env` as `CREMIND_HOST_DOCUMENTS`,
+`CREMIND_DOCUMENTS_READ_ONLY` and `CREMIND_COMPOSE_HOST_DIR` (the bundle's own
+folder, which the app names in its instructions). The value is written
+unquoted, so a path containing `$`, `#` or `"`, or starting or ending with
+whitespace, is refused with the offending character named — Compose's `.env`
+parser would expand, truncate or unquote it. Apostrophes and inner spaces are
+fine (`/home/you/John's Documents`).
+
+Platform notes the installer prints:
+
+- **Linux:** the container runs as root, so files the agent creates in a
+  read-write folder are owned by root on the host.
+- **macOS:** Docker Desktop asks to access your Documents folder the first
+  time; if you deny it, the folder looks empty inside the container and
+  nothing is indexed.
+- **WSL:** `~/Documents` is the distro's Linux home. For your Windows
+  Documents folder use `/mnt/c/Users/<you>/Documents`.
+- **Installer inside a container:** the folder is not created (it would be
+  created inside that container); Docker creates it on the Docker host.
+
+To move it later, edit `CREMIND_HOST_DOCUMENTS` in `docker/.env` and run
+`docker compose up -d`, or re-run the installer with `--documents-dir`.
+Native installs use your real `~/Documents` directly; Kubernetes mounts the
+chart's `persistence.work` volume there instead.
 
 The bundle defines four services. Only `cremind` is started at install
 time; the others are activated by the wizard:
@@ -327,6 +376,8 @@ container-friendly defaults) for one release; new scripts should use
 | `--no-port-forward`                  | (kubernetes) Don't start the background port-forward; just print the command. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
 | `--vnc-password PW`                  | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
+| `--documents-dir PATH`               | (docker) The folder mounted at `/root/Documents`, created if missing. Falls back to `$CREMIND_DOCUMENTS_DIR`, the previous install's folder, then `~/Documents`. `$`, `#`, `"` and leading/trailing whitespace are refused. See [The Documents folder](#the-documents-folder). |
+| `--documents-access rw\|ro`          | (docker) Mount it read-write (default) or read-only. Falls back to `$CREMIND_DOCUMENTS_ACCESS`, then the previous install's choice. |
 | `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
 | `--boot-service` / `--no-boot-service` | (native) Register a login/boot service that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker (the daemon supervises the container) and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `--no-launch`                        | Don't open the wizard at the end. |
@@ -357,6 +408,8 @@ container-friendly defaults) for one release; new scripts should use
 | `-NoPortForward`                    | (kubernetes) Don't start the background port-forward; just print the command. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
 | `-VncPassword PW`                   | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
+| `-DocumentsDir PATH`                | (docker) The folder mounted at `/root/Documents`, created if missing and written with forward slashes. Falls back to `$env:CREMIND_DOCUMENTS_DIR`, the previous install's folder, then your Documents folder (OneDrive-aware). `$`, `#`, `"` and leading/trailing whitespace are refused. |
+| `-DocumentsAccess rw\|ro`           | (docker) Mount it read-write (default) or read-only. Falls back to `$env:CREMIND_DOCUMENTS_ACCESS`, then the previous install's choice. |
 | `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
 | `-BootService` / `-NoBootService`   | (native) Register a logon Scheduled Task that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |
@@ -394,7 +447,8 @@ the wizard, not by the installer, so they survive re-runs as well.
 | Path | Purpose |
 |---|---|
 | `~/.cremind/docker/docker-compose.yml` | Compose orchestration for cremind, postgres, qdrant. |
-| `~/.cremind/docker/.env`               | Secrets and config that Compose substitutes (chmod 600). |
+| `~/.cremind/docker/.env`               | Secrets and config that Compose substitutes (chmod 600), including the Documents folder. |
+| Your Documents folder                 | Bind-mounted at `/root/Documents`; created if missing. Uninstalling never deletes it (only the `docker/documents` fallback, used when no folder could be recorded, lives inside the bundle and goes with it). |
 | `~/.cremind/install.log`               | Output of `compose pull` / `compose up`. |
 | Docker named volumes                  | `cremind-data`, `pg-data`, `qdrant-data`. Persisted across restarts. |
 

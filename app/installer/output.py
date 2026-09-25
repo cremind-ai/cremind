@@ -40,6 +40,15 @@ class TuiResult:
     # VNC_PASSWORD later from the flag/previous/generated chain, so reusing
     # that name would have the TUI's answer clobbered (or clobber it).
     vnc_password: str = ""
+    # Docker mode: the host folder mounted at /root/Documents, and "rw" / "ro"
+    # for how it is mounted. Written as DOCUMENTS_DIR_INPUT /
+    # DOCUMENTS_ACCESS_INPUT for the same reason as VNC_PASSWORD_INPUT: the
+    # shells resolve CREMIND_HOST_DOCUMENTS themselves (flag > env > previous
+    # .env > default) and must not have it clobbered by sourcing this file.
+    # The path is written as typed (a Windows path keeps its backslashes);
+    # the shells turn it into the forward-slash form the compose .env gets.
+    documents_dir: str = ""
+    documents_access: str = ""
     custom_listen_host: str = ""
     custom_public_url: str = ""
     custom_allowed_origins: str = ""
@@ -70,6 +79,8 @@ class TuiResult:
             "SSL_CHOICE": self.ssl_choice,
             "DESKTOP_UI": self.desktop,
             "VNC_PASSWORD_INPUT": self.vnc_password,
+            "DOCUMENTS_DIR_INPUT": self.documents_dir,
+            "DOCUMENTS_ACCESS_INPUT": self.documents_access,
             "CUSTOM_listen_host": self.custom_listen_host,
             "CUSTOM_public_url": self.custom_public_url,
             "CUSTOM_allowed_origins": self.custom_allowed_origins,
@@ -103,6 +114,11 @@ def _sh_quote(value: str) -> str:
         raise ValueError(f"installer answers must be single-line: {value!r}")
     if value == "" or all(c in _SAFE for c in value):
         return value
+    # Inside single quotes bash takes every character literally, so spaces,
+    # backslashes (a Windows path) and ``$`` need nothing more. The one
+    # character that cannot appear is ``'`` itself: close the quote, emit an
+    # escaped one, reopen — ``John's`` becomes ``'John'\''s'``. install.ps1
+    # undoes exactly that ``'\''`` sequence after stripping the outer quotes.
     return "'" + value.replace("'", "'\\''") + "'"
 
 

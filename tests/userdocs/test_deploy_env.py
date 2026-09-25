@@ -8,6 +8,8 @@ Docker Desktop / WSL mounts on which inotify never fires.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.userdocs import deploy_env as de
@@ -67,10 +69,12 @@ def test_mount_for_path_is_none_off_linux(monkeypatch):
     assert de.mount_for_path("/root/Documents") is None
 
 
-def _status(monkeypatch, text: str, *, container: bool = True, **env) -> dict:
+def _status(monkeypatch, text: str, *, container: bool = True, pod: bool = False, **env) -> dict:
     # The real longest-prefix lookup, fed a fixture instead of /proc.
     monkeypatch.setattr(de, "mount_for_path", lambda path, t=None: _REAL_MOUNT_FOR_PATH(path, text))
     monkeypatch.setattr(de, "in_container", lambda: container)
+    # Not the env var: CI itself may run in a pod.
+    monkeypatch.setattr(de, "in_kubernetes", lambda: pod)
     for key in ("CREMIND_DOCUMENTS_BIND", "CREMIND_HOST_DOCUMENTS_HINT", "CREMIND_COMPOSE_HOST_DIR"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -80,10 +84,22 @@ def _status(monkeypatch, text: str, *, container: bool = True, **env) -> dict:
 
 def test_docker_root_status_legacy_overlay(monkeypatch):
     s = _status(monkeypatch, OVERLAY_ONLY, CREMIND_HOST_DOCUMENTS_HINT="C:/Users/lee/Documents")
-    assert s["in_container"] is True
+    assert s["in_container"] is True and s["kubernetes"] is False
     assert s["root_mounted"] is False and s["persistent"] is False and s["fstype"] == "overlay"
     assert s["bind_expected"] is False
     assert s["snippet"] == '- "C:/Users/lee/Documents:/root/Documents"'
+
+
+def test_docker_root_status_in_a_pod_without_the_work_volume(monkeypatch):
+    s = _status(monkeypatch, OVERLAY_ONLY, pod=True)
+    assert s["in_container"] is True and s["kubernetes"] is True
+    assert s["root_mounted"] is False and s["bind_expected"] is False
+
+
+def test_docker_root_status_kubernetes_implies_a_container(monkeypatch):
+    # The two flags never disagree: no container, no pod.
+    s = _status(monkeypatch, OVERLAY_ONLY, container=False, pod=True)
+    assert s["in_container"] is False and s["kubernetes"] is False
 
 
 def test_docker_root_status_bound(monkeypatch):
@@ -103,6 +119,7 @@ def test_docker_root_status_unknown_off_linux(monkeypatch):
     monkeypatch.setattr(de, "in_container", lambda: False)
     s = de.docker_root_status("C:/Users/lee/Documents")
     assert s["root_mounted"] is None and s["persistent"] is None and s["snippet"] is None
+    assert s["kubernetes"] is False
 
 
 def test_in_container_signals(monkeypatch, tmp_path):
@@ -188,3 +205,116 @@ def test_requested_mode_is_honoured(linux):
     assert de.choose_watch_mode("/root/Documents", requested="native") == ("native", "requested")
     linux["text"] = EXT4_BIND
     assert de.choose_watch_mode("/root/Documents", requested="poll") == ("poll", "requested")
+
+
+# ── the snapshot's docker block (runtime.docker_view) ──────────────────────
+#
+# Old installs keep the documents folder in the container's own layer; the UI
+# and `cremind userdocs status` warn from this block. It is read by configure
+# (on the maintenance thread) and only served by the snapshot, which is built
+# on every progress frame and must never block or raise.
+
+
+LEGACY_STATUS = {
+    "in_container": True, "kubernetes": False, "root_mounted": False, "persistent": False,
+    "fstype": "overlay", "compose_host_dir": "/opt/cremind", "host_documents_hint": None,
+    "bind_expected": False, "snippet": '- "~/Documents:/root/Documents"',
+}
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    """docker_root_status as configure sees it, counting calls."""
+    state = {"calls": [], "status": dict(LEGACY_STATUS), "error": None}
+
+    def fake(root):
+        state["calls"].append(root)
+        if state["error"] is not None:
+            raise state["error"]
+        return dict(state["status"])
+
+    monkeypatch.setattr(de, "docker_root_status", fake)
+    return state
+
+
+def _runtime(root: str | None = "/root/Documents", *, local_on: bool = True):
+    from app.userdocs.runtime import ProfileRuntime
+
+    rt = ProfileRuntime(SimpleNamespace(), "alice", "uid-alice")
+    rt.settings = {"enabled": local_on}
+    rt.root = root
+    return rt
+
+
+def test_snapshot_serves_the_docker_block_read_by_configure(probe):
+    rt = _runtime()
+    assert rt.runtime_snapshot()["docker"] is None  # not checked yet: no guess
+    rt._refresh_docker_status("/root/Documents")
+    docker = rt.runtime_snapshot()["docker"]
+    assert docker == {
+        "in_container": True, "kubernetes": False, "root_mounted": False, "persistent": False,
+        "fstype": "overlay", "bind_expected": False, "snippet": '- "~/Documents:/root/Documents"',
+    }
+    for _ in range(5):
+        rt.runtime_snapshot()
+    assert probe["calls"] == ["/root/Documents"]  # cached: snapshots never probe
+
+
+def test_docker_block_is_per_root(probe):
+    rt = _runtime()
+    rt._refresh_docker_status("/root/Documents")
+    rt.root = "/data/docs"  # a new root that configure has not checked yet
+    assert rt.docker_view() is None
+    probe["status"] = {**LEGACY_STATUS, "root_mounted": True, "persistent": True, "fstype": "ext4"}
+    rt._refresh_docker_status("/data/docs")
+    assert rt.docker_view()["root_mounted"] is True
+
+
+def test_docker_block_only_while_the_local_folder_is_on(probe):
+    rt = _runtime(local_on=False)
+    rt._refresh_docker_status("/root/Documents")
+    assert rt.runtime_snapshot()["docker"] is None
+
+
+def test_a_failing_probe_is_unknown_not_an_error(probe):
+    probe["error"] = OSError("mountinfo vanished")
+    rt = _runtime()
+    rt._refresh_docker_status("/root/Documents")  # does not raise
+    assert rt.runtime_snapshot()["docker"] is None
+
+
+def test_configure_rechecks_the_container_mount(probe, monkeypatch, tmp_path):
+    """Every configure that settles a root re-reads the mount, so the block
+    follows a changed folder (and a restarted, fixed container)."""
+    import app.storage.userdocs_storage as uds_storage
+    from app.userdocs import settings as uds
+
+    root = str(tmp_path)
+    row = {"enabled": True, "root_mode": uds.ROOT_CUSTOM, "root_path": root, "first_sync_confirmed_at": 1.0}
+
+    class _Storage:
+        def get_source(self, profile, kind):
+            return row if kind == uds.SOURCE_LOCAL else None
+
+    class _DB:
+        closed = False
+
+        def get_source_state(self, source):
+            return {}
+
+    monkeypatch.setattr(uds_storage, "get_userdocs_storage", lambda: _Storage())
+    monkeypatch.setattr(uds, "read_admin_policy", lambda: SimpleNamespace(allowed=True))
+    monkeypatch.setattr(uds, "feature_effective", lambda policy: (True, None))
+    monkeypatch.setattr(uds, "validate_root", lambda path, is_admin=False: SimpleNamespace(
+        ok=True, path=root, locked_excludes=[], code=None, message=None))
+    rt = _runtime(root=None)
+    monkeypatch.setattr(rt, "ensure_db", lambda: _DB())
+    monkeypatch.setattr(rt.drive, "configure", lambda r: None)
+    monkeypatch.setattr(rt, "_start_watching", lambda opts: None)
+    monkeypatch.setattr(rt, "request_scan", lambda reason: None)
+
+    rt.configure()
+    assert probe["calls"] == [root]
+    assert rt.runtime_snapshot()["docker"]["root_mounted"] is False
+    rt.configure()
+    assert probe["calls"] == [root, root]
