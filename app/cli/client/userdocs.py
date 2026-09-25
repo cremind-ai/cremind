@@ -9,6 +9,9 @@ recognise:
   request with `confirm` set to apply it.
 - **409 FeatureNotInstalled** — allowing the feature needs optional extras;
   install them with `cremind features install userdocs`.
+- **409 DriveNotLinked / DriveFoldersRequired** — turning Drive on needs a
+  linked gdrive skill, and a whole-Drive account needs folders to index
+  (`drive/folders` lists them).
 
 `query/{find|search|read}` run the agent's search leaves and answer with the
 text the agent would read; `citations/resolve` looks citation tokens up.
@@ -94,6 +97,15 @@ async def start_estimate(client: Client) -> dict[str, Any]:
 
 async def get_storage(client: Client) -> dict[str, Any]:
     resp = await client.get_json("/api/userdocs/storage")
+    return resp if isinstance(resp, dict) else {}
+
+
+async def drive_folders(client: Client, *, parent: Optional[str] = None) -> dict[str, Any]:
+    """One level of the linked Drive's folders: ``{folders: [{id, name}],
+    parent: {id, name} | None, whole_drive}``. Without ``parent``, the top
+    level (My Drive on a whole-Drive account, the granted folders otherwise)."""
+    params = {"parent": parent} if parent else None
+    resp = await client.get_json("/api/userdocs/drive/folders", params=params)
     return resp if isinstance(resp, dict) else {}
 
 

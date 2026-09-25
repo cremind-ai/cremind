@@ -476,6 +476,19 @@ def _count(profile: str, kind: str, what: str, ctx: dict[str, Any]) -> Effect:
     return Effect(what)
 
 
+def _narrows_folders(cur: dict[str, Any], patch: dict[str, Any]) -> bool:
+    """Whether a Drive patch narrows ``include_folders``: a folder chosen
+    before is no longer listed (a subfolder instead of its parent, say), or
+    a chosen set replaces "everything granted". Only a count can tell whether
+    anything indexed actually falls outside — the effect counter's job."""
+    opts = patch.get("options")
+    if not isinstance(opts, dict) or "include_folders" not in opts:
+        return False
+    old = set(normalize_options(cur.get("options")).get("include_folders") or [])
+    new = set(normalize_options({"include_folders": opts["include_folders"]})["include_folders"])
+    return bool(new) and (not old or bool(old - new))
+
+
 def plan_source_change(
     profile: str,
     kind: str,
@@ -486,16 +499,23 @@ def plan_source_change(
 
     Destructive effects: turning the source off *and* deleting its index,
     moving the root (files outside the new folder leave the index), adding
-    excludes that drop indexed files, and turning Drive off (its index goes).
-    Turning a source off while keeping the index is not destructive.
+    excludes that drop indexed files, turning Drive off (its index goes),
+    and narrowing Drive's ``include_folders`` (files outside the folders
+    now chosen leave the index). Turning a source off while keeping the
+    index is not destructive.
     """
     effects: list[Effect] = []
     cur = current or {}
     ctx = {"current": cur, "patch": patch}
+    purging = False
     if patch.get("delete_index"):
         effects.append(_count(profile, kind, "purge_all" if kind == SOURCE_LOCAL else "purge_drive", ctx))
+        purging = True
     elif kind == SOURCE_DRIVE and cur.get("enabled") and patch.get("enabled") is False:
         effects.append(_count(profile, kind, "purge_drive", ctx))
+        purging = True
+    if kind == SOURCE_DRIVE and cur.get("enabled") and not purging and _narrows_folders(cur, patch):
+        effects.append(_count(profile, kind, "purge_out_of_scope", ctx))
     if kind == SOURCE_LOCAL and cur.get("root_path") and "root_path" in patch:
         if _norm(str(patch.get("root_path") or "")) != _norm(str(cur.get("root_path") or "")):
             effects.append(_count(profile, kind, "purge_out_of_scope", ctx))

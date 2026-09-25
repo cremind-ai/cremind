@@ -145,6 +145,51 @@ export type UserDocsConfirmation =
   | { kind: 'mass_delete'; missing: number; total: number }
   | { kind: 'root_change'; from: string | null; to: string | null; files: number };
 
+/** Where an indexed file comes from. */
+export type UserDocsSourceKind = 'local' | 'drive';
+
+/**
+ * Why the Drive source is held (`source_state('drive')`). Revoked and
+ * unlinked hide Drive from search and remove its index at `detail.purge_at`;
+ * unreachable and misconfigured keep the index searchable (possibly stale)
+ * and never remove anything.
+ */
+export type UserDocsDriveHoldReason =
+  | 'auth_revoked'
+  | 'drive_unlinked'
+  | 'drive_unreachable'
+  | 'drive_misconfigured';
+
+/** A folder in `include_folders`, as the Drive view reports it: a bare
+ *  Drive folder id, or one the server resolved to a name. */
+export type UserDocsDriveFolderRef = string | { id: string; name?: string | null; path?: string | null };
+
+/**
+ * The Drive half of the snapshot (`snapshot.drive`, the runtime's
+ * `DriveSource.view()`). It is reported beside the top-level state rather
+ * than folded into it, because that state belongs to the local folder: a
+ * Drive hold must not hide a local one, nor the reverse.
+ */
+export interface UserDocsDriveView {
+  enabled: boolean;
+  /** live | hold | disabled */
+  state: 'live' | 'hold' | 'disabled' | string;
+  reason: UserDocsDriveHoldReason | string | null;
+  /** Hold details: `purge_at` (epoch ms, revoked / unlinked only), `message`. */
+  detail?: Record<string, any> | null;
+  /** The Google account the index was built from. */
+  account_email?: string | null;
+  identity_set?: boolean;
+  whole_drive?: boolean;
+  include_folders?: UserDocsDriveFolderRef[];
+  /** Last change-feed poll and last full reconcile (epoch s or ms). */
+  last_sync_at?: number | null;
+  last_full_at?: number | null;
+  counts?: { indexed?: number; pending?: number; error?: number; metadata_only?: number };
+  /** A held mass removal, confirmed with `source: 'drive'`. */
+  confirmation?: UserDocsConfirmation | null;
+}
+
 /**
  * The one snapshot every surface reads (`app/userdocs/state.py`). Each frame
  * replaces the previous one outright. Everything after `sources` is only
@@ -181,6 +226,8 @@ export interface UserDocsSnapshot {
   confirmation?: UserDocsConfirmation | null;
   engine_sources?: Record<string, { root?: string; watch?: string | null; watch_reason?: string | null }>;
   watch?: { mode: string | null; reason: string | null };
+  /** Google Drive, reported separately from the local folder's state. */
+  drive?: UserDocsDriveView | null;
 }
 
 /**
@@ -252,8 +299,18 @@ export interface UserDocsPolicyView {
 export interface UserDocsDriveLink {
   linked: boolean;
   email?: string | null;
+  /** The scopes include all of Drive (`drive` / `drive.readonly`): such an
+   *  account must choose `include_folders` before Drive can be turned on. */
   whole_drive?: boolean;
   access_model?: string | null;
+  /** The token predates the scopes Cremind now asks for — re-link. */
+  scopes_stale?: boolean;
+  /** The account the Drive index was built from; after a re-link to another
+   *  address it differs from `email` until the engine has re-indexed. */
+  identity_email?: string | null;
+  /** The engine's Drive view as of the settings read (same shape as
+   *  `snapshot.drive`); the live snapshot supersedes it. */
+  index?: UserDocsDriveView | null;
 }
 
 /** Why images can't be sent to a vision model right now. The first four are
@@ -391,6 +448,7 @@ export type UserDocsControlAction =
   | 'pause'
   | 'resume'
   | 'rescan'
+  | 'sync_now'
   | 'reindex'
   | 'retry_failed'
   | 'rebuild'
@@ -402,7 +460,12 @@ export type UserDocsControlAction =
 
 export interface UserDocsControlRequest {
   action: UserDocsControlAction;
-  /** File ids (8-character cite ids) or paths relative to the root. */
+  /** Which source the action is for (rescan, sync_now, confirm_deletions,
+   *  reject_deletions, retry_failed, reindex). The server defaults to local,
+   *  so it is only sent for Drive. */
+  source?: UserDocsSourceKind;
+  /** File ids (8-character cite ids) or paths relative to the root (for
+   *  Drive: display paths or Drive file ids). */
   targets?: string[];
   /** rebuild: also re-read every file, not just re-embed the stored text. */
   reextract?: boolean;
@@ -434,6 +497,11 @@ export interface UserDocsFileRow {
   indexed_at: number | null;
   chunks: number | null;
   caption_state: string | null;
+  /** `local` | `drive`. */
+  source: string | null;
+  /** Drive rows: the file's page in Google Drive. Put in an href only
+   *  through `safeWebLink` (https only). */
+  web_link: string | null;
 }
 
 export interface UserDocsFilesQuery {
@@ -459,7 +527,6 @@ export interface UserDocsFileDetail extends UserDocsFileRow {
   first_seen_at: number | null;
   taken_at: number | null;
   doc_created_at: number | null;
-  source: string | null;
 }
 
 export interface UserDocsActivityEvent {
@@ -494,8 +561,8 @@ export interface UserDocsStorageInfo {
  * A non-2xx answer from `/api/userdocs/*`, with the server's structure kept.
  * `code` is the body's `error` field (`ValidationFailed`,
  * `ConfirmationRequired`, `FeatureNotInstalled`, `FeatureDisabledByAdmin`,
- * `EmbeddingDisabled`, `DriveNotLinked`, `NotEnabled`, `EngineNotRunning`,
- * `NotFound`, …).
+ * `EmbeddingDisabled`, `DriveNotLinked`, `DriveFoldersRequired`,
+ * `DriveUnreachable`, `NotEnabled`, `EngineNotRunning`, `NotFound`, …).
  */
 export class UserDocsApiError extends Error {
   readonly status: number;
@@ -649,6 +716,33 @@ export function browseUserDocsFolders(
   if (hidden) params.set('hidden', '1');
   const qs = params.toString();
   return request(agentUrl, token, `/api/userdocs/browse${qs ? `?${qs}` : ''}`);
+}
+
+export interface DriveFolder {
+  id: string;
+  name: string;
+}
+
+export interface DriveFolderListing {
+  folders: DriveFolder[];
+  /** The folder listed; null at the top (My Drive for a whole-Drive account,
+   *  the granted folders for a per-file one). */
+  parent: DriveFolder | null;
+  whole_drive: boolean;
+}
+
+/**
+ * One level of the linked Google Drive's folders, for the `include_folders`
+ * picker. `parent: null` lists the top. Throws `UserDocsApiError` —
+ * `DriveNotLinked` (409) or `DriveUnreachable` (503).
+ */
+export function listDriveFolders(
+  agentUrl: string,
+  token: string,
+  parent: string | null,
+): Promise<DriveFolderListing> {
+  const qs = parent ? `?parent=${encodeURIComponent(parent)}` : '';
+  return request(agentUrl, token, `/api/userdocs/drive/folders${qs}`);
 }
 
 export function getUserDocsAdmin(agentUrl: string, token: string): Promise<UserDocsAdminView> {

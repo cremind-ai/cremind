@@ -84,6 +84,17 @@ VISIBLE_SQL = "status NOT IN ('missing', 'tombstone')"
 # that initial sync, so their first_seen_at is the day the index was built.
 INITIAL_SYNC_WINDOW_S = 6 * 3600.0
 
+# A first-seen cutoff: one epoch for every row, or one per source (the local
+# folder and Drive had their first syncs on different days), or None.
+Cutoff = float | dict[str, float] | None
+
+
+def cutoff_for(cutoff: Cutoff, source: str | None) -> float | None:
+    """The first-seen cutoff that applies to a row of ``source``."""
+    if isinstance(cutoff, dict):
+        return cutoff.get(source or "local")
+    return cutoff
+
 _SCREENSHOT_RE = re.compile(r"screen\s*shot|screenshot|chup\s*man\s*hinh|anh\s*man\s*hinh|snip", re.I)
 
 
@@ -188,7 +199,7 @@ def date_columns(date_field: str) -> tuple[str, ...]:
 
 
 def matched_date(row: dict[str, Any], date_field: str, window: DateWindow | None,
-                 first_seen_cutoff: float | None) -> tuple[str, float] | None:
+                 first_seen_cutoff: Cutoff) -> tuple[str, float] | None:
     """Which date of ``row`` put it in ``window`` — ``(column, ts)`` — or,
     with no window, the date to show for it (modified). None when nothing
     matches."""
@@ -197,7 +208,7 @@ def matched_date(row: dict[str, Any], date_field: str, window: DateWindow | None
         return ("mtime", float(ts)) if ts else None
     for col in date_columns(date_field):
         ts = row.get(col)
-        if col == "first_seen_at" and not _first_seen_counts(ts, first_seen_cutoff):
+        if col == "first_seen_at" and not _first_seen_counts(ts, cutoff_for(first_seen_cutoff, row.get("source"))):
             continue
         if window.contains(ts):
             return col, float(ts)
@@ -445,7 +456,7 @@ class Scope:
     source: str | None = None
     hidden_sources: frozenset[str] = frozenset()
     window: DateWindow | None = None
-    first_seen_cutoff: float | None = None
+    first_seen_cutoff: Cutoff = None
     notes: list[str] = field(default_factory=list)
     # A hard filter matched nothing (an unknown folder, a file id that does
     # not exist): the answer is "no results", never "all results".
@@ -536,10 +547,20 @@ def file_conditions(f: Filters, scope: Scope, *, cite_ids: list[str] | None = No
         parts = []
         for col in date_columns(f.date_field):
             if col == "first_seen_at":
-                if scope.first_seen_cutoff is None:
+                cut = scope.first_seen_cutoff
+                if isinstance(cut, dict):
+                    # Each source counts from its own first sync.
+                    for src, value in sorted(cut.items()):
+                        if value is None:
+                            continue
+                        parts.append("(source = ? AND first_seen_at > ? AND first_seen_at >= ? "
+                                     "AND first_seen_at < ?)")
+                        params += [src, value, _finite(scope.window.start), _finite(scope.window.end)]
+                    continue
+                if cut is None:
                     continue
                 parts.append("(first_seen_at > ? AND first_seen_at >= ? AND first_seen_at < ?)")
-                params += [scope.first_seen_cutoff, _finite(scope.window.start), _finite(scope.window.end)]
+                params += [cut, _finite(scope.window.start), _finite(scope.window.end)]
             else:
                 parts.append(f"({col} >= ? AND {col} < ?)")
                 params += [_finite(scope.window.start), _finite(scope.window.end)]
@@ -580,14 +601,20 @@ def glob_match(rel_path: str, globs: list[str]) -> bool:
     return False
 
 
+# Drive holds that hide Drive's rows: Google no longer lets Cremind read the
+# account (access revoked, or the link removed outside Cremind), so what the
+# index holds is served to nobody until Google is re-linked or it is purged.
+HIDDEN_HOLD_REASONS = frozenset({"auth_revoked", "drive_unlinked"})
+
+
 def hidden_sources(db: Any) -> frozenset[str]:
-    """Sources whose rows must not be served: a Drive whose authorisation was
-    revoked is on hold until it is re-linked or purged."""
+    """Sources whose rows must not be served: a Drive whose access was
+    revoked or unlinked is on hold until it is re-linked or purged."""
     try:
         drive = db.get_source_state("drive")
     except Exception:  # noqa: BLE001 — a state read must not break search
         return frozenset()
-    if (drive or {}).get("state") == "hold" and (drive or {}).get("reason") in ("auth_revoked",):
+    if (drive or {}).get("state") == "hold" and (drive or {}).get("reason") in HIDDEN_HOLD_REASONS:
         return frozenset({"drive"})
     return frozenset()
 
@@ -599,7 +626,7 @@ def resolve_scope(
     folders: list[dict[str, Any]] | None,
     tz: _dt.tzinfo,
     widen_days: int = 0,
-    first_seen_cutoff: float | None = None,
+    first_seen_cutoff: Cutoff = None,
     ignore_date: bool = False,
 ) -> Scope:
     """Run the hard filters against the index and return the scope.
@@ -703,11 +730,13 @@ def soft_boost(row: dict[str, Any], f: Filters, identity: dict[str, Any]) -> tup
 
 
 __all__ = [
+    "Cutoff",
     "DATE_FIELDS",
     "DATE_LABELS",
     "DateWindow",
     "FilterError",
     "Filters",
+    "HIDDEN_HOLD_REASONS",
     "IMAGE_ORIGINS",
     "INITIAL_SYNC_WINDOW_S",
     "SOURCES",
@@ -715,6 +744,7 @@ __all__ = [
     "TYPE_KINDS",
     "TYPE_NAMES",
     "VISIBLE_SQL",
+    "cutoff_for",
     "date_columns",
     "file_conditions",
     "folder_conditions",

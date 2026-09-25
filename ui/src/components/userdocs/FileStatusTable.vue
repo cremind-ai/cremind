@@ -8,15 +8,20 @@
  *
  * Reindex is emitted, not sent: the page runs every control action, so their
  * errors and the snapshot they return land in one place.
+ *
+ * With Google Drive on, files come from two sources: a source filter and
+ * column appear, and a Drive file links to its page in Drive (https links
+ * only — the link is server-supplied).
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { ElButton, ElInput, ElTable, ElTableColumn } from 'element-plus';
+import { ElButton, ElInput, ElOption, ElSelect, ElTable, ElTableColumn } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../../stores/settings';
 import {
   listUserDocsFiles,
   UserDocsApiError,
   type UserDocsFileRow,
+  type UserDocsSourceKind,
 } from '../../services/userdocsApi';
 import {
   STATUS_ORDER,
@@ -24,6 +29,8 @@ import {
   formatBytes,
   formatCount,
   reasonLabel,
+  safeWebLink,
+  sourceLabel,
   statusLabel,
 } from '../../utils/userdocsView';
 
@@ -31,10 +38,13 @@ const props = withDefaults(defineProps<{
   /** Bump to reload from the first page (after a reindex, a rescan…). */
   refreshKey?: number;
   busy?: boolean;
-}>(), { refreshKey: 0, busy: false });
+  /** Files come from more than one source (Google Drive is on). */
+  showSource?: boolean;
+}>(), { refreshKey: 0, busy: false, showSource: false });
 
 const emit = defineEmits<{
-  reindex: [targets: string[]];
+  /** `source` is set for Drive files only (the server defaults to local). */
+  reindex: [targets: string[], source?: UserDocsSourceKind];
   'engine-down': [];
 }>();
 
@@ -42,6 +52,7 @@ const settingsStore = useSettingsStore();
 
 const PAGE = 100;
 const status = ref<string>('');
+const source = ref<'' | UserDocsSourceKind>('');
 const query = ref('');
 const files = ref<UserDocsFileRow[]>([]);
 const counts = ref<Record<string, number>>({});
@@ -71,6 +82,7 @@ async function load(reset: boolean) {
   try {
     const page = await listUserDocsFiles(settingsStore.agentUrl, settingsStore.authToken, {
       status: status.value || null,
+      source: (props.showSource && source.value) || null,
       q: query.value.trim() || null,
       after: reset ? null : next.value,
       limit: PAGE,
@@ -105,7 +117,28 @@ watch(query, () => {
   searchTimer = setTimeout(() => { searchTimer = null; void load(true); }, 300);
 });
 watch(status, () => { void load(true); });
+watch(source, () => { void load(true); });
 watch(() => props.refreshKey, () => { void load(true); });
+// Drive turned off: back to one source (the filter would hide the rest).
+watch(() => props.showSource, (shown) => { if (!shown) source.value = ''; });
+
+const SOURCE_OPTIONS: { value: '' | UserDocsSourceKind; label: string }[] = [
+  { value: '', label: 'All sources' },
+  { value: 'local', label: sourceLabel('local') },
+  { value: 'drive', label: sourceLabel('drive') },
+];
+
+// Table slot rows are typed loosely by ElTable, hence Partial.
+function isDrive(row: Partial<UserDocsFileRow>): boolean {
+  return row.source === 'drive';
+}
+
+function reindexRow(row: Partial<UserDocsFileRow>) {
+  const target = row.fid || row.rel_path || '';
+  if (!target) return;
+  if (isDrive(row)) emit('reindex', [target], 'drive');
+  else emit('reindex', [target]);
+}
 
 onMounted(() => { void load(true); });
 onBeforeUnmount(() => { if (searchTimer !== null) clearTimeout(searchTimer); });
@@ -145,15 +178,26 @@ defineExpose({ showStatus, reload: () => load(true) });
           {{ tab.label }} <span class="tab-n">{{ formatCount(tab.n) }}</span>
         </button>
       </div>
-      <ElInput
-        v-model="query"
-        size="small"
-        clearable
-        placeholder="Search names and paths"
-        class="files-search"
-      >
-        <template #prefix><Icon icon="mdi:magnify" /></template>
-      </ElInput>
+      <div class="files-filters">
+        <ElSelect
+          v-if="showSource"
+          v-model="source"
+          size="small"
+          class="files-source"
+          aria-label="Source"
+        >
+          <ElOption v-for="o in SOURCE_OPTIONS" :key="o.value || 'all'" :value="o.value" :label="o.label" />
+        </ElSelect>
+        <ElInput
+          v-model="query"
+          size="small"
+          clearable
+          placeholder="Search names and paths"
+          class="files-search"
+        >
+          <template #prefix><Icon icon="mdi:magnify" /></template>
+        </ElInput>
+      </div>
     </div>
 
     <p v-if="note" class="note">{{ note }}</p>
@@ -167,6 +211,17 @@ defineExpose({ showStatus, reload: () => load(true) });
       class="files-table"
       empty-text="No files"
     >
+      <ElTableColumn v-if="showSource" label="Source" width="64" align="center">
+        <template #default="{ row }">
+          <Icon
+            :icon="isDrive(row) ? 'mdi:google-drive' : 'mdi:laptop'"
+            class="cell-source"
+            :class="{ drive: isDrive(row) }"
+            :title="sourceLabel(row.source)"
+            :aria-label="sourceLabel(row.source)"
+          />
+        </template>
+      </ElTableColumn>
       <ElTableColumn label="File" min-width="260">
         <template #default="{ row }">
           <div class="cell-file">
@@ -198,17 +253,30 @@ defineExpose({ showStatus, reload: () => load(true) });
       <ElTableColumn label="Passages" width="84" align="right">
         <template #default="{ row }">{{ row.chunks ?? '' }}</template>
       </ElTableColumn>
-      <ElTableColumn width="96" align="right">
+      <ElTableColumn :width="showSource ? 124 : 96" align="right">
         <template #default="{ row }">
-          <ElButton
-            size="small"
-            text
-            :disabled="busy || row.status === 'missing'"
-            title="Read this file again and update its index"
-            @click="emit('reindex', [row.fid || row.rel_path])"
-          >
-            Reindex
-          </ElButton>
+          <div class="cell-actions">
+            <a
+              v-if="isDrive(row) && safeWebLink(row.web_link)"
+              :href="safeWebLink(row.web_link) ?? undefined"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="open-drive"
+              title="Open in Google Drive"
+              aria-label="Open in Google Drive"
+            >
+              <Icon icon="mdi:open-in-new" />
+            </a>
+            <ElButton
+              size="small"
+              text
+              :disabled="busy || row.status === 'missing'"
+              title="Read this file again and update its index"
+              @click="reindexRow(row)"
+            >
+              Reindex
+            </ElButton>
+          </div>
         </template>
       </ElTableColumn>
     </ElTable>
@@ -222,7 +290,9 @@ defineExpose({ showStatus, reload: () => load(true) });
 <style scoped>
 .files { display: flex; flex-direction: column; gap: 10px; }
 .files-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.files-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .files-search { width: 220px; }
+.files-source { width: 150px; }
 .tabs { display: flex; flex-wrap: wrap; gap: 4px; }
 .tab {
   display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px;
@@ -254,6 +324,14 @@ defineExpose({ showStatus, reload: () => load(true) });
 .status-dot.st-dirty { --tone: var(--primary-color); }
 .status-dot.st-error { --tone: var(--danger-color); }
 .status-dot.st-missing, .status-dot.st-deferred, .status-dot.st-awaiting_extractor { --tone: var(--warning-color); }
+.cell-source { font-size: 16px; color: var(--text-secondary); vertical-align: middle; }
+.cell-source.drive { color: var(--primary-color); }
+.cell-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 2px; }
+.open-drive {
+  display: inline-flex; padding: 4px; border-radius: 4px; line-height: 1;
+  color: var(--text-secondary); font-size: 15px;
+}
+.open-drive:hover { color: var(--primary-color); background: var(--hover-bg); }
 .note { margin: 0; font-size: 0.85rem; color: var(--text-secondary); }
 .more { display: flex; justify-content: center; }
 </style>

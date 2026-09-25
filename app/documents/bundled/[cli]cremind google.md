@@ -1,5 +1,5 @@
 ---
-description: "**Unlink, disconnect, revoke, or remove a linked Google account** from the Google Suite skills (`gmail`, `gcalendar`, `gdrive`, `gsheets`, `gdocs`), and show which Google account each one uses. Use it when the user wants to sign out of Google, log out, switch Google account, remove the wrong account, or revoke Cremind's access to Gmail/Calendar/Drive/Sheets/Docs. `cremind google status` reports the linked address per skill; `cremind google unlink <skill>` deletes this machine's credentials and revokes access at Google; `--all` does every Google skill at once. Two facts matter: **Google treats Cremind as ONE app**, so revoking one skill's grant can end it for every sibling skill on the same address — a per-skill unlink therefore declines to revoke while a sibling still shares it; and **unlinking gdrive destroys its per-file grants permanently**, so the user must pick the files again after re-linking. Re-linking needs a fresh consent from chat via the skill itself. Distinct from `cremind calendar google disconnect` (the Calendar & Schedule page's credential)."
+description: "**Unlink, disconnect, revoke, or remove a linked Google account** from the Google Suite skills (`gmail`, `gcalendar`, `gdrive`, `gsheets`, `gdocs`), and show which Google account each one uses. Use it when the user wants to sign out of Google, log out, switch Google account, remove the wrong account, or revoke Cremind's access to Gmail/Calendar/Drive/Sheets/Docs. `cremind google status` reports the linked address per skill; `cremind google unlink <skill>` deletes this machine's credentials and revokes access at Google; `--all` does every Google skill at once. Two facts matter: **Google treats Cremind as ONE app**, so revoking one skill's grant can end it for every sibling skill on the same address — a per-skill unlink therefore declines to revoke while a sibling still shares it; and **unlinking gdrive destroys its per-file grants permanently** (the user must pick the files again after re-linking) and removes the Drive files indexed for search. Re-linking needs a fresh consent from chat via the skill itself. Distinct from `cremind calendar google disconnect` (the Calendar & Schedule page's credential)."
 ---
 
 # `cremind google` — linked Google accounts
@@ -123,6 +123,8 @@ Google push channel is closed (this needs a live credential, so it happens befor
 the revoke); the grant is revoked at Google; the local files are deleted; and the
 backend's cached tokens for that profile are dropped. `scripts/.env` is
 **preserved** — it holds bring-your-own-client configuration, not link state.
+Unlinking `gdrive` also deletes that profile's Drive index in User Document
+Search (`cremind userdocs drive`) at once; unlinking any other skill leaves it.
 
 Unlinking something that is not linked succeeds and reports `not linked`, so the
 command is safe to repeat.

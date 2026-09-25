@@ -292,3 +292,101 @@ def test_a_publish_failure_never_fails_a_completed_unlink(wired, monkeypatch):
     resp = asyncio.run(UNLINK(_req(skill="gmail")))
 
     assert resp.status_code == 200
+
+
+# ── the Drive index of User Document Search ──────────────────────────────────
+#
+# A gdrive unlink through Cremind deletes the Drive index at once — but only
+# when the link is really gone (engine report AND filesystem), and never for
+# another skill's unlink.
+
+
+@pytest.fixture
+def purges(monkeypatch):
+    import app.drive.skill_token as drive_token
+    from app.userdocs import state as uds_state
+
+    recorded: List[tuple] = []
+    token: Dict[str, Any] = {"path": None}  # the gdrive token file as the filesystem sees it
+    monkeypatch.setattr(drive_token, "token_path", lambda profile: token["path"])
+    uds_state.set_purge_handler(lambda profile, kind: recorded.append((profile, kind)))
+    yield SimpleNamespace(recorded=recorded, token=token)
+    uds_state.set_purge_handler(None)
+
+
+def test_a_gdrive_unlink_purges_the_drive_index(wired, purges):
+    resp = asyncio.run(UNLINK(_req("alice", skill="gdrive")))
+
+    assert resp.status_code == 200
+    assert purges.recorded == [("alice", "drive")]
+
+
+def test_unlinking_a_gdrive_that_was_not_linked_still_purges(wired, purges):
+    """The user asked Cremind to drop Drive; whatever index is left goes too."""
+    wired.state["result"] = {"ok": True, "unlinked": False, "already": True, "still_linked": False}
+
+    asyncio.run(UNLINK(_req("alice", skill="gdrive")))
+
+    assert purges.recorded == [("alice", "drive")]
+
+
+def test_a_failed_wipe_keeps_the_drive_index(wired, purges):
+    wired.state["result"] = {"ok": False, "unlinked": False, "still_linked": True}
+
+    resp = asyncio.run(UNLINK(_req("alice", skill="gdrive")))
+
+    assert resp.status_code == 500
+    assert purges.recorded == []
+
+
+def test_a_token_back_on_disk_keeps_the_drive_index(wired, purges):
+    """Re-linked from chat between the wipe and the check: a live link again."""
+    purges.token["path"] = object()
+
+    asyncio.run(UNLINK(_req("alice", skill="gdrive")))
+
+    assert purges.recorded == []
+
+
+@pytest.mark.parametrize("skill", ["gcalendar", "gmail", "gsheets", "gdocs"])
+def test_other_skills_never_purge_the_drive_index(wired, purges, skill):
+    asyncio.run(UNLINK(_req("alice", skill=skill)))
+
+    assert purges.recorded == []
+
+
+def test_unlink_all_purges_drive_when_gdrive_went(wired, purges):
+    wired.state["all"] = {
+        "ok": True, "failed": [],
+        "results": [{"skill": "gcalendar", "still_linked": False}, {"skill": "gdrive", "still_linked": False}],
+    }
+
+    asyncio.run(UNLINK_ALL(_req("alice")))
+
+    assert purges.recorded == [("alice", "drive")]
+
+
+def test_unlink_all_without_gdrive_or_with_its_wipe_failed_keeps_it(wired, purges):
+    wired.state["all"] = {"ok": True, "failed": [], "results": [{"skill": "gmail", "still_linked": False}]}
+    asyncio.run(UNLINK_ALL(_req("alice")))
+
+    wired.state["all"] = {
+        "ok": False, "failed": ["gdrive"], "results": [{"skill": "gdrive", "still_linked": True}],
+    }
+    asyncio.run(UNLINK_ALL(_req("alice")))
+
+    assert purges.recorded == []
+
+
+def test_a_purge_failure_never_fails_a_completed_unlink(wired, purges):
+    from app.userdocs import state as uds_state
+
+    def explode(profile, kind):
+        raise RuntimeError("engine queue closed")
+
+    uds_state.set_purge_handler(explode)
+
+    resp = asyncio.run(UNLINK(_req("alice", skill="gdrive")))
+
+    assert resp.status_code == 200
+    assert wired.published["settings"] == ["alice"]

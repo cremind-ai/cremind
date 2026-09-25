@@ -6,7 +6,12 @@ profile that has the feature switched on, and owns:
 - the profile's index file (:class:`~app.userdocs.index.IndexDB`),
 - the folder watcher (or the polling schedule when watching cannot work),
 - full scans (boot catch-up, periodic reconcile, after a burst of events),
-- the per-file pipeline — fingerprint → extract → chunk → diff → write.
+- the per-file pipeline — fingerprint → extract → chunk → diff → write,
+- the Google Drive half (``rt.drive``, a
+  :class:`~app.userdocs.sources.drive.DriveSource`), which shares the index
+  file and the content tail (:meth:`index_content`) but has its own sync,
+  holds and confirmations. Either half may be on without the other: the
+  index stays open while either is.
 
 Vectors are deliberately *not* written here. The pipeline stores chunks with
 ``vec_gen = NULL`` and the service's embedding loop fills them in
@@ -30,7 +35,7 @@ import datetime as _dt
 import os
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from app.userdocs import settings as uds
 from app.userdocs import state as uds_state
@@ -98,6 +103,18 @@ def ts_from_iso(value: Any) -> float | None:
         return None
 
 
+def extract_outcome(result: t.ExtractResult) -> tuple[str, str | None, str | None]:
+    """(status, reason, error) of an extraction, as the index records it."""
+    doc_meta = result.doc_meta or {}
+    if result.status in (t.EXTRACT_OK, t.EXTRACT_PARTIAL):
+        return "indexed", (f"partial:{result.reason}" if result.status == t.EXTRACT_PARTIAL else None), None
+    if result.status == t.EXTRACT_METADATA_ONLY:
+        return "metadata_only", result.reason, None
+    if result.reason == "awaiting_extractor":
+        return "awaiting_extractor", (doc_meta.get("missing") or "extractor"), None
+    return "error", (result.reason or "corrupt"), doc_meta.get("error")
+
+
 def _norm(path: str | None) -> str:
     return os.path.normcase(os.path.normpath(path)) if path else ""
 
@@ -138,7 +155,8 @@ class ProfileRuntime:
         self.progress = SyncProgress(profile, publish=uds_state.publish_snapshot)
         self.db: Any = None
 
-        self.settings: dict[str, Any] = {}
+        self.settings: dict[str, Any] = {}      # the local row (per-profile options live here)
+        self.drive_settings: dict[str, Any] = {}
         self.root: str | None = None
         self.matcher: Any = None
         self.watcher: Any = None
@@ -169,20 +187,31 @@ class ProfileRuntime:
         self._pending_changed: set[str] = set()
         self._pending_removed: set[str] = set()
         self._folder_cache: dict[str, int] = {}
+        # Dirty files per source, from the last refresh_totals: what is
+        # waiting depends on whether that source may work right now.
+        self._dirty: dict[str, int] = {}
         self.stop_event = threading.Event()
+        self._closed = False
 
         from app.userdocs.discovery.guard import DeleteBurst, RootGuard
+        from app.userdocs.sources.drive import DriveSource
 
         self.guard = RootGuard()
         self.delete_burst = DeleteBurst()
+        self.drive = DriveSource(self)
 
     # ── index file ─────────────────────────────────────────────────────────
 
     def ensure_db(self):
-        """Open (or create, or rebuild) this profile's index file."""
+        """Open (or create, or rebuild) this profile's index file.
+
+        Refused once the runtime is closed: a Drive sync still unwinding
+        after the profile's index was deleted must not create it again."""
         with self.lock:
             if self.db is not None and not self.db.closed:
                 return self.db
+            if self._closed:
+                raise RuntimeError("the runtime is closed")
             from app.userdocs.index import (
                 IndexCorrupt,
                 IndexDB,
@@ -205,10 +234,16 @@ class ProfileRuntime:
             return self.db
 
     def close(self) -> None:
+        # Drive first: its sync notices the close before the index goes.
+        try:
+            self.drive.close()
+        except Exception:  # noqa: BLE001
+            logger.exception(f"[userdocs] {self.profile}: closing the Drive source failed")
         self.stop_event.set()
         self._stop_watching()
         self.progress.close()
         with self.lock:
+            self._closed = True
             if self.db is not None:
                 try:
                     self.db.close()
@@ -224,14 +259,21 @@ class ProfileRuntime:
         Called after every settings save, admin-gate change and embedding
         transition, and at boot. Idempotent: it only starts or stops what
         actually changed.
+
+        Drive is configured first, from its own row (it applies the admin
+        gate itself): whether it is on decides if the index stays open when
+        the local folder is off.
         """
         from app.storage.userdocs_storage import get_userdocs_storage
 
         storage = get_userdocs_storage()
         row = storage.get_source(self.profile, SOURCE) or {}
+        drive_row = storage.get_source(self.profile, uds.SOURCE_DRIVE) or {}
         policy = uds.read_admin_policy()
         ok, reason = uds.feature_effective(policy)
         self.settings = row
+        self.drive_settings = drive_row
+        self._configure_drive(drive_row, ok)
 
         if not row.get("enabled"):
             self._deactivate("disabled", None)
@@ -305,19 +347,45 @@ class ProfileRuntime:
             self._start_watching(opts)
         self.request_scan("configure")
 
+    def _configure_drive(self, row: dict[str, Any], ok: bool) -> None:
+        """Hand the drive row to the Drive half. The user's pause is one
+        switch for the whole profile, kept in the local source state, so a
+        Drive-only profile reads it here."""
+        if ok and row.get("enabled"):
+            try:
+                db = self.ensure_db()
+                self.paused_user = bool(db.get_source_state(SOURCE).get("paused_user"))
+            except Exception:  # noqa: BLE001
+                logger.exception(f"[userdocs] {self.profile}: could not open the index for Google Drive")
+        try:
+            self.drive.configure(row or None)
+        except Exception:  # noqa: BLE001 — Drive must never stop the local folder from configuring
+            logger.exception(f"[userdocs] {self.profile}: configuring Google Drive failed")
+
     def _deactivate(self, state: str, reason: str | None) -> None:
         self.active = False
         self._stop_watching()
+        # Disabled but kept: close the file (it reopens on enable) — unless
+        # Drive, which shares it, is still on.
+        close = state == "disabled" and not self.drive.enabled
+        if close and self.db is not None and self.pending_vector_deletes:
+            # Nothing flushes them once the file is closed (a Drive index
+            # deleted as Drive was turned off, say).
+            from app.userdocs import vector_sync
+
+            vector_sync.flush_deletes(self)
         with self.lock:
             self.suspended = reason if state == "suspended" else None
-            if state == "disabled" and self.db is not None:
-                # Disabled but kept: close the file; it reopens on enable.
+            if close and self.db is not None:
                 try:
                     self.db.close()
                 except Exception:  # noqa: BLE001
                     pass
                 self.db = None
-        self.progress.set_state(state, reason)
+        if self.drive.enabled:
+            self._publish_state()
+        else:
+            self.progress.set_state(state, reason)
 
     def _set_hold(self, reason: str, detail: dict[str, Any] | None) -> None:
         with self.lock:
@@ -889,13 +957,18 @@ class ProfileRuntime:
     # ── the per-file pipeline ──────────────────────────────────────────────
 
     def process(self, row: dict[str, Any]) -> None:
-        """Index one dirty file (pipeline worker thread)."""
+        """Index one dirty file (pipeline worker thread): a folder file here,
+        a Drive file by the Drive half — both end in :meth:`index_content`."""
         fid = int(row["id"])
         rel = row["rel_path"]
         name = row.get("name") or rel.rsplit("/", 1)[-1]
+        source = row.get("source") or SOURCE
         self.progress.file_started(fid, name=name, rel_path=rel, stage="read")
         try:
-            outcome, message, reason = self._process(row)
+            if source == uds.SOURCE_DRIVE:
+                outcome, message, reason = self.drive.process(row)
+            else:
+                outcome, message, reason = self._process(row)
         except Exception as exc:  # noqa: BLE001 — one bad file never stops the queue
             logger.exception(f"[userdocs] {self.profile}: indexing {rel} failed")
             outcome, message, reason = "failed", f"{name}: {exc}", "internal_error"
@@ -904,7 +977,7 @@ class ProfileRuntime:
                                     reason=reason, fid=row.get("cite_id"))
         if outcome not in ("unchanged",) and self.db is not None:
             level = "error" if outcome == "failed" else "info"
-            self.db.add_activity(outcome, message, source=SOURCE, level=level, file_id=fid, rel_path=rel)
+            self.db.add_activity(outcome, message, source=source, level=level, file_id=fid, rel_path=rel)
 
     def _mark_failed(self, row: dict[str, Any], reason: str, error: str | None) -> None:
         if self.db is None:
@@ -917,8 +990,7 @@ class ProfileRuntime:
 
     def _process(self, row: dict[str, Any]) -> tuple[str, str, str | None]:
         from app.userdocs import governor as gov
-        from app.userdocs.chunking import CHUNKER_VERSION, chunk_blocks, detect_legal_meta, diff_chunks, looks_legal
-        from app.userdocs.chunking import make_file_card
+        from app.userdocs.chunking import CHUNKER_VERSION
         from app.userdocs.discovery.hashing import QUICK_HASH_MIN_SIZE, fs_path, is_placeholder, quick_hash, sha256_file
         from app.userdocs.discovery.ignore import METADATA_ONLY, SKIP
         from app.userdocs.extract import EXTRACTOR_VERSION
@@ -1033,34 +1105,106 @@ class ProfileRuntime:
                 doc_meta = dict(result.doc_meta or {})
                 exif = result.exif
                 image = result.image
-                if result.status in (t.EXTRACT_OK, t.EXTRACT_PARTIAL):
-                    self.progress.file_stage(fid, "chunk")
-                    legal = looks_legal(result.blocks)
-                    body = chunk_blocks(result.blocks, legal=legal)
-                    if legal:
-                        meta = detect_legal_meta(result.blocks)
-                        if meta:
-                            doc_meta["legal"] = meta
-                    if result.status == t.EXTRACT_PARTIAL:
-                        reason = f"partial:{result.reason}"
-                    if result.ocr_pages:
-                        doc_meta["scanned_pages"] = [p.get("page") for p in result.ocr_pages]
-                elif result.status == t.EXTRACT_METADATA_ONLY:
-                    status, reason = "metadata_only", result.reason
-                elif result.reason == "awaiting_extractor":
-                    status, reason = "awaiting_extractor", (doc_meta.get("missing") or "extractor")
-                else:
-                    status, reason, error = "error", result.reason or "corrupt", doc_meta.get("error")
-                if result.ocr_pages and status == "indexed":
-                    ocr_chunks, pending, ocr_state = self._ocr_pages(result.ocr_pages, start_ordinal=len(body))
-                    body += ocr_chunks
-                    if pending:
-                        doc_meta["ocr_pending_pages"] = pending
-                        caption_state = ocr_state
-                    else:
-                        doc_meta.pop("ocr_pending_pages", None)
-                        caption_state = "done" if ocr_chunks else caption_state
+                status, reason, error = extract_outcome(result)
+                if sha != row.get("sha256"):
+                    # New content: a caption of the old picture says nothing
+                    # about this one.
+                    caption_state = None
+                if status == "indexed":
+                    body, caption_state = self._body_from_result(fid, result, doc_meta, caption_state)
 
+        return self._write_file(
+            row=row, name=name, rel=rel, kind=kind, mime=mime, sha=sha, hash_kind=hash_kind,
+            size=int(st.st_size), mtime=float(st.st_mtime), body=body, existing=existing,
+            doc_meta=doc_meta, exif=exif, image=image, status=status, reason=reason, error=error,
+            caption_state=caption_state, content_unchanged=content_unchanged,
+            extra={"status": "metadata only (content not read)"} if not content_allowed else None,
+            source=SOURCE, file_fields=fingerprint, caption_path=fs_path(abs_path),
+        )
+
+    # ── the content tail, shared by the folder and Drive ───────────────────
+
+    def index_content(
+        self, *, row: dict[str, Any], name: str, rel: str, kind: str, mime: str | None, sha: str | None,
+        size: int, result: t.ExtractResult | None, status: str, reason: str | None, error: str | None,
+        image: dict[str, Any] | None, exif: dict[str, Any] | None, image_bytes: bytes | None,
+        taken_ts: float | None, created_ts: float | None, extra: dict[str, Any] | None, source: str,
+        drive_fields: dict[str, Any],
+    ) -> tuple[str, str, str | None]:
+        """Index content a source already has in hand — the Drive half's way
+        into the same tail the folder uses: chunks, legal metadata, scanned
+        pages, the image caption (from ``image_bytes``), the file card, the
+        chunk diff and the row. ``result`` None indexes the file by its card
+        alone (metadata only: any earlier body leaves the index).
+
+        ``drive_fields`` (the Drive columns, ``mtime`` and ``birthtime``) are
+        written next to ``size``. Same return contract as the pipeline:
+        (event, activity text, error reason)."""
+        db = self.db
+        if db is None:
+            raise RuntimeError("runtime is not configured")
+        fid = int(row["id"])
+        existing = db.get_chunks(fid)
+        doc_meta: dict[str, Any] = dict(result.doc_meta or {}) if result is not None else {}
+        # A caption made for these very bytes still stands; new bytes start over.
+        caption_state = row.get("caption_state") if (sha and sha == row.get("sha256")) else None
+        body: list[t.Chunk] = []
+        if result is not None and status == "indexed":
+            body, caption_state = self._body_from_result(fid, result, doc_meta, caption_state)
+        fields = dict(drive_fields or {})
+        fields["size"] = int(size or 0)
+        return self._write_file(
+            row=row, name=name, rel=rel, kind=kind, mime=mime, sha=sha, hash_kind="full" if sha else None,
+            size=int(size or 0), mtime=fields.get("mtime"), body=body, existing=existing, doc_meta=doc_meta,
+            exif=exif, image=image, status=status, reason=reason, error=error, caption_state=caption_state,
+            content_unchanged=False, extra=extra or None, source=source, file_fields=fields,
+            caption_data=image_bytes, taken_ts=taken_ts, created_ts=created_ts,
+        )
+
+    def _body_from_result(
+        self, fid: int, result: t.ExtractResult, doc_meta: dict[str, Any], caption_state: str | None,
+    ) -> tuple[list[t.Chunk], str | None]:
+        """The body chunks of a successful extraction: chunked text (legal
+        documents by article), then the transcribed scanned pages. Fills
+        ``doc_meta`` in place; returns (body, caption state)."""
+        from app.userdocs.chunking import chunk_blocks, detect_legal_meta, looks_legal
+
+        self.progress.file_stage(fid, "chunk")
+        legal = looks_legal(result.blocks)
+        body = chunk_blocks(result.blocks, legal=legal)
+        if legal:
+            meta = detect_legal_meta(result.blocks)
+            if meta:
+                doc_meta["legal"] = meta
+        if result.ocr_pages:
+            doc_meta["scanned_pages"] = [p.get("page") for p in result.ocr_pages]
+            ocr_chunks, pending, ocr_state = self._ocr_pages(result.ocr_pages, start_ordinal=len(body))
+            body += ocr_chunks
+            if pending:
+                doc_meta["ocr_pending_pages"] = pending
+                caption_state = ocr_state
+            else:
+                doc_meta.pop("ocr_pending_pages", None)
+                caption_state = "done" if ocr_chunks else caption_state
+        return body, caption_state
+
+    def _write_file(
+        self, *, row: dict[str, Any], name: str, rel: str, kind: str, mime: str | None, sha: str | None,
+        hash_kind: str | None, size: int, mtime: float | None, body: list[t.Chunk], existing: list[Any],
+        doc_meta: dict[str, Any], exif: dict[str, Any] | None, image: dict[str, Any] | None, status: str,
+        reason: str | None, error: str | None, caption_state: str | None, content_unchanged: bool,
+        extra: dict[str, Any] | None, source: str, file_fields: dict[str, Any],
+        caption_path: str | None = None, caption_data: bytes | None = None,
+        taken_ts: float | None = None, created_ts: float | None = None,
+    ) -> tuple[str, str, str | None]:
+        """Caption, card, chunk diff, row: the end of every file's indexing."""
+        from app.userdocs.chunking import CHUNKER_VERSION, diff_chunks, make_file_card
+        from app.userdocs.extract import EXTRACTOR_VERSION
+
+        db = self.db
+        if db is None:
+            raise RuntimeError("runtime is not configured")
+        fid = int(row["id"])
         newly_captioned = False
         if kind == t.KIND_IMAGE and status == "indexed" and caption_state != "done":
             # An image is found by its name, folder, date and camera from the
@@ -1068,23 +1212,25 @@ class ProfileRuntime:
             # Specialized Vision Model, consent and today's quota allow.
             self.progress.file_stage(fid, "caption")
             caption_state, caption_chunk = self._caption_image(
-                rel=rel, sha=sha, abs_path=fs_path(abs_path), image=image, exif=exif, size=int(st.st_size),
+                rel=rel, sha=sha, abs_path=caption_path, data=caption_data, image=image, exif=exif, size=size,
             )
             if caption_chunk is not None:
                 body = [c for c in body if c.ctype != t.CTYPE_CAPTION] + [caption_chunk]
                 newly_captioned = True
 
-        taken_ts = ts_from_iso((exif or {}).get("taken_at"))
-        created_ts = ts_from_iso(doc_meta.get("created"))
+        if taken_ts is None:
+            taken_ts = ts_from_iso((exif or {}).get("taken_at"))
+        if created_ts is None:
+            created_ts = ts_from_iso(doc_meta.get("created"))
         camera = " ".join(x for x in ((exif or {}).get("make"), (exif or {}).get("model")) if x) or None
         summary = body[0].text if body else None
         card = make_file_card(
-            name=name, rel_path=rel, kind=kind, size=int(st.st_size),
-            mtime_iso=iso_local(st.st_mtime) or "",
+            name=name, rel_path=rel, kind=kind, size=size,
+            mtime_iso=iso_local(mtime) or "",
             title=doc_meta.get("title"), author=doc_meta.get("author"),
             created_iso=iso_local(created_ts), taken_iso=iso_local(taken_ts), camera=camera,
             summary_text=summary,
-            extra={"status": "metadata only (content not read)"} if not content_allowed else None,
+            extra=extra,
         )
         new_chunks = [card] + body
         diff = diff_chunks(existing, new_chunks)
@@ -1096,11 +1242,11 @@ class ProfileRuntime:
             "taken_at": taken_ts, "doc_created_at": created_ts,
             "extractor_version": EXTRACTOR_VERSION, "chunker_version": CHUNKER_VERSION,
             "caption_state": caption_state,
-            **fingerprint,
+            **file_fields,
         }
         self.progress.file_stage(fid, "index", {"done": 0, "total": len(diff.add)})
         try:
-            db.apply_chunks(file_id=fid, folder_id=row.get("folder_id"), source=SOURCE, diff=diff,
+            db.apply_chunks(file_id=fid, folder_id=row.get("folder_id"), source=source, diff=diff,
                             file_fields=fields)
         except LookupError:
             return "skipped", f"{name} changed while it was being indexed", None
@@ -1153,9 +1299,14 @@ class ProfileRuntime:
         return captioner.daily_cap(uds.normalize_options(self.settings.get("options")))
 
     def _caption_image(
-        self, *, rel: str, sha: str | None, abs_path: str, image: dict[str, Any] | None,
+        self, *, rel: str, sha: str | None, abs_path: str | None = None, data: bytes | None = None,
+        load: Callable[[], bytes | None] | None = None, image: dict[str, Any] | None,
         exif: dict[str, Any] | None, size: int,
     ) -> tuple[str, t.Chunk | None]:
+        """Caption one image from a file (``abs_path``), bytes in hand
+        (``data``) or bytes fetched only once a vision call will really be
+        made (``load``) — a cached caption or an ineligible image costs no
+        download."""
         from app.storage.userdocs_storage import get_userdocs_storage
         from app.userdocs.chunking import make_caption_chunk
         from app.userdocs.vision import captioner, resolver
@@ -1177,7 +1328,14 @@ class ProfileRuntime:
         if not storage.reserve_vision(self.profile, day, self.caption_cap()):
             return "over_cap", None
         try:
-            jpeg = captioner.prepare_jpeg(path=abs_path)
+            if data is None and abs_path is None and load is not None:
+                data = load()
+            if data is not None:
+                jpeg = captioner.prepare_jpeg(data=data)
+            elif abs_path is not None:
+                jpeg = captioner.prepare_jpeg(path=abs_path)
+            else:
+                raise ValueError("no image to describe")
             llm = resolver.build_vision_llm(self.profile, res)
             out = captioner.run_vision(llm, self.profile, jpeg, mode="image", exif=exif)
         except Exception as exc:  # noqa: BLE001 — a failed call must not eat the quota
@@ -1252,11 +1410,15 @@ class ProfileRuntime:
     def requeue_waiting_vision(self) -> int:
         """Re-queue images (and scanned PDFs) that are waiting for a vision
         model, consent or tomorrow's quota, once what they wait for is there.
-        Called by the service's housekeeping; cheap when nothing waits."""
+        Called by the service's housekeeping; cheap when nothing waits.
+        Covers the folder and Drive alike (a Drive image is downloaded again
+        for its caption); the caption options are the profile's, on the
+        local row."""
         from app.storage.userdocs_storage import get_userdocs_storage
         from app.userdocs.vision import captioner
 
-        if self.db is None or not self.active or self.paused_user:
+        sources = self.syncing_sources()
+        if self.db is None or not sources or self.paused_user:
             return 0
         opts = uds.normalize_options(self.settings.get("options"))
         if not (opts.get("caption") or {}).get("enabled", True):
@@ -1264,10 +1426,10 @@ class ProfileRuntime:
             return 0
         # Images indexed while descriptions were off wait too, once they are on.
         waiting = self.db.read_sql(
-            "SELECT id, kind FROM files WHERE source = ? AND caption_state IN "
+            f"SELECT id, kind FROM files WHERE source IN ({', '.join('?' * len(sources))}) AND caption_state IN "
             "('awaiting_vision', 'awaiting_consent', 'over_cap', 'captions_off') "
             "AND status = 'indexed' ORDER BY COALESCE(taken_at, mtime) DESC LIMIT 5000",
-            (SOURCE,),
+            tuple(sources),
         )
         _res, blocked = self.vision_gate()
         usage = get_userdocs_storage().vision_usage(self.profile, captioner.local_day(self.profile))
@@ -1423,11 +1585,60 @@ class ProfileRuntime:
 
     # ── snapshot ───────────────────────────────────────────────────────────
 
+    def local_on(self) -> bool:
+        """The local folder is switched on (it may still be held or waiting)."""
+        return bool(self.active or self.settings.get("enabled"))
+
+    def syncing_sources(self) -> list[str]:
+        """The sources this runtime keeps in sync right now: the folder while
+        it is active, Drive while it is on (held or not — a held Drive keeps
+        its index and its queue)."""
+        out = [SOURCE] if self.active else []
+        if self.drive.enabled:
+            out.append(uds.SOURCE_DRIVE)
+        return out
+
+    def _drive_state(self) -> tuple[str | None, str | None]:
+        try:
+            view = self.drive.view()
+        except Exception:  # noqa: BLE001 — the snapshot must never fail on Drive
+            return None, None
+        return view.get("state"), view.get("reason")
+
+    def _drive_can_work(self) -> bool:
+        try:
+            return bool(self.drive.work_allowed())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _drive_hidden(self) -> bool:
+        """Drive's results are hidden from search (a revoked or unlinked
+        account), so its files do not count in the totals either."""
+        from app.userdocs.query.filters import HIDDEN_HOLD_REASONS
+
+        state, reason = self._drive_state()
+        return state == "hold" and reason in HIDDEN_HOLD_REASONS
+
     def refresh_totals(self) -> None:
+        """Per-status file counts of the sources that are on — the folder's
+        and Drive's together (a hidden Drive's are left out)."""
         if self.db is None:
             return
+        drive_on = self.drive.enabled
         try:
-            self.progress.set_totals(self.db.count_by_status(SOURCE))
+            local = self.db.count_by_status(SOURCE) if (self.local_on() or not drive_on) else {}
+            drive = self.db.count_by_status(uds.SOURCE_DRIVE) if drive_on else {}
+        except Exception:  # noqa: BLE001
+            return
+        with self.lock:
+            self._dirty = {SOURCE: int(local.get("dirty", 0)), uds.SOURCE_DRIVE: int(drive.get("dirty", 0))}
+        stages = dict(local)
+        if drive and not self._drive_hidden():
+            for k, v in drive.items():
+                stages[k] = stages.get(k, 0) + int(v)
+        try:
+            self.progress.set_totals(stages)
+            self.drive.refresh_counts()
         except Exception:  # noqa: BLE001
             pass
 
@@ -1445,15 +1656,27 @@ class ProfileRuntime:
             return
         with self.lock:
             busy = bool(self.in_flight) or self.scanning
-        if busy or self.db is None:
+        if busy or self.db is None or self._drive_state()[0] == "syncing":
             return
-        counts = self.db.count_by_status(SOURCE)
-        if not counts.get("dirty"):
+        waiting = 0
+        if self.local_on() or not self.drive.enabled:
+            waiting += int(self.db.count_by_status(SOURCE).get("dirty", 0))
+        if self._drive_can_work():
+            # A held Drive's queue does not keep the batch open: nothing
+            # would drain it until the hold clears.
+            waiting += int(self.db.count_by_status(uds.SOURCE_DRIVE).get("dirty", 0))
+        if not waiting:
             self.progress.end_batch()
 
     def pending_count(self) -> int:
-        stages = self.progress.stages
-        return int(stages.get("dirty", 0))
+        """Files waiting that can be worked on: the folder's, and Drive's
+        while Drive may work."""
+        with self.lock:
+            dirty = dict(self._dirty)
+        n = int(dirty.get(SOURCE, 0))
+        if dirty.get(uds.SOURCE_DRIVE) and self._drive_can_work():
+            n += int(dirty[uds.SOURCE_DRIVE])
+        return n
 
     def _publish_state(self) -> None:
         state, reason = self.effective_state()
@@ -1461,22 +1684,29 @@ class ProfileRuntime:
 
     def effective_state(self) -> tuple[str, str | None]:
         """Precedence: hold > confirmation > user pause > storage pause >
-        re-embed > scanning/estimating > indexing > idle."""
+        re-embed > scanning/estimating > indexing > idle.
+
+        Holds and confirmations here are the local folder's; Drive reports
+        its own in ``snapshot["drive"]``. With only Drive on, the state is
+        what the engine is doing for it — never "disabled"."""
         if self.suspended:
             return "suspended", self.suspended
-        if not self.active and not self.settings.get("enabled"):
+        local_on = self.local_on()
+        drive_on = self.drive.enabled
+        if not local_on and not drive_on:
             return "disabled", None
-        if self.hold:
-            return "hold", self.hold.get("reason")
-        if self.confirmation:
-            return "awaiting_confirmation", self.confirmation.get("kind")
-        if self.estimating:
-            return "estimating", None
+        if local_on:
+            if self.hold:
+                return "hold", self.hold.get("reason")
+            if self.confirmation:
+                return "awaiting_confirmation", self.confirmation.get("kind")
+            if self.estimating:
+                return "estimating", None
         if self.paused_user:
             return "paused", "user"
         if self.level in ("budget", "disk_low", "disk_critical"):
             return "paused", self.level
-        if self.scanning:
+        if self.scanning or (drive_on and self._drive_state()[0] == "syncing"):
             return "scanning", None
         reembed = self.progress.reembed
         if reembed.get("total") and reembed.get("done", 0) < reembed.get("total", 0):
@@ -1495,6 +1725,10 @@ class ProfileRuntime:
         snap["watch"] = {"mode": self.watch_mode, "reason": self.watch_reason}
         coverage = snap.get("vector_coverage_pct")
         snap["tool_mode"] = "normal" if coverage in (None, 100.0) else "partial"
+        try:
+            snap["drive"] = self.drive.view()
+        except Exception:  # noqa: BLE001
+            snap["drive"] = {"enabled": False, "state": "disabled", "reason": None}
         return snap
 
 

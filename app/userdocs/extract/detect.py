@@ -8,20 +8,23 @@ settle the question: a ZIP whose directory is not in the head, an OLE file
 whose stream names are not in the first directory sector, or a text file,
 where the bytes say "text" but not which kind.
 
-:func:`sniff` works on bytes alone (a Drive export has no path).
-:func:`detect_file` reads a file's head and tail, then looks inside ZIP and OLE
-containers, whose kind is set by what they hold. It reads the file, so the
-caller must never hand it a cloud placeholder: reading one would download it.
+:func:`sniff` works on a head and tail alone. :func:`detect_file` reads a
+file's head and tail, then looks inside ZIP and OLE containers, whose kind is
+set by what they hold. It reads the file, so the caller must never hand it a
+cloud placeholder: reading one would download it. :func:`detect_bytes` does the
+same for a file already in memory (a Drive download has no path), so a ZIP
+whose directory lies past the first 8 KiB is still read to the end.
 """
 
 from __future__ import annotations
 
 import codecs
+import io
 import os
 import re
 import struct
 import zlib
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from app.userdocs.types import (
     KIND_ARCHIVE,
@@ -57,7 +60,7 @@ from app.userdocs.types import (
     KIND_XML,
 )
 
-__all__ = ["HEAD_BYTES", "TAIL_BYTES", "sniff", "detect_file", "is_executable_ext"]
+__all__ = ["HEAD_BYTES", "TAIL_BYTES", "sniff", "detect_file", "detect_bytes", "is_executable_ext"]
 
 HEAD_BYTES = 8192
 TAIL_BYTES = 512
@@ -674,11 +677,11 @@ def sniff(head: bytes, tail: bytes, ext: str | None) -> Kind:
     return KIND_OTHER, None
 
 
-def _refine_zip(path: str, ext: str, fallback: Kind) -> Kind:
+def _refine_zip(source: str | BinaryIO, ext: str, fallback: Kind) -> Kind:
     import zipfile
 
     try:
-        with zipfile.ZipFile(path) as zf:
+        with zipfile.ZipFile(source) as zf:
             names = zf.namelist()
 
             def read(name: str) -> bytes | None:
@@ -695,13 +698,15 @@ def _refine_zip(path: str, ext: str, fallback: Kind) -> Kind:
         return fallback
 
 
-def _refine_ole(path: str, ext: str, fallback: Kind) -> Kind:
+def _refine_ole(source: str | BinaryIO, ext: str, fallback: Kind) -> Kind:
+    """``source`` is a path or a file object, never raw bytes: olefile reads
+    bytes shorter than a minimal OLE file as a *file name*."""
     try:
         import olefile
     except ImportError:
         return fallback
     try:
-        ole = olefile.OleFileIO(path)
+        ole = olefile.OleFileIO(source)
     except Exception:  # olefile raises plain OSError/ValueError subclasses on junk
         return fallback
     try:
@@ -734,4 +739,21 @@ def detect_file(path: str) -> Kind:
         return _refine_zip(path, ext, found)
     if head[:8] == _OLE_MAGIC:
         return _refine_ole(path, ext, found)
+    return found
+
+
+def detect_bytes(data: bytes, name: str) -> Kind:
+    """``(kind, mime)`` for a file held in memory, named ``name`` (only its
+    extension is used, as a tie-breaker). The same decision as
+    :func:`detect_file`: :func:`sniff`, then the whole ZIP directory or OLE
+    directory, read from ``data`` through a stream."""
+    data = data or b""
+    ext = os.path.splitext(name or "")[1].lower()
+    head = data[:HEAD_BYTES]
+    tail = data[-TAIL_BYTES:] if data else b""
+    found = sniff(head, tail, ext)
+    if head[:4] in _ZIP_MAGICS:
+        return _refine_zip(io.BytesIO(data), ext, found)
+    if head[:8] == _OLE_MAGIC:
+        return _refine_ole(io.BytesIO(data), ext, found)
     return found

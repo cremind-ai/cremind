@@ -836,6 +836,85 @@ class IndexDB:
         rows = self._read("SELECT * FROM files WHERE sha256 = ? ORDER BY id LIMIT ?", (sha256, int(limit)))
         return [_decode("files", r) for r in rows]
 
+    # ── Drive rows ─────────────────────────────────────────────────────────
+    #
+    # A Drive row is keyed by its file id (``path_hash`` is derived from it),
+    # never by its display path: Drive allows two files of the same name in
+    # one folder, and a legacy file can have several parents.
+
+    def file_by_drive_id(self, file_id: str) -> dict[str, Any] | None:
+        """The Drive row for a Drive file id (case-sensitive), or None."""
+        return _decode(
+            "files",
+            self._read_one(
+                "SELECT * FROM files WHERE source = 'drive' AND drive_file_id = ? ORDER BY id LIMIT 1",
+                (str(file_id),),
+            ),
+        )
+
+    def files_by_drive_ids(self, ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """``{drive file id: row}`` for the ids that have a Drive row."""
+        wanted = list(dict.fromkeys(str(i) for i in ids if i))
+        out: dict[str, dict[str, Any]] = {}
+        for batch in _batches(wanted):
+            for r in self._read(
+                f"SELECT * FROM files WHERE source = 'drive' AND drive_file_id IN ({_qmarks(len(batch))})", batch
+            ):
+                out.setdefault(r["drive_file_id"], _decode("files", r))  # type: ignore[arg-type]
+        return out
+
+    def drive_manifest(self) -> dict[str, dict[str, Any]]:
+        """Every Drive file row as the reconcile compares it with a listing,
+        keyed by Drive file id: the content fingerprint (``drive_md5``,
+        ``size``, ``drive_version``, ``drive_modified``), where it sits
+        (``rel_path``, ``name``, ``folder_id``), the listed details a rename
+        or touch rewrites, and its status."""
+        rows = self._read(
+            "SELECT id, drive_file_id, drive_md5, size, drive_version, drive_modified, status, "
+            "status_reason, folder_id, rel_path, name, mtime, birthtime, drive_mime, drive_web_link, "
+            "drive_created, drive_modified_by_me_at, missing_since "
+            "FROM files WHERE source = 'drive' AND drive_file_id IS NOT NULL"
+        )
+        return {r["drive_file_id"]: dict(r) for r in rows}
+
+    def drive_file_ids_outside(self, folder_ids: Iterable[str]) -> list[int]:
+        """Row ids of Drive files that are not under any of ``folder_ids``
+        (Drive folder ids), judged from the folder rows' parent links. An
+        empty set narrows nothing, so nothing is outside it."""
+        roots = {str(f) for f in folder_ids if f}
+        if not roots:
+            return []
+        parent: dict[int, int | None] = {}
+        drive_id: dict[int, str | None] = {}
+        for r in self._read("SELECT id, parent_id, drive_id FROM folders WHERE source = 'drive'"):
+            parent[int(r["id"])] = r["parent_id"]
+            drive_id[int(r["id"])] = r["drive_id"]
+        inside: dict[int, bool] = {}
+
+        def under(fid: int | None) -> bool:
+            chain: list[int] = []
+            verdict = False
+            while fid is not None and fid in parent and fid not in chain:
+                if fid in inside:
+                    verdict = inside[fid]
+                    break
+                chain.append(fid)
+                if drive_id.get(fid) in roots:
+                    verdict = True
+                    break
+                fid = parent[fid]
+            for f in chain:
+                inside[f] = verdict
+            return verdict
+
+        rows = self._read("SELECT id, folder_id FROM files WHERE source = 'drive'")
+        return [int(r["id"]) for r in rows if not under(r["folder_id"])]
+
+    def drive_files_outside(self, folder_ids: Iterable[str]) -> int:
+        """How many Drive files narrowing ``include_folders`` to
+        ``folder_ids`` would remove — the count a settings plan shows."""
+        return len(self.drive_file_ids_outside(folder_ids))
+
     def mark_dirty(self, file_ids: Iterable[int], *, priority: int) -> int:
         """Queue files for (re)indexing; returns how many rows were marked.
 
@@ -880,10 +959,19 @@ class IndexDB:
             )
             return max(cur.rowcount, 0)
 
-    def next_work(self, *, limit: int, now: float, exclude_ids: Iterable[int] = ()) -> list[dict[str, Any]]:
+    def next_work(
+        self,
+        *,
+        limit: int,
+        now: float,
+        exclude_ids: Iterable[int] = (),
+        sources: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Files to process next: dirty ones, and errored ones whose backoff
         has expired, most urgent first (priority, then queue time).
-        ``exclude_ids`` are the files already in flight.
+        ``exclude_ids`` are the files already in flight. ``sources`` limits
+        the pick to those sources (None = every source, empty = none): a held
+        Drive source must not stall local work, nor the other way round.
 
         Two index-served queries merged here rather than one ``OR``, which
         SQLite would answer with a scan of the whole table on every call."""
@@ -891,13 +979,20 @@ class IndexDB:
         n = int(limit) + len(excl)
         if int(limit) <= 0:
             return []
+        src_sql, src_params = "", []
+        if sources is not None:
+            wanted = list(dict.fromkeys(str(s) for s in sources))
+            if not wanted:
+                return []
+            src_sql, src_params = f" AND source IN ({_qmarks(len(wanted))})", wanted
         dirty = self._read(
-            "SELECT * FROM files WHERE status = 'dirty' ORDER BY priority, queued_at, id LIMIT ?", (n,)
+            f"SELECT * FROM files WHERE status = 'dirty'{src_sql} ORDER BY priority, queued_at, id LIMIT ?",
+            (*src_params, n),
         )
         due = self._read(
-            "SELECT * FROM files WHERE status = 'error' AND next_attempt_at <= ? "
+            f"SELECT * FROM files WHERE status = 'error' AND next_attempt_at <= ?{src_sql} "
             "ORDER BY priority, queued_at, id LIMIT ?",
-            (float(now), n),
+            (float(now), *src_params, n),
         )
 
         def key(r: sqlite3.Row) -> tuple:
@@ -1925,10 +2020,14 @@ class IndexDB:
             raise ValueError(f"full-text query rejected: {exc}") from exc
         return [(int(r[0]), -float(r[1])) for r in rows]
 
-    def query_overview(self) -> dict[str, int]:
+    def query_overview(self, hidden_sources: Iterable[str] = frozenset()) -> dict[str, int]:
         """The counts a search result's header reports, in one pass over
         ``files``: searchable files, files still waiting to be (re)indexed,
-        images waiting for a caption, and files that could not be read."""
+        images waiting for a caption, and files that could not be read.
+        Rows of ``hidden_sources`` (a revoked Drive) are not counted — search
+        cannot reach them, so the header must not promise them."""
+        hidden = sorted({str(s) for s in hidden_sources})
+        where = f" WHERE source NOT IN ({_qmarks(len(hidden))})" if hidden else ""
         row = self._read_one(
             "SELECT "
             "COALESCE(SUM(CASE WHEN status NOT IN ('missing', 'tombstone') THEN 1 ELSE 0 END), 0), "
@@ -1937,7 +2036,8 @@ class IndexDB:
             "  ('awaiting_vision', 'awaiting_consent', 'over_cap') "
             "  AND status NOT IN ('missing', 'tombstone') THEN 1 ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) "
-            "FROM files"
+            f"FROM files{where}",
+            hidden,
         )
         visible, pending, captions, errors = (int(v or 0) for v in (row or (0, 0, 0, 0)))
         return {"files": visible, "pending": pending, "awaiting_captions": captions, "unreadable": errors}

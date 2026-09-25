@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN files with User Document Search via `cremind userdocs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind userdocs research`. Not for Cremind's own documentation (that is documentation_search)."
+description: "Search the user's OWN files with User Document Search via `cremind userdocs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind userdocs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind userdocs research`. Not for Cremind's own documentation (that is documentation_search)."
 ---
 
 # `cremind userdocs` — User Document Search
@@ -14,7 +14,8 @@ manual. Searching and reading the index from the terminal (`search`, `find`,
 `read`, `cite`) is documented in **`cremind userdocs search`**; deep research
 jobs over many files (`research run|status|continue|cancel|list` — compile a
 folder into one table, or a legal or financial analysis with verified quotes)
-in **`cremind userdocs research`**.
+in **`cremind userdocs research`**; indexing Google Drive (`drive …`) in
+**`cremind userdocs drive`**.
 
 Two levels of switch:
 
@@ -74,7 +75,9 @@ indexing · 3120/12840 files · 12 failed · ~30 min left · now: MKT-report/q3.
 
 `suspended(admin_gate)` means the admin has not allowed the feature;
 `suspended(embedding_off)` means Vector Embedding is off — the index is kept
-and still searchable by keyword, but nothing syncs.
+and still searchable by keyword, but nothing syncs. With Google Drive indexing
+on, the line also shows `drive: <state>` (e.g. `drive: hold(auth_revoked)`;
+see `cremind userdocs drive`).
 
 ### `cremind userdocs settings`
 
@@ -157,17 +160,25 @@ cremind userdocs pause                 # stop syncing; the index stays searchabl
 cremind userdocs resume                # continue; changes made meanwhile are picked up
 cremind userdocs rescan                # walk the whole folder now
 cremind userdocs reindex PATH|FID ...  # re-read these files/folders first
-cremind userdocs retry [--file-id FID] # retry failed files (all, or one per --file-id)
+cremind userdocs retry [--file-id FID] [--source local|drive]  # retry failed files
 cremind userdocs rebuild [--reextract] [--yes]
-cremind userdocs deletions confirm     # remove held vanished files from the index
-cremind userdocs deletions reject      # keep them (hidden, re-checked for 14 days)
+cremind userdocs deletions confirm [--source local|drive]  # remove held vanished files
+cremind userdocs deletions reject [--source local|drive]   # keep them (hidden, re-checked 14 days)
 ```
 
 `rebuild` re-embeds everything from the stored text (`--reextract` also
 re-reads every file) — rarely needed. When many files vanish at once (an
 unplugged drive, a renamed folder) nothing is deleted: they are hidden from
 search until you run `deletions confirm` (remove them) or `deletions reject`
-(keep them; they are re-checked on every scan for 14 days).
+(keep them; they are re-checked on every scan for 14 days). `--source drive`
+aims `retry` and `deletions` at Google Drive instead of the folder.
+
+### Google Drive
+
+`cremind userdocs drive status|enable|disable|sync` and `drive folders
+list|set` index your Google Drive files next to the folder (Drive can be on
+while the folder is off). `drive disable --yes` deletes the Drive index. See
+**`cremind userdocs drive`**.
 
 ### `cremind userdocs caption`
 
@@ -242,12 +253,13 @@ Without flags, prints the current setting.
 ### Inspecting the index
 
 ```bash
-cremind userdocs files [--status S] [--kind K] [--query TEXT] [--limit N] [--all]
+cremind userdocs files [--status S] [--kind K] [--query TEXT] [--source local|drive|all] [--limit N] [--all]
 cremind userdocs activity [--limit N]
 cremind userdocs estimate [--wait]
 cremind userdocs storage
 ```
 
+`files --source drive` lists only Google Drive files (`Drive/…` paths).
 `files --status error` lists files that failed and why (`encrypted`,
 `timeout`, `too_large`, `permission_denied`, …); `metadata_only` files are
 indexed by name, type, size and dates only (executables, archives, media,

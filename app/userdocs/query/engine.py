@@ -123,9 +123,50 @@ def _percent(done: int, total: int) -> int:
     return int(100 * done / total) if done < total else 100
 
 
-def status_notes(snapshot: dict[str, Any]) -> list[str]:
+def _day_of(ms: Any, tz: _dt.tzinfo | None) -> str | None:
+    """The calendar day of an epoch-ms timestamp in ``tz`` (the server's
+    zone when None)."""
+    try:
+        when = _dt.datetime.fromtimestamp(float(ms) / 1000, tz) if tz else \
+            _dt.datetime.fromtimestamp(float(ms) / 1000).astimezone()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return when.strftime("%Y-%m-%d")
+
+
+def drive_notes(drive: dict[str, Any] | None, tz: _dt.tzinfo | None = None) -> list[str]:
+    """What Google Drive's state means for an answer: results hidden (access
+    revoked or unlinked, with the day the Drive index goes), possibly stale
+    (Drive unreachable or misconfigured), or files held for a decision."""
+    if not drive or not drive.get("enabled"):
+        return []
+    state, reason = drive.get("state"), drive.get("reason")
+    detail = drive.get("detail") or {}
+    if state == "hold" and reason in F.HIDDEN_HOLD_REASONS:
+        why = "access was revoked" if reason == "auth_revoked" else "Drive is no longer linked"
+        if detail.get("purged_at"):
+            return [f"Google Drive results are unavailable: Google {why} and the Drive index was removed. "
+                    "Re-link Google (Settings → GSuite) to index Drive again."]
+        day = _day_of(detail.get("purge_at"), tz) if detail.get("purge_at") else None
+        tail = f"; the Drive index is removed on {day}" if day else ""
+        return [f"Google Drive results are hidden until Google is re-linked ({why}){tail}."]
+    if state == "hold" and reason == "drive_unreachable":
+        if detail.get("why") == "many_unavailable":
+            return ["Many Google Drive files became unavailable at once, so Drive syncing is on hold: "
+                    "Drive results may be out of date."]
+        return ["Google Drive can't be reached right now: Drive results may be out of date."]
+    if state == "hold":
+        return [f"Google Drive syncing is on hold ({detail.get('why') or detail.get('kind') or reason}): "
+                "Drive results may be out of date."]
+    if state == "awaiting_confirmation" and reason == "mass_delete":
+        return ["Many Google Drive files vanished at once; they are hidden until the user confirms or rejects "
+                "removing them (Settings → My Documents)."]
+    return []
+
+
+def status_notes(snapshot: dict[str, Any], tz: _dt.tzinfo | None = None) -> list[str]:
     """Sentences about the index's state that qualify every answer: a
-    suspended sync, a held folder, a first sync still running."""
+    suspended sync, a held folder or Drive, a first sync still running."""
     notes: list[str] = []
     state, reason = snapshot.get("state"), snapshot.get("reason")
     if state == "suspended" and reason == "embedding_off":
@@ -138,6 +179,7 @@ def status_notes(snapshot: dict[str, Any]) -> list[str]:
     elif state == "awaiting_confirmation" and reason == "mass_delete":
         notes.append("Many files vanished at once; they are hidden until the user confirms or rejects "
                      "removing them (Settings → My Documents).")
+    notes += drive_notes(snapshot.get("drive"), tz)
     stages = snapshot.get("stages") or {}
     total = sum(int(v or 0) for k, v in stages.items() if k not in ("tombstone", "missing"))
     pending = int(stages.get("dirty") or 0) + int(stages.get("deferred") or 0)
@@ -168,6 +210,40 @@ def _unavailable_message(snapshot: dict[str, Any]) -> tuple[str, str]:
     if state == "hold":
         return "no_index", f"User Document Search is on hold ({reason}) and has not indexed anything yet."
     return "no_index", "The user's files have not been indexed yet; the first sync is starting. Try again shortly."
+
+
+# A Drive image is downloaded for an image check only up to this size.
+VERIFY_DRIVE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _drive_client(profile: str) -> Any:
+    """A Drive client for the profile — the same factory the Drive source
+    uses, so one seam serves both."""
+    import threading
+
+    from app.userdocs.sources import drive as drive_source
+
+    return drive_source._default_client_factory(profile, threading.Event())
+
+
+def _drive_image_loader(client: Any, row: dict[str, Any]) -> Callable[[], bytes | None]:
+    """Fetch a Drive image's bytes (None when Drive will not give them: gone,
+    not downloadable, too large, unreachable)."""
+    def load() -> bytes | None:
+        file_id = row.get("drive_file_id")
+        if not file_id:
+            return None
+        try:
+            meta = client.get(str(file_id))
+            if not meta or meta.get("trashed"):
+                return None
+            content = client.fetch_content(meta, max_bytes=VERIFY_DRIVE_MAX_BYTES)
+        except Exception as exc:  # noqa: BLE001 — a failed download only skips the check
+            logger.info(f"[userdocs] image check: Drive file {row.get('cite_id')} not downloaded: {exc}")
+            return None
+        data = getattr(content, "data", None) if content is not None else None
+        return bytes(data) if data else None
+    return load
 
 
 def _supported(run: dict[str, Any]) -> bool:
@@ -300,15 +376,21 @@ class QueryEngine:
                 self._files[i] = found.get(i)
         return {int(i): self._files[int(i)] for i in ids if self._files.get(int(i)) is not None}  # type: ignore[misc]
 
-    def first_seen_cutoff(self) -> float | None:
-        """Files first seen after this were found by a live watcher or a
-        later scan, so their first_seen_at is a real "appeared" date."""
+    def first_seen_cutoff(self) -> dict[str, float] | None:
+        """Files first seen after this were found by a live watcher, a later
+        scan or Drive's change feed, so their first_seen_at is a real
+        "appeared" date. Per source: the folder and Drive each had their own
+        first sync."""
         if self._cutoff is False:
-            try:
-                base = self.db.min_first_seen("local")
-            except Exception:  # noqa: BLE001
-                base = None
-            self._cutoff = None if base is None else base + F.INITIAL_SYNC_WINDOW_S
+            cut: dict[str, float] = {}
+            for source in ("local", "drive"):
+                try:
+                    base = self.db.min_first_seen(source)
+                except Exception:  # noqa: BLE001
+                    base = None
+                if base is not None:
+                    cut[source] = base + F.INITIAL_SYNC_WINDOW_S
+            self._cutoff = cut or None
         return self._cutoff  # type: ignore[return-value]
 
     def vector_handles(self) -> tuple[Any, Any] | None:
@@ -322,7 +404,8 @@ class QueryEngine:
 
     def overview(self) -> dict[str, int]:
         try:
-            return self.db.query_overview()
+            # A hidden Drive's files are not promised in the header either.
+            return self.db.query_overview(hidden_sources=F.hidden_sources(self.db))
         except Exception:  # noqa: BLE001
             return {"files": 0, "pending": 0, "awaiting_captions": 0, "unreadable": 0}
 
@@ -382,7 +465,7 @@ class QueryEngine:
         top_k = max(1, min(int(top_k or 8), 50))
         page = max(1, int(page or 1))
         terms = analyze(query)
-        notes = status_notes(self.snapshot)
+        notes = status_notes(self.snapshot, self.tz)
         limit = min(400, max(60, top_k * page * 8))
 
         relaxed: list[str] = []
@@ -574,7 +657,9 @@ class QueryEngine:
         A caption can miscount ("two puppies" vs three); when the user asked
         for something specific this checks the few images that matter. It
         needs the same consent and daily quota as captioning, and says so —
-        in the result — when it cannot run."""
+        in the result — when it cannot run. A Google Drive image is
+        downloaded for the check; one Drive will not hand over is skipped,
+        with a note."""
         from app.storage.userdocs_storage import get_userdocs_storage
         from app.userdocs import settings as uds
         from app.userdocs.discovery.hashing import fs_path
@@ -584,7 +669,8 @@ class QueryEngine:
                    if g.file and g.file.get("kind") == t.KIND_IMAGE][: self.VERIFY_MAX]
         if not targets:
             return []
-        if not self.root:
+        on_drive = [g for g in targets if g.file.get("source") == "drive"]
+        if not self.root and not on_drive:
             return ["Image check skipped: the indexed folder is not available."]
         res = resolver.resolve_dedicated_vision(self.profile)
         if not res.ok:
@@ -601,49 +687,97 @@ class QueryEngine:
             if label:
                 wanted[_OBJECT_SYNONYMS.get(label, label)] = o.get("count")
         labels = list(wanted)
-        root = uds.real_path(self.root)
+        root = uds.real_path(self.root) if self.root else None
         llm = None
         checked = 0
-        for g in targets:
-            # Only a file that really sits under the indexed folder is sent: a
-            # symlink swapped in since indexing must not leak another image.
-            path = uds.real_path(os.path.join(root, *str(g.file["rel_path"]).split("/")))
-            if not uds.is_inside(path, root) or not os.path.isfile(fs_path(path)):
-                continue
-            if not storage.reserve_vision(self.profile, day, cap):
-                return [f"Image check stopped after {checked}: today's image quota is used up."]
-            try:
-                jpeg = captioner.prepare_jpeg(path=fs_path(path))
-                llm = llm or resolver.build_vision_llm(self.profile, res)
-                verdict = captioner.run_verify(llm, self.profile, jpeg, labels=labels, query=query)
-            except Exception as exc:  # noqa: BLE001 — a failed check leaves the ranking as it was
-                storage.refund_vision(self.profile, day)
-                logger.info(f"[userdocs] {self.profile}: image check failed for fid "
-                            f"{g.file.get('cite_id')}: {exc}")
-                continue
-            checked += 1
-            factor = 1.0
-            why: list[str] = []
-            seen_by = {_OBJECT_SYNONYMS.get(fold(k), fold(k)): v for k, v in verdict["counts"].items()}
-            for label, count in wanted.items():
-                seen = seen_by.get(label, seen_by.get(label + "s"))
-                if seen is None or count is None:
-                    continue
-                if int(seen) == int(count):
-                    factor *= 1.6
-                    why.append(f"checked: {seen} {label}")
+        skipped: list[str] = []
+        drive_client: Any = None
+        try:
+            for g in targets:
+                if g.file.get("source") == "drive":
+                    # Drive images are downloaded for the check (Google has
+                    # them, not this disk); one that cannot be is skipped.
+                    if drive_client is None:
+                        try:
+                            drive_client = _drive_client(self.profile)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.info(f"[userdocs] {self.profile}: no Drive client for the image check: {exc}")
+                            drive_client = False
+                    if drive_client is False:
+                        skipped.append("drive")
+                        continue
+                    load = _drive_image_loader(drive_client, g.file)
                 else:
-                    factor *= 0.5
-                    why.append(f"checked: {seen} {label}, not {count}")
-            if verdict["matches"] is False:
-                factor *= 0.6
-                why.append("checked: does not match the description")
-            elif verdict["matches"] is True:
-                factor *= 1.2
-            g.score *= factor
-            if why and g.passages:
-                g.passages[0].reasons.extend(why)
-        return [f"{checked} image(s) re-checked with the vision model."] if checked else []
+                    if root is None:
+                        skipped.append("local")
+                        continue
+                    # Only a file that really sits under the indexed folder is
+                    # sent: a symlink swapped in since indexing must not leak
+                    # another image.
+                    path = uds.real_path(os.path.join(root, *str(g.file["rel_path"]).split("/")))
+                    if not uds.is_inside(path, root) or not os.path.isfile(fs_path(path)):
+                        continue
+                    load = None
+                if not storage.reserve_vision(self.profile, day, cap):
+                    return [f"Image check stopped after {checked}: today's image quota is used up."]
+                try:
+                    if load is not None:
+                        data = load()
+                        if data is None:
+                            storage.refund_vision(self.profile, day)
+                            skipped.append("drive")
+                            continue
+                        jpeg = captioner.prepare_jpeg(data=data)
+                    else:
+                        jpeg = captioner.prepare_jpeg(path=fs_path(path))
+                    llm = llm or resolver.build_vision_llm(self.profile, res)
+                    verdict = captioner.run_verify(llm, self.profile, jpeg, labels=labels, query=query)
+                except Exception as exc:  # noqa: BLE001 — a failed check leaves the ranking as it was
+                    storage.refund_vision(self.profile, day)
+                    logger.info(f"[userdocs] {self.profile}: image check failed for fid "
+                                f"{g.file.get('cite_id')}: {exc}")
+                    continue
+                checked += 1
+                self._apply_verdict(g, verdict, wanted)
+        finally:
+            if drive_client:
+                try:
+                    drive_client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        notes = [f"{checked} image(s) re-checked with the vision model."] if checked else []
+        if skipped.count("drive"):
+            notes.append(f"Image check skipped for {skipped.count('drive')} Google Drive image(s): "
+                         "they could not be downloaded.")
+        if skipped.count("local"):
+            notes.append(f"Image check skipped for {skipped.count('local')} image(s): "
+                         "the indexed folder is not available.")
+        return notes
+
+    @staticmethod
+    def _apply_verdict(g: Group, verdict: dict[str, Any], wanted: dict[str, Any]) -> None:
+        """Re-score one image group by what the vision model saw in it."""
+        factor = 1.0
+        why: list[str] = []
+        seen_by = {_OBJECT_SYNONYMS.get(fold(k), fold(k)): v for k, v in verdict["counts"].items()}
+        for label, count in wanted.items():
+            seen = seen_by.get(label, seen_by.get(label + "s"))
+            if seen is None or count is None:
+                continue
+            if int(seen) == int(count):
+                factor *= 1.6
+                why.append(f"checked: {seen} {label}")
+            else:
+                factor *= 0.5
+                why.append(f"checked: {seen} {label}, not {count}")
+        if verdict["matches"] is False:
+            factor *= 0.6
+            why.append("checked: does not match the description")
+        elif verdict["matches"] is True:
+            factor *= 1.2
+        g.score *= factor
+        if why and g.passages:
+            g.passages[0].reasons.extend(why)
 
     def _image_object_factor(self, file_row: dict[str, Any], objects: list[dict[str, Any]]) -> tuple[float, list[str]]:
         """Soft check of ``image_objects`` against the image's caption: +50%
@@ -723,4 +857,4 @@ class QueryEngine:
         return read(self, file, **kw)
 
 
-__all__ = ["Access", "MODES", "QueryEngine", "SearchOutcome", "open_engine", "status_notes"]
+__all__ = ["Access", "MODES", "QueryEngine", "SearchOutcome", "drive_notes", "open_engine", "status_notes"]

@@ -5,15 +5,20 @@ One :class:`UserDocsService` per server process, holding a
 on. Its threads:
 
 - **maintenance** (1): applies settings changes, drains watcher events, starts
-  scans when due, removes tombstones, measures storage. Every hook called from
-  elsewhere (settings saved, embedding changed, purge requested) only queues a
-  command here, so no caller — including the event loop — ever waits on it.
+  scans and Google Drive syncs when due, removes tombstones, measures
+  storage. Every hook called from elsewhere (settings saved, embedding
+  changed, purge requested, Google unlinked) only queues a command here, so
+  no caller — including the event loop — ever waits on it.
 - **pipeline workers** (``userdocs.workers``, default 2): take dirty files
   round-robin across profiles, so one profile's 50,000-file first sync cannot
   starve another profile's single edit.
 - **embedder** (1): fills in vectors (:mod:`app.userdocs.vector_sync`).
-- **scan executor** (2): full scans and estimates, which can take minutes on a
-  large tree and must not hold up the maintenance loop.
+- **scan executor** (2): full scans, estimates and Drive syncs, which can take
+  minutes on a large tree and must not hold up the maintenance loop.
+
+The pipeline serves each profile's two sources independently: a held,
+paused-for-confirmation or unlinked Drive never stalls the local folder's
+work, nor the other way round.
 
 Nothing here blocks the event loop: the API calls the facade methods through
 ``asyncio.to_thread``, and :meth:`stop` returns within its budget even with a
@@ -27,7 +32,7 @@ import queue
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from app.userdocs import settings as uds
@@ -64,6 +69,10 @@ class UserDocsService:
         self._commands: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._scan_exec = ThreadPoolExecutor(max_workers=2, thread_name_prefix="userdocs-scan")
+        # One queued-or-running Drive sync per profile: the maintenance loop
+        # sees "due" every pass until the sync starts, and must not pile up
+        # submissions behind a long scan.
+        self._drive_syncs: dict[str, Future] = {}
         self._pool: Any = None
         self._pool_lock = threading.Lock()
         self._rr = 0
@@ -93,6 +102,7 @@ class UserDocsService:
         uds_state.set_runtime_provider(self.runtime_snapshot)
         uds_state.add_settings_listener(self._on_settings_changed)
         uds_state.set_purge_handler(self._on_purge)
+        uds_state.set_drive_suspend_handler(self._on_suspend_drive)
         uds.set_effect_counter(self.count_effect)
         add_listener(self._on_embedding)
 
@@ -146,6 +156,7 @@ class UserDocsService:
             rt.close()
         uds_state.set_runtime_provider(None)
         uds_state.set_purge_handler(None)
+        uds_state.set_drive_suspend_handler(None)
         uds.set_effect_counter(None)
 
     # ── wake-ups and commands ──────────────────────────────────────────────
@@ -166,6 +177,10 @@ class UserDocsService:
 
     def _on_purge(self, profile: str, kind: str) -> None:
         self.command("purge", profile, kind)
+
+    def _on_suspend_drive(self, profile: str) -> None:
+        # Called by the Google unlink hook, possibly on the event loop.
+        self.command("suspend_drive", profile)
 
     def _on_embedding(self, status: Any, embedding: Any, vector_store: Any) -> None:
         # May run on the event loop: queue and return.
@@ -233,7 +248,11 @@ class UserDocsService:
                         self._scan_exec.submit(rt.run_scan)
                 except Exception:  # noqa: BLE001
                     logger.exception(f"[userdocs] {rt.profile}: maintenance step failed")
-            busy = any(rt.active and (rt.pending_count() or rt.scanning) for rt in runtimes)
+                try:
+                    self._drive_tick(rt, now)
+                except Exception:  # noqa: BLE001
+                    logger.exception(f"[userdocs] {rt.profile}: Drive maintenance step failed")
+            busy = any((rt.active or rt.drive.enabled) and (rt.pending_count() or rt.scanning) for rt in runtimes)
             interval = GOVERNOR_INTERVAL_S if busy else GOVERNOR_IDLE_INTERVAL_S
             if now - self._last_governor >= interval:
                 self._last_governor = now
@@ -249,6 +268,9 @@ class UserDocsService:
                         # so it looks once a minute.
                         rt.requeue_waiting_vision()
                         rt.refresh_totals()
+                        # Hold retries and the 7-day purge timer; no network
+                        # here — a due purge is re-confirmed by a sync.
+                        rt.drive.housekeeping(now)
                     except Exception:  # noqa: BLE001
                         logger.exception(f"[userdocs] {rt.profile}: housekeeping failed")
             if now - self._last_gc >= GC_INTERVAL_S:
@@ -257,6 +279,23 @@ class UserDocsService:
             with self._cv:
                 if self._commands.empty():
                     self._cv.wait(timeout=2.0)
+
+    def _drive_tick(self, rt: ProfileRuntime, now: float) -> None:
+        """Start the profile's Drive sync when it is due (the change feed
+        every few minutes, a held source on its backoff, "Sync now") —
+        unless one is already queued or running."""
+        with self._lock:
+            fut = self._drive_syncs.get(rt.profile)
+            if fut is not None and not fut.done():
+                return
+        if not rt.drive.sync_due(now):
+            return
+        try:
+            fut = self._scan_exec.submit(rt.drive.run_sync)
+        except RuntimeError:  # the executor is shutting down
+            return
+        with self._lock:
+            self._drive_syncs[rt.profile] = fut
 
     def _run_command(self, cmd: tuple[Any, ...]) -> None:
         name = cmd[0]
@@ -280,6 +319,10 @@ class UserDocsService:
                 _stop_research_if_off(p)
         elif name == "purge":
             self._purge(cmd[1], cmd[2])
+        elif name == "suspend_drive":
+            rt = self.runtime(cmd[1])
+            if rt is not None:
+                rt.drive.suspend()
         elif name == "after_estimate":
             rt = self.runtime(cmd[1])
             if rt is not None:
@@ -304,23 +347,43 @@ class UserDocsService:
 
     # ── pipeline workers ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _work_sources(rt: ProfileRuntime) -> list[str]:
+        """The sources whose files ``rt``'s pipeline may process now: the
+        folder unless it is off, paused, held or waiting for the first-sync
+        go-ahead; Drive while it may work (on, not held, not waiting for a
+        decision, not paused)."""
+        if rt.db is None:
+            return []
+        out: list[str] = []
+        if (rt.active and not rt.paused_user and not rt.hold
+                and not (rt.confirmation and rt.confirmation.get("kind") == "first_sync")):
+            out.append(SOURCE)
+        try:
+            if rt.drive.work_allowed():
+                out.append(uds.SOURCE_DRIVE)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
     def _next_work(self) -> tuple[ProfileRuntime, dict[str, Any]] | None:
         with self._lock:
-            runtimes = [
-                rt for rt in self._runtimes.values()
-                if rt.active and rt.db is not None and not rt.paused_user and not rt.hold
-                and not (rt.confirmation and rt.confirmation.get("kind") == "first_sync")
-            ]
-            if not runtimes:
-                return None
-            self._rr = (self._rr + 1) % len(runtimes)
-            order = runtimes[self._rr:] + runtimes[:self._rr]
+            runtimes = list(self._runtimes.values())
+        eligible = [(rt, srcs) for rt in runtimes if (srcs := self._work_sources(rt))]
+        if not eligible:
+            return None
+        with self._lock:
+            self._rr = (self._rr + 1) % len(eligible)
+            order = eligible[self._rr:] + eligible[:self._rr]
         now = time.time()
-        for rt in order:
+        for rt, sources in order:
             with rt.lock:
                 exclude = set(rt.in_flight)
+            db = rt.db
+            if db is None:
+                continue
             try:
-                rows = rt.db.next_work(limit=1, now=now, exclude_ids=exclude)
+                rows = db.next_work(limit=1, now=now, exclude_ids=exclude, sources=sources)
             except Exception:  # noqa: BLE001
                 continue
             if not rows:
@@ -469,24 +532,32 @@ class UserDocsService:
     # ── purge / GC ─────────────────────────────────────────────────────────
 
     def _purge(self, profile: str, kind: str) -> None:
-        """Delete a source's index. When nothing else is left in the profile's
-        index, the whole file and its collections go — the only way to give
-        the disk space back at once."""
+        """Delete a source's index.
+
+        Drive (purge set D): its files, chunks, vectors, folders, source
+        state and citations — the Drive sync is stopped first, and the rest
+        of the profile's index is never touched, even when Drive was all it
+        held. The local folder: when nothing else is left in the profile's
+        index (and Drive is off), the whole file and its collections go —
+        the only way to give the disk space back at once."""
         from app.storage.userdocs_storage import get_userdocs_storage
         from app.userdocs import vector_sync
-        from app.userdocs.index import index_dir
+        from app.userdocs.index import index_dir, index_path
 
         rt = self.runtime(profile, create=True)
         if rt is None:
             return
+        if kind == uds.SOURCE_DRIVE:
+            self._purge_drive(profile, rt)
+            return
         storage = get_userdocs_storage()
-        other = uds.SOURCE_DRIVE if kind == uds.SOURCE_LOCAL else uds.SOURCE_LOCAL
         db = None
-        try:
-            db = rt.ensure_db()
-        except Exception:  # noqa: BLE001
-            pass
-        others_left = bool(db and sum(db.count_by_status(other).values()))
+        if rt.db is not None or os.path.exists(index_path(rt.uid)):
+            try:
+                db = rt.ensure_db()
+            except Exception:  # noqa: BLE001
+                pass
+        others_left = bool(db and (rt.drive.enabled or sum(db.count_by_status(uds.SOURCE_DRIVE).values())))
         if db is not None and others_left:
             for ids in db.purge_source(kind):
                 rt.queue_vector_deletes(ids)
@@ -507,6 +578,32 @@ class UserDocsService:
         if new_rt is not None:
             new_rt.progress.set_state("disabled", None)
             uds_state.publish_snapshot(profile)
+
+    def _purge_drive(self, profile: str, rt: ProfileRuntime) -> None:
+        """Purge set D (see :meth:`_purge`). With no index file there is
+        nothing but citations to delete, and no file is created for it."""
+        from app.userdocs.index import index_path
+
+        if rt.db is None and not os.path.exists(index_path(rt.uid)):
+            _purge_drive_citations(profile)
+            rt.drive.reset()
+            return
+        # Stops an in-flight sync, deletes rows, queues vector deletes and
+        # the citations, and forgets the in-memory Drive state.
+        n = rt.drive.purge_index(keep_hold=False)
+        db = rt.db
+        if db is not None:
+            db.add_activity("purged", f"Deleted the Google Drive index as requested ({n} files).",
+                            source=uds.SOURCE_DRIVE, detail={"files": n})
+        logger.info(f"[userdocs] {profile}: Drive index deleted ({n} files)")
+        rt.refresh_totals()
+        if not rt.local_on() and not rt.drive.enabled:
+            # Nothing is on (an unlink after Drive was already off): flush
+            # the vector deletes and close the file the purge opened.
+            rt._deactivate("disabled", None)
+        else:
+            rt._publish_state()
+        self.wake_embedder()
 
     def _gc_orphan_indexes(self) -> None:
         """Index folders and collections whose profile no longer exists."""
@@ -578,6 +675,12 @@ class UserDocsService:
         if rt is None:
             raise NotFound("Unknown profile.")
         storage = get_userdocs_storage()
+        # Which source a rescan, sync, deletion decision, retry or re-index
+        # is about; the folder unless the caller says Drive.
+        source = kw.get("source") or SOURCE
+        if source not in uds.SOURCE_KINDS:
+            raise UnknownAction(f"Unknown source {source!r}.")
+        drive = source == uds.SOURCE_DRIVE
         if action == "start":
             if not (storage.get_source(profile, SOURCE) or {}).get("enabled"):
                 raise NotEnabled("Turn User Document Search on first.")
@@ -597,23 +700,36 @@ class UserDocsService:
             db.update_source_state(SOURCE, paused_user=0)
             rt.paused_user = False
             self.command("configure", profile)
-        elif action == "rescan":
+        elif action in ("rescan", "sync_now") and drive:
+            # Drive: "Sync now" reads the change feed at once; a rescan
+            # re-lists everything (a full reconcile). The maintenance loop
+            # starts it on the scan executor right away.
+            self._require_drive(rt)
+            rt.drive.request_sync("user", full=action == "rescan")
+        elif action in ("rescan", "sync_now"):
             self._require(profile)
             rt.request_scan("user")
         elif action == "reindex":
-            n = self._reindex(rt, kw.get("targets") or [])
+            n = self._reindex(rt, kw.get("targets") or [], source)
             return {"accepted": True, "files": n, "snapshot": uds_state.build_snapshot(profile)}
         elif action == "retry_failed":
-            n = self._retry(rt, kw.get("targets") or [])
+            n = self._retry(rt, kw.get("targets") or [], kw.get("source"))
             return {"accepted": True, "files": n, "snapshot": uds_state.build_snapshot(profile)}
         elif action == "rebuild":
             self._rebuild(profile, rt, bool(kw.get("reextract")), kw.get("confirm"))
         elif action == "confirm_deletions":
             self._require(profile)
-            rt.confirm_deletions()
+            if drive:
+                rt.drive.confirm_deletions()
+                rt.refresh_totals()
+            else:
+                rt.confirm_deletions()
         elif action == "reject_deletions":
             self._require(profile)
-            rt.reject_deletions()
+            if drive:
+                rt.drive.reject_deletions()
+            else:
+                rt.reject_deletions()
         elif action in ("consent_vision", "revoke_vision_consent"):
             self._vision_consent(profile, grant=action == "consent_vision", shown=kw.get("model"))
         elif action == "confirm_root_change":
@@ -669,7 +785,16 @@ class UserDocsService:
             )
         uds_state.notify_settings_changed(profile, SOURCE)
 
-    def _resolve_targets(self, rt: ProfileRuntime, targets: list[str]) -> list[int]:
+    def _require_drive(self, rt: ProfileRuntime) -> None:
+        if not rt.drive.enabled:
+            raise NotEnabled("Google Drive indexing is off for this profile.")
+
+    def _resolve_targets(self, rt: ProfileRuntime, targets: list[str], source: str = SOURCE) -> list[int]:
+        """File ids for ``targets``: citation ids (any source), then — for
+        the folder — paths relative to it (or absolute inside it), or — for
+        Drive — Drive file ids and display paths ("Drive/Work/plan.docx",
+        with or without the "Drive/" prefix; a folder path takes its
+        subtree)."""
         db = rt.ensure_db()
         ids: set[int] = set()
         for raw in targets:
@@ -680,6 +805,17 @@ class UserDocsService:
             if row is not None:
                 ids.add(int(row["id"]))
                 continue
+            if source == uds.SOURCE_DRIVE:
+                row = db.file_by_drive_id(s) if "/" not in s else None
+                if row is not None:
+                    ids.add(int(row["id"]))
+                    continue
+                path = s.strip("/")
+                if path != "Drive" and not path.startswith("Drive/"):
+                    path = f"Drive/{path}"
+                for r in db.files_under(uds.SOURCE_DRIVE, path):
+                    ids.add(int(r["id"]))
+                continue
             if rt.root and os.path.isabs(s):
                 try:
                     s = os.path.relpath(s, rt.root).replace(os.sep, "/")
@@ -689,8 +825,8 @@ class UserDocsService:
                 ids.add(int(r["id"]))
         return sorted(ids)
 
-    def _reindex(self, rt: ProfileRuntime, targets: list[str]) -> int:
-        ids = self._resolve_targets(rt, targets)
+    def _reindex(self, rt: ProfileRuntime, targets: list[str], source: str = SOURCE) -> int:
+        ids = self._resolve_targets(rt, targets, source)
         if not ids:
             raise NotFound("No indexed file or folder matches.")
         for fid in ids:
@@ -701,18 +837,23 @@ class UserDocsService:
         self.wake()
         return len(ids)
 
-    def _retry(self, rt: ProfileRuntime, targets: list[str]) -> int:
+    def _retry(self, rt: ProfileRuntime, targets: list[str], source: str | None = None) -> int:
+        """Retry failed files: ``targets`` (resolved in ``source``, the
+        folder by default), or every failure of ``source`` — of every source
+        when none is named."""
         db = rt.ensure_db()
         if targets:
-            ids = self._resolve_targets(rt, targets)
+            ids = self._resolve_targets(rt, targets, source or SOURCE)
         else:
-            ids = [int(r["id"]) for r in db.list_files(status="error", limit=100_000)]
-            ids += [int(r["id"]) for r in db.list_files(status="awaiting_extractor", limit=100_000)]
+            ids = [int(r["id"]) for r in db.list_files(status="error", source=source, limit=100_000)]
+            ids += [int(r["id"]) for r in db.list_files(status="awaiting_extractor", source=source, limit=100_000)]
             # Indexed files whose image description or page OCR failed (a
             # provider error, say): the vision call is tried again.
+            sources = [source] if source else list(uds.SOURCE_KINDS)
             for r in db.read_sql(
-                "SELECT id, kind FROM files WHERE source = ? AND status = 'indexed' AND caption_state = 'failed'",
-                (SOURCE,),
+                f"SELECT id, kind FROM files WHERE source IN ({', '.join('?' * len(sources))}) "
+                "AND status = 'indexed' AND caption_state = 'failed'",
+                tuple(sources),
             ):
                 ids.append(int(r["id"]))
                 if r.get("kind") != t.KIND_IMAGE:
@@ -744,7 +885,11 @@ class UserDocsService:
             )
         db.clear_vec_gen()
         if reextract:
-            ids = [int(r["id"]) for r in db.list_files(source=SOURCE, limit=1_000_000)]
+            # Every source: a Drive file is downloaded again, like a local
+            # file is read again.
+            sources = [SOURCE] if (rt.local_on() or not rt.drive.enabled) else []
+            sources += [uds.SOURCE_DRIVE] if rt.drive.enabled else []
+            ids = [int(r["id"]) for src in sources for r in db.list_files(source=src, limit=1_000_000)]
             for fid in ids:
                 db.update_file(fid, extractor_version=None, chunker_version=None)
             db.mark_dirty(ids, priority=P_UPGRADE)
@@ -829,6 +974,15 @@ class UserDocsService:
             src = uds.SOURCE_DRIVE if what == "purge_drive" else SOURCE
             n = sum(db.count_by_status(src).values())
             return uds.Effect(what, files=n, bytes=int(db.size_bytes()) if what == "purge_all" else 0)
+        if what == "purge_out_of_scope" and kind == uds.SOURCE_DRIVE:
+            # Drive: narrowing include_folders removes every Drive file not
+            # under one of the folders now chosen. Drive has no excludes.
+            opts = (ctx.get("patch") or {}).get("options")
+            if not isinstance(opts, dict) or "include_folders" not in opts:
+                return uds.Effect(what, files=0)
+            new = uds.normalize_options({"include_folders": opts["include_folders"]})["include_folders"]
+            n = db.drive_files_outside(set(new)) if new else 0
+            return uds.Effect(what, files=n, detail={"include_folders": list(new)})
         if what == "purge_out_of_scope":
             patch = ctx.get("patch") or {}
             manifest = db.load_manifest(SOURCE)
@@ -927,6 +1081,17 @@ def _purge_citations(profile: str) -> None:
         purge_profile(profile)
     except Exception:  # noqa: BLE001
         logger.exception(f"[userdocs] {profile}: could not delete the citation registry")
+
+
+def _purge_drive_citations(profile: str) -> None:
+    """Purge set D's share of the citation registry (the rows issued for
+    Drive files). Best-effort, like the whole-registry purge."""
+    try:
+        from app.storage.userdocs_citations_storage import get_userdocs_citations_storage
+
+        get_userdocs_citations_storage().delete_source_kind(profile, uds.SOURCE_DRIVE)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[userdocs] {profile}: could not delete the Drive citations")
 
 
 def _purge_research(profile: str) -> None:

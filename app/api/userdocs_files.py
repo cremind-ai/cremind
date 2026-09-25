@@ -10,19 +10,26 @@ What a citation chip opens:
   ``?pages=3-5`` or ``?lines=40-58``; without a selector, the start of the file.
   The text comes from the index, never from re-reading the file.
 - ``GET /api/userdocs/files/{fid}/raw`` — the original bytes, for "open at page
-  N". Local files only, and only when the file's real path is still inside the
+  N". A local file is served only when its real path is still inside the
   profile's indexed folder: the index names a path, and the path is re-checked
-  now (a symlink swapped in since indexing must not reach outside). Drive files
-  answer 409 ``DriveFile`` with their ``web_link``.
+  now (a symlink swapped in since indexing must not reach outside). A Drive
+  file is fetched from Google through the profile's own link and passed
+  through in memory, up to 20 MB (a Google Doc, Sheet or Slides arrives as the
+  export it was indexed from); anything larger, or anything Google will not
+  hand over, answers 409 ``DriveFile`` with its ``web_link`` to open it there.
 - ``GET /api/userdocs/files/{fid}/thumbnail?size=256`` — a JPEG made in memory
   and cached in a small in-process LRU; never written to disk, so viewing the
-  user's photos leaves no copies of them behind.
+  user's photos leaves no copies of them behind. Drive images are fetched the
+  same way as ``raw``.
 
 The profile is always the caller's own (``request.user.username``). A ``fid``
 is looked up in the caller's own index only, so another profile's ids are
 simply unknown here — 404, indistinguishable from an id that never existed.
+Drive rows are 404 too while Drive is hidden (its Google link was revoked or
+removed): search does not show them, so neither does the viewer.
 
-Everything that touches SQLite or the filesystem runs in ``asyncio.to_thread``.
+Everything that touches SQLite, the filesystem or Google runs in
+``asyncio.to_thread``.
 """
 
 from __future__ import annotations
@@ -34,7 +41,8 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import quote
 
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
@@ -62,6 +70,9 @@ THUMB_MIN, THUMB_MAX, THUMB_DEFAULT = 32, 1024, 256
 THUMB_MAX_FILE_BYTES = 64 * 1024 * 1024
 _THUMB_CACHE_ENTRIES = 256
 _THUMB_CACHE_BYTES = 16 * 1024 * 1024
+# Drive bytes pass through the server's memory; past this a Drive file opens
+# in Google Drive instead, so a viewer click never streams hundreds of MB.
+DRIVE_PROXY_MAX_BYTES = 20 * 1024 * 1024
 
 _FID_RE = re.compile(f"^{CITE_ALPHABET_RE}{{8}}$")
 _C8_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -119,16 +130,25 @@ async def _run(fn, *args) -> Any:
 # ── lookups (worker threads) ───────────────────────────────────────────────
 
 
+def _hidden_sources(db: Any) -> frozenset:
+    from app.userdocs.query.filters import hidden_sources
+
+    return hidden_sources(db)
+
+
 def _record(db: Any, fid: str) -> Tuple[str, Dict[str, Any]]:
     if db is None:
         raise _Fail(404, "NotFound", "No such file.")
+    hidden = _hidden_sources(db)
     rec = db.file_by_cite(fid)
     if rec is not None:
         if rec.get("status") in _GONE_FILE_STATUSES:
             raise _Fail(404, "NotFound", "That file is no longer in your documents.")
+        if rec.get("source") in hidden:
+            raise _Fail(404, "NotFound", "Your Google Drive files are hidden until Google Drive is re-linked.")
         return "file", rec
     rec = db.folder_by_cite(fid)
-    if rec is not None and rec.get("status") in (None, "live"):
+    if rec is not None and rec.get("status") in (None, "live") and rec.get("source") not in hidden:
         return "folder", rec
     raise _Fail(404, "NotFound", "No such file.")
 
@@ -186,6 +206,75 @@ def _local_file(profile: str, rec: Dict[str, Any]) -> str:
     if not os.path.isfile(real):
         raise _Fail(404, "FileMissing", "The file is no longer on disk.")
     return real
+
+
+def _drive_file(rec: Dict[str, Any], reason: Optional[str] = None) -> _Fail:
+    extra: Dict[str, Any] = {"web_link": rec.get("drive_web_link")}
+    if reason:
+        extra["reason"] = reason
+    return _Fail(409, "DriveFile", "This file lives in Google Drive; open it there.", **extra)
+
+
+def _drive_client(profile: str):
+    """A Drive client on the profile's gdrive link (replaced in tests)."""
+    from app.userdocs.sources.drive_client import DriveClient
+
+    return DriveClient(profile)
+
+
+def _drive_content(profile: str, rec: Dict[str, Any], cap: int) -> Tuple[bytes, str, str]:
+    """``(bytes, name, mime)`` of an indexed Drive file, fetched now through
+    the profile's own link, or a 409 ``DriveFile`` (with ``reason``) when it
+    is too large, not downloadable or Google is not answering.
+
+    The metadata is re-read first: it is what says whether the owner still
+    allows downloads and how large the file is *now*, before any bytes move.
+    """
+    file_id = rec.get("drive_file_id")
+    if not file_id:
+        raise _drive_file(rec)
+    if rec.get("status_reason") == "not_downloadable":
+        raise _drive_file(rec, "not_downloadable")
+    try:
+        if int(rec.get("size") or 0) > cap:
+            raise _drive_file(rec, "too_large")
+    except (TypeError, ValueError):
+        pass
+    try:
+        client = _drive_client(profile)
+    except Exception as exc:  # noqa: BLE001
+        logger.info(f"[userdocs] {profile}: no Drive client for {rec.get('cite_id')}: {exc}")
+        raise _drive_file(rec, "unavailable") from None
+    try:
+        meta = client.get(str(file_id))
+        if int(meta.get("size") or 0) > cap:
+            raise _drive_file(rec, "too_large")
+        content = client.fetch_content(meta, max_bytes=cap)
+    except _Fail:
+        raise
+    except Exception as exc:  # noqa: BLE001 — DriveError, or a transport failure
+        reason = str(getattr(exc, "kind", "") or "unavailable")
+        logger.info(f"[userdocs] {profile}: Drive bytes unavailable for {rec.get('cite_id')}: {reason}")
+        raise _drive_file(rec, reason) from None
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if content is None:
+        raise _drive_file(rec, "no_content")
+    name = str(rec.get("name") or meta.get("name") or "file")
+    if content.export_mime:
+        # A Google-native file has no bytes of its own; this is its export.
+        if content.ext and not name.lower().endswith(content.ext.lower()):
+            name += content.ext
+        mime = content.export_mime
+    else:
+        mime = (
+            rec.get("mime") or meta.get("mimeType") or mimetypes.guess_type(name)[0]
+            or "application/octet-stream"
+        )
+    return bytes(content.data), name, mime
 
 
 def _resolve(profile: str, conversation_id: Optional[str], tokens: List[str]) -> Dict[str, Any]:
@@ -272,17 +361,30 @@ def _file_text(
     }
 
 
-def _raw_target(profile: str, fid: str) -> Tuple[str, str, str]:
+def _raw_target(profile: str, fid: str) -> Tuple[Union[str, bytes], str, str]:
+    """``(path or bytes, name, mime)``: a path for a local file, the bytes
+    themselves for a Drive file."""
+    from app.userdocs import settings as uds
     from app.userdocs.citations import profile_index
 
     with profile_index(profile) as db:
         target, rec = _record(db, fid)
     if target != "file":
         raise _Fail(404, "NotFound", "A folder has no file to open.")
+    if rec.get("source") == uds.SOURCE_DRIVE:
+        return _drive_content(profile, rec, DRIVE_PROXY_MAX_BYTES)
     path = _local_file(profile, rec)
     name = rec.get("name") or os.path.basename(path)
     mime = rec.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream"
     return path, name, mime
+
+
+def _content_disposition(disposition: str, name: str) -> str:
+    """Starlette's FileResponse form, for a response built from bytes."""
+    quoted = quote(name)
+    if quoted != name:
+        return f"{disposition}; filename*=utf-8''{quoted}"
+    return f'{disposition}; filename="{name}"'
 
 
 # ── thumbnails ─────────────────────────────────────────────────────────────
@@ -320,8 +422,9 @@ def clear_thumbnail_cache() -> None:
         _thumbs_bytes = 0
 
 
-def _render_thumbnail(path: str, size: int) -> bytes:
-    """A JPEG no larger than ``size`` on its long side, built in memory."""
+def _render_thumbnail(src: Union[str, bytes], size: int, *, label: Optional[str] = None) -> bytes:
+    """A JPEG no larger than ``size`` on its long side, built in memory from a
+    path or from bytes already in memory (a Drive image)."""
     try:
         from PIL import Image, ImageOps
     except ImportError:
@@ -332,10 +435,11 @@ def _render_thumbnail(path: str, size: int) -> bytes:
         _register_heif()  # HEIC/HEIF when pillow-heif is installed; a no-op otherwise
     except Exception:  # noqa: BLE001
         pass
+    what = label or (os.path.basename(src) if isinstance(src, str) else "image")
     try:
-        with Image.open(path) as src:
-            src.draft("RGB", (size, size))  # JPEG decodes at a reduced scale
-            im = ImageOps.exif_transpose(src)
+        with Image.open(io.BytesIO(src) if isinstance(src, bytes) else src) as img:
+            img.draft("RGB", (size, size))  # JPEG decodes at a reduced scale
+            im = ImageOps.exif_transpose(img)
             im.thumbnail((size, size))
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                 rgba = im.convert("RGBA")
@@ -348,28 +452,36 @@ def _render_thumbnail(path: str, size: int) -> bytes:
             im.save(buf, "JPEG", quality=82, optimize=True)
             return buf.getvalue()
     except (Image.DecompressionBombError, OSError, ValueError, SyntaxError) as exc:
-        logger.info(f"[userdocs] no thumbnail for {os.path.basename(path)}: {exc}")
+        logger.info(f"[userdocs] no thumbnail for {what}: {exc}")
         raise _Fail(422, "ThumbnailFailed", "Cannot make a preview of this image.") from None
 
 
 def _thumbnail(profile: str, fid: str, size: int) -> bytes:
+    from app.userdocs import settings as uds
     from app.userdocs.citations import profile_index
 
     with profile_index(profile) as db:
         target, rec = _record(db, fid)
     if target != "file" or rec.get("kind") != "image":
         raise _Fail(415, "NoThumbnail", "Only images have previews.")
-    version = rec.get("sha256") or f"{rec.get('size')}:{rec.get('mtime_ns')}"
+    version = (
+        rec.get("sha256") or rec.get("drive_md5") or rec.get("drive_version")
+        or f"{rec.get('size')}:{rec.get('mtime_ns')}"
+    )
     # The profile is part of the key: two profiles indexing the same folder
     # share file ids by coincidence only.
     key = (profile, fid, version, size)
     cached = _thumb_get(key)
     if cached is not None:
         return cached
-    path = _local_file(profile, rec)
-    if os.path.getsize(path) > THUMB_MAX_FILE_BYTES:
-        raise _Fail(413, "TooLarge", "That image is too large to preview.")
-    data = _render_thumbnail(path, size)
+    if rec.get("source") == uds.SOURCE_DRIVE:
+        raw, name, _mime = _drive_content(profile, rec, DRIVE_PROXY_MAX_BYTES)
+        data = _render_thumbnail(raw, size, label=name)
+    else:
+        path = _local_file(profile, rec)
+        if os.path.getsize(path) > THUMB_MAX_FILE_BYTES:
+            raise _Fail(413, "TooLarge", "That image is too large to preview.")
+        data = _render_thumbnail(path, size)
     _thumb_put(key, data)
     return data
 
@@ -435,7 +547,7 @@ def get_userdocs_files_routes() -> List[Route]:
         result = await _run(_raw_target, _profile(request), fid)
         if isinstance(result, Response):
             return result
-        path, name, mime = result
+        src, name, mime = result
         active = mime in _ACTIVE_TYPES or mime.endswith("+xml")
         headers = {"X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-cache"}
         if active:
@@ -443,11 +555,16 @@ def get_userdocs_files_routes() -> List[Route]:
             # script, no forms, no same-origin access. (Not on everything —
             # a sandboxed PDF will not open in the browser's viewer.)
             headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+        media_type = "application/octet-stream" if active else mime
+        disposition = "attachment" if active else "inline"
+        if isinstance(src, bytes):
+            headers["Content-Disposition"] = _content_disposition(disposition, name)
+            return Response(src, media_type=media_type, headers=headers)
         return FileResponse(
-            path,
-            media_type="application/octet-stream" if active else mime,
+            src,
+            media_type=media_type,
             filename=name,
-            content_disposition_type="attachment" if active else "inline",
+            content_disposition_type=disposition,
             headers=headers,
         )
 

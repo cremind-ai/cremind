@@ -9,6 +9,7 @@ and the ``cremind userdocs`` CLI:
 - ``GET/PUT /api/userdocs/settings``   — this profile's sources (folder, Drive).
 - ``POST    /api/userdocs/validate-root`` — would this folder be accepted?
 - ``GET     /api/userdocs/browse``     — directory picker for the root.
+- ``GET     /api/userdocs/drive/folders`` — Drive folder picker (``include_folders``).
 
 The profile is always the caller's own (``request.user.username``), never a
 body or query field, so no route can read or change another profile's index.
@@ -18,7 +19,9 @@ content (turning Drive off, moving the folder, deleting the index) answers
 ``409 ConfirmationRequired`` with a plan of what would go and a ``confirm``
 token; repeating the request with that token applies it. The token is bound to
 the exact change and the row's version, so a stale dialog cannot confirm a
-different change.
+different change. Turning Drive off always deletes the Drive index once
+applied: a Drive index outliving its switch would keep serving files the user
+chose to stop sharing.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
@@ -41,6 +46,21 @@ from app.utils.logger import logger
 # The directory picker never lists more than this many subfolders; a folder
 # with more is shown truncated rather than stalling the dialog.
 _BROWSE_LIMIT = 2000
+
+# A Drive file/folder id: what Google hands out, and all the Drive client will
+# splice into a query ("'<id>' in parents").
+_DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
+# The gdrive skill replaces its token file atomically, so a read can land
+# mid-swap and see nothing. Before concluding "not linked", read once more.
+_TOKEN_REREAD_S = 0.25
+
+# Whole-Drive access: either scope lets a listing enumerate the entire Drive,
+# which is why such an account must name the folders to index.
+_WHOLE_DRIVE_SCOPES = frozenset({
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.readonly",
+})
 
 
 def _profile(request: Request) -> str:
@@ -107,31 +127,83 @@ def _source_payload(row: Optional[Dict[str, Any]], kind: str) -> Dict[str, Any]:
     }
 
 
+def _is_whole_drive(scopes: Any) -> bool:
+    try:
+        from app.userdocs.sources.drive_client import is_whole_drive
+    except ImportError:  # the Drive client is absent (a slim build): same rule, local copy
+        return bool(_WHOLE_DRIVE_SCOPES & set(scopes or []))
+    return bool(is_whole_drive(list(scopes or [])))
+
+
+def _drive_index_view(profile: str) -> Optional[Dict[str, Any]]:
+    """The engine's view of the Drive index (state, hold reason, counts, last
+    sync), as the progress snapshot carries it; None when there is none."""
+    try:
+        drive = uds_state.build_snapshot(profile).get("drive")
+    except Exception as exc:  # noqa: BLE001 — a settings page must render regardless
+        logger.debug(f"[userdocs] drive index view failed for {profile}: {exc}")
+        return None
+    return drive if isinstance(drive, dict) else None
+
+
 def _drive_view(profile: str) -> Dict[str, Any]:
     """Drive link state for the settings page. ``status`` may consult the
-    Google broker for the expected scopes, so it runs off the event loop."""
+    Google broker for the expected scopes, so it runs off the event loop.
+
+    ``whole_drive`` follows the indexing rule (``drive`` or ``drive.readonly``
+    in the granted scopes), because it decides whether folders must be chosen.
+    ``identity_email`` is the account the Drive index was built from — after a
+    re-link to another address it differs from ``email`` until the engine has
+    re-indexed. ``index`` is the engine's Drive view, when an engine runs."""
+    index = _drive_index_view(profile)
+    identity_email = (index or {}).get("account_email")
     try:
         from app.drive import skill_token
 
         st = skill_token.status(profile)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[userdocs] drive status failed for {profile}: {exc}")
-        return {"linked": False}
+        return {"linked": False, "identity_email": identity_email, "index": index}
+    linked = bool(st.get("linked"))
     return {
-        "linked": bool(st.get("linked")),
+        "linked": linked,
         "email": st.get("email"),
-        "whole_drive": bool(st.get("whole_drive")),
+        "whole_drive": linked and _is_whole_drive(st.get("scopes")),
         "access_model": st.get("access_model"),
+        "scopes_stale": bool(st.get("scopes_stale")),
+        "identity_email": identity_email,
+        "index": index,
     }
+
+
+def _drive_token(profile: str) -> Optional[Dict[str, Any]]:
+    """The gdrive skill's token file, read a second time before concluding it
+    is missing (a read can land in the middle of the skill's atomic swap)."""
+    from app.drive import skill_token
+
+    data = skill_token.read_token(profile)
+    if data or skill_token.skill_dir(profile) is None:
+        return data or None
+    time.sleep(_TOKEN_REREAD_S)
+    return skill_token.read_token(profile) or None
 
 
 def _drive_linked(profile: str) -> bool:
     try:
-        from app.drive import skill_token
-
-        return bool(skill_token.read_token(profile))
+        return bool(_drive_token(profile))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _drive_not_linked(message: Optional[str] = None, **extra: Any) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": "DriveNotLinked",
+            "message": message or "Link Google Drive first (Settings → GSuite, or the gdrive skill).",
+            **extra,
+        },
+        status_code=409,
+    )
 
 
 # ── admin ──────────────────────────────────────────────────────────────────
@@ -250,13 +322,7 @@ def _build_patch(
             if not ok:
                 raise _BadRequest(_gate_error(reason))
             if kind == uds.SOURCE_DRIVE and not _drive_linked(profile):
-                raise _BadRequest(JSONResponse(
-                    {
-                        "error": "DriveNotLinked",
-                        "message": "Link Google Drive first (Settings → GSuite, or the gdrive skill).",
-                    },
-                    status_code=409,
-                ))
+                raise _BadRequest(_drive_not_linked())
         patch["enabled"] = enabled
 
     if kind == uds.SOURCE_LOCAL:
@@ -288,11 +354,49 @@ def _build_patch(
             raw_opts = {k: v for k, v in raw_opts.items() if k != "caption_consent"}
         patch["options"] = uds.normalize_options(raw_opts, base=cur.get("options"))
 
-    if body.get("confirm_first_sync"):
-        import time as _time
+    if kind == uds.SOURCE_DRIVE:
+        _check_drive_folders(profile, patch, cur)
 
-        patch["first_sync_confirmed_at"] = _time.time() * 1000
+    if body.get("confirm_first_sync"):
+        patch["first_sync_confirmed_at"] = time.time() * 1000
     return patch
+
+
+def _check_drive_folders(profile: str, patch: Dict[str, Any], cur: Dict[str, Any]) -> None:
+    """Folder ids must look like Drive ids, and a whole-Drive account must
+    name at least one folder before Drive indexing can be on.
+
+    Whole-Drive access would otherwise index everything in the account, which
+    nobody asked for by flipping one switch. A per-file account needs no
+    folders: what it can reach is already what the user granted.
+    """
+    opts = patch.get("options") or uds.normalize_options(cur.get("options"))
+    folders = list(opts.get("include_folders") or [])
+    if "options" in patch:
+        bad = [f for f in folders if not _DRIVE_ID_RE.match(f)]
+        if bad:
+            raise _validation_failed({"include_folders": f"not a Drive folder id: {bad[0]}"})
+    turning_on = patch.get("enabled") is True
+    stays_on = bool(patch.get("enabled", cur.get("enabled")))
+    if folders or not stays_on or not (turning_on or "options" in patch):
+        return
+    try:
+        scopes = (_drive_token(profile) or {}).get("scopes")
+    except Exception:  # noqa: BLE001 — unreadable token: the linked check decides
+        return
+    if _is_whole_drive(scopes):
+        raise _BadRequest(JSONResponse(
+            {
+                "error": "DriveFoldersRequired",
+                "message": (
+                    "This Google account gives Cremind access to your whole Drive, so choose "
+                    "at least one folder to index first (My Documents → Google Drive → Choose "
+                    "folders, or `cremind userdocs drive enable --folder ID`)."
+                ),
+                "whole_drive": True,
+            },
+            status_code=409,
+        ))
 
 
 def _apply_settings(profile: str, admin: bool, body: Dict[str, Any]) -> JSONResponse:
@@ -332,9 +436,17 @@ def _apply_settings(profile: str, admin: bool, body: Dict[str, Any]) -> JSONResp
             status_code=409,
         )
 
+    # Turning Drive off deletes its index (the plan above said so, and was
+    # confirmed when there was anything to delete), with or without
+    # delete_index.
+    drive_off = (
+        kind == uds.SOURCE_DRIVE
+        and bool((current or {}).get("enabled"))
+        and patch.get("enabled") is False
+    )
     if patch:
         storage.upsert_source(profile, kind, **patch)
-    if delete_index:
+    if delete_index or drive_off:
         uds_state.request_purge(profile, kind)
     uds_state.notify_settings_changed(profile, kind)
     return JSONResponse({
@@ -400,6 +512,84 @@ def _browse(profile: str, admin: bool, raw: Optional[str], hidden: bool) -> JSON
         "entries": entries,
         "truncated": truncated,
         "roots": roots,
+    })
+
+
+# ── Drive folder picker ────────────────────────────────────────────────────
+
+
+def _drive_client(profile: str):
+    """A Drive client on the profile's gdrive link (replaced in tests)."""
+    from app.userdocs.sources.drive_client import DriveClient
+
+    return DriveClient(profile)
+
+
+def _drive_error(profile: str, exc: Exception) -> JSONResponse:
+    kind = str(getattr(exc, "kind", "") or "")
+    if kind in ("unlinked", "auth_revoked", "auth_failed", "auth_misconfigured"):
+        return _drive_not_linked(
+            None if kind == "unlinked"
+            else "Google refused Cremind's Drive access. Re-link Google Drive (Settings → GSuite).",
+            reason=kind,
+        )
+    if kind in ("not_found", "not_authorized"):
+        return JSONResponse(
+            {"error": "NotFound", "message": "No such Drive folder (or Cremind cannot see it).", "reason": kind},
+            status_code=404,
+        )
+    logger.info(f"[userdocs] {profile}: Drive folder listing failed: {kind or type(exc).__name__}: {exc}")
+    return JSONResponse(
+        {
+            "error": "DriveUnreachable",
+            "message": "Google Drive could not be reached. Try again in a moment.",
+            "reason": kind or "error",
+        },
+        status_code=503,
+    )
+
+
+def _drive_folders(profile: str, parent: Optional[str]) -> JSONResponse:
+    """One level of the profile's Drive folders for the ``include_folders``
+    picker: under ``parent``, or the top level (My Drive's root on a whole-Drive
+    account, the granted folders on a per-file one)."""
+    if parent is not None and not _DRIVE_ID_RE.match(parent):
+        return JSONResponse(
+            {"error": "ValidationFailed", "details": {"parent": "not a Drive folder id"}},
+            status_code=400,
+        )
+    try:
+        token = _drive_token(profile)
+    except Exception:  # noqa: BLE001
+        token = None
+    if not token:
+        return _drive_not_linked()
+    try:
+        client = _drive_client(profile)
+    except Exception as exc:  # noqa: BLE001
+        return _drive_error(profile, exc)
+    try:
+        parent_view = None
+        if parent is not None:
+            meta = client.get(parent)
+            parent_view = {"id": parent, "name": str(meta.get("name") or parent)}
+        rows = client.list_child_folders(parent)
+    except Exception as exc:  # noqa: BLE001 — DriveError or a transport failure
+        return _drive_error(profile, exc)
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    folders = [
+        {"id": str(r["id"]), "name": str(r.get("name") or r["id"])}
+        for r in rows or [] if isinstance(r, dict) and r.get("id")
+    ]
+    folders.sort(key=lambda f: (f["name"].lower(), f["id"]))
+    return JSONResponse({
+        "folders": folders,
+        "parent": parent_view,
+        "whole_drive": _is_whole_drive(token.get("scopes")),
     })
 
 
@@ -563,9 +753,11 @@ def get_userdocs_routes() -> List[Route]:
     # ── engine-backed routes ───────────────────────────────────────────────
 
     async def handle_control(request: Request) -> JSONResponse:
-        """``{action: start|pause|resume|rescan|reindex|retry_failed|rebuild|
-        confirm_deletions|reject_deletions|confirm_root_change, targets?,
-        reextract?, confirm?}`` → 202 with the fresh snapshot."""
+        """``{action: start|pause|resume|rescan|sync_now|reindex|retry_failed|
+        rebuild|confirm_deletions|reject_deletions|confirm_root_change,
+        targets?, reextract?, confirm?, source?}`` → 202 with the fresh
+        snapshot. ``source`` (local | drive, default local) picks which
+        source a rescan, sync, retry or deletion decision is about."""
         denied = require_auth(request)
         if denied is not None:
             return denied
@@ -573,7 +765,12 @@ def get_userdocs_routes() -> List[Route]:
         action = str(body.get("action") or "")
         # Only the known parameters travel on: anything else in the body
         # (a "profile", say) is dropped, never a way to aim at another profile.
-        params = {k: body[k] for k in ("targets", "reextract", "confirm", "model") if k in body}
+        params = {k: body[k] for k in ("targets", "reextract", "confirm", "model", "source") if k in body}
+        if "source" in params and params["source"] not in uds.SOURCE_KINDS:
+            return JSONResponse(
+                {"error": "ValidationFailed", "details": {"source": "must be 'local' or 'drive'"}},
+                status_code=400,
+            )
         return await _engine_call(
             lambda svc: svc.control(_profile(request), action, **params), status=202,
         )
@@ -589,11 +786,19 @@ def get_userdocs_routes() -> List[Route]:
         except ValueError:
             return JSONResponse({"error": "ValidationFailed", "details": {"limit": "must be a number"}}, status_code=400)
         after = (q.get("after_path") or "", after_id) if after_id is not None else None
+        source = (q.get("source") or "").lower() or None
+        if source == "all":
+            source = None
+        if source is not None and source not in uds.SOURCE_KINDS:
+            return JSONResponse(
+                {"error": "ValidationFailed", "details": {"source": "must be local, drive or all"}},
+                status_code=400,
+            )
         return await _engine_call(lambda svc: svc.list_files(
             _profile(request),
             status=q.get("status") or None,
             kind=q.get("kind") or None,
-            source=q.get("source") or None,
+            source=source,
             q=q.get("q") or None,
             after=after,
             limit=limit,
@@ -638,7 +843,17 @@ def get_userdocs_routes() -> List[Route]:
             return denied
         return await _engine_call(lambda svc: svc.storage(_profile(request)))
 
+    async def handle_drive_folders(request: Request) -> JSONResponse:
+        """``?parent=<folder id>`` → ``{folders: [{id, name}], parent, whole_drive}``.
+        Asks Google, so it runs in a worker thread."""
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        parent = request.query_params.get("parent") or None
+        return await asyncio.to_thread(_drive_folders, _profile(request), parent)
+
     return [
+        Route("/api/userdocs/drive/folders", handle_drive_folders, methods=["GET"]),
         Route("/api/userdocs/control", handle_control, methods=["POST"]),
         Route("/api/userdocs/files", handle_files, methods=["GET"]),
         Route("/api/userdocs/files/{fid}", handle_file_detail, methods=["GET"]),

@@ -258,6 +258,7 @@ def _resolve(
     with profile_index(profile) as db:
         files: dict[str, tuple[str, dict[str, Any] | None]] = {}
         chunk_lists: dict[tuple[str, int], list[Any]] = {}
+        hidden = _hidden_sources(db)
         for token, (cite_id, c8) in strict.items():
             rows = registry.get(token, [])
             here = [r for r in rows if conversation_id and r.get("conversation_id") == conversation_id]
@@ -273,6 +274,12 @@ def _resolve(
                     out[token] = _Resolved(_snapshot_item(token, REMOVED, snap, rec, target))
                 else:
                     out[token] = _Resolved(_invalid_item(token))
+                continue
+            if (rec.get("source") or "local") in hidden:
+                # A Drive whose access was revoked or unlinked is held: show
+                # what was cited (the snapshot taken when it was), never the
+                # live index, until Google is re-linked.
+                out[token] = _Resolved(_snapshot_item(token, STALE, snap, rec, target))
                 continue
 
             if not c8:
@@ -320,6 +327,14 @@ def _resolve(
                     ))
             out[token] = _Resolved(item, candidates)
     return out
+
+
+def _hidden_sources(db: Any) -> frozenset[str]:
+    if db is None:
+        return frozenset()
+    from app.userdocs.query.filters import hidden_sources
+
+    return hidden_sources(db)
 
 
 def _lookup_target(db: Any, cite_id: str) -> tuple[str, dict[str, Any] | None]:

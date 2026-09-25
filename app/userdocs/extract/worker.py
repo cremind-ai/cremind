@@ -257,21 +257,30 @@ def main() -> int:
         except (ValueError, AttributeError) as exc:
             _write_frame(proto_out, {"ok": False, "error": f"bad request: {exc}"})
             continue
+        finally:
+            # The raw frame is a full copy of any inline data; the parsed
+            # message is all that is needed from here on.
+            del frame
         if op == "ping":
             reply = {"ok": True, "op": "pong", "pid": os.getpid()}
         elif op == "extract":
             wire = message.get("req") or {}
-            data_b64 = wire.get("data_b64")
+            deadline_s = float(message.get("deadline_s") or 0) or None
+            # Pop, so the message no longer holds the base64 string once it
+            # is decoded: an in-memory file (a Drive download) would otherwise
+            # sit in the worker three times over while it is parsed.
+            data_b64 = wire.pop("data_b64", None)
             limits = dict(wire.get("limits") or {})
             test_op = limits.pop("test_op", None)
-            req = ExtractRequest(
-                name=wire.get("name") or "",
-                kind=wire.get("kind") or "",
-                path=wire.get("path"),
-                data=base64.b64decode(data_b64) if data_b64 else None,
-                limits=limits,
-            )
-            watchdog.deadline_s = float(message.get("deadline_s") or 0) or None
+            name, kind, path = wire.get("name") or "", wire.get("kind") or "", wire.get("path")
+            del message, wire
+            # b"" is data too: a blank Google Doc exports as zero bytes and
+            # must extract as empty, not fail as "no input".
+            data = base64.b64decode(data_b64) if data_b64 is not None else None
+            del data_b64
+            req = ExtractRequest(name=name, kind=kind, path=path, data=data, limits=limits)
+            del data
+            watchdog.deadline_s = deadline_s
             watchdog.busy_since = time.monotonic()
             try:
                 if test_ops and isinstance(test_op, dict):
@@ -279,7 +288,7 @@ def main() -> int:
                 reply = {"ok": True, "result": extract_any(req).to_dict()}
             finally:
                 watchdog.busy_since = None
-            del req, wire, data_b64
+            del req
         else:
             reply = {"ok": False, "error": f"unknown op {op!r}"}
         _write_frame(proto_out, reply)

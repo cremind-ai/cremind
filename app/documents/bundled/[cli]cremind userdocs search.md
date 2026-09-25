@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN indexed files from the terminal with `cremind userdocs search` (passages by meaning and keyword, with --folder, --type, --from/--to dates, --group-by folder, --thorough), `cremind userdocs find` (files, folders or code projects by name, type or date, --kind project), `cremind userdocs read` (a file's text by --pages, --lines, --section such as 'Điều 203', --sheet, --slide) and `cremind userdocs cite` (where a [ud:…] citation points). Same results the agent's user_documents tool gets. Needs User Document Search enabled. Not for Cremind's own documentation (that is documentation_search)."
+description: "Search the user's OWN indexed files (local folder and Google Drive) from the terminal with `cremind userdocs search` (passages by meaning and keyword, with --folder, --type, --from/--to dates, --source local|drive, --group-by folder, --thorough), `cremind userdocs find` (files, folders or code projects by name, type or date, --kind project), `cremind userdocs read` (a file's text by --pages, --lines, --section such as 'Điều 203', --sheet, --slide) and `cremind userdocs cite` (where a [ud:…] citation points). Same results the agent's user_documents tool gets. Needs User Document Search enabled. Not for Cremind's own documentation (that is documentation_search)."
 ---
 
 # `cremind userdocs search` — searching your own files
@@ -33,7 +33,7 @@ and by exact words.
 
 ```bash
 cremind userdocs search QUERY [--folder NAME]... [--type TYPE]... [--from DATE] [--to DATE]
-                              [--date-field any|modified|created|taken]
+                              [--date-field any|modified|created|taken] [--source local|drive|all]
                               [--group-by file|folder|chunk] [--top-k N] [--thorough]
 ```
 
@@ -43,6 +43,7 @@ cremind userdocs search QUERY [--folder NAME]... [--type TYPE]... [--from DATE] 
 | `--type`       | —        | `document`, `pdf`, `word`, `spreadsheet`, `presentation`, `text`, `code`, `image`, `audio`, `video`, `archive`, `executable`, `other`. Repeatable. |
 | `--from`, `--to` | —      | Date window, `YYYY-MM-DD` (or `YYYY-MM`, `YYYY`), inclusive, in the profile's time zone. |
 | `--date-field` | `any`    | Which date the window applies to; `any` = created, modified, photo taken, or first seen. |
+| `--source`     | `all`    | `local` (the indexed folder), `drive` (Google Drive files, paths `Drive/…`), or `all`. |
 | `--group-by`   | `file`   | `file` (two passages per file), `folder` (nearest project folder, else parent), `chunk`. |
 | `--top-k`      | 8        | Results per page. |
 | `--thorough`   | off      | Restore Vietnamese accents, translate the query, rerank the best 30 with the `low` model group. |
@@ -70,13 +71,13 @@ topic — or list what a filter selects.
 
 ```bash
 cremind userdocs find [QUERY] [--kind file|folder|project] [--folder NAME]... [--type TYPE]...
-                              [--from DATE] [--to DATE] [--sort ORDER] [--limit N]
+                              [--from DATE] [--to DATE] [--source local|drive|all] [--sort ORDER] [--limit N]
 ```
 
 | Flag       | Default | Meaning |
 |------------|---------|---------|
 | `--kind`   | `file`  | `file`, `folder`, or `project` (folders with a README, a manifest, `.git`, or several source files). |
-| `--folder`, `--type`, `--from`, `--to` | — | As for `search`. For folders and projects the date is their activity (changes beneath them, last commit). |
+| `--folder`, `--type`, `--from`, `--to`, `--source` | — | As for `search`. For folders and projects the date is their activity (changes beneath them, last commit). |
 | `--sort`   | `relevance` with a query, else `newest` | `relevance`, `newest`, `oldest`, `name`, `largest`, `smallest`. |
 | `--limit`  | 20      | Results per page. |
 

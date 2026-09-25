@@ -140,11 +140,18 @@ def _payloads(rt: Any, rows: list[dict[str, Any]]) -> list[dict[str, int]]:
     return out
 
 
+def _syncing(rt: Any) -> bool:
+    """Either source of the profile is on: the local folder syncing, or
+    Google Drive (a Drive-only profile embeds just the same)."""
+    drive = getattr(rt, "drive", None)
+    return bool(rt.active or (drive is not None and drive.enabled))
+
+
 def step(rt: Any) -> int:
     """Embed one batch for ``rt``; returns how many chunks got vectors."""
     from app.userdocs import governor as gov
 
-    if rt.db is None or not rt.active or rt.paused_user:
+    if rt.db is None or not _syncing(rt) or rt.paused_user:
         return 0
     handles = live_handles()
     if handles is None:
@@ -214,6 +221,30 @@ def step(rt: Any) -> int:
         return 0
     db.set_vec_gen(ids, gen)
     _report_coverage(rt, gen)
+    return len(ids)
+
+
+def flush_deletes(rt: Any) -> int:
+    """Delete the vectors of chunks already gone from the index, now — for a
+    runtime about to close its index file (both sources off), after which no
+    embedding step would do it. Best effort: an unreachable store leaves
+    them to search-time filtering and the weekly GC."""
+    handles = live_handles()
+    if handles is None or rt.db is None:
+        return 0
+    _emb, store = handles
+    try:
+        coll = rt.db.active_collection()
+    except Exception:  # noqa: BLE001
+        return 0
+    ids = rt.take_vector_deletes()
+    if not coll or not ids:
+        return 0
+    try:
+        store.delete_ids(coll["name"], ids)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[userdocs] {rt.profile}: vector delete failed: {exc}")
+        return 0
     return len(ids)
 
 

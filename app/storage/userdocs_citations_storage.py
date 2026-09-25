@@ -187,6 +187,17 @@ class UserDocCitationsStorage(SyncStorageBase):
         with self._engine.begin() as conn:
             return conn.execute(delete(_CIT).where(_CIT.c.profile == profile)).rowcount
 
+    def delete_source_kind(self, profile: str, kind: str) -> int:
+        """Purge set D's share of the registry: every citation of the
+        profile's ``kind`` source (``"drive"``), the rest untouched. A Drive
+        index removed after an unlink or a revocation must leave no token
+        that still "verifies" against rows that are gone. Messages keep their
+        own ``metadata.citations`` snapshots."""
+        with self._engine.begin() as conn:
+            return conn.execute(
+                delete(_CIT).where(and_(_CIT.c.profile == profile, _CIT.c.source_kind == kind))
+            ).rowcount
+
     # ── reads ─────────────────────────────────────────────────────────────
 
     def rows_for_cite_ids(self, profile: str, cite_ids: Iterable[str]) -> list[dict[str, Any]]:

@@ -14,6 +14,15 @@ package's sync service imports, which the extractor worker must not pay for.
 Large tables are split into row groups with the header repeated (see
 :func:`~._base.group_rows`), so a table pasted into a document chunks like a
 spreadsheet instead of arriving as one oversized block.
+
+A Google Doc exported as Markdown is a converted document too, so its caller
+asks for ``limits["md_locators"] = "structure"``. With ``limits["md_export"]``
+two export habits are undone: images are inlined as base64 reference
+definitions (``[image1]: <data:image/png;base64,...>``), which would be indexed
+as text and eat the text budget, and punctuation is backslash-escaped
+(``Điều 12\\.``), which breaks legal-heading matching. Escapes are undone per
+block, after the structure is parsed, because they are what keeps ``\\# note``
+from being a heading; fenced code and code spans keep theirs.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ from typing import Any
 
 from app.userdocs.types import ANCHOR_HARD, ANCHOR_NONE, ANCHOR_SOFT
 
-from ._base import Ctx, group_rows, read_text
+from ._base import Ctx, decode_text, group_rows, read_text
 
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
@@ -34,6 +43,45 @@ _QUOTE_RE = re.compile(r"^ {0,3}>")
 _TABLE_RE = re.compile(r"^ {0,3}\|")
 _TABLE_SEP_RE = re.compile(r"^ {0,3}\|?[ \t]*:?-{1,}:?[ \t]*(\|[ \t]*:?-{1,}:?[ \t]*)*\|?[ \t]*$")
 _TABLE_ROW_MIN_SPLIT = 12  # smaller tables stay one block
+
+# Export cleanup (limits["md_export"]).
+_DATA_IMAGE_DEF_RE = re.compile(
+    r"^ {0,3}\[([^\]\n]{1,200})\]:[ \t]*<?data:image/[^\n]*(?:\n|\Z)", re.MULTILINE | re.IGNORECASE)
+_DATA_IMAGE_INLINE_RE = re.compile(r"!\[([^\]\n]*)\]\(<?data:image/[^)\n]*\)", re.IGNORECASE)
+_IMAGE_REF_RE = re.compile(r"!\[([^\]\n]*)\]\[([^\]\n]*)\]")
+# A code span (kept as is) or one escaped punctuation character.
+_UNESCAPE_RE = re.compile(r"(`+)(?:.+?)\1|\\([.\-*_#+!()\[\]])", re.DOTALL)
+# How far past the text budget an export is read: its base64 images are
+# stripped before the budget applies to what is left.
+_EXPORT_READ_FACTOR = 4
+
+
+def strip_data_images(text: str) -> str:
+    """Drop inlined base64 images from exported Markdown: the reference
+    definitions, the ``![alt][imageN]`` uses that pointed at them (their alt
+    text stays), and inline ``![alt](data:image/...)``."""
+    labels: set[str] = set()
+
+    def drop_def(m: re.Match[str]) -> str:
+        labels.add(m.group(1).strip().casefold())
+        return ""
+
+    text = _DATA_IMAGE_DEF_RE.sub(drop_def, text)
+    text = _DATA_IMAGE_INLINE_RE.sub(lambda m: m.group(1), text)
+    if labels:
+        def drop_use(m: re.Match[str]) -> str:
+            label = (m.group(2) or m.group(1)).strip().casefold()
+            return m.group(1) if label in labels else m.group(0)
+
+        text = _IMAGE_REF_RE.sub(drop_use, text)
+    return text
+
+
+def unescape_markdown(text: str) -> str:
+    """``\\.`` → ``.`` and the like, outside code spans."""
+    if "\\" not in text:
+        return text
+    return _UNESCAPE_RE.sub(lambda m: m.group(0) if m.group(1) else m.group(2), text)
 
 
 class _FenceTracker:
@@ -79,12 +127,16 @@ def _role_of(first_line: str) -> str:
 class _Emitter:
     """Turns line spans into blocks with the right locator for ``mode``."""
 
-    def __init__(self, ctx: Ctx, mode: str, base: dict[str, Any] | None) -> None:
+    def __init__(self, ctx: Ctx, mode: str, base: dict[str, Any] | None, unescape: bool = False) -> None:
         self.ctx = ctx
         self.mode = mode
         self.base = dict(base or {})
         self.path: list[tuple[int, str]] = []
         self.para = 0
+        self.unescape = unescape
+
+    def _clean(self, text: str) -> str:
+        return unescape_markdown(text) if self.unescape else text
 
     def _locator(self, start: int, end: int, lines: list[str]) -> dict[str, Any]:
         loc = dict(self.base)
@@ -100,7 +152,7 @@ class _Emitter:
         return loc
 
     def heading(self, level: int, title: str, start: int, end: int) -> None:
-        title = title.strip()
+        title = self._clean(title.strip())
         while self.path and self.path[-1][0] >= level:
             self.path.pop()
         self.path.append((level, title))
@@ -114,7 +166,8 @@ class _Emitter:
         if role == "table":
             self._table(lines, start)
             return
-        self.ctx.add("\n".join(lines), anchor=ANCHOR_NONE, role=role,
+        text = "\n".join(lines)
+        self.ctx.add(text if role == "code" else self._clean(text), anchor=ANCHOR_NONE, role=role,
                      locator=self._locator(start, start + len(lines), lines))
 
     def _table(self, lines: list[str], start: int) -> None:
@@ -122,7 +175,7 @@ class _Emitter:
         header = lines[:2] if has_header else []
         body = list(enumerate(lines[2:] if has_header else lines))
         if len(body) < _TABLE_ROW_MIN_SPLIT:
-            self.ctx.add("\n".join(lines), role="table",
+            self.ctx.add(self._clean("\n".join(lines)), role="table",
                          locator=self._locator(start, start + len(lines), lines))
             return
         offset = start + len(header)
@@ -137,19 +190,20 @@ class _Emitter:
                                 chunk if counted_header else header + chunk)
             counted_header = True
             loc["rows"] = [first + 1, last + 1]
-            self.ctx.add("\n".join(header + chunk), role="table", locator=loc)
+            self.ctx.add(self._clean("\n".join(header + chunk)), role="table", locator=loc)
 
 
 def emit_markdown(ctx: Ctx, text: str, *, mode: str = "lines",
-                  base: dict[str, Any] | None = None) -> None:
+                  base: dict[str, Any] | None = None, unescape: bool = False) -> None:
     """Parse ``text`` (``\\n`` line ends) into ``ctx`` as blocks.
 
     Headings H1-H3 are hard anchors and H4-H6 soft ones; paragraphs are runs
     of lines between blank lines; a fenced block is one ``code`` block even
-    across blank lines; a run of ``|`` lines is a table.
+    across blank lines; a run of ``|`` lines is a table. ``unescape`` undoes
+    backslash escapes in every block but code (see the module docstring).
     """
     lines = text.split("\n")
-    out = _Emitter(ctx, mode, base)
+    out = _Emitter(ctx, mode, base, unescape)
     n = len(lines)
     i = 0
 
@@ -237,5 +291,21 @@ def _front_matter_meta(ctx: Ctx, lines: list[str]) -> None:
             ctx.result.doc_meta.setdefault("created", value)
 
 
+def _read_export(ctx: Ctx) -> str:
+    """An exported document's text with its inlined images removed. Read past
+    the text budget first, since the images are usually most of the bytes;
+    :meth:`Ctx.add` still holds what is left to the budget."""
+    data, truncated = ctx.read_bytes(ctx.max_text_bytes * _EXPORT_READ_FACTOR)
+    if truncated:
+        ctx.mark_partial()
+    text, encoding = decode_text(data)
+    del data
+    ctx.result.doc_meta.setdefault("encoding", encoding)
+    return strip_data_images(text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def extract_markdown(ctx: Ctx) -> None:
-    emit_markdown(ctx, read_text(ctx), mode="lines")
+    export = bool(ctx.limits.get("md_export"))
+    mode = "structure" if ctx.limits.get("md_locators") == "structure" else "lines"
+    text = _read_export(ctx) if export else read_text(ctx)
+    emit_markdown(ctx, text, mode=mode, unescape=export)

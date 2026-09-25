@@ -8,9 +8,11 @@ profile's settings row — and caches both for a few seconds: agent runs are
 built on the event loop, and a busy channel can start several a second, so
 the gate must not turn every run into database round trips.
 
-Hidden when the admin has not allowed the feature, when the profile has not
-turned it on (or has no folder), and when the conversation's origin is not
-one the profile allowed (``options.allow_in``):
+Hidden when the admin has not allowed the feature, when the profile has
+neither a local folder (on, with a root) nor Google Drive indexing on, and
+when the conversation's origin is not one the profile allowed
+(``options.allow_in`` — on the local row, which holds the per-profile
+options even when only Drive is on):
 
 - ``web_cli`` — the web UI, the CLI, and the profile's own automations
   (runs with no message origin); on by default;
@@ -54,10 +56,15 @@ def origin_class(message_origin: dict[str, Any] | None) -> str:
     return ORIGIN_WEB_CLI
 
 
+def _drive_key(profile: str) -> str:
+    return f"{profile}\x00drive"
+
+
 def _invalidate(profile: str, _kind: str) -> None:
     # An admin-gate save notifies every profile, so the gate value goes too.
     with _lock:
         _cache.pop(profile, None)
+        _cache.pop(_drive_key(profile), None)
         _cache.pop(_ADMIN_KEY, None)
 
 
@@ -99,6 +106,13 @@ def _source_row(profile: str) -> dict[str, Any] | None:
     return _cached(profile, lambda: get_userdocs_storage().get_source(profile, uds.SOURCE_LOCAL))
 
 
+def _drive_row(profile: str) -> dict[str, Any] | None:
+    from app.storage.userdocs_storage import get_userdocs_storage
+    from app.userdocs import settings as uds
+
+    return _cached(_drive_key(profile), lambda: get_userdocs_storage().get_source(profile, uds.SOURCE_DRIVE))
+
+
 def clear_cache() -> None:
     with _lock:
         _cache.clear()
@@ -115,10 +129,13 @@ def userdocs_tool_available(profile: str, origin: str | dict[str, Any] | None = 
         if not _admin_allowed():
             return False
         row = _source_row(profile)
-        if not row or not row.get("enabled") or not row.get("root_path"):
-            return False
+        local_on = bool(row and row.get("enabled") and row.get("root_path"))
+        if not local_on:
+            drive = _drive_row(profile)
+            if not (drive and drive.get("enabled")):
+                return False
         key = origin if isinstance(origin, str) else origin_class(origin)
-        allow = uds.normalize_options(row.get("options")).get("allow_in") or {}
+        allow = uds.normalize_options((row or {}).get("options")).get("allow_in") or {}
         return bool(allow.get(key, uds.DEFAULT_ALLOW_IN.get(key, False)))
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[userdocs] tool gate for {profile} failed: {exc}")

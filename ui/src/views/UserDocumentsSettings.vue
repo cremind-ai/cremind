@@ -21,6 +21,11 @@
  * An admin-disabled gate replaces the page with an explanation (admins get a
  * link to the gate); an engine that failed to start (503) replaces only the
  * live panels, since settings can still be saved.
+ *
+ * Google Drive is a second source with its own switch (DriveIndexingSection).
+ * A profile may use either or both, so "on" for the live panels means the
+ * local folder or Drive; the per-profile options (captions, identity, where
+ * the agent may use it) stay on the local source's row either way.
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
@@ -48,9 +53,11 @@ import {
   type UserDocsSettings,
   type UserDocsSettingsPatch,
   type UserDocsSettingsSaved,
+  type UserDocsSourceKind,
   type UserDocsStorageInfo,
 } from '../services/userdocsApi';
 import { formatBytes, formatCount, stateBanner, type BannerActionId } from '../utils/userdocsView';
+import DriveIndexingSection from '../components/userdocs/DriveIndexingSection.vue';
 import UserDocsStatePanel from '../components/userdocs/UserDocsStatePanel.vue';
 import RootFolderPicker from '../components/userdocs/RootFolderPicker.vue';
 import ExcludeRulesEditor from '../components/userdocs/ExcludeRulesEditor.vue';
@@ -87,8 +94,12 @@ const togglingEnabled = ref(false);
 
 const snapshot = computed(() => store.snapshot);
 const local = computed(() => settings.value?.local ?? null);
+const drive = computed(() => settings.value?.drive ?? null);
 const policy = computed(() => settings.value?.policy_view ?? null);
-const enabled = computed(() => !!local.value?.enabled);
+const localEnabled = computed(() => !!local.value?.enabled);
+const driveEnabled = computed(() => !!drive.value?.enabled);
+/** Either source is on: the live panels (sync, storage, files) apply. */
+const enabled = computed(() => localEnabled.value || driveEnabled.value);
 const isAdmin = computed(() => !!policy.value?.is_admin);
 
 const banner = computed(() => {
@@ -97,6 +108,7 @@ const banner = computed(() => {
   return stateBanner(snap, settings.value, {
     asOf: asOf.value,
     keptIndexBytes: snap.state === 'disabled' ? storageDetail.value?.total_bytes ?? null : null,
+    driveEnabled: driveEnabled.value,
   });
 });
 
@@ -188,6 +200,15 @@ function describeError(e: unknown): string {
         return 'Vector Embedding is off, so document search cannot be turned on right now.';
       case 'NotEnabled':
         return 'Turn document search on first.';
+      case 'DriveNotLinked':
+        // The link state shown is stale; show it as it is now.
+        void loadSettings();
+        return e.message;
+      case 'DriveFoldersRequired':
+        // A whole-Drive account names folders first: open the picker, and
+        // saving it turns Drive on.
+        driveSection.value?.openPicker('enable');
+        return e.message;
       case 'VisionModelChanged':
       case 'VisionNotConfigured':
         // Show the model as it is now before asking again.
@@ -270,15 +291,16 @@ function onPlanOpenChange(open: boolean) {
 
 // ── settings saves ────────────────────────────────────────────────────────
 
-/** Save part of the local source's settings; true when it was applied. */
-async function saveLocal(
+/** Save part of one source's settings; true when it was applied. */
+async function saveSource(
+  kind: UserDocsSourceKind,
   patch: Omit<UserDocsSettingsPatch, 'kind'>,
   confirmTitle: string,
   confirmLabel: string,
 ): Promise<boolean> {
   try {
     const outcome = await saveUserDocsSettings(settingsStore.agentUrl, settingsStore.authToken, {
-      kind: 'local', ...patch,
+      kind, ...patch,
     });
     const saved: UserDocsSettingsSaved | null = await resolveConfirm(outcome, confirmTitle, confirmLabel);
     if (!saved) return false;
@@ -289,6 +311,22 @@ async function saveLocal(
     ElMessage.error(describeError(e));
     return false;
   }
+}
+
+function saveLocal(
+  patch: Omit<UserDocsSettingsPatch, 'kind'>,
+  confirmTitle: string,
+  confirmLabel: string,
+): Promise<boolean> {
+  return saveSource('local', patch, confirmTitle, confirmLabel);
+}
+
+function saveDrive(
+  patch: Omit<UserDocsSettingsPatch, 'kind'>,
+  confirmTitle: string,
+  confirmLabel: string,
+): Promise<boolean> {
+  return saveSource('drive', patch, confirmTitle, confirmLabel);
 }
 
 async function onToggleEnabled(next: string | number | boolean) {
@@ -412,6 +450,61 @@ function goToLlmSettings() {
   void router.push({ name: 'llm-settings', params: { profile: props.profile } });
 }
 
+// ── Google Drive ──────────────────────────────────────────────────────────
+
+const driveSection = ref<InstanceType<typeof DriveIndexingSection> | null>(null);
+
+/**
+ * One Drive change through the confirm flow. Turning Drive off always
+ * removes its index, and narrowing its folders removes the files outside
+ * them, so the server answers both with a plan first; turning it on for a
+ * whole-Drive account without folders is refused (DriveFoldersRequired).
+ */
+async function applyDrive(change: { enabled?: boolean; include_folders?: string[] }): Promise<boolean> {
+  const patch: Omit<UserDocsSettingsPatch, 'kind'> = {};
+  if (change.enabled !== undefined) patch.enabled = change.enabled;
+  if (change.include_folders !== undefined) patch.options = { include_folders: change.include_folders };
+  const turningOff = change.enabled === false;
+  const turningOn = change.enabled === true;
+  const ok = await saveDrive(
+    patch,
+    turningOff ? 'Turn off Google Drive search?' : turningOn ? 'Turn on Google Drive search?' : 'Change the Drive folders?',
+    turningOff ? 'Turn off and remove' : turningOn ? 'Turn on' : 'Change folders',
+  );
+  if (ok) {
+    ElMessage.success(turningOff
+      ? 'Google Drive search is off. Its index is being removed.'
+      : turningOn
+        ? 'Google Drive search is on. Cremind is listing your Drive.'
+        : 'Drive folders saved.');
+    fileTableKey.value += 1;
+  }
+  return ok;
+}
+
+async function syncDrive(full: boolean) {
+  if (await control(full ? 'rescan' : 'sync_now', { source: 'drive' })) {
+    ElMessage.success(full ? 'Checking every Drive file.' : 'Checking Google Drive for changes.');
+  }
+}
+
+async function removeDriveDeletions() {
+  if (await control('confirm_deletions', { source: 'drive' })) {
+    ElMessage.success('The vanished Drive files were removed from the index.');
+    fileTableKey.value += 1;
+  }
+}
+
+async function keepDriveDeletions() {
+  if (await control('reject_deletions', { source: 'drive' })) {
+    ElMessage.success('Kept. Cremind checks them again on the next full sync.');
+  }
+}
+
+function goToGsuiteSettings() {
+  void router.push({ name: 'gsuite-settings', params: { profile: props.profile } });
+}
+
 // ── engine actions ────────────────────────────────────────────────────────
 
 const fileTableKey = ref(0);
@@ -459,8 +552,8 @@ async function retryAll() {
   }
 }
 
-async function reindex(targets: string[]) {
-  const res = await control('reindex', { targets });
+async function reindex(targets: string[], source?: UserDocsSourceKind) {
+  const res = await control('reindex', source === 'drive' ? { targets, source } : { targets });
   if (res) {
     ElMessage.success(`Reindexing ${formatCount(res.files ?? targets.length)} file${(res.files ?? targets.length) === 1 ? '' : 's'}.`);
     fileTableKey.value += 1;
@@ -622,9 +715,7 @@ function onBannerAction(id: BannerActionId) {
     case 'resume':
     case 'pause': void togglePause(); break;
     case 'retry_failed': void retryAll(); break;
-    case 'relink_google':
-      void router.push({ name: 'gsuite-settings', params: { profile: props.profile } });
-      break;
+    case 'relink_google': goToGsuiteSettings(); break;
   }
 }
 
@@ -657,8 +748,9 @@ function goBack() {
         <h1 class="ud-title">My Documents</h1>
         <p class="ud-subtitle">
           Let the agent search your own files and answer with citations you can open. Cremind keeps
-          a private index of the folder you choose and updates it as files change — only this
-          profile can search it, and your files are never modified.
+          a private index of the folder you choose (and of your Google Drive, if you turn it on) and
+          updates it as files change — only this profile can search it, and your files are never
+          modified.
         </p>
       </div>
 
@@ -687,7 +779,7 @@ function goBack() {
               An administrator has to allow User Document Search before you can use it. Ask your
               administrator if you need it.
             </p>
-            <p v-if="local.enabled">
+            <p v-if="enabled">
               Your index is kept, and syncing picks up where it left off once it is allowed again.
             </p>
             <ElButton v-if="isAdmin" size="small" type="primary" @click="goToEmbeddingSettings">
@@ -709,14 +801,14 @@ function goBack() {
                 </p>
               </div>
               <ElSwitch
-                :model-value="enabled"
+                :model-value="localEnabled"
                 :loading="togglingEnabled"
-                :disabled="!enabled && !policy.effective"
+                :disabled="!localEnabled && !policy.effective"
                 aria-label="Search my documents"
                 @update:model-value="onToggleEnabled"
               />
             </div>
-            <p v-if="!enabled && policy.reason === 'embedding_disabled'" class="ud-note">
+            <p v-if="!localEnabled && policy.reason === 'embedding_disabled'" class="ud-note">
               <Icon icon="mdi:information-outline" />
               <span>
                 Vector Embedding is off on this server, so document search can't be turned on right now.
@@ -733,7 +825,7 @@ function goBack() {
             <h2>Folder</h2>
             <p class="ud-muted">
               Everything inside it is indexed, subfolders included, except what you exclude below.
-              <template v-if="!enabled">Choose it before turning search on, if you like.</template>
+              <template v-if="!localEnabled">Choose it before turning search on, if you like.</template>
             </p>
             <RootFolderPicker
               :source="local"
@@ -752,6 +844,23 @@ function goBack() {
               :saving="savingExcludes"
               :disabled="savingExcludes"
               @save="onSaveExcludes"
+            />
+          </section>
+
+          <!-- Google Drive: a second source, on its own switch -->
+          <section class="ud-card">
+            <DriveIndexingSection
+              ref="driveSection"
+              :source="drive"
+              :link="settings.drive_link"
+              :snapshot="snapshot"
+              :can-enable="policy.effective"
+              :save="applyDrive"
+              :busy="acting"
+              @sync="syncDrive"
+              @confirm-deletions="removeDriveDeletions"
+              @reject-deletions="keepDriveDeletions"
+              @open-gsuite="goToGsuiteSettings"
             />
           </section>
 
@@ -818,7 +927,7 @@ function goBack() {
                       <Icon :icon="pausedByUser ? 'mdi:play' : 'mdi:pause'" class="btn-icon" />
                       {{ pausedByUser ? 'Resume' : 'Pause' }}
                     </ElButton>
-                    <ElButton size="small" :disabled="acting" @click="rescan">
+                    <ElButton v-if="localEnabled" size="small" :disabled="acting" @click="rescan">
                       <Icon icon="mdi:refresh" class="btn-icon" /> Rescan
                     </ElButton>
                     <ElButton size="small" :disabled="acting" @click="rebuildReextract = false; rebuildOpen = true">
@@ -847,6 +956,7 @@ function goBack() {
                   ref="fileTable"
                   :refresh-key="fileTableKey"
                   :busy="acting"
+                  :show-source="driveEnabled"
                   @reindex="reindex"
                   @engine-down="onEngineDown"
                 />
@@ -859,6 +969,9 @@ function goBack() {
 
     <!-- Turn off: keep or delete the index -->
     <ElDialog v-model="disableOpen" title="Turn off document search?" width="480px" append-to-body>
+      <p v-if="driveEnabled" class="ud-dialog-text">
+        This turns off your folder only. Google Drive search stays on, with its own index.
+      </p>
       <ElRadioGroup v-model="disableDeleteIndex" class="ud-disable-options">
         <ElRadio :value="false">
           <strong>Keep the index</strong>

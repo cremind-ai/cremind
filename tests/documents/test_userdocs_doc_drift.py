@@ -1,13 +1,16 @@
 """Doc/code drift pin for `[cli]cremind userdocs.md`,
-`[cli]cremind userdocs search.md` and `[cli]cremind userdocs research.md`.
+`[cli]cremind userdocs search.md`, `[cli]cremind userdocs research.md` and
+`[cli]cremind userdocs drive.md`.
 
 CLAUDE.md mandates that a CLI command and its bundled doc move in lockstep.
 This walks the nested Typer groups (`userdocs`, `userdocs excludes`,
-`userdocs admin`, `userdocs research`) so a new subcommand or flag cannot
-land undocumented. The query subcommands (`search`, `find`, `read`, `cite`)
-and the research jobs (`research …`) live in their own docs — one reference
-per question a user asks ("set it up" vs "search my files" vs "research this
-folder"), each small enough to be delivered whole.
+`userdocs admin`, `userdocs research`, `userdocs drive`, `userdocs drive
+folders`) so a new subcommand or flag cannot land undocumented. The query
+subcommands (`search`, `find`, `read`, `cite`), the research jobs
+(`research …`) and Google Drive indexing (`drive …`) live in their own docs —
+one reference per question a user asks ("set it up" vs "search my files" vs
+"research this folder" vs "index my Drive"), each small enough to be
+delivered whole.
 
 The ``description`` is the only text embedded into ``documentation_search``,
 so it must carry what users actually ask ("search my files", "index my
@@ -28,12 +31,17 @@ BUNDLED = Path(__file__).resolve().parents[2] / "app" / "documents" / "bundled"
 DOC = BUNDLED / "[cli]cremind userdocs.md"
 SEARCH_DOC = BUNDLED / "[cli]cremind userdocs search.md"
 RESEARCH_DOC = BUNDLED / "[cli]cremind userdocs research.md"
+DRIVE_DOC = BUNDLED / "[cli]cremind userdocs drive.md"
 
 # Documented in SEARCH_DOC instead of DOC.
 SEARCH_COMMANDS = frozenset({"search", "find", "read", "cite"})
 # Every command of this group is documented in RESEARCH_DOC.
 RESEARCH_GROUP = "research"
 RESEARCH_COMMANDS = frozenset({"run", "status", "continue", "cancel", "list"})
+# Every command of this group (and its `folders` subgroup) is in DRIVE_DOC.
+DRIVE_GROUP = "drive"
+DRIVE_COMMANDS = frozenset({"status", "enable", "disable", "sync", "folders list", "folders set"})
+ALL_DOCS = [DOC, SEARCH_DOC, RESEARCH_DOC, DRIVE_DOC]
 
 
 def _doc_text(doc: Path = DOC) -> str:
@@ -54,7 +62,7 @@ def _walk(app, prefix: str):
         yield from _walk(group.typer_instance, f"{prefix} {group.name}")
 
 
-@pytest.mark.parametrize("doc", [DOC, SEARCH_DOC, RESEARCH_DOC], ids=lambda d: d.name)
+@pytest.mark.parametrize("doc", ALL_DOCS, ids=lambda d: d.name)
 def test_frontmatter_is_well_formed(doc):
     lines = _doc_text(doc).splitlines()
     assert lines[0] == "---"
@@ -67,7 +75,8 @@ def test_frontmatter_is_well_formed(doc):
 
 def test_the_description_carries_what_users_ask():
     description = _description().lower()
-    for keyword in ("own files", "index", "folder", "sync progress", "admin", "vector embedding"):
+    for keyword in ("own files", "index", "folder", "sync progress", "admin", "vector embedding",
+                    "google drive"):
         assert keyword in description, f"description never mentions {keyword!r}"
     assert "not for cremind's own documentation" in description
 
@@ -76,6 +85,8 @@ def _doc_for(path: str) -> Path:
     parts = path.split(" ")
     if parts[2] == RESEARCH_GROUP:
         return RESEARCH_DOC
+    if parts[2] == DRIVE_GROUP:
+        return DRIVE_DOC
     if parts[2] in SEARCH_COMMANDS and len(parts) == 3:
         return SEARCH_DOC
     return DOC
@@ -86,7 +97,7 @@ def test_every_subcommand_and_flag_is_documented():
 
     from app.cli.commands.userdocs import userdocs_app
 
-    texts = {doc: _doc_text(doc) for doc in (DOC, SEARCH_DOC, RESEARCH_DOC)}
+    texts = {doc: _doc_text(doc) for doc in ALL_DOCS}
     seen = []
     for path, callback in _walk(userdocs_app, "cremind userdocs"):
         seen.append(path)
@@ -103,6 +114,25 @@ def test_every_subcommand_and_flag_is_documented():
     assert "cremind userdocs status" in seen
     assert {f"cremind userdocs {c}" for c in SEARCH_COMMANDS} <= set(seen)
     assert {f"cremind userdocs research {c}" for c in RESEARCH_COMMANDS} <= set(seen)
+    assert {f"cremind userdocs drive {c}" for c in DRIVE_COMMANDS} <= set(seen)
+
+
+def test_the_drive_doc_carries_what_users_ask():
+    """Retrieval must find it for "index/search my Google Drive", and the body
+    must teach what a script cannot guess: disabling deletes, whole-Drive
+    accounts need folders, and what each hold means for the index."""
+    description = _description(DRIVE_DOC).lower()
+    for keyword in ("own", "google drive", "index", "search", "folder", "whole-drive", "per-file",
+                    "disable", "deletes", "gdrive skill", "not for cremind's own documentation"):
+        assert keyword in description, f"drive doc description never mentions {keyword!r}"
+    text = _doc_text(DRIVE_DOC)
+    for word in ("DriveFoldersRequired", "DriveNotLinked", "auth_revoked", "drive_unlinked",
+                 "drive_unreachable", "drive_misconfigured", "7 days", "cremind google unlink gdrive",
+                 "--source drive", "exits 2"):
+        assert word in text, f"drive doc never explains {word!r}"
+    # The main doc and the search doc point to it / to the source filter.
+    assert "cremind userdocs drive" in _doc_text()
+    assert "--source" in _doc_text(SEARCH_DOC)
 
 
 def test_the_research_doc_carries_what_users_ask():

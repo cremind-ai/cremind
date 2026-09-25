@@ -87,6 +87,29 @@ def request_purge(profile: str, kind: str) -> bool:
     return True
 
 
+DriveSuspendHandler = Callable[[str], None]
+_drive_suspend_handler: DriveSuspendHandler | None = None
+
+
+def set_drive_suspend_handler(fn: DriveSuspendHandler | None) -> None:
+    """Register what "stop Drive for this profile now" does (the engine's)."""
+    global _drive_suspend_handler
+    _drive_suspend_handler = fn
+
+
+def suspend_drive(profile: str) -> bool:
+    """Stop ``profile``'s Drive sync until its token is checked again — the
+    Google unlink hook calls this for every Google skill it removes, so it
+    decides nothing by itself: a still-linked Drive resumes on that check.
+
+    Never blocks (the engine queues it) and is a no-op with no engine
+    running; returns whether an engine took it."""
+    if _drive_suspend_handler is None:
+        return False
+    _drive_suspend_handler(profile)
+    return True
+
+
 def notify_settings_changed(profile: str, kind: str) -> None:
     for fn in list(_settings_listeners):
         try:
@@ -117,10 +140,24 @@ def _source_view(row: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _drive_default(row: dict[str, Any] | None, effective: bool, gate_reason: str | None) -> dict[str, Any]:
+    """The Drive part of a snapshot when no engine reports one."""
+    on = bool(row and row.get("enabled"))
+    if on and not effective:
+        reason = "admin_gate" if gate_reason == "admin_gate_off" else "embedding_off"
+        return {"enabled": False, "state": "suspended", "reason": reason}
+    return {"enabled": False, "state": "disabled", "reason": None}
+
+
 def build_snapshot(profile: str, *, storage=None) -> dict[str, Any]:
     """Assemble the current snapshot for ``profile``. Synchronous and cheap
     (two indexed reads plus the engine's in-memory counters); API handlers
-    call it through ``asyncio.to_thread``."""
+    call it through ``asyncio.to_thread``.
+
+    The feature is on when either source is: a profile may index Google
+    Drive with its local folder off. ``drive`` is the Drive half's own view
+    (state, hold, counts, confirmation) — its holds never replace the
+    top-level state, which belongs to the folder and the engine as a whole."""
     if storage is None:
         from app.storage.userdocs_storage import get_userdocs_storage
         storage = get_userdocs_storage()
@@ -129,7 +166,7 @@ def build_snapshot(profile: str, *, storage=None) -> dict[str, Any]:
 
     local = storage.get_source(profile, uds.SOURCE_LOCAL)
     drive = storage.get_source(profile, uds.SOURCE_DRIVE)
-    enabled = bool(local and local.get("enabled"))
+    enabled = bool(local and local.get("enabled")) or bool(drive and drive.get("enabled"))
 
     snap: dict[str, Any] = {
         "v": SNAPSHOT_VERSION,
@@ -146,6 +183,7 @@ def build_snapshot(profile: str, *, storage=None) -> dict[str, Any]:
             uds.SOURCE_LOCAL: _source_view(local),
             uds.SOURCE_DRIVE: _source_view(drive),
         },
+        "drive": _drive_default(drive, effective, gate_reason),
     }
 
     if not policy.allowed:

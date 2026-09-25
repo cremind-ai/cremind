@@ -10,7 +10,11 @@
  */
 
 import type {
+  DriveFolder,
   PlanEffect,
+  UserDocsDriveFolderRef,
+  UserDocsDriveLink,
+  UserDocsDriveView,
   UserDocsSettings,
   UserDocsSnapshot,
 } from '../services/userdocsApi';
@@ -185,6 +189,10 @@ export function effectLabel(effect: PlanEffect): string {
     case 'purge_drive':
       return `Remove ${files} from Google Drive from the index${size}.`;
     case 'purge_out_of_scope':
+      // Narrowing Drive's folders: the counter is asked with kind="drive".
+      if (effect.detail?.kind === 'drive' || effect.detail?.source === 'drive') {
+        return `Remove ${plural(effect.files, 'Google Drive file')} that are not inside the chosen folders from the index.`;
+      }
       return effect.detail?.to
         ? `Remove ${files} that are not inside ${effect.detail.to} from the index.`
         : `Remove ${files} that the new rules leave out from the index.`;
@@ -241,6 +249,10 @@ export interface BannerContext {
   asOf?: number | null;
   /** Size of an index kept while the feature is off. */
   keptIndexBytes?: number | null;
+  /** Google Drive is on for the profile (the saved setting). Defaults to the
+   *  snapshot's `drive.enabled`; with the local folder off it turns "search
+   *  is off" into "searching Drive only". */
+  driveEnabled?: boolean;
 }
 
 function banner(
@@ -251,6 +263,14 @@ function banner(
   extra: Partial<Pick<StateBanner, 'snippet' | 'busy'>> = {},
 ): StateBanner {
   return { tone, title, body, actions, snippet: extra.snippet ?? null, busy: extra.busy ?? false };
+}
+
+/** A server message as the lead sentence of a body: capitalised, closed
+ *  with a full stop, followed by a space. Empty when there is none. */
+function sentence(message: unknown): string {
+  if (typeof message !== 'string' || !message.trim()) return '';
+  const text = message.trim();
+  return `${text[0].toUpperCase()}${text.slice(1)}${/[.!?]$/.test(text) ? '' : '.'} `;
 }
 
 function rootOf(snap: UserDocsSnapshot, settings: UserDocsSettings | null | undefined): string {
@@ -331,7 +351,10 @@ function holdBanner(
       );
     }
 
-    // Google Drive holds (the Drive source reports these for itself).
+    // Google Drive holds. The Drive source reports these in `snap.drive`,
+    // beside the local folder's state; `driveBanner` words them through here.
+    // Revoked and unlinked hide Drive from search and remove its index when
+    // the timer runs out; unreachable and misconfigured never remove anything.
     case 'auth_revoked': {
       const when = formatWhen(Number(detail.purge_at) || null);
       return banner(
@@ -342,11 +365,31 @@ function holdBanner(
         [{ id: 'relink_google', label: 'Re-link Google', primary: true }],
       );
     }
+    case 'drive_unlinked': {
+      const when = formatWhen(Number(detail.purge_at) || null);
+      return banner(
+        'warning',
+        `Google Drive was unlinked — Drive index removed${when ? ` on ${when}` : ' soon'}`,
+        'This profile no longer has a Google Drive link (it was unlinked, or the Drive skill was removed), '
+          + 'so Drive files are hidden from search and not synced. Link Google Drive again to keep their index.',
+        [{ id: 'relink_google', label: 'Link Google Drive', primary: true }],
+      );
+    }
     case 'drive_unreachable':
       return banner(
         'warning',
         'Google Drive is unreachable — results may be outdated',
-        'Drive files stay searchable as they were last synced; syncing resumes when Drive answers again.',
+        `${sentence(detail.message)}Drive files stay searchable as they were last synced; syncing resumes `
+          + 'when Drive answers again.',
+      );
+    case 'drive_misconfigured':
+      return banner(
+        'warning',
+        "Google refused Cremind's sign-in — results may be outdated",
+        `${sentence(detail.message)}Drive files stay searchable as they were last synced, and nothing is `
+          + 'removed. Re-linking Google usually fixes it; if it keeps happening, the Google client settings '
+          + 'need checking.',
+        [{ id: 'relink_google', label: 'Re-link Google' }],
       );
 
     default:
@@ -378,9 +421,23 @@ export function stateBanner(
   const failed = failedCount(snap);
   const failedNote = failed > 0 ? ` ${plural(failed, 'file')} could not be indexed.` : '';
   const retry: BannerAction[] = failed > 0 ? [{ id: 'retry_failed', label: 'Retry failed files' }] : [];
+  // A profile may search Google Drive with no local folder at all; the
+  // top-level state is the local folder's, so "off" must not read as
+  // "document search is off" then.
+  const driveOn = ctx.driveEnabled ?? !!snap.drive?.enabled;
+  const localOn = !!snap.sources?.local?.enabled;
 
   switch (snap.state) {
     case 'disabled': {
+      if (driveOn) {
+        return banner(
+          'info',
+          'Searching Google Drive only',
+          'The agent searches your Google Drive files. No folder on this computer is indexed — turn on '
+            + 'Search my documents to add one.',
+          [{ id: 'enable', label: 'Index a folder too' }],
+        );
+      }
       const kept = ctx.keptIndexBytes && ctx.keptIndexBytes > 0
         ? ` Your index is kept (${formatBytes(ctx.keptIndexBytes)}) — turning it back on only catches up with what changed.`
         : '';
@@ -588,10 +645,13 @@ export function stateBanner(
       const watching = snap.watch?.mode === 'poll'
         ? 'checked for changes regularly'
         : 'watched for changes';
+      const where = !localOn && driveOn
+        ? 'Google Drive is checked for changes every few minutes'
+        : `your folder is ${watching}`;
       return banner(
         failed > 0 ? 'warning' : 'success',
         failed > 0 ? `Up to date — ${plural(failed, 'file')} could not be indexed` : 'Up to date',
-        `${indexed != null ? `${plural(indexed, 'file')} indexed; ` : ''}your folder is ${watching}.`
+        `${indexed != null ? `${plural(indexed, 'file')} indexed; ` : ''}${where}.`
           + (failed > 0 ? ' See the failed files below for why.' : ''),
         retry,
       );
@@ -734,4 +794,254 @@ export function chipTooltip(snap: UserDocsSnapshot | null | undefined): string {
     return `${plural(failed, 'document')} could not be indexed`;
   }
   return stateBanner(snap).title;
+}
+
+// ── Google Drive ───────────────────────────────────────────────────────────
+// Drive is a second source beside the local folder, with its own state in
+// `snap.drive`. Everything here reads that view (or the saved link) and never
+// the top-level state, which belongs to the local folder.
+
+const DRIVE_HOLD_REASONS = new Set(['auth_revoked', 'drive_unlinked', 'drive_unreachable', 'drive_misconfigured']);
+
+/**
+ * The Drive banner: a hold (revoked, unlinked, unreachable, misconfigured —
+ * worded by the same table as the top-level banner) or a held mass removal.
+ * Null while Drive is off or simply live; the Drive section's status line
+ * covers those.
+ */
+export function driveBanner(snap: UserDocsSnapshot | null | undefined): StateBanner | null {
+  const drive = snap?.drive;
+  if (!snap || !drive?.enabled) return null;
+  if (drive.state === 'hold') {
+    const detail = drive.detail ?? {};
+    if (drive.reason && DRIVE_HOLD_REASONS.has(drive.reason)) {
+      return holdBanner({ ...snap, state: 'hold', reason: drive.reason, detail, confirmation: null }, null);
+    }
+    return banner(
+      'warning',
+      'Google Drive syncing is on hold',
+      `${sentence(detail.message) || 'Something needs attention before Drive can sync again. '}`
+        + 'Nothing has been removed from the index.',
+    );
+  }
+  const conf = drive.confirmation;
+  if (conf?.kind === 'mass_delete') {
+    return banner(
+      'warning',
+      `${formatCount(conf.missing)} of ${formatCount(conf.total)} Google Drive files disappeared — remove them?`,
+      'They vanished from what Cremind can see in your Drive all at once — moved to the trash, unshared, '
+        + 'or moved out of the chosen folders. Nothing is removed from the index until you decide; if access '
+        + 'changed by mistake, keep them.',
+      [{ id: 'review_deletions', label: 'Review', primary: true }],
+    );
+  }
+  return null;
+}
+
+/** Epoch seconds or milliseconds → milliseconds. The Drive view's sync
+ *  times come from the index, which keeps seconds; `purge_at` is already ms. */
+export function toEpochMs(ts: number | null | undefined): number | null {
+  const n = Number(ts);
+  if (ts == null || !Number.isFinite(n) || n <= 0) return null;
+  return n < 1e11 ? n * 1000 : n;
+}
+
+/** "just now", "12 min ago", "3 h ago", then the date and time. */
+export function formatAgo(ts: number | null | undefined, now = Date.now()): string {
+  const ms = toEpochMs(ts);
+  if (ms == null) return '';
+  const s = Math.max(0, (now - ms) / 1000);
+  if (s < 60) return 'just now';
+  const min = Math.floor(s / 60);
+  if (min < 60) return `${min} min ago`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return formatWhen(ms);
+}
+
+/** "1,204 files indexed · 3 waiting · 2 failed · 7 by name only". */
+export function driveCountsText(view: UserDocsDriveView | null | undefined): string {
+  const c = view?.counts ?? {};
+  const parts = [`${plural(Number(c.indexed) || 0, 'file')} indexed`];
+  if (Number(c.pending) > 0) parts.push(`${formatCount(c.pending)} waiting`);
+  if (Number(c.error) > 0) parts.push(`${formatCount(c.error)} failed`);
+  if (Number(c.metadata_only) > 0) parts.push(`${formatCount(c.metadata_only)} by name only`);
+  return parts.join(' · ');
+}
+
+export interface DriveStatus {
+  tone: BannerTone;
+  label: string;
+  busy: boolean;
+}
+
+/** The short status beside the Drive switch; null while Drive is off. */
+export function driveStatus(view: UserDocsDriveView | null | undefined): DriveStatus | null {
+  if (!view?.enabled) return null;
+  if (view.state === 'hold') {
+    switch (view.reason) {
+      case 'auth_revoked': return { tone: 'warning', label: 'On hold — Google access was revoked', busy: false };
+      case 'drive_unlinked': return { tone: 'warning', label: 'On hold — Google Drive was unlinked', busy: false };
+      case 'drive_unreachable': return { tone: 'warning', label: 'Unreachable — retrying', busy: false };
+      case 'drive_misconfigured': return { tone: 'warning', label: 'Sign-in refused — retrying', busy: false };
+      default: return { tone: 'warning', label: 'On hold', busy: false };
+    }
+  }
+  if (view.confirmation) return { tone: 'warning', label: 'Waiting for your confirmation', busy: false };
+  const counts = view.counts ?? {};
+  const pending = Number(counts.pending) || 0;
+  if (pending > 0) return { tone: 'info', label: `Indexing — ${formatCount(pending)} waiting`, busy: true };
+  const known = (Number(counts.indexed) || 0) + (Number(counts.error) || 0) + (Number(counts.metadata_only) || 0);
+  if (!view.last_sync_at && !view.last_full_at && known === 0) {
+    // The first listing has not finished (or found nothing yet).
+    return { tone: 'info', label: 'Listing your Drive…', busy: true };
+  }
+  const failed = Number(counts.error) || 0;
+  if (failed > 0) return { tone: 'warning', label: `Up to date — ${plural(failed, 'file')} failed`, busy: false };
+  return { tone: 'success', label: 'Up to date', busy: false };
+}
+
+/** What the linked account lets Cremind index. */
+export function driveAccessText(link: UserDocsDriveLink | null | undefined): string {
+  if (!link?.linked) return 'Not linked';
+  return link.whole_drive
+    ? 'Whole Drive — choose the folders to index'
+    : 'The files you granted Cremind, and the files it created';
+}
+
+export type DriveEnableBlocker = 'not_linked' | 'folders_required' | null;
+
+/** Why Drive can't be turned on as it stands. A whole-Drive account must
+ *  name folders first — indexing someone's entire Drive is never implied. */
+export function driveEnableBlocker(
+  link: UserDocsDriveLink | null | undefined,
+  folders: readonly string[],
+): DriveEnableBlocker {
+  if (!link?.linked) return 'not_linked';
+  if (link.whole_drive && folders.length === 0) return 'folders_required';
+  return null;
+}
+
+// ── the Drive folder picker ───────────────────────────────────────────────
+
+/** One step of the picker's path; the first (`id: null`) is the top. */
+export interface DriveCrumb {
+  id: string | null;
+  name: string;
+}
+
+export function driveRootCrumb(wholeDrive: boolean): DriveCrumb {
+  return { id: null, name: wholeDrive ? 'My Drive' : 'Shared with Cremind' };
+}
+
+/** The path after opening `folder`. */
+export function enterFolder(crumbs: readonly DriveCrumb[], folder: DriveFolder): DriveCrumb[] {
+  return [...crumbs, { id: folder.id, name: folder.name }];
+}
+
+/** The path after going back to the crumb at `index` (the top stays). */
+export function crumbsTo(crumbs: readonly DriveCrumb[], index: number): DriveCrumb[] {
+  return crumbs.slice(0, Math.max(1, index + 1));
+}
+
+/** The chosen folder the current one sits in, if any: a folder's subfolders
+ *  are indexed with it, so choosing them as well would add nothing. */
+export function coveringFolder(crumbs: readonly DriveCrumb[], selected: readonly DriveFolder[]): DriveFolder | null {
+  const chosen = new Set(selected.map(f => f.id));
+  for (const c of crumbs) {
+    if (c.id && chosen.has(c.id)) return { id: c.id, name: c.name };
+  }
+  return null;
+}
+
+/** Choose `folder`, or un-choose it if it already is. */
+export function toggleFolder(selected: readonly DriveFolder[], folder: DriveFolder): DriveFolder[] {
+  return selected.some(f => f.id === folder.id)
+    ? selected.filter(f => f.id !== folder.id)
+    : [...selected, { id: folder.id, name: folder.name }];
+}
+
+/** Same folders, whatever the order. */
+export function sameFolderSet(a: readonly string[], b: readonly string[]): boolean {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every(id => right.has(id));
+}
+
+/** Folders `next` drops from `saved`. Dropping one (or adding one to an
+ *  empty per-file set) narrows what is indexed, so the server confirms it. */
+export function droppedFolders(saved: readonly string[], next: readonly string[]): string[] {
+  const keep = new Set(next);
+  return saved.filter(id => !keep.has(id));
+}
+
+/** How an id with no known name is shown. */
+export function folderFallbackName(id: string): string {
+  return `Folder ${id.length > 8 ? `${id.slice(0, 8)}…` : id}`;
+}
+
+/**
+ * The chosen folders with names: `ids` (the saved setting) in order, named
+ * from the Drive view's resolved entries, then from names the picker learned,
+ * then a fallback. Ids only in `refs` (a view newer than the settings) are
+ * left out — the saved setting is what a save would keep.
+ */
+export function namedFolders(
+  ids: readonly string[],
+  refs: readonly UserDocsDriveFolderRef[] | null | undefined = [],
+  known: Readonly<Record<string, string>> = {},
+): DriveFolder[] {
+  const fromView: Record<string, string> = {};
+  for (const ref of refs ?? []) {
+    if (ref && typeof ref === 'object' && ref.id && ref.name) fromView[ref.id] = ref.name;
+  }
+  const seen = new Set<string>();
+  const out: DriveFolder[] = [];
+  for (const id of ids) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, name: fromView[id] || known[id] || folderFallbackName(id) });
+  }
+  return out;
+}
+
+const DRIVE_ID = /^[A-Za-z0-9_-]+$/;
+
+/** A folder id from a pasted Google Drive link, or a bare id; null when the
+ *  text is neither (the server validates ids against the same pattern). */
+export function parseDriveFolderRef(text: string | null | undefined): string | null {
+  const t = (text ?? '').trim();
+  if (!t) return null;
+  if (DRIVE_ID.test(t)) return t.length >= 10 ? t : null;
+  let url: URL;
+  try {
+    url = new URL(t);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' || !/(^|\.)google\.com$/i.test(url.hostname)) return null;
+  const m = url.pathname.match(/\/folders\/([A-Za-z0-9_-]+)/);
+  if (m) return m[1];
+  const id = url.searchParams.get('id');
+  return id && DRIVE_ID.test(id) ? id : null;
+}
+
+// ── files from both sources ───────────────────────────────────────────────
+
+/** Only an https link is ever put in an href — a server-supplied string must
+ *  not become a `javascript:` (or any other scheme's) URL. */
+export function safeWebLink(link: string | null | undefined): string | null {
+  if (typeof link !== 'string') return null;
+  const t = link.trim();
+  if (!/^https:\/\//i.test(t)) return null;
+  try {
+    return new URL(t).protocol === 'https:' ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/** "Google Drive" / "This computer". */
+export function sourceLabel(source: string | null | undefined): string {
+  return source === 'drive' ? 'Google Drive' : 'This computer';
 }

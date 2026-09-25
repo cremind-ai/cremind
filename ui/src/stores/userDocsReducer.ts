@@ -70,6 +70,9 @@ export function needsAttention(snap: UserDocsSnapshot | null | undefined): boole
   if (!snap) return false;
   if (snap.state === 'awaiting_confirmation' || snap.state === 'hold') return true;
   if (snap.state === 'paused' && STORAGE_PAUSES.has(snap.reason ?? '')) return true;
+  // Drive's holds and confirmations live in snap.drive, never in the
+  // top-level state (which is the local folder's).
+  if (snap.drive?.enabled && (snap.drive.state === 'hold' || snap.drive.confirmation)) return true;
   return failedCount(snap) > 0;
 }
 

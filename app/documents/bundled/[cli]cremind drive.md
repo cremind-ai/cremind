@@ -1,5 +1,5 @@
 ---
-description: "Grant Cremind access to individual **Google Drive files**, list the Drive files it can reach, and check which Drive access model this account uses. By default Cremind holds **per-file** access (the `drive.file` OAuth scope), so it can only open files the user explicitly picked through Google's file picker plus files Cremind created — knowing a Drive link is never enough and there is no whole-Drive search. An account linked with bring-your-own Google credentials holds **whole-Drive** access instead, where every file is reachable and grants are unnecessary; `cremind drive status` reports which applies, so run it before concluding a file is out of reach. Use this when a Drive file returns a 403/404, when the user pastes a Drive URL Cremind cannot read, when asked what Drive files Cremind can see, or to review which files have been granted."
+description: "Grant Cremind access to individual **Google Drive files**, list the Drive files it can reach, and check which Drive access model this account uses. By default Cremind holds **per-file** access (the `drive.file` OAuth scope), so it can only open files the user explicitly picked through Google's file picker plus files Cremind created — knowing a Drive link is never enough and there is no whole-Drive search. An account linked with bring-your-own Google credentials holds **whole-Drive** access instead, where every file is reachable and grants are unnecessary; `cremind drive status` reports which applies, so run it before concluding a file is out of reach. Use this when a Drive file returns a 403/404, when the user pastes a Drive URL Cremind cannot read, when asked what Drive files Cremind can see, or to review which files have been granted. Searching inside Drive files is `cremind userdocs drive` (User Document Search)."
 ---
 
 # `cremind drive` — Google Drive access
@@ -22,6 +22,8 @@ granted" from "does not exist". The fix is a grant, never a retry.
 **Whole-Drive.** The token holds the wider `.../auth/drive` scope. Every file is
 reachable, `files` is a real whole-Drive listing, and `grant` is unnecessary — do
 not run it. A 403/404 here means the file genuinely is missing, not ungranted.
+Indexing such a Drive for search (`cremind userdocs drive enable`) needs folders
+chosen first, so it never takes in the whole Drive.
 
 Two different situations produce this, and `status` names which one in its
 `Access:` line — do not assume the user configured anything:
@@ -126,7 +128,9 @@ Grants are permanent until Cremind's Drive access is revoked, which removes
 command. Use **`cremind google unlink gdrive`** to do that (it revokes at Google
 *and* clears the local credential); <https://myaccount.google.com/connections> is
 the manual fallback. Either way the grants are gone for good: re-linking does not
-restore them, so the user has to pick the files again.
+restore them, so the user has to pick the files again. Unlinking also removes the
+Drive files indexed for search (`cremind userdocs drive`) — at once through
+Cremind, or after 7 days when access was removed elsewhere.
 
 ### `grant-complete`
 
@@ -151,7 +155,9 @@ These limits apply when `status` reports **per-file** access; under whole-Drive
 access none of them do.
 
 - **No whole-Drive search.** `files` lists the granted set, not the user's Drive.
-  To act on a file the user names, ask for the URL or run `grant`.
+  To act on a file the user names, ask for the URL or run `grant`. The granted
+  files themselves can be indexed and searched by content with
+  `cremind userdocs drive enable`.
 - **No whole-Drive monitoring.** The gdrive skill's `file_changed` events cover
   granted files only.
 - **No finding a Sheet or Doc by name.** Ask for the URL or id — the **gsheets**

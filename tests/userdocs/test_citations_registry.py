@@ -295,3 +295,33 @@ def test_cascades_with_the_conversation(env):
         c.execute(text("DELETE FROM conversations WHERE id='c-web'"))
     assert env.cit.count("alice", "c-web") == 0
     assert env.cit.count("alice") == 1
+
+
+def test_a_held_drive_citation_shows_its_snapshot_not_the_live_index(env):
+    """After Google access was revoked (or the token vanished), Drive is held
+    and hidden from search; a citation into it must not read the live index
+    either — it shows what was cited, marked stale, until Google is re-linked."""
+    from app.userdocs.cite import make_token
+
+    db = env.db
+    doc = db.insert_file("drive", "Drive/Hop dong.md", "h-drive", name="Hop dong.md", kind="markdown",
+                         status="indexed", drive_file_id="1AbC", drive_web_link="https://drive.google.com/x")
+    chunks = [c for c in env.note_chunks]
+    from app.userdocs.types import ChunkDiff
+
+    db.apply_chunks(file_id=doc["id"], folder_id=None, source="drive", diff=ChunkDiff(add=chunks))
+    tok = make_token(doc["cite_id"], chunks[0].text_hash)
+    cit.issue("alice", "c-web", [IssuedCitation(
+        token=tok, cite_id=doc["cite_id"], ref_id=doc["id"], text_hash=chunks[0].text_hash,
+        source_kind="drive", rel_path=doc["rel_path"], snippet="what was cited", leaf="search")])
+
+    live = cit.resolve_tokens("alice", "c-web", [tok])[tok]
+    assert live["status"] == "verified"
+
+    db.update_source_state("drive", state="hold", reason="auth_revoked")
+    held = cit.resolve_tokens("alice", "c-web", [tok])[tok]
+    assert held["status"] == "stale"
+    assert held["snippet"] == "what was cited"
+
+    db.update_source_state("drive", state="hold", reason="drive_unreachable")  # stale, not hidden
+    assert cit.resolve_tokens("alice", "c-web", [tok])[tok]["status"] == "verified"

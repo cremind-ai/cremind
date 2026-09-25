@@ -1,21 +1,25 @@
 """`cremind userdocs ...` — User Document Search for the current profile.
 
 Mirrors Settings → My Documents: turn indexing of your own files on or off,
-choose the folder, manage exclude rules, and watch sync progress. `admin`
-subcommands mirror the gate on the Vector Embedding page. `search`, `find`,
-`read` and `cite` query the index the way the agent does (documented
-separately, in `[cli]cremind userdocs search.md`), and `research` runs the
-agent's deep-research jobs (in `[cli]cremind userdocs research.md`).
+choose the folder, manage exclude rules, and watch sync progress. `drive`
+does the same for Google Drive files (documented in
+`[cli]cremind userdocs drive.md`). `admin` subcommands mirror the gate on the
+Vector Embedding page. `search`, `find`, `read` and `cite` query the index the
+way the agent does (documented separately, in `[cli]cremind userdocs
+search.md`), and `research` runs the agent's deep-research jobs (in
+`[cli]cremind userdocs research.md`).
 
 Changes that would remove indexed content (moving the folder, adding excludes
-that drop files, deleting the index) are refused with a plan of what would go.
-Re-run with `--yes` to apply — non-interactive callers (scripts, the agent's
-own shell) must pass it explicitly; nothing is ever deleted by default.
+that drop files, deleting the index, turning Drive off, dropping Drive
+folders) are refused with a plan of what would go. Re-run with `--yes` to
+apply — non-interactive callers (scripts, the agent's own shell) must pass it
+explicitly; nothing is ever deleted by default.
 """
 
 from __future__ import annotations
 
 import json as _json
+import re
 import sys
 from typing import Any, Optional
 
@@ -48,10 +52,22 @@ research_app = typer.Typer(
     help="Deep research over your documents: analyze a question with verified quotes, or compile a folder.",
     no_args_is_help=True,
 )
+drive_app = typer.Typer(
+    name="drive",
+    help="Index your Google Drive files too: turn it on or off, choose folders, sync now.",
+    no_args_is_help=True,
+)
+drive_folders_app = typer.Typer(
+    name="folders",
+    help="List your Drive's folders, or choose which ones to index.",
+    no_args_is_help=True,
+)
+drive_app.add_typer(drive_folders_app, name="folders")
 userdocs_app.add_typer(excludes_app, name="excludes")
 userdocs_app.add_typer(admin_app, name="admin")
 userdocs_app.add_typer(deletions_app, name="deletions")
 userdocs_app.add_typer(research_app, name="research")
+userdocs_app.add_typer(drive_app, name="drive")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -108,6 +124,10 @@ def _handle_known_errors(e: Any) -> None:
     if err in ("FeatureDisabledByAdmin", "EmbeddingDisabled", "DriveNotLinked"):
         sys.stderr.write((detail.get("message") or err) + "\n")
         raise typer.Exit(code=1)
+    if err == "DriveFoldersRequired":
+        sys.stderr.write((detail.get("message") or err) + "\n")
+        sys.stderr.write("List them: cremind userdocs drive folders list\n")
+        raise typer.Exit(code=1)
 
 
 def _put_settings(ctx: typer.Context, body: dict[str, Any], yes: bool) -> dict[str, Any]:
@@ -143,6 +163,20 @@ def _put_settings(ctx: typer.Context, body: dict[str, Any], yes: bool) -> dict[s
         raise
 
 
+_SOURCES = ("local", "drive", "all")
+
+
+def _source_option(value: Optional[str]) -> Optional[str]:
+    """``--source`` checked here, so a typo fails fast instead of matching nothing."""
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v not in _SOURCES:
+        typer.echo(f"--source must be one of: {', '.join(_SOURCES)}", err=True)
+        raise typer.Exit(code=1)
+    return v
+
+
 def _print(ctx: typer.Context, out: Any) -> None:
     from app.cli.output import OutputMode, print_json, print_map
 
@@ -172,9 +206,76 @@ def summarize_snapshot(snap: dict[str, Any]) -> str:
     if current:
         c = current[0]
         parts.append(f"now: {c.get('rel_path') or c.get('name')} ({c.get('stage')})")
+    drive = snap.get("drive")
+    if isinstance(drive, dict) and drive.get("enabled"):
+        parts.append(f"drive: {_drive_state(drive)}")
     tool = snap.get("tool_mode")
     if tool and tool != "normal":
         parts.append(f"search: {tool}")
+    return " · ".join(parts)
+
+
+def _when(ts: Any) -> str:
+    """An epoch timestamp (seconds or milliseconds) as local 'YYYY-MM-DD HH:MM'."""
+    import datetime as _dt
+
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if value > 1e11:  # milliseconds
+        value /= 1000
+    return _dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+
+
+def _drive_state(drive: dict[str, Any]) -> str:
+    """'live', 'hold(auth_revoked) — index removed on …', plus pending work
+    and a waiting confirmation: the Drive half of a status line."""
+    state = drive.get("state") or "unknown"
+    reason = drive.get("reason")
+    text = f"{state}({reason})" if reason else str(state)
+    detail = drive.get("detail") if isinstance(drive.get("detail"), dict) else {}
+    purge_at = _when(detail.get("purge_at"))
+    if purge_at:
+        text += f", index removed on {purge_at} unless Google is re-linked"
+    conf = drive.get("confirmation")
+    if isinstance(conf, dict) and conf.get("kind"):
+        text += f", waiting for you: {conf['kind']}"
+    counts = drive.get("counts") or {}
+    if counts.get("pending"):
+        text += f", {counts['pending']} pending"
+    if counts.get("error"):
+        text += f", {counts['error']} failed"
+    return text
+
+
+def summarize_drive(source: dict[str, Any], link: dict[str, Any]) -> str:
+    """One human line for `drive status`: the switch, the engine's state, the
+    linked account and access model, folders, counts and the last sync."""
+    index = link.get("index") if isinstance(link.get("index"), dict) else {}
+    parts = ["on" if source.get("enabled") else "off"]
+    if source.get("enabled") and index.get("state"):
+        parts.append(_drive_state(index))
+    if link.get("linked"):
+        access = "whole-Drive" if link.get("whole_drive") else "per-file"
+        parts.append(f"linked as {link.get('email') or '?'} ({access})")
+        if link.get("scopes_stale"):
+            parts.append("re-link needed (see `cremind drive status`)")
+    else:
+        parts.append("Google Drive is not linked (link the gdrive skill first)")
+    folders = ((source.get("options") or {}).get("include_folders")) or []
+    if folders:
+        parts.append("folders: " + ", ".join(str(f) for f in folders))
+    elif link.get("linked"):
+        parts.append("folders: none chosen" if link.get("whole_drive") else "folders: every granted file")
+    counts = index.get("counts") or {}
+    if counts.get("indexed") or counts.get("metadata_only"):
+        parts.append(f"{int(counts.get('indexed') or 0) + int(counts.get('metadata_only') or 0)} files indexed")
+    last = _when(index.get("last_sync_at"))
+    if last:
+        parts.append(f"last sync {last}")
     return " · ".join(parts)
 
 
@@ -265,7 +366,7 @@ def userdocs_enable(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Apply without asking if it removes content."),
 ) -> None:
-    """Turn on User Document Search for this profile."""
+    """Turn on User Document Search for this profile (your folder; Drive is `drive enable`)."""
     body: dict[str, Any] = {"kind": "local", "enabled": True}
     if root:
         body.update(root_mode="custom", root_path=root)
@@ -283,7 +384,7 @@ def userdocs_disable(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Confirm deleting the index."),
 ) -> None:
-    """Turn off User Document Search for this profile (the index is kept unless --delete-index)."""
+    """Turn off indexing of your folder (the index is kept unless --delete-index; Drive is `drive disable`)."""
     body: dict[str, Any] = {"kind": "local", "enabled": False}
     if delete_index:
         body["delete_index"] = True
@@ -402,9 +503,12 @@ def userdocs_retry(
     file_id: Optional[list[str]] = typer.Option(
         None, "--file-id", help="Retry only this file (repeatable). Default: every failed file.",
     ),
+    source: Optional[str] = typer.Option(
+        None, "--source", help="local (default) | drive: whose failed files to retry.",
+    ),
 ) -> None:
     """Retry files that failed to index."""
-    params: dict[str, Any] = {}
+    params: dict[str, Any] = _source_param(source)
     if file_id:
         params["targets"] = list(file_id)
     _print_summary(ctx, _control(ctx, "retry_failed", **params))
@@ -424,18 +528,37 @@ def userdocs_rebuild(
     _print_summary(ctx, _control(ctx, "rebuild", yes=yes, reextract=reextract))
 
 
+def _source_param(source: Optional[str]) -> dict[str, Any]:
+    """``{"source": …}`` for a control action about one source (local or
+    drive), or nothing — the server's default is the local folder."""
+    src = _source_option(source)
+    if src == "all":
+        typer.echo("--source must be local or drive here", err=True)
+        raise typer.Exit(code=1)
+    return {"source": src} if src else {}
+
+
+_DELETIONS_SOURCE_HELP = "local (default) | drive: which source's held deletions."
+
+
 @deletions_app.command("confirm")
 @graceful_errors
-def deletions_confirm(ctx: typer.Context) -> None:
+def deletions_confirm(
+    ctx: typer.Context,
+    source: Optional[str] = typer.Option(None, "--source", help=_DELETIONS_SOURCE_HELP),
+) -> None:
     """Remove the files that vanished from the index (they are hidden until you decide)."""
-    _print_summary(ctx, _control(ctx, "confirm_deletions"))
+    _print_summary(ctx, _control(ctx, "confirm_deletions", **_source_param(source)))
 
 
 @deletions_app.command("reject")
 @graceful_errors
-def deletions_reject(ctx: typer.Context) -> None:
+def deletions_reject(
+    ctx: typer.Context,
+    source: Optional[str] = typer.Option(None, "--source", help=_DELETIONS_SOURCE_HELP),
+) -> None:
     """Keep them: they stay hidden and are re-checked on every scan for 14 days."""
-    _print_summary(ctx, _control(ctx, "reject_deletions"))
+    _print_summary(ctx, _control(ctx, "reject_deletions", **_source_param(source)))
 
 
 # ── inspection ─────────────────────────────────────────────────────────────
@@ -451,6 +574,9 @@ def userdocs_files(
     ),
     kind: Optional[str] = typer.Option(None, "--kind", help="pdf, docx, image, executable, … "),
     query: Optional[str] = typer.Option(None, "--query", "-q", help="Match in the file name or path."),
+    source: Optional[str] = typer.Option(
+        None, "--source", help="local (your folder) | drive (Google Drive) | all (default).",
+    ),
     limit: int = typer.Option(50, "--limit", help="Rows per page."),
     all_pages: bool = typer.Option(False, "--all", help="Keep paging until the end."),
 ) -> None:
@@ -465,6 +591,7 @@ def userdocs_files(
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
     cfg.require_token()
+    src = _source_option(source)
 
     async def _run() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -473,6 +600,7 @@ def userdocs_files(
             while True:
                 page = await list_files(
                     client, status=status, kind=kind, q=query, limit=limit,
+                    source=None if src == "all" else src,
                     after_path=after[0] if after else None,
                     after_id=after[1] if after else None,
                 )
@@ -594,8 +722,12 @@ def _filters(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     date_field: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     out: dict[str, Any] = {}
+    src = _source_option(source)
+    if src and src != "all":
+        out["source"] = src
     if folder:
         out["folder"] = list(folder)
     if types:
@@ -653,6 +785,8 @@ def userdocs_search(
     date_from: Optional[str] = typer.Option(None, "--from", help="First day, YYYY-MM-DD (or YYYY-MM, YYYY)."),
     date_to: Optional[str] = typer.Option(None, "--to", help="Last day, inclusive."),
     date_field: Optional[str] = typer.Option(None, "--date-field", help="any (default) | modified | created | taken"),
+    source: Optional[str] = typer.Option(
+        None, "--source", help="local (your folder) | drive (Google Drive) | all (default)."),
     group_by: Optional[str] = typer.Option(None, "--group-by", help="file (default) | folder | chunk"),
     top_k: Optional[int] = typer.Option(None, "--top-k", help="Results per page (default 8)."),
     thorough: bool = typer.Option(False, "--thorough", help="Restore accents, translate, and rerank with a model."),
@@ -661,7 +795,7 @@ def userdocs_search(
     _query(ctx, "search", {
         "query": query,
         "filters": _filters(folder=folder, types=types, date_from=date_from, date_to=date_to,
-                            date_field=date_field),
+                            date_field=date_field, source=source),
         "group_by": group_by, "top_k": top_k, "thorough": thorough or None,
     })
 
@@ -676,6 +810,8 @@ def userdocs_find(
     types: Optional[list[str]] = typer.Option(None, "--type", help="File type (repeatable)."),
     date_from: Optional[str] = typer.Option(None, "--from", help="First day, YYYY-MM-DD (or YYYY-MM, YYYY)."),
     date_to: Optional[str] = typer.Option(None, "--to", help="Last day, inclusive."),
+    source: Optional[str] = typer.Option(
+        None, "--source", help="local (your folder) | drive (Google Drive) | all (default)."),
     sort: Optional[str] = typer.Option(
         None, "--sort", help="relevance | newest | oldest | name | largest | smallest"),
     limit: Optional[int] = typer.Option(None, "--limit", help="Results per page (default 20)."),
@@ -683,7 +819,8 @@ def userdocs_find(
     """Find files, folders or projects by name, type, date or topic."""
     _query(ctx, "find", {
         "query": query, "kind": kind,
-        "filters": _filters(folder=folder, types=types, date_from=date_from, date_to=date_to),
+        "filters": _filters(folder=folder, types=types, date_from=date_from, date_to=date_to,
+                            source=source),
         "sort": sort, "limit": limit,
     })
 
@@ -971,6 +1108,195 @@ def excludes_remove(
         raise typer.Exit(code=1)
     out = _put_settings(ctx, {"kind": "local", "excludes": kept}, yes=False)
     _print(ctx, {"excludes": ((out.get("settings") or {}).get("local") or {}).get("excludes")})
+
+
+# ── Google Drive ───────────────────────────────────────────────────────────
+#
+# Drive is the second source of the same index: its own switch, its own
+# folders (`include_folders`), synced from Google's change feed. Linking the
+# account belongs to the gdrive skill; these commands only index what that
+# link can see. Turning Drive off deletes the Drive index, so `disable`
+# always needs --yes.
+
+# Accepts a pasted folder link as well as a bare id:
+# https://drive.google.com/drive/folders/<id> or …/open?id=<id>.
+_DRIVE_FOLDER_URL = re.compile(r"(?:/folders/|[?&]id=)([A-Za-z0-9_-]+)")
+
+
+def _folder_ids(values: Optional[list[str]]) -> list[str]:
+    out: list[str] = []
+    for v in _split_list(values) or []:
+        m = _DRIVE_FOLDER_URL.search(v)
+        fid = m.group(1) if m else v
+        if fid not in out:
+            out.append(fid)
+    return out
+
+
+def _settings(ctx: typer.Context) -> dict[str, Any]:
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.userdocs import get_settings
+    from app.cli.config import Config
+
+    cfg: Config = ctx.obj["cfg"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_settings(client)
+
+    return asyncio.run(_run())
+
+
+def _drive_settings_out(ctx: typer.Context, out: dict[str, Any]) -> None:
+    _print(ctx, (out.get("settings") or {}).get("drive") or out)
+
+
+@drive_app.command("status")
+@graceful_errors
+def drive_status(ctx: typer.Context) -> None:
+    """Show Drive indexing: on or off, its state, the linked account, folders and counts."""
+    from app.cli.output import OutputMode, print_json
+
+    settings = _settings(ctx)
+    source = settings.get("drive") or {}
+    link = settings.get("drive_link") or {}
+    mode: OutputMode = ctx.obj["mode"]
+    if mode.json:
+        print_json({"source": source, "link": link})
+        return
+    sys.stdout.write(summarize_drive(source, link) + "\n")
+
+
+@drive_app.command("enable")
+@graceful_errors
+def drive_enable(
+    ctx: typer.Context,
+    folder: Optional[list[str]] = typer.Option(
+        None, "--folder",
+        help="A Drive folder to index: its id or link (repeatable; replaces the list). "
+             "Required for a whole-Drive account.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply even if indexed Drive files are removed."),
+) -> None:
+    """Turn on indexing of your Google Drive files (link the gdrive skill first)."""
+    body: dict[str, Any] = {"kind": "drive", "enabled": True}
+    folders = _folder_ids(folder)
+    if folders:
+        body["options"] = {"include_folders": folders}
+    _drive_settings_out(ctx, _put_settings(ctx, body, yes))
+
+
+@drive_app.command("disable")
+@graceful_errors
+def drive_disable(
+    ctx: typer.Context,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm deleting the Drive index."),
+) -> None:
+    """Turn off Drive indexing. This deletes the Drive index, so it needs --yes."""
+    settings = _settings(ctx)
+    source = settings.get("drive") or {}
+    if not source.get("enabled"):
+        sys.stderr.write("Drive indexing is already off.\n")
+        _print(ctx, source)
+        return
+    if not yes:
+        counts = ((settings.get("drive_link") or {}).get("index") or {}).get("counts") or {}
+        files = sum(int(v) for v in counts.values() if isinstance(v, (int, float)))
+        suffix = f" ({files} files)" if files else ""
+        sys.stderr.write(f"This change would:\n  - delete every indexed Google Drive file{suffix}\n")
+        sys.stderr.write("Nothing was changed. Re-run with --yes to apply.\n")
+        raise typer.Exit(code=2)
+    _drive_settings_out(ctx, _put_settings(ctx, {"kind": "drive", "enabled": False}, yes=True))
+
+
+@drive_app.command("sync")
+@graceful_errors
+def drive_sync(
+    ctx: typer.Context,
+    full: bool = typer.Option(
+        False, "--full", help="Re-list everything in scope instead of reading only what changed.",
+    ),
+) -> None:
+    """Check Google Drive for changes now instead of at the next poll (every 5 minutes)."""
+    _print_summary(ctx, _control(ctx, "rescan" if full else "sync_now", source="drive"))
+
+
+@drive_folders_app.command("list")
+@graceful_errors
+def drive_folders_list(
+    ctx: typer.Context,
+    parent: Optional[str] = typer.Option(
+        None, "--parent", help="List the folders inside this one (id or link). Default: the top level.",
+    ),
+) -> None:
+    """List Drive folders one level at a time, with the ids `folders set` takes (* = indexed)."""
+    import asyncio
+
+    from app.cli.client._base import APIError, Client
+    from app.cli.client.userdocs import drive_folders, get_settings
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+    parent_ids = _folder_ids([parent]) if parent else []
+    parent_id = parent_ids[0] if parent_ids else None
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        async with Client(cfg) as client:
+            listing = await drive_folders(client, parent=parent_id)
+            return listing, await get_settings(client)
+
+    try:
+        listing, settings = asyncio.run(_run())
+    except APIError as e:
+        detail = _api_detail(e)
+        if detail and detail.get("message"):
+            sys.stderr.write(f"{detail['message']}\n")
+            raise typer.Exit(code=1) from e
+        raise
+    if mode.json:
+        print_json(listing)
+        return
+    chosen = set(((settings.get("drive") or {}).get("options") or {}).get("include_folders") or [])
+    where = listing.get("parent") or {}
+    if where:
+        sys.stdout.write(f"In {where.get('name')} ({where.get('id')}):\n")
+    else:
+        top = "My Drive" if listing.get("whole_drive") else "the folders you granted"
+        sys.stdout.write(f"Top level ({top}):\n")
+    folders = listing.get("folders") or []
+    if not folders:
+        sys.stdout.write("  (no folders)\n")
+    for f in folders:
+        mark = "*" if f.get("id") in chosen else " "
+        sys.stdout.write(f"{mark} {f.get('id', ''):34} {f.get('name', '')}\n")
+
+
+@drive_folders_app.command("set")
+@graceful_errors
+def drive_folders_set(
+    ctx: typer.Context,
+    folders: Optional[list[str]] = typer.Argument(
+        None, help="Folders to index: ids or links (replaces the list).",
+    ),
+    clear: bool = typer.Option(
+        False, "--clear", help="Index every file the link can reach again (per-file accounts only).",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply even if indexed Drive files are removed."),
+) -> None:
+    """Choose which Drive folders to index. Files outside them leave the index (asks first)."""
+    ids = _folder_ids(folders)
+    if bool(ids) == clear:
+        typer.echo("give folder ids or --clear (exactly one)", err=True)
+        raise typer.Exit(code=1)
+    out = _put_settings(ctx, {"kind": "drive", "options": {"include_folders": ids}}, yes)
+    drive = (out.get("settings") or {}).get("drive") or {}
+    _print(ctx, {"include_folders": (drive.get("options") or {}).get("include_folders")})
 
 
 # ── admin ──────────────────────────────────────────────────────────────────
