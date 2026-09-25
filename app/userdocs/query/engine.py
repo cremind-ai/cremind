@@ -240,7 +240,7 @@ def open_engine(profile: str) -> Access:
             logger.debug(f"[userdocs] {profile}: could not queue {file_id} for re-indexing: {exc}")
 
     engine = QueryEngine(profile, db, tz=tz, identity=identity, snapshot=snapshot, root=rt.root,
-                         on_stale=on_stale)
+                         on_stale=on_stale, runtime=rt)
     return Access(engine, snapshot=snapshot)
 
 
@@ -261,6 +261,7 @@ class QueryEngine:
         root: str | None = None,
         on_stale: Callable[[int], None] | None = None,
         vector_handles: Callable[[], tuple[Any, Any] | None] | None = None,
+        runtime: Any = None,
     ) -> None:
         self.profile = profile
         self.db = db
@@ -270,6 +271,9 @@ class QueryEngine:
         self.snapshot = snapshot or {}
         self.root = root
         self.on_stale = on_stale
+        # The profile's sync runtime (None in tests and read-only uses):
+        # research asks it to re-index what changed before reading.
+        self.runtime = runtime
         self._vector_handles = vector_handles
         self._folders: dict[int, dict[str, Any]] | None = None
         self._files: dict[int, dict[str, Any] | None] = {}

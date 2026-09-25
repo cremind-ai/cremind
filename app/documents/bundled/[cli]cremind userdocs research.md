@@ -16,6 +16,13 @@ registers the answer's `[ud:…]` citations for the conversation (so they
 verify when the answer is saved) and shows the Research activity panel. A job
 started here belongs to no conversation.
 
+A job reads the text the index holds, so it first brings the index up to
+date: it checks the folder for new files (a scan, when the folder is
+polled), compares every file in scope with the disk, and re-indexes the
+changed ones before reading. A changed file that could not be re-indexed in
+time, or while sync is paused, is never read from its old text: it shows as
+`not_indexed_yet` and the job asks before going on without it.
+
 A job runs on the server, not in your terminal: Ctrl-C stops following it,
 not the job. A profile runs one job at a time — a second `run` is refused
 with `ResearchBusy`, which names the running job. A job stops at the
@@ -222,4 +229,7 @@ the budget: `cremind tools set-var user_documents RESEARCH_TOKEN_BUDGET=500000`.
 
 **Many `unread` files** — they are not indexed yet or need the vision model
 (`cremind userdocs caption --consent-vision`); `cremind userdocs files --status error`
-says why a file failed.
+says why a file failed. Files edited just before the job show as
+`not_indexed_yet` when sync is paused (`cremind userdocs resume`) or their
+re-index took too long: wait for `cremind userdocs status` to show idle, then
+`continue` the job.

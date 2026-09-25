@@ -155,6 +155,10 @@ class ProfileRuntime:
 
         self.scanning = False
         self.estimating = False
+        # Scans started / finished so far: what a scan ticket is checked against.
+        self.scans_started = 0
+        self.scans_finished = 0
+        self._draining = 0
         self.scan_requested: str | None = None
         self.next_scan_at = 0.0
         self.last_scan_s = 0.0
@@ -418,15 +422,23 @@ class ProfileRuntime:
         a move: the row keeps its chunks and vectors and only its card is
         refreshed.
         """
+        with self.lock:
+            changed, removed = self._pending_changed, self._pending_removed
+            self._pending_changed, self._pending_removed = set(), set()
+            self._draining += 1
+        try:
+            self._drain(changed, removed)
+        finally:
+            with self.lock:
+                self._draining -= 1
+
+    def _drain(self, changed: set[str], removed: set[str]) -> None:
         from app.userdocs.discovery.ignore import SKIP
         from app.userdocs.discovery.hashing import fs_path
         from app.userdocs.discovery.walker import fit_i63, path_hash
         from app.userdocs.discovery.watcher import ROOT_RESCAN
         from app.userdocs.textnorm import fold
 
-        with self.lock:
-            changed, removed = self._pending_changed, self._pending_removed
-            self._pending_changed, self._pending_removed = set(), set()
         if not self.active or self.hold or self.db is None or self.root is None:
             return
         db = self.db
@@ -552,6 +564,94 @@ class ProfileRuntime:
             return False
         return bool(self.scan_requested) or (self.next_scan_at and now >= self.next_scan_at)
 
+    # ── freshness: research reads the index, so it first asks for it to be current
+
+    def scan_ticket(self, reason: str) -> int:
+        """Ask for a full scan; :meth:`scan_done` says when it has run. A scan
+        already under way when asked does not count: it may have walked past
+        a folder before the file the caller is after appeared in it."""
+        with self.lock:
+            ticket = self.scans_started + 1
+            self.scan_requested = self.scan_requested or reason
+        self.service.wake()
+        return ticket
+
+    def scan_done(self, ticket: int) -> bool:
+        with self.lock:
+            return self.scans_finished >= ticket
+
+    def finds_new_files_by_scan(self) -> bool:
+        """True when only a scan would notice a new file: polling mode, or a
+        native watcher that is gone or has died."""
+        with self.lock:
+            watcher, mode = self.watcher, self.watch_mode
+        return mode == "poll" or watcher is None or not watcher.is_alive()
+
+    def watch_settled(self) -> bool:
+        """The watcher has handed over everything it saw, and every path it
+        handed over is in the index (as a queued file or a tombstone)."""
+        with self.lock:
+            watcher = self.watcher
+            busy = bool(self._pending_changed or self._pending_removed or self._draining)
+        return not busy and (watcher is None or watcher.pending_count() == 0)
+
+    def sync_blocker(self) -> tuple[str, str | None] | None:
+        """``(state, reason)`` as the UI shows it when queued files are not
+        being indexed now (sync paused, the folder held, the first sync not
+        confirmed yet); None while the queue is worked — the same test the
+        service's workers use to pick this profile."""
+        with self.lock:
+            runs = (
+                self.active and self.db is not None and not self.paused_user and not self.hold
+                and not (self.confirmation and self.confirmation.get("kind") == "first_sync")
+            )
+        return None if runs else self.effective_state()
+
+    def scan_blocker(self) -> tuple[str, str | None] | None:
+        """Like :meth:`sync_blocker`, for scans (:meth:`scan_due`'s test): a
+        pending confirmation of any kind holds scans, not only the first sync."""
+        with self.lock:
+            runs = self.active and not self.hold and not self.paused_user and not self.confirmation
+        return None if runs else self.effective_state()
+
+    def indexing_any(self, file_ids: Iterable[int]) -> bool:
+        with self.lock:
+            return any(int(i) in self.in_flight for i in file_ids)
+
+    def queue_if_changed(self, rows: Iterable[dict[str, Any]]) -> tuple[list[int], list[int]]:
+        """Put the out-of-date files among ``rows`` first in the queue, and
+        return ``(changed, queued)``: both are what a caller waits for.
+
+        ``changed`` are files whose content on disk is not what was indexed,
+        or that are gone (processing turns a vanished file into a tombstone);
+        they are queued at P_INTERACTIVE. ``queued`` were already waiting and
+        are moved up to it without being queued again, so one being indexed
+        right now does not start over. Rows of other sources are left alone.
+        """
+        from app.userdocs.discovery.hashing import changed_on_disk
+
+        db, root = self.db, self.root
+        if db is None or root is None:
+            return [], []
+        changed: list[int] = []
+        queued: list[int] = []
+        for r in rows:
+            if r.get("source") != SOURCE:
+                continue
+            status = r.get("status")
+            if status == "dirty":
+                queued.append(int(r["id"]))
+            elif status not in ("tombstone", "missing") and changed_on_disk(root, r):
+                changed.append(int(r["id"]))
+        if changed:
+            db.mark_dirty(changed, priority=P_INTERACTIVE)
+            self.note_queued(len(changed), "changes")
+        if queued:
+            db.prioritize(queued, priority=P_INTERACTIVE)
+        if changed or queued:
+            self.service.wake()
+        return changed, queued
+
     def run_scan(self) -> None:
         """A full reconcile of the folder against the index (scan executor)."""
         from app.userdocs.discovery.guard import RootGuard
@@ -564,6 +664,8 @@ class ProfileRuntime:
             self.scanning = True
             reason = self.scan_requested or "reconcile"
             self.scan_requested = None
+            self.scans_started += 1
+            seq = self.scans_started
         started = time.monotonic()
         try:
             if not self.active or self.root is None or self.db is None:
@@ -623,6 +725,7 @@ class ProfileRuntime:
             elapsed = time.monotonic() - started
             with self.lock:
                 self.scanning = False
+                self.scans_finished = max(self.scans_finished, seq)
                 self.last_scan_s = elapsed
                 interval = (
                     min(900.0, max(30.0, 10 * elapsed)) if self.watch_mode == "poll" else NATIVE_RECONCILE_S

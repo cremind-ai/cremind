@@ -7,9 +7,11 @@ law must be searched from several angles, because the provision that decides
 a case is as often an exception or a procedural rule as the headline
 article. The pipeline:
 
-1. **Coverage first.** Resolve the primary scope (the case) and the reference
-   scope (the law, the policy). An ambiguous folder, files that cannot be
-   read, or an estimate over the budget stop the job to ask.
+1. **Coverage first.** Bring the index up to date with the folder (in-scope
+   files changed since they were indexed are re-indexed first, see
+   :mod:`.freshness`), then resolve the primary scope (the case) and the
+   reference scope (the law, the policy). An ambiguous folder, files that
+   cannot be read, or an estimate over the budget stop the job to ask.
 2. **Read the case in full**, window by window (four model calls at a time),
    recording facts — each checked against its source — parties, dates, the
    instruments named, and the issues to research.
@@ -54,6 +56,7 @@ from app.userdocs.chunking import extract_refs
 from app.userdocs.cite import locator_label
 from app.userdocs.query.filters import FilterError
 from app.userdocs.query.terms import analyze as analyze_terms
+from app.userdocs.research import freshness
 from app.userdocs.research import legal as L
 from app.userdocs.research.context import (
     BudgetExceeded,
@@ -561,8 +564,12 @@ class _Analyze:
 
     # ── 1. coverage ───────────────────────────────────────────────────────
 
-    async def coverage(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    async def scopes(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[tuple[str, str]]]:
+        """The case files and the reference files (None: no reference scope,
+        search the whole index), with the notes and gaps to record as
+        ``(kind, text)``; raises :class:`NeedsInput` for an ambiguous scope."""
         ctx = self.ctx
+        said: list[tuple[str, str]] = []
         primary: list[dict[str, Any]] = []
         if _has_filters(ctx.spec.scope):
             res = await resolve_scope(ctx, ctx.spec.scope)
@@ -570,12 +577,12 @@ class _Analyze:
                 await self.save()
                 raise NeedsInput(res.clarification, NEEDS_CLARIFICATION)
             primary = res.files
-            for n in res.notes:
-                self.note(f"Case scope: {n}")
+            said += [("note", f"Case scope: {n}") for n in res.notes]
             if not primary:
-                self.gap("The case scope matched no files: the issues were taken from the question alone.")
+                said.append(("gap", "The case scope matched no files: the issues were taken from the question alone."))
             if res.truncated:
-                self.gap(f"The case scope has more files than a job reads; only the first {len(primary)} were used.")
+                said.append(("gap", f"The case scope has more files than a job reads; only the first "
+                                    f"{len(primary)} were used."))
         references: list[dict[str, Any]] | None = None
         if _has_filters(ctx.spec.reference_scope):
             # Its own answer key: which case folder was meant never redirects
@@ -589,10 +596,25 @@ class _Analyze:
                 raise NeedsInput(clar, NEEDS_CLARIFICATION)
             pids = {int(r["id"]) for r in primary}
             references = [r for r in res.files if int(r["id"]) not in pids]
-            for n in res.notes:
-                self.note(f"Reference scope: {n}")
+            said += [("note", f"Reference scope: {n}") for n in res.notes]
             if not references:
-                self.gap("The reference scope matched no files.")
+                said.append(("gap", "The reference scope matched no files."))
+        return primary, references, said
+
+    async def coverage(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+        ctx = self.ctx
+        # The index is what is read: bring it up to date with the folder, and
+        # re-index the in-scope files that changed, before resolving for good.
+        for n in await freshness.settle_discovery(ctx):
+            self.note(n)
+        primary, references, said = await self.scopes()
+        refreshed = await freshness.refresh_files(ctx, primary + (references or []))
+        for n in refreshed.notes:
+            self.note(n)
+        if refreshed.changed:
+            primary, references, said = await self.scopes()
+        for kind, text in said:
+            (self.note if kind == "note" else self.gap)(text)
         self.remember(primary + (references or []))
         await self.load_totals([int(r["id"]) for r in primary + (references or [])])
         await self.update_coverage(primary, references)

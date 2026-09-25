@@ -5,9 +5,11 @@ question. The answer is right only if every file in the folder was read, and
 read in full, so this pipeline never works from snippets. It runs in seven
 steps:
 
-1. **Scope.** List every file in scope and whether its content can be read
-   (the coverage table). Stop and ask before compiling without the files
-   that cannot be read.
+1. **Scope.** Bring the index up to date with the folder (files changed
+   since they were indexed are re-indexed first, see :mod:`.freshness`),
+   then list every file in scope and whether its content can be read (the
+   coverage table). Stop and ask before compiling without the files that
+   cannot be read.
 2. **Estimate.** Work out what reading everything costs, and stop and ask
    when that is more than the budget left.
 3. **Plan.** The model designs the table from the question and a small
@@ -47,6 +49,7 @@ from app.userdocs import types as t
 from app.userdocs.cite import escape_in_document_text, parse_tokens
 from app.userdocs.research import artifacts
 from app.userdocs.research import coverage as cov
+from app.userdocs.research import freshness
 from app.userdocs.research.context import (
     BudgetExceeded,
     Cancelled,
@@ -1235,13 +1238,24 @@ async def run_compile(ctx: ResearchContext) -> Dossier:
 
     # ── 1. scope and coverage ──
     ctx.phase("Listing the files in scope")
+    # The index is what is read: bring it up to date with the folder first.
+    fresh_notes = await freshness.settle_discovery(ctx)
     sid = ctx.step("Listing the files in scope")
-    scope = await cov.resolve_scope(ctx, ctx.spec.scope)
-    if scope.clarification is not None:
-        ctx.done_step(sid, ok=False, suffix=" — needs an answer")
-        await ctx.save()
-        raise NeedsInput(scope.clarification)
-    run = _Run(files=scope.files, notes=list(scope.notes))
+
+    async def resolve() -> cov.ScopeResult:
+        found = await cov.resolve_scope(ctx, ctx.spec.scope)
+        if found.clarification is not None:
+            ctx.done_step(sid, ok=False, suffix=" — needs an answer")
+            await ctx.save()
+            raise NeedsInput(found.clarification)
+        return found
+
+    scope = await resolve()
+    refreshed = await freshness.refresh_files(ctx, scope.files)
+    fresh_notes += refreshed.notes
+    if refreshed.changed:
+        scope = await resolve()
+    run = _Run(files=scope.files, notes=list(scope.notes) + fresh_notes)
     if scope.truncated:
         run.gaps.append(f"The scope has more than {cov.MAX_SCOPE_FILES} files; only the first "
                         f"{cov.MAX_SCOPE_FILES} (by path) were compiled.")

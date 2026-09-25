@@ -426,12 +426,9 @@ def _is_stale(engine: Any, row: dict[str, Any]) -> bool | None:
     when that cannot be checked: a Drive file, or no folder configured)."""
     if row.get("source") != "local" or not engine.root:
         return None
-    path = os.path.join(engine.root, *(row.get("rel_path") or "").split("/"))
-    try:
-        st = os.stat(path, follow_symlinks=False)
-    except OSError:
-        return True
-    return int(st.st_size) != int(row.get("size") or -1) or int(st.st_mtime_ns) != int(row.get("mtime_ns") or -1)
+    from app.userdocs.discovery.hashing import changed_on_disk
+
+    return changed_on_disk(engine.root, row)
 
 
 def read(

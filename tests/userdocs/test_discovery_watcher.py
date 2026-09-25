@@ -88,6 +88,20 @@ def test_create_modify_delete(watch, tmp_path):
     assert col.wait_for(lambda c: "a.txt" in c.removed)
 
 
+def test_paths_count_as_pending_until_handed_over(watch, tmp_path):
+    # Research waits for pending_count() == 0 before resolving its scope, so
+    # a path must never read as settled while it is still on its way.
+    w, col = watch()
+    counts: list[int] = []
+    deliver = w.on_paths
+    w.on_paths = lambda ch, rm: (counts.append(w.pending_count()), deliver(ch, rm))
+    assert w.pending_count() == 0
+    (tmp_path / "a.txt").write_text("one", encoding="utf-8")
+    assert col.wait_for(lambda c: "a.txt" in c.changed)
+    assert counts and all(n > 0 for n in counts), counts
+    assert col.wait_for(lambda c: w.pending_count() == 0)
+
+
 def test_rename_is_remove_plus_change(watch, tmp_path):
     (tmp_path / "old.txt").write_text("x", encoding="utf-8")
     w, col = watch()

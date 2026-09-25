@@ -84,6 +84,21 @@ def is_placeholder(name: str, st: os.stat_result | None) -> bool:
     return bool(flags & SF_DATALESS)
 
 
+def changed_on_disk(root: str, row: dict) -> bool:
+    """Whether the local file behind index row ``row`` (its ``rel_path``
+    under ``root``) is no longer what was indexed: its size or modification
+    time differ, or it is gone. ``stat`` only — nothing is opened."""
+    abs_path = os.path.join(root, *(row.get("rel_path") or "").split("/"))
+    try:
+        st = os.stat(fs_path(abs_path), follow_symlinks=False)
+    except OSError:
+        return True
+    size, mtime_ns = row.get("size"), row.get("mtime_ns")
+    if size is None or mtime_ns is None:
+        return True
+    return int(st.st_size) != int(size) or int(st.st_mtime_ns) != int(mtime_ns)
+
+
 def _readable_regular_file(abs_path: str) -> bool:
     """A regular, non-placeholder file. Opening a FIFO blocks until a writer
     appears, and opening a placeholder starts a download."""

@@ -866,3 +866,34 @@ def test_named_instruments_in_a_question():
     assert L.named_from_text("hợp đồng ký năm 2023") == []
     assert L.named_from_text("Luật sư tư vấn năm 2023") == []  # a lawyer, not a law
     assert L.named_from_text("Law No. 45/2013/QH13")[0].number == "45/2013/QH13"
+
+
+def test_a_case_file_changed_since_indexing_is_not_read_from_its_old_text(alice, tmp_path):
+    # The ABC contract was edited on disk after it was indexed; the complaint
+    # is as indexed. Sync is paused, so the job cannot wait for the re-index:
+    # it asks, rather than read the contract's old text.
+    from types import SimpleNamespace
+
+    from app.userdocs.runtime import ProfileRuntime
+
+    root = tmp_path / "root"
+    for rel, lines in (("Clients/ABC/HopDong.txt", CONTRACT + ["Phụ lục 2: điều khoản mới."]),
+                       ("Clients/ABC/DonKhieuNai.txt", COMPLAINT)):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines), encoding="utf-8")
+    st = (root / "Clients/ABC/DonKhieuNai.txt").stat()
+    alice.db.update_file(alice.rows["Clients/ABC/DonKhieuNai.txt"]["id"], size=st.st_size, mtime_ns=st.st_mtime_ns)
+    rt = ProfileRuntime(SimpleNamespace(wake=lambda: None), "alice", "uid-alice")
+    rt.db, rt.root, rt.active, rt.paused_user = alice.db, str(root), True, True
+    engine = _engine(alice)
+    engine.runtime = rt
+    fake = FakeLLM()
+    ctx = make_ctx(engine, fake, question="Tranh chấp của ABC?", domain="general", scope={"folder": ["ABC"]})
+    with pytest.raises(NeedsInput) as ei:
+        asyncio.run(run_analyze(ctx))
+    assert ei.value.status == NEEDS_CONFIRMATION
+    assert [(c["rel_path"], c["reason"]) for c in ei.value.clarification.candidates] == [
+        ("Clients/ABC/HopDong.txt", "not_indexed_yet")]
+    assert fake.names() == [], "nothing is read before the user answers"
+    assert any("sync is paused" in n for n in ctx.dossier.notes), ctx.dossier.notes

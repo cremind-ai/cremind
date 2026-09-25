@@ -863,6 +863,23 @@ class IndexDB:
             )
             return max(cur.rowcount, 0)
 
+    def prioritize(self, file_ids: Iterable[int], *, priority: int) -> int:
+        """Move files already waiting up to ``priority`` (never down).
+        ``queued_at`` is left alone, unlike :meth:`mark_dirty`: a file being
+        indexed right now keeps its compare-and-set and is not made to start
+        over."""
+        ids = _unique_ints(file_ids)
+        if not ids:
+            return 0
+        p = int(priority)
+        with self._tx() as conn:
+            cur = conn.executemany(
+                "UPDATE files SET priority = ? "
+                "WHERE id = ? AND status = 'dirty' AND (priority IS NULL OR priority > ?)",
+                [(p, fid, p) for fid in ids],
+            )
+            return max(cur.rowcount, 0)
+
     def next_work(self, *, limit: int, now: float, exclude_ids: Iterable[int] = ()) -> list[dict[str, Any]]:
         """Files to process next: dirty ones, and errored ones whose backoff
         has expired, most urgent first (priority, then queue time).

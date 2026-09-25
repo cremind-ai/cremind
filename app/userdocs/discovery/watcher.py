@@ -163,6 +163,7 @@ class SourceWatcher:
         )
         self._lock = threading.Lock()
         self._pending: dict[str, _Pending] = {}
+        self._in_hand = 0
         self._delivered: dict[str, tuple[int, int]] = {}
         self._overflow = False
         self._stop = threading.Event()
@@ -237,6 +238,12 @@ class SourceWatcher:
             return all(e.is_alive() for e in observer.emitters)
         except Exception:  # noqa: BLE001
             return True
+
+    def pending_count(self) -> int:
+        """Paths seen but not handed over yet (still debouncing, or waiting
+        for a file being written to settle)."""
+        with self._lock:
+            return len(self._pending) + self._in_hand
 
     # ── event intake (watchdog's thread) ───────────────────────────────────
 
@@ -318,6 +325,9 @@ class SourceWatcher:
             except Exception as exc:  # noqa: BLE001 — never let the settle loop die
                 logger.warning(f"[userdocs] watcher: settle pass failed: {exc}")
                 wait_s = 1.0
+            finally:
+                with self._lock:
+                    self._in_hand = 0
             if self._stop.is_set():
                 break
             # New events are always at least ``debounce_s`` from due, so
@@ -337,6 +347,9 @@ class SourceWatcher:
                     ready.append((key, p.seq, p.rel, p.abs_path, p.kind, p.is_dir, p.phase, p.sig, p.attempts))
                 elif p.due < next_due:
                     next_due = p.due
+            # Taken out of ``_pending`` below but not delivered until the end
+            # of the pass: still pending as far as pending_count() goes.
+            self._in_hand = len(ready)
 
         changed: set[str] = {ROOT_RESCAN} if overflow else set()
         removed: set[str] = set()
