@@ -117,7 +117,7 @@ data:
          every rollout would download them again. */}}
   HF_HOME: {{ printf "%s/.cache/huggingface" .Values.cremind.systemDir | quote }}
   SENTENCE_TRANSFORMERS_HOME: {{ printf "%s/.cache/sentence-transformers" .Values.cremind.systemDir | quote }}
-  {{- /* Volume sizes for User Document Search's storage governor. From inside
+  {{- /* Volume sizes for Documentation search's storage governor. From inside
          this pod, statvfs sees the system PVC and nothing of a database or a
          vector store running in another pod, so the chart states the sizes of
          the ones it runs itself: only for an enabled subchart, and only when

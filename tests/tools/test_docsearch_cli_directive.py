@@ -1,6 +1,6 @@
-"""CLI-execution directive prepended to documentation_search results.
+"""CLI-execution directive prepended to cremind_documentation_search results.
 
-When ``documentation_search`` returns a ``cremind`` CLI reference (``[cli]…``)
+When ``cremind_documentation_search`` returns a ``cremind`` CLI reference (``[cli]…``)
 and exec_shell is callable for the profile, the tool prepends an agent directive
 telling the reasoning model to RUN the documented command via exec_shell and
 answer from live output, instead of paraphrasing the man page (the original
@@ -23,7 +23,7 @@ import pytest
 
 from app.constants import ChatCompletionTypeEnum
 
-import app.tools.builtin.documentation_search as ds
+import app.tools.builtin.cremind_documentation_search as ds
 
 
 # settings.toml's ``[tool_result].max_tokens`` default.
@@ -100,7 +100,7 @@ def _patch_registry(monkeypatch, *, leaves: Optional[List[Dict[str, Any]]] = Non
 
 
 def _run(name: str) -> str:
-    res = asyncio.run(ds.DocumentationSearchTool().run(
+    res = asyncio.run(ds.CremindDocumentationSearchTool().run(
         {"query": "list llm providers", "_llm": _FakeLLM(), "_profile": "admin"}
     ))
     assert res.content, "expected a text result"
@@ -286,8 +286,8 @@ def test_the_reader_names_search_but_search_does_not_name_the_reader():
     # search leaf's static description must not name the reader: a profile can
     # disable that leaf, so only the envelope footer — which checks — names it.
     assert f"`{ds.SEARCH_LEAF_FN}`" in ds.ReadDocumentationSectionTool().description
-    assert f"`{ds.SECTION_LEAF_FN}`" not in ds.DocumentationSearchTool().description
-    assert "closing line" in ds.DocumentationSearchTool().description
+    assert f"`{ds.SECTION_LEAF_FN}`" not in ds.CremindDocumentationSearchTool().description
+    assert "closing line" in ds.CremindDocumentationSearchTool().description
 
 
 def test_exposed_function_names_match_registration():
@@ -299,14 +299,14 @@ def test_exposed_function_names_match_registration():
 
     tool_id = slugify(ds.SERVER_NAME)
     assert tool_id == ds._TOOL_ID == ds.TOOL_CONFIG["name"]
-    assert make_leaf_name(tool_id, ds.DocumentationSearchTool.name) == ds.SEARCH_LEAF_FN
+    assert make_leaf_name(tool_id, ds.CremindDocumentationSearchTool.name) == ds.SEARCH_LEAF_FN
     assert make_leaf_name(tool_id, ds.ReadDocumentationSectionTool.name) == ds.SECTION_LEAF_FN
 
 
 def test_search_tool_class_keeps_its_leaf_name():
-    # The reasoning agent imports DocumentationSearchTool as its local search
+    # The reasoning agent imports CremindDocumentationSearchTool as its local search
     # tool and derives the guidance's function name from this ``name``.
-    assert ds.DocumentationSearchTool.name == "search_documentation"
+    assert ds.CremindDocumentationSearchTool.name == "search_documentation"
     assert ds.ReadDocumentationSectionTool.name == "read_documentation_section"
 
 
@@ -338,7 +338,7 @@ def _long_cli_body() -> str:
 
 
 def _search(query: str) -> str:
-    res = asyncio.run(ds.DocumentationSearchTool().run(
+    res = asyncio.run(ds.CremindDocumentationSearchTool().run(
         {"query": query, "_llm": _FakeLLM(), "_profile": "admin"}
     ))
     assert res.content, "expected a text result"

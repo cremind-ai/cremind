@@ -6,7 +6,7 @@ and vector store if needed, drops every collection that the new store
 doesn't yet contain, and rebuilds the known caches:
 
 - ``gg_places_types``         — Google Places type embeddings (336 entries)
-- ``documentation_search``    — shared + per-profile ``.md`` docs
+- ``cremind_documentation_search`` — shared + per-profile Cremind ``.md`` docs
 
 A rebuild always runs after the new model/store come up because the
 caller's intent is "re-sync everything"; partial rebuilds invite subtle
@@ -31,7 +31,12 @@ from app.utils.logger import logger
 # (``long_term_memory_*``) and now-removed tool-card embeddings are NOT owned:
 # memory has no rebuild source, and tool-card embeddings no longer exist.
 _OWNED_COLLECTION_PREFIXES: tuple[str, ...] = ()
-_OWNED_COLLECTIONS_EXACT = ("gg_places_types", "documentation_search")
+# ``documentation_search`` is the Cremind manual's collection from before it
+# was renamed; it has no rebuild of its own, so a re-sync simply drops it.
+# (Personal-document collections start with ``doc_`` and are never owned.)
+_OWNED_COLLECTIONS_EXACT = (
+    "gg_places_types", "cremind_documentation_search", "documentation_search",
+)
 
 
 def persist_embedding_config(body: dict, config_storage) -> None:
@@ -246,7 +251,7 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
 
     - ``gg_places._build_embedding_table`` rebuilds the place-type cache
       eagerly so the first place search isn't slow.
-    - ``DocumentSyncService.full_reconcile`` re-emits doc embeddings for
+    - ``CremindDocumentSyncService.full_reconcile`` re-emits doc embeddings for
       the shared scope and each profile.
 
     Long-term memory collections are intentionally NOT rebuilt here — they have
@@ -261,7 +266,7 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
 
     embedding_state.set_phase("rebuilding_docs")
     try:
-        from app.documents import get_service
+        from app.cremind_documents import get_service
         service = get_service()
         if service is not None and vector_store is not None:
             # The service resolves its handles from ``embedding_state`` on every
@@ -269,7 +274,7 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
             # ``is_ready()`` stays False until mark_ready() below, so without
             # pinning the reconcile would resolve to no store and silently index
             # nothing into the collection we just dropped.
-            from app.documents.sync import SHARED_SCOPE
+            from app.cremind_documents.sync import SHARED_SCOPE
             with service.pinned(vector_store=vector_store, embedding=embedding):
                 service.full_reconcile(SHARED_SCOPE)
                 for profile in profiles:

@@ -2282,8 +2282,7 @@ if (($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and $DesktopUi -ne '0' -and
 
 # ── documents folder (docker mode only) ───────────────────────────────────
 #
-# The host folder the container sees as /root/Documents — what User Document
-# Search indexes and where the agent works by default. Without the bind it
+# The host folder the container sees as /root/Documents — what Documentation search indexes and where the agent works by default. Without the bind it
 # lives on the container's own layer and vanishes whenever compose recreates
 # the container. Kubernetes never gets here: the chart's persistence.work
 # volume is mounted at the same path.

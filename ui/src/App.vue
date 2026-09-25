@@ -5,7 +5,7 @@ import { useChatStore } from './stores/chat';
 import { useGroupChatStore } from './stores/groupChat';
 import { useSettingsStore } from './stores/settings';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
-import { useUserDocsStore } from './stores/userDocs';
+import { useDocumentsStore } from './stores/documents';
 import { checkSetupStatus } from './services/configApi';
 import { PROFILE_ROUTES, CHAT_ROUTES } from './router/profileRoutes';
 import NavRail from './components/NavRail.vue';
@@ -82,7 +82,7 @@ const chatStore = useChatStore();
 const groupChatStore = useGroupChatStore();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
-const userDocsStore = useUserDocsStore();
+const documentsStore = useDocumentsStore();
 let stopHttpsCoordinator: (() => void) | null = null;
 let stopElectronMigrationGuard: (() => void) | null = null;
 let stopElectronMigrationRelease: (() => void) | null = null;
@@ -226,18 +226,18 @@ watch(
   },
 );
 
-// User Document Search progress follows the same chat-route rule: the store
+// Documentation search progress follows the same chat-route rule: the store
 // rides profile-events only where chat already holds it, and streams or polls
 // elsewhere — so it needs to know where we are.
 watch(
   () => route.name,
-  (name) => userDocsStore.setRoute(typeof name === 'string' ? name : ''),
+  (name) => documentsStore.setRoute(typeof name === 'string' ? name : ''),
   { immediate: true },
 );
 
 onUnmounted(() => {
   embeddingStatusStore.disconnect();
-  userDocsStore.disconnect();
+  documentsStore.disconnect();
   stopHttpsCoordinator?.();
   stopElectronMigrationGuard?.();
   stopElectronMigrationRelease?.();
@@ -277,7 +277,7 @@ onMounted(async () => {
   // Once, like the embedding store: it opens nothing until a profile token
   // exists, and follows token and route changes on its own. Its NavRail chip
   // never uses the embedding overlay above.
-  userDocsStore.connect(settingsStore.agentUrl);
+  documentsStore.connect(settingsStore.agentUrl);
 
   // Handle OAuth callback redirect
   const params = new URLSearchParams(window.location.search);

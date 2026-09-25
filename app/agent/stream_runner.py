@@ -1118,11 +1118,11 @@ async def run_agent_to_bus(
                 "agent_activity": activity_snapshot,
             }
 
-        # Research activity (a user_documents research job): the same, for its
+        # Research activity (a documentation_search research job): the same, for its
         # own panel. A job outlives the turn that started it, so finish()
         # patches the persisted message later (see set_persist_target below).
         try:
-            from app.userdocs.research import activity as research_activity
+            from app.documents.research import activity as research_activity
             research_snapshot = research_activity.get_snapshot(conversation_id)
         except Exception:  # noqa: BLE001
             research_snapshot = None
@@ -1145,15 +1145,18 @@ async def run_agent_to_bus(
                 "run_id": run_id,
             }
 
-        # User Document Search citations: verify every "[ud:…]" token in the
+        # Documentation search citations: verify every "[doc:…]" token (or a
+        # pre-rename "[doc:…]" one) in the
         # answer against what the tools actually issued, before the row is
         # written, so the verdict is part of the persisted message. The text
         # is never edited, and an answer that cites nothing costs a substring
         # test. Best-effort: a failed check saves the message without it.
+        from app.documents.cite import mentions_citation
+
         citations_meta: Dict[str, Any] | None = None
-        if "ud:" in final_text.lower():
+        if mentions_citation(final_text):
             try:
-                from app.userdocs.citations import finalize_citations
+                from app.documents.citations import finalize_citations
 
                 citations_meta = await asyncio.to_thread(
                     finalize_citations, profile, conversation_id, final_text,
@@ -1240,7 +1243,7 @@ async def run_agent_to_bus(
                 pass
         if research_snapshot and assistant_msg_id:
             try:
-                from app.userdocs.research import activity as research_activity
+                from app.documents.research import activity as research_activity
                 research_activity.set_persist_target(conversation_id, assistant_msg_id)
             except Exception:  # noqa: BLE001
                 pass
@@ -1575,7 +1578,7 @@ async def run_agent_to_bus(
         # one-shot claim. Free for a conversation no job reported to.
         if not event_run:
             try:
-                from app.userdocs.research import jobs as research_jobs
+                from app.documents.research import jobs as research_jobs
                 await research_jobs.on_turn_end(
                     conversation_id=conversation_id, profile=profile,
                 )

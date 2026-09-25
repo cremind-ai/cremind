@@ -1,7 +1,7 @@
 # AUTO-GENERATED copy of install/catalog.toml shipped with the
 # backend. Do not edit by hand — re-run
 # `python install/scripts/build_catalog.py`.
-# Source SHA-256: 1a412c31dd6066e34fd40403179fc63dfd78045d582e82413956941b5d2feb93
+# Source SHA-256: 28faaec7462b498f919c09f65cf2b66fcfc8b421b142b07dec275d577347002d
 
 # Cremind install/setup catalog — single source of truth.
 #
@@ -182,7 +182,7 @@ hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ign
 # ── Docker documents folder ────────────────────────────────────────────────
 # Asked only when the install mode is Docker, after [vnc_password]: which
 # folder on this machine the container sees as /root/Documents — the folder
-# User Document Search indexes and the agent's default working folder — and
+# Documentation search indexes and the agent's default working folder — and
 # whether the container may write to it. Without a bind mount that folder
 # lives on the container's own layer and is lost whenever the container is
 # recreated. Kubernetes never asks: the chart's persistence.work volume is

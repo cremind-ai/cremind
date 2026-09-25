@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  1a412c31dd6066e34fd40403179fc63dfd78045d582e82413956941b5d2feb93
+# Source SHA-256:  28faaec7462b498f919c09f65cf2b66fcfc8b421b142b07dec275d577347002d
 
 $script:CatalogSchema = 1
 

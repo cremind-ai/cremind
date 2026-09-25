@@ -26,7 +26,7 @@
 # project name matches.
 #
 # The cremind service mounts your Documents folder from the host as
-# /root/Documents: the agent's working folder, and what User Document Search
+# /root/Documents: the agent's working folder, and what Documentation search
 # indexes. The installer asks which folder and whether the agent may write to
 # it, and records the answers in ``.env``:
 #
@@ -138,7 +138,7 @@ services:
       # /opt/cremind-compose below.
       CREMIND_COMPOSE_FILE: /opt/cremind-compose/docker-compose.yml
       CREMIND_COMPOSE_ENV_FILE: /opt/cremind-compose/.env
-      # User Document Search. BIND is a literal like INSTALL_MODE above: it
+      # Documentation search. BIND is a literal like INSTALL_MODE above: it
       # says THIS file mounts the documents folder (see ``volumes:``), so a
       # /root/Documents that is not a mount reads as a lost mount rather than
       # as an install that predates it. The other two only repeat the

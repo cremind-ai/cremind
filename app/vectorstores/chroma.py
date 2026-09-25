@@ -11,7 +11,7 @@ from app.utils.logger import logger
 from .base import EmbeddingProvider, StoredPoint, VectorStoreBase
 
 if TYPE_CHECKING:
-    from app.userdocs.vectors import VectorFilter
+    from app.documents.vectors import VectorFilter
 
 
 class ChromaException(VectorStoreException):
@@ -98,7 +98,7 @@ def _to_chroma_where(filter: Optional[dict]) -> Optional[dict]:
 def _coerce_id(raw_id: Any) -> Union[int, str]:
     """Round-trip numeric ids back to int.
 
-    Chroma stores ids as strings. Callers (e.g. ``DocumentSyncService``)
+    Chroma stores ids as strings. Callers (e.g. ``CremindDocumentSyncService``)
     construct numeric ids and compare against returned ids by equality, so
     a digits-only string id is coerced back to int. Non-numeric ids
     (UUIDs, slugs, etc.) pass through unchanged.
@@ -133,7 +133,7 @@ def _collection_space(col: Any) -> Optional[str]:
 
 
 def _ud_metadata(payload: Optional[dict]) -> Optional[dict]:
-    """A userdocs payload as Chroma metadata. Chroma rejects an empty dict,
+    """A documents payload as Chroma metadata. Chroma rejects an empty dict,
     so a payload with nothing in it is sent as ``None``."""
     md = {k: v for k, v in (payload or {}).items() if v is not None}
     return _coerce_metadata(md) or None
@@ -478,7 +478,7 @@ class ChromaClient(VectorStoreBase):
             out.append(payload)
         return out
 
-    # ── Pre-embedded primitives (User Document Search) ──────────────────────
+    # ── Pre-embedded primitives (Documentation search) ──────────────────────
     #
     # Contract in VectorStoreBase. Two Chroma-specific rules:
     # - Writes resolve the collection with ``get_collection``, NEVER

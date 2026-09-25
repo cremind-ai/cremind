@@ -9,7 +9,7 @@ Four **optional** auxiliary groups fall back to the single model when unset:
 - ``vision`` — used only by the ``image_understanding`` tool.
 - ``audio`` — used only by the ``audio_understanding`` tool.
 - ``low`` — the low-performance / cheap model for lightweight auxiliary tasks
-  (e.g. the skill-event matching gate and the ``documentation_search`` relevance
+  (e.g. the skill-event matching gate and the ``cremind_documentation_search`` relevance
   judge). Generalized so future features needing a cheaper model can resolve it
   via ``create_llm_for_group("low", ...)``.
 - ``plan`` — the model used during plan mode's *planning* phase (research,
@@ -87,7 +87,7 @@ class ModelGroupManager:
         # Auth-method eligibility guard (self-heal). A stored group value may point
         # at a model the provider's ACTIVE auth method can't serve — e.g. after
         # "Sign in with ChatGPT" a stale ``model_group.low = openai/gpt-4.1-mini``
-        # 400s on the Codex backend, which made ``documentation_search`` return
+        # 400s on the Codex backend, which made ``cremind_documentation_search`` return
         # "no relevant result found". The OAuth/Settings paths reconcile at
         # switch time, but pre-existing, CLI-set, and blueprint-imported values
         # don't re-run that — so recover here too. Only fires when a model
@@ -177,9 +177,9 @@ class ModelGroupManager:
           ``vision`` group here so a *stale* dedicated model the user configured and
           then turned off can't leak back in.
 
-        ``documentation_search`` — its relevance judge is a frugal LLM-as-judge, so
+        ``cremind_documentation_search`` — its relevance judge is a frugal LLM-as-judge, so
         it runs on the ``low`` (low-performance) model, which itself falls back to
-        the single model when unset. ``user_documents`` likewise, for its thorough
+        the single model when unset. ``documentation_search`` likewise, for its thorough
         mode's query variants and rerank.
 
         Every other tool uses the single configured model. ``tool_name`` may be a
@@ -200,16 +200,16 @@ class ModelGroupManager:
             if audio_feature_enabled(profile):
                 return self.create_llm_for_group("audio", profile=profile)
             return self.create_llm_for_model(profile=profile)
-        # The documentation_search relevance judge is a lightweight LLM-as-judge
-        # (name+description only, structured tool-call output, no bodies/history) —
-        # exactly the cheap auxiliary task the low-performance group exists for.
-        # Falls back to the single model when ``low`` is unset.
+        # Both document searches run cheap auxiliary LLM steps, exactly what the
+        # low-performance group exists for (it falls back to the single model
+        # when ``low`` is unset):
+        # - ``cremind_documentation_search``'s relevance judge (name+description
+        #   only, structured tool-call output, no bodies/history);
+        # - ``documentation_search``'s thorough mode (restoring accents,
+        #   translating the query, reranking the top 30). Its deep research
+        #   picks its own group (RESEARCH_MODEL_GROUP).
+        # The substring matches both ids.
         if "documentation_search" in name:
-            return self.create_llm_for_group("low", profile=profile)
-        # User Documents' thorough mode (restoring accents, translating the
-        # query, reranking the top 30) is the same kind of cheap auxiliary
-        # step. Its deep research picks its own group (RESEARCH_MODEL_GROUP).
-        if "user_documents" in name:
             return self.create_llm_for_group("low", profile=profile)
         return self.create_llm_for_model(profile=profile)
 

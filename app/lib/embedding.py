@@ -9,13 +9,13 @@ Satisfies the ``EmbeddingProvider`` protocol declared in
 ``app/vectorstores/base.py``.
 
 **One lock around every model call.** The single instance is shared by chat
-(documentation search, memory), the documents sync and User Document Search's
+(Cremind documentation search, memory), the documents sync and Documentation search's
 background indexer, which run on different threads. A Hugging Face *fast*
 tokenizer is a Rust object that is not safe to use from two threads at once
 (it fails with ``RuntimeError: Already borrowed``), so every call into the
 provider holds ``_lock``.
 
-**Interactive callers go first.** The userdocs indexer embeds in batches of up
+**Interactive callers go first.** The documents indexer embeds in batches of up
 to a few hundred milliseconds. A search query (``embed_query`` /
 ``embed_search_query``) registers itself in ``_interactive_waiting`` before it
 queues for the lock, and ``embed_passages`` checks that counter before every
@@ -26,7 +26,7 @@ whole backlog. Batch size adapts so one batch stays near ``_TARGET_BATCH_S``.
 their exact historical outputs (no prompt prefix): the documentation, memory
 and tool collections were built that way. ``embed_passages`` /
 ``embed_search_query`` add the provider's trained prompts; see
-:mod:`app.userdocs.embed_prompts`.
+:mod:`app.documents.embed_prompts`.
 """
 
 from __future__ import annotations
@@ -123,21 +123,21 @@ class LocalEmbeddings:
 
     def embed_query(self, text: str) -> List[float]:
         # A query is someone waiting on an answer: it jumps ahead of the
-        # userdocs background batches.
+        # documents background batches.
         with self._interactive():
             return self._provider.encode(text)
 
-    # ── User Document Search ────────────────────────────────────────────────
+    # ── Documentation search ────────────────────────────────────────────────
 
     def embed_search_query(self, text: str) -> List[float]:
-        """Embed a userdocs search query, with the provider's query prompt."""
+        """Embed a documents search query, with the provider's query prompt."""
         with self._interactive():
             return self._provider.encode(self.query_prefix + text)
 
     def embed_passages(
         self, texts: List[str], *, batch_size: Optional[int] = None,
     ) -> List[List[float]]:
-        """Embed passages for a userdocs collection, with the passage prompt.
+        """Embed passages for a documents collection, with the passage prompt.
 
         Returns one vector per text, in order. ``batch_size=None`` adapts the
         batch so each holds the model for about ``_TARGET_BATCH_S``; a fixed

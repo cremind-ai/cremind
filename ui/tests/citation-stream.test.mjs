@@ -27,7 +27,7 @@ function sse(...frames) {
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 
 test('a citations event is delivered to its conversation, and only to it', async () => {
-  const citations = { v: 1, unverified: 0, items: [{ n: 1, token: '[ud:k7m2xq9a]', status: 'verified' }] }
+  const citations = { v: 1, unverified: 0, items: [{ n: 1, token: '[doc:k7m2xq9a]', status: 'verified' }] }
   env.route('/api/profile-events/stream', () => sse(
     frame('ready', {}),
     frame('conversation-event', { conversation_id: 'c2', seq: 1, type: 'text', data: { token: 'other' } }),

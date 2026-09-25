@@ -29,8 +29,8 @@ name:
     data: {"status": ..., "phase": ..., "error": ..., "ready": bool,
            "busy": bool, "enabled": bool}
 
-    event: userdocs
-    data: {<User Document Search snapshot, see app.userdocs.state>}
+    event: documentation_search
+    data: {<Documentation search snapshot, see app.documents.state>}
 
     event: ready
     data: {}
@@ -67,7 +67,7 @@ from app.events.profile_stream_fanout import get_profile_stream_fanout
 from app.events.settings_state_bus import get_settings_state_stream_bus
 from app.events.stream_bus import get_event_stream_bus
 from app.events.transport_state_bus import get_transport_state_bus
-from app.events.userdocs_bus import get_userdocs_stream_bus
+from app.events.documents_bus import get_documents_stream_bus
 from app.config.tls_transition import public_transition
 from app.storage.conversation_storage import ConversationStorage
 from app.tools.builtin.exec_shell import list_processes
@@ -87,11 +87,11 @@ def _event_frame(event_name: str, data: Any) -> bytes:
     return f"event: {event_name}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
 
-def _userdocs_snapshot(profile: str) -> Dict[str, Any]:
-    """The User Document Search snapshot, or a minimal one if it cannot be
+def _documents_snapshot(profile: str) -> Dict[str, Any]:
+    """The Documentation search snapshot, or a minimal one if it cannot be
     built — a broken index must never take the chat stream down with it."""
     try:
-        from app.userdocs.state import build_snapshot
+        from app.documents.state import build_snapshot
 
         return build_snapshot(profile)
     except Exception:  # noqa: BLE001
@@ -160,7 +160,7 @@ def get_profile_events_routes(
         emb_queue = emb_bus.subscribe()
         transport_bus = get_transport_state_bus()
         transport_queue = transport_bus.subscribe()
-        ud_bus = get_userdocs_stream_bus()
+        ud_bus = get_documents_stream_bus()
         ud_queue = ud_bus.subscribe(profile)
 
         replay = get_event_notifications().since(profile, since_ms)
@@ -197,7 +197,7 @@ def get_profile_events_routes(
                     "embedding-state", _augment_with_enabled(embedding_state.to_dict()),
                 )
                 yield _event_frame(
-                    "userdocs", await asyncio.to_thread(_userdocs_snapshot, profile),
+                    "documentation_search", await asyncio.to_thread(_documents_snapshot, profile),
                 )
                 transition = public_transition()
                 if transition:
@@ -268,7 +268,7 @@ def get_profile_events_routes(
                             transport_task = asyncio.ensure_future(transport_queue.get())
                         elif task is ud_task:
                             # Already a full snapshot — forward as-is.
-                            yield _event_frame("userdocs", task.result())
+                            yield _event_frame("documentation_search", task.result())
                             ud_task = asyncio.ensure_future(ud_queue.get())
 
                     if await request.is_disconnected():

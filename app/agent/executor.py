@@ -428,13 +428,15 @@ class CremindAgentExecutor(AgentExecutor):
                 # re-render terminal chips (see mapBackendMessage on the UI side).
                 persist_parts = (collected_file_parts or []) + collected_terminal_parts or None
 
-                # User Document Search citations, as on the stream-runner
+                # Documentation search citations, as on the stream-runner
                 # path. ``context_id`` binds registrations a first message's
                 # tools made before this conversation row existed.
+                from app.documents.cite import mentions_citation
+
                 agent_metadata = None
-                if "ud:" in final_response_text.lower():
+                if mentions_citation(final_response_text):
                     try:
-                        from app.userdocs.citations import finalize_citations
+                        from app.documents.citations import finalize_citations
 
                         citations_meta = await asyncio.to_thread(
                             finalize_citations, profile, conversation_id,

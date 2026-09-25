@@ -1,16 +1,19 @@
 /**
  * Citation tokens in the web UI: parse, number, render as chips, flatten for copy.
  *
- * The agent cites the user's own documents by copying the tokens the User
- * Documents tools print next to every result — `[ud:k7m2xq9a]` for a file or
- * folder, `[ud:k7m2xq9a#3f9c2e1b]` for one chunk of it. The grammar is
- * app/userdocs/cite.py's, reimplemented here rather than asked of the server
+ * The agent cites the user's own documents by copying the tokens the
+ * Documentation search tools print next to every result — `[doc:k7m2xq9a]` for
+ * a file or folder, `[doc:k7m2xq9a#3f9c2e1b]` for one chunk of it. Answers
+ * written before the rename use the older `[ud:…]` prefix: it is read forever
+ * and means the same citation, so every parser here turns both prefixes into
+ * the one canonical `[doc:…]` form (items from old metadata included). The grammar is
+ * app/documents/cite.py's, reimplemented here rather than asked of the server
  * because the numbering is visible: the web bubble, a channel's "Sources:"
  * footer and the CLI must all call the same source "[2]", so the tolerant parse
  * and the first-appearance numbering have to agree with the Python exactly.
  * ui/tests/fixtures/citation-grammar.json holds the cases both sides are
  * checked against (ui/tests/citation-grammar.test.mjs and
- * tests/userdocs/test_cite_ui_parity.py).
+ * tests/documents/test_cite_ui_parity.py).
  *
  * Deliberately dependency-free (types only), so the grammar can be tested
  * without a browser and imported anywhere without dragging a store along.
@@ -32,7 +35,7 @@ export type QuoteStatus = 'exact' | 'normalized' | 'fuzzy' | 'mismatch' | null;
 
 export interface CitationFile {
   /** The file's cite id: the same 8 characters as the token, and the key of
-   *  every /api/userdocs/files/{fid} route. */
+   *  every /api/documentation-search/files/{fid} route. */
   fid: string;
   name: string;
   rel_path: string;
@@ -134,25 +137,34 @@ export function citationStatusInfo(
   }
 }
 
-// ── the grammar (mirror of app/userdocs/cite.py) ──────────────────────────────
+// ── the grammar (mirror of app/documents/cite.py) ──────────────────────────────
 
 // The shape of every token the parser can produce: 8 lowercase ASCII letters
 // or digits, then optionally 8 hex. Wider than the Crockford alphabet on
-// purpose — cite.py lowercases whatever it was given ("[ud:ILOUilou]" →
-// "[ud:ilouilou]") and leaves rejecting it to verification, which marks it
-// invalid; it must still count, and render, as a numbered citation or the
-// numbers after it would drift from the other renderers'.
-const TOKEN_SHAPE_RE = /^\[ud:([0-9a-z]{8})(?:#([0-9a-f]{8}))?\]$/;
+// purpose — cite.py lowercases whatever a legacy "ud:" token held
+// ("[ud:ILOUilou]" → "[doc:ilouilou]") and leaves rejecting it to
+// verification, which marks it invalid; it must still count, and render, as a
+// numbered citation or the numbers after it would drift from the other
+// renderers'. LEGACY_SHAPE_RE is the same shape under the old prefix, which
+// saved message metadata may still carry.
+const TOKEN_SHAPE_RE = /^\[doc:([0-9a-z]{8})(?:#([0-9a-f]{8}))?\]$/;
+const LEGACY_SHAPE_RE = /^\[ud:([0-9a-z]{8})(?:#([0-9a-f]{8}))?\]$/;
 
 // What models actually write when they copy a token imperfectly: full-width
 // brackets, spaces, upper case, several tokens in one bracket. cite.py spells
-// this with re.IGNORECASE; here the case-insensitivity is written out
-// ([Uu][Dd]) instead of using the `i` flag, so the characters that can reach a
-// canonical token stay ASCII letters and digits whatever the engine's case
-// folding does.
+// the case-insensitivity out the same way ([Dd][Oo][Cc], [Uu][Dd]) instead of
+// using the `i` flag, so the characters that can reach a canonical token stay
+// ASCII letters and digits whatever the engine's case folding does. "doc:" is
+// an ordinary word, so a doc: id must use the cite alphabet (either case) —
+// "[doc:overview]" in prose is not a citation; the legacy ud: prefix keeps its
+// original, looser id shape.
+const DOC_ID = '[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{8}';
+const UD_ID = '[0-9A-Za-z]{8}';
 const TOLERANT_SRC =
-  String.raw`[\[【]\s*((?:[Uu][Dd]:\s*[0-9A-Za-z]{8}(?:#[0-9A-Fa-f]{8})?\s*[;,]?\s*)+)[\]】]`;
-const ONE_SRC = String.raw`[Uu][Dd]:\s*([0-9A-Za-z]{8})(?:#([0-9A-Fa-f]{8}))?`;
+  String.raw`[\[【]\s*((?:(?:[Dd][Oo][Cc]:\s*${DOC_ID}|[Uu][Dd]:\s*${UD_ID})(?:#[0-9A-Fa-f]{8})?\s*[;,]?\s*)+)[\]】]`;
+// Groups 1–2: a doc: token; 3–4: a legacy ud: token.
+const ONE_SRC =
+  String.raw`(?:[Dd][Oo][Cc]:\s*(${DOC_ID})(?:#([0-9A-Fa-f]{8}))?|[Uu][Dd]:\s*(${UD_ID})(?:#([0-9A-Fa-f]{8}))?)`;
 
 export interface ParsedCitation {
   /** Canonical form — what the registry stores and what items are keyed by. */
@@ -166,7 +178,7 @@ export interface ParsedCitation {
 }
 
 export function makeToken(citeId: string, c8?: string | null): string {
-  return c8 ? `[ud:${citeId}#${c8.slice(0, 8)}]` : `[ud:${citeId}]`;
+  return c8 ? `[doc:${citeId}#${c8.slice(0, 8)}]` : `[doc:${citeId}]`;
 }
 
 /** The parts of a token in canonical (lower-case) form, or null for anything
@@ -176,16 +188,29 @@ export function tokenParts(token: string): { citeId: string; c8: string | null }
   return m ? { citeId: m[1], c8: m[2] ?? null } : null;
 }
 
+/** A stored token under either prefix in today's canonical `[doc:…]` form, or
+ *  null when it is not a canonical token at all (cite.py's canonical_token). */
+export function canonicalToken(token: string): string | null {
+  const m = TOKEN_SHAPE_RE.exec(token) ?? LEGACY_SHAPE_RE.exec(token);
+  return m ? makeToken(m[1], m[2] ?? null) : null;
+}
+
+/** One match of ONE_SRC as a canonical id and chunk part (either prefix). */
+function oneToken(one: RegExpMatchArray): { citeId: string; c8: string | null } {
+  const id = one[1] ?? one[3] ?? '';
+  const hash = one[2] ?? one[4];
+  return { citeId: id.toLowerCase(), c8: hash ? hash.toLowerCase() : null };
+}
+
 /** Every citation in `text`, in order of appearance — cite.py's parse_tokens. */
 export function parseCitationTokens(text: string): ParsedCitation[] {
   const out: ParsedCitation[] = [];
-  if (!text || !text.toLowerCase().includes('ud:')) return out;
+  if (!mentionsCitations(text)) return out;
   for (const bracket of text.matchAll(new RegExp(TOLERANT_SRC, 'g'))) {
     const start = bracket.index ?? 0;
     const end = start + bracket[0].length;
     for (const one of bracket[1].matchAll(new RegExp(ONE_SRC, 'g'))) {
-      const citeId = one[1].toLowerCase();
-      const c8 = one[2] ? one[2].toLowerCase() : null;
+      const { citeId, c8 } = oneToken(one);
       out.push({ token: makeToken(citeId, c8), citeId, c8, start, end });
     }
   }
@@ -204,7 +229,7 @@ export function numberTokens(text: string): Map<string, number> {
 
 /** Whether a message is worth rendering through the citation-aware parser. */
 export function mentionsCitations(text: string | null | undefined): boolean {
-  return !!text && /ud\s*[:：]/i.test(text);
+  return !!text && /(?:doc|ud)\s*[:：]/i.test(text);
 }
 
 // ── normalising what the server sends ─────────────────────────────────────────
@@ -219,8 +244,8 @@ function str(v: unknown): string {
  *  know. */
 export function normalizeCitationItem(raw: any, fallbackToken?: string): CitationItem | null {
   if (!raw || typeof raw !== 'object') return null;
-  const token = str(raw.token) || fallbackToken || '';
-  if (!tokenParts(token)) return null;
+  const token = canonicalToken(str(raw.token) || fallbackToken || '');
+  if (!token) return null;
   const f = raw.file && typeof raw.file === 'object' ? raw.file : null;
   return {
     n: typeof raw.n === 'number' ? raw.n : 0,
@@ -267,7 +292,7 @@ export interface CitationRenderContext {
 }
 
 interface CiteToken extends Tokens.Generic {
-  type: 'udCite';
+  type: 'docCite';
   raw: string;
   /** Canonical tokens in this bracket, deduplicated, in order. Empty for a
    *  near miss, which renders as escaped text. */
@@ -281,13 +306,13 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, ch => ESCAPES[ch]);
 }
 
-// A bracket that starts like a citation but is not one ("[ud:<script>]", a
-// neutralised "[ud：…]" from document text, a truncated hash). marked would
+// A bracket that starts like a citation but is not one ("[doc:<script>]", a
+// neutralised "[doc：…]" from document text, a truncated hash). marked would
 // pass any HTML inside it straight through; rendering it as escaped text
 // means a string a document planted, and the agent echoed, stays inert. A
 // following "(" is left alone: that is a Markdown link, not a citation.
-const NEAR_MISS_RE = /^[\[【]\s*[Uu][Dd]\s*[:：][^\]】\n]{0,200}[\]】](?!\()/;
-const START_RE = /[\[【]\s*[Uu][Dd]\s*[:：]/;
+const NEAR_MISS_RE = /^[\[【]\s*(?:[Dd][Oo][Cc]|[Uu][Dd])\s*[:：][^\]】\n]{0,200}[\]】](?!\()/;
+const START_RE = /[\[【]\s*(?:[Dd][Oo][Cc]|[Uu][Dd])\s*[:：]/;
 const TOLERANT_AT_START_RE = new RegExp(`^${TOLERANT_SRC}`);
 
 function chipHtml(
@@ -300,13 +325,13 @@ function chipHtml(
   if (!tokenParts(token)) return escapeHtml(token);
   const status = info && STATUSES.has(info.status) ? info.status : 'pending';
   const quote = info?.quote_status === 'mismatch' ? ' data-quote="mismatch"' : '';
-  return `<button type="button" class="ud-cite" data-token="${token}" data-n="${n}"`
+  return `<button type="button" class="doc-cite" data-token="${token}" data-n="${n}"`
     + ` data-status="${status}"${quote} aria-label="Source ${n}">${n}</button>`;
 }
 
 /**
  * A marked extension that renders citation tokens as numbered chips:
- * `<button type="button" class="ud-cite" data-token="[ud:…]" data-n="2"
+ * `<button type="button" class="doc-cite" data-token="[doc:…]" data-n="2"
  * data-status="verified">2</button>`. The number is the token's first
  * appearance in the WHOLE message (computed in the preprocess hook), so a
  * token first cited inside a code span keeps the number the other renderers
@@ -322,7 +347,7 @@ export function citationMarkedExtension(ctx: CitationRenderContext = {}): Marked
       },
     },
     extensions: [{
-      name: 'udCite',
+      name: 'docCite',
       level: 'inline',
       start(src: string) {
         const m = START_RE.exec(src);
@@ -333,13 +358,14 @@ export function citationMarkedExtension(ctx: CitationRenderContext = {}): Marked
         if (m) {
           const cites: string[] = [];
           for (const one of m[1].matchAll(new RegExp(ONE_SRC, 'g'))) {
-            const token = makeToken(one[1].toLowerCase(), one[2] ? one[2].toLowerCase() : null);
+            const { citeId, c8 } = oneToken(one);
+            const token = makeToken(citeId, c8);
             if (!cites.includes(token)) cites.push(token);
           }
-          return { type: 'udCite', raw: m[0], cites };
+          return { type: 'docCite', raw: m[0], cites };
         }
         const near = NEAR_MISS_RE.exec(src);
-        if (near) return { type: 'udCite', raw: near[0], cites: [] };
+        if (near) return { type: 'docCite', raw: near[0], cites: [] };
         return undefined;
       },
       renderer(token: Tokens.Generic) {
@@ -379,7 +405,7 @@ function describe(item: CitationItem | undefined): string {
 
 /**
  * The message as plain text for the clipboard: every citation bracket becomes
- * its number(s) — "[ud:a#b; ud:c#d]" → "[1][2]" — and a "Sources:" list
+ * its number(s) — "[doc:a#b; doc:c#d]" → "[1][2]" — and a "Sources:" list
  * follows, numbered the way the chips are. A token pasted anywhere else means
  * nothing; a numbered footnote with a file name does.
  */
@@ -391,7 +417,7 @@ export function toPlainFootnotes(
   if (!parsed.length) return text;
   const numbers = numberTokens(text);
   const byToken = new Map<string, CitationItem>();
-  for (const item of items) byToken.set(item.token, item);
+  for (const item of items) byToken.set(canonicalToken(item.token) ?? item.token, item);
 
   let out = '';
   let cursor = 0;

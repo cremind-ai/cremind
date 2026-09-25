@@ -294,7 +294,7 @@ def test_a_publish_failure_never_fails_a_completed_unlink(wired, monkeypatch):
     assert resp.status_code == 200
 
 
-# ── the Drive index of User Document Search ──────────────────────────────────
+# ── the Drive index of Documentation search ──────────────────────────────────
 #
 # A gdrive unlink through Cremind deletes the Drive index at once — but only
 # when the link is really gone (engine report AND filesystem), and never for
@@ -304,7 +304,7 @@ def test_a_publish_failure_never_fails_a_completed_unlink(wired, monkeypatch):
 @pytest.fixture
 def purges(monkeypatch):
     import app.drive.skill_token as drive_token
-    from app.userdocs import state as uds_state
+    from app.documents import state as uds_state
 
     recorded: List[tuple] = []
     token: Dict[str, Any] = {"path": None}  # the gdrive token file as the filesystem sees it
@@ -379,7 +379,7 @@ def test_unlink_all_without_gdrive_or_with_its_wipe_failed_keeps_it(wired, purge
 
 
 def test_a_purge_failure_never_fails_a_completed_unlink(wired, purges):
-    from app.userdocs import state as uds_state
+    from app.documents import state as uds_state
 
     def explode(profile, kind):
         raise RuntimeError("engine queue closed")

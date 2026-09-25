@@ -88,7 +88,7 @@ class DockerDocuments:
     prompt: str = "Which folder on this computer should Cremind use as its Documents folder?"
     hint: str = (
         "It is mounted into the container at /root/Documents, the agent's "
-        "default working folder and the folder User Document Search indexes. "
+        "default working folder and the folder Documentation search indexes. "
         "It is created if it does not exist."
     )
     access_prompt: str = "Should Cremind be able to change files in that folder?"

@@ -32,7 +32,7 @@ COMPOSE_TEMPLATE = TEMPLATES / "docker-compose.yml.tmpl"
 ENV_TEMPLATE = TEMPLATES / "docker.env.tmpl"
 SH = REPO_ROOT / "install" / "install.sh"
 PS1 = REPO_ROOT / "install" / "install.ps1"
-DEPLOY_ENV = REPO_ROOT / "app" / "userdocs" / "deploy_env.py"
+DEPLOY_ENV = REPO_ROOT / "app" / "documents" / "deploy_env.py"
 
 WINDOWS_DOCUMENTS = "C:/Users/x/Documents"
 BUNDLE_DIR = "C:/Users/x/AppData/Local/cremind/docker"
@@ -154,7 +154,7 @@ def test_the_template_tells_the_app_what_it_mounted() -> None:
 
 
 def test_the_app_reads_the_names_the_template_sets() -> None:
-    """``app.userdocs.deploy_env.docker_root_status`` is the reader."""
+    """``app.documents.deploy_env.docker_root_status`` is the reader."""
     source = DEPLOY_ENV.read_text(encoding="utf-8")
     for name in ("CREMIND_DOCUMENTS_BIND", "CREMIND_HOST_DOCUMENTS_HINT", "CREMIND_COMPOSE_HOST_DIR"):
         assert f'"{name}"' in source, name

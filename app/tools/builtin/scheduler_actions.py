@@ -75,7 +75,7 @@ class ScheduleCreateTool(BuiltInTool):
         "recurrences are stored as a single advancing rule, never an infinite set. "
         "This tool ONLY creates events — it does not list, change, or stop them. "
         "To LIST, EDIT, pause/resume, or CANCEL an EXISTING schedule event, use "
-        "the `cremind calendar` CLI instead (run `documentation_search` for the "
+        "the `cremind calendar` CLI instead (run `cremind_documentation_search` for the "
         "\"cremind calendar\" doc to get the exact subcommands and flags, then "
         "run the command with the Shell Executor): e.g. `cremind calendar "
         "schedule list` to find an event id, `cremind calendar edit <id>` with "

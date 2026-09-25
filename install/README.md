@@ -94,8 +94,7 @@ shows no radio (it's local-only).
 
 ### The Documents folder
 
-The container sees one folder of yours as `/root/Documents`: User Document
-Search indexes it, and the agent reads and saves files there by default.
+The container sees one folder of yours as `/root/Documents`: Documentation search indexes it, and the agent reads and saves files there by default.
 Without a bind mount that folder would live on the container's own layer and
 disappear whenever the container is recreated (an image upgrade, a
 `docker compose down && up`), so the installer asks for a real one:

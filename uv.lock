@@ -791,6 +791,10 @@ claude-code = [
 codex = [
     { name = "openai-codex" },
 ]
+documentation-search = [
+    { name = "pillow" },
+    { name = "pillow-heif" },
+]
 documents = [
     { name = "markitdown", extra = ["all"] },
     { name = "pandas" },
@@ -824,10 +828,6 @@ postgres = [
 ]
 tokenization = [
     { name = "tiktoken" },
-]
-userdocs = [
-    { name = "pillow" },
-    { name = "pillow-heif" },
 ]
 vectorstore-chroma = [
     { name = "chromadb" },
@@ -889,9 +889,9 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'embeddings-gemma'", specifier = ">=3.0.1" },
     { name = "pandas", marker = "extra == 'embeddings-me5'", specifier = ">=3.0.1" },
     { name = "pillow", marker = "extra == 'all'", specifier = ">=10.0" },
-    { name = "pillow", marker = "extra == 'userdocs'", specifier = ">=10.0" },
+    { name = "pillow", marker = "extra == 'documentation-search'", specifier = ">=10.0" },
     { name = "pillow-heif", marker = "extra == 'all'", specifier = ">=0.18" },
-    { name = "pillow-heif", marker = "extra == 'userdocs'", specifier = ">=0.18" },
+    { name = "pillow-heif", marker = "extra == 'documentation-search'", specifier = ">=0.18" },
     { name = "playwright", marker = "extra == 'all'", specifier = ">=1.52.0" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.52.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.47" },
@@ -930,7 +930,7 @@ requires-dist = [
     { name = "watchdog", specifier = ">=4.0.0" },
     { name = "websockets", specifier = ">=13.0" },
 ]
-provides-extras = ["all", "browser", "channel-discord", "channel-slack", "channel-telegram-bot", "channel-telegram-userbot", "claude-code", "codex", "documents", "embeddings-gemma", "embeddings-me5", "google", "llm-anthropic", "llm-groq", "llm-openai", "postgres", "tokenization", "userdocs", "vectorstore-chroma", "vectorstore-qdrant"]
+provides-extras = ["all", "browser", "channel-discord", "channel-slack", "channel-telegram-bot", "channel-telegram-userbot", "claude-code", "codex", "documentation-search", "documents", "embeddings-gemma", "embeddings-me5", "google", "llm-anthropic", "llm-groq", "llm-openai", "postgres", "tokenization", "vectorstore-chroma", "vectorstore-qdrant"]
 
 [package.metadata.requires-dev]
 dev = [

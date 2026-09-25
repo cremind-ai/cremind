@@ -20,8 +20,7 @@ Status transitions:
 
 Listeners (:func:`add_listener`) hear every settled transition — READY,
 FAILED and DISABLED — whichever path caused it: boot, the apply pipeline,
-``defer_apply``, a failed load, or embedding being switched off. User Document
-Search uses this to notice a model or store change (and re-embed into a new
+``defer_apply``, a failed load, or embedding being switched off. Documentation search uses this to notice a model or store change (and re-embed into a new
 collection) without hooking each of those paths separately.
 """
 

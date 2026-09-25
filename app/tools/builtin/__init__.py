@@ -66,8 +66,8 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "sleep",
     "claude_code",
     "codex",
+    "cremind_documentation_search",
     "documentation_search",
-    "user_documents",
     "change_working_directory",
     "web_search",
     "web_fetch",
@@ -472,7 +472,7 @@ async def register_builtin_tools(
             )
 
         # The group's child LLM (used only by tools with an internal LLM step,
-        # e.g. image_understanding / documentation_search) is the single
+        # e.g. image_understanding / cremind_documentation_search) is the single
         # configured model resolved by the factory (image_understanding → the
         # optional vision model). There are no per-tool LLM overrides anymore.
         try:

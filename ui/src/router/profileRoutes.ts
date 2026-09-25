@@ -17,7 +17,7 @@ export const PROFILE_ROUTES = new Set([
   'tools-skills-settings',
   'user-config-settings',
   'embedding-settings',
-  'user-documents-settings',
+  'documents-settings',
   'gsuite-settings',
   'profile-settings',
   'channels-settings',

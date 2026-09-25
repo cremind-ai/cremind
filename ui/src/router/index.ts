@@ -214,11 +214,11 @@ const routes = [
     },
   },
   {
-    // User Document Search for this profile. No admin guard: every profile
+    // Documentation search for this profile. No admin guard: every profile
     // owns its own index, and the page itself explains an admin-disabled gate.
     path: '/:profile/settings/documents',
-    name: 'user-documents-settings',
-    component: () => import('../views/UserDocumentsSettings.vue'),
+    name: 'documents-settings',
+    component: () => import('../views/DocumentsSettings.vue'),
     props: true,
     meta: { title: 'My Documents' },
   },

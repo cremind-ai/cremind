@@ -1127,7 +1127,7 @@ def test_reasoning_effort_is_a_strict_dropdown():
 def test_reasoning_effort_description_and_doc_point_at_the_live_list():
     """The levels differ per account and per model, so neither the variable
     description (what Settings and `cremind tools get` show) nor the bundled
-    ``[tool]codex.md`` row (what documentation_search answers "which efforts can
+    ``[tool]codex.md`` row (what cremind_documentation_search answers "which efforts can
     Codex use?" from) may carry a fixed set - both send the reader to the live
     list instead. A copied-in list would be wrong for somebody's account."""
     import re
@@ -1139,7 +1139,7 @@ def test_reasoning_effort_description_and_doc_point_at_the_live_list():
     desc = TOOL_CONFIG["required_config"][r.Var.REASONING_EFFORT]["description"]
     doc = (
         Path(__file__).resolve().parents[2]
-        / "app" / "documents" / "bundled" / "[tool]codex.md"
+        / "app" / "cremind_documents" / "bundled" / "[tool]codex.md"
     ).read_text(encoding="utf-8")
     rows = [line for line in doc.splitlines() if line.startswith("| `CODEX_REASONING_EFFORT`")]
     assert rows, "[tool]codex.md has no CODEX_REASONING_EFFORT row"

@@ -318,7 +318,7 @@ def get_conversation_routes(
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        from app.userdocs.research import activity as research_activity
+        from app.documents.research import activity as research_activity
         return JSONResponse({"activity": research_activity.get_snapshot(conversation_id)})
 
     async def handle_get_memory(request: Request) -> JSONResponse:

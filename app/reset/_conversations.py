@@ -88,7 +88,7 @@ async def cleanup_conversation_dependents(
         # The conversation's Research activity panel lives in memory; its
         # research job row goes with the conversation (FK cascade), and a job
         # still running stops quietly at its next save.
-        from app.userdocs.research import activity as research_activity
+        from app.documents.research import activity as research_activity
         research_activity.clear(conversation_id)
     except Exception:  # noqa: BLE001
         logger.debug("research activity clear failed during conv clean", exc_info=True)

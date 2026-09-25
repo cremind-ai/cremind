@@ -177,7 +177,7 @@ hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ign
 # ── Docker documents folder ────────────────────────────────────────────────
 # Asked only when the install mode is Docker, after [vnc_password]: which
 # folder on this machine the container sees as /root/Documents — the folder
-# User Document Search indexes and the agent's default working folder — and
+# Documentation search indexes and the agent's default working folder — and
 # whether the container may write to it. Without a bind mount that folder
 # lives on the container's own layer and is lost whenever the container is
 # recreated. Kubernetes never asks: the chart's persistence.work volume is

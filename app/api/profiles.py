@@ -202,11 +202,11 @@ def get_profile_routes(
             )
         # The document index is keyed by the profile's uuid, which the delete
         # below removes with the row — read it first so the index can be found.
-        userdocs_uid = None
+        documents_uid = None
         try:
-            from app.storage.userdocs_storage import get_userdocs_storage
+            from app.storage.documents_storage import get_documents_storage
 
-            userdocs_uid = await asyncio.to_thread(get_userdocs_storage().profile_uid, profile_name)
+            documents_uid = await asyncio.to_thread(get_documents_storage().profile_uid, profile_name)
         except Exception:  # noqa: BLE001 — never block the delete
             logger.debug(f"Could not read the uuid of profile '{profile_name}'", exc_info=True)
         try:
@@ -270,12 +270,12 @@ def get_profile_routes(
                     f"'{profile_name}'"
                 )
 
-            # User Document Search: settings rows cascade with the profile, but
+            # Documentation search: settings rows cascade with the profile, but
             # its index file and vector collections live outside the database.
             try:
-                from app.userdocs.service import forget_profile
+                from app.documents.service import forget_profile
 
-                await asyncio.to_thread(forget_profile, profile_name, userdocs_uid)
+                await asyncio.to_thread(forget_profile, profile_name, documents_uid)
             except Exception:  # noqa: BLE001 — never block the delete
                 logger.exception(
                     f"Could not remove the document index of deleted profile '{profile_name}'"

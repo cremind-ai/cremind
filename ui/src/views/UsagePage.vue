@@ -172,8 +172,8 @@ const bySourceOption = computed(() => {
   const slices = [...(summary.value?.by_source ?? [])].slice(0, 12).reverse();
   const typeColor: Record<string, string> = {
     reasoning: c.primary, tool: c.warning, subagent: c.series[3], intrinsic: c.success, aggregate: c.textSecondary,
-    // User Document Search's own model calls: image descriptions and checks.
-    userdocs: c.series[5],
+    // Documentation search's own model calls: image descriptions and checks.
+    documents: c.series[5],
   };
   return {
     tooltip: {
@@ -181,7 +181,7 @@ const bySourceOption = computed(() => {
       backgroundColor: c.surface, borderColor: c.border, textStyle: { color: c.text },
       formatter: (ps: any) => {
         const s = slices[ps[0].dataIndex];
-        const type = s.source_type === 'userdocs' ? 'my documents' : s.source_type;
+        const type = s.source_type === 'documents' ? 'documentation search' : s.source_type;
         return `${s.display_name} (${type})<br/>${formatTokens(s.total_tokens)} tok · ${formatUsd(s.estimated_cost_usd)}`;
       },
     },

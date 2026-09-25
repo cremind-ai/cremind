@@ -12,13 +12,13 @@ class EmbeddingProvider(ABC):
     # The prompts the model was trained with: e5 expects "query: "/"passage: ",
     # EmbeddingGemma its task prompts. Without them retrieval quality drops.
     #
-    # They are used ONLY by the User Document Search path
+    # They are used ONLY by the Documentation search path
     # (``LocalEmbeddings.embed_passages`` / ``embed_search_query``). Every
     # collection that existed before it (documentation, memory, tool tables)
     # was built by ``encode()`` with no prefix, and a query embedded with a
     # prefix would not be comparable with those vectors, so ``encode()`` must
-    # stay prefix-free. The userdocs collections record which prompt scheme
-    # built them in their name (``app.userdocs.embed_prompts.PROMPT_SCHEME``).
+    # stay prefix-free. The documents collections record which prompt scheme
+    # built them in their name (``app.documents.embed_prompts.PROMPT_SCHEME``).
     QUERY_PREFIX: str = ""
     PASSAGE_PREFIX: str = ""
 

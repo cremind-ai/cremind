@@ -28,10 +28,10 @@ from app.api.auth import get_auth_routes
 from app.api.tokens import get_token_routes
 from app.api.usage import get_usage_routes
 from app.api.user_config import get_user_config_routes
-from app.api.userdocs import get_userdocs_routes
-from app.api.userdocs_files import get_userdocs_files_routes
-from app.api.userdocs_query import get_userdocs_query_routes
-from app.api.userdocs_research import get_userdocs_research_routes
+from app.api.documents import get_documents_routes
+from app.api.documents_files import get_documents_files_routes
+from app.api.documents_query import get_documents_query_routes
+from app.api.documents_research import get_documents_research_routes
 
 
 def get_api_routes(
@@ -94,12 +94,12 @@ def get_api_routes(
     routes.extend(get_calendar_routes(conversation_storage))
     routes.extend(get_drive_routes())
     # The query, research and file routes come first: Starlette matches in
-    # order, and /api/userdocs/files/{fid}/text must not be shadowed by
+    # order, and /api/documentation-search/files/{fid}/text must not be shadowed by
     # /files/{fid}.
-    routes.extend(get_userdocs_query_routes())
-    routes.extend(get_userdocs_research_routes())
-    routes.extend(get_userdocs_files_routes())
-    routes.extend(get_userdocs_routes())
+    routes.extend(get_documents_query_routes())
+    routes.extend(get_documents_research_routes())
+    routes.extend(get_documents_files_routes())
+    routes.extend(get_documents_routes())
     routes.extend(get_google_routes())
     routes.extend(get_admin_stream_routes())
     routes.extend(get_settings_stream_routes())

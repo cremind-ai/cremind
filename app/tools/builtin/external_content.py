@@ -81,7 +81,7 @@ _DOC_MARKER_SPOOF_RE = re.compile(
 )
 
 
-def wrap_document_content(content: Optional[str], *, source: str = "user_documents") -> str:
+def wrap_document_content(content: Optional[str], *, source: str = "documentation_search") -> str:
     """Delimit text taken from the user's indexed files, like
     :func:`wrap_web_content`: a unique-id marker the content cannot forge
     (lookalikes of both the document and the web markers are replaced with

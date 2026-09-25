@@ -26,7 +26,7 @@ import app.calendar.skill_token as calendar_token
 import app.drive.grant_flow as grant_flow
 import app.drive.skill_token as drive_token
 import app.google.unlink as U
-import app.userdocs.state as uds_state
+import app.documents.state as uds_state
 
 SKILLS = ("gcalendar", "gdrive", "gmail")
 
@@ -63,7 +63,7 @@ def two_profiles(tmp_path, monkeypatch):
         return {"stopped": [], "removed_autostart": 0}
 
     published: List[str] = []
-    # The Drive index of User Document Search: purge requests and suspensions,
+    # The Drive index of Documentation search: purge requests and suspensions,
     # recorded per profile (no engine runs here).
     purged: List[tuple] = []
     suspended: List[str] = []
@@ -232,7 +232,7 @@ def test_one_profiles_shared_grant_never_implicates_anothers(two_profiles):
     assert sorted(result["siblings_sharing_grant"]) == ["gdrive", "gmail"]
 
 
-# ── the Drive index of User Document Search ──────────────────────────────────
+# ── the Drive index of Documentation search ──────────────────────────────────
 
 
 def test_a_gdrive_unlink_purges_only_that_profiles_drive_index(two_profiles):

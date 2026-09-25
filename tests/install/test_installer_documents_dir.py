@@ -1,7 +1,7 @@
 """Parity + contract guards for the installers' Docker documents folder.
 
-A Docker install binds one host folder at ``/root/Documents`` — what User
-Document Search indexes and where the agent works. The two installers are
+A Docker install binds one host folder at ``/root/Documents`` — what Documentation
+search indexes and where the agent works. The two installers are
 hand-maintained mirrors, nothing executes either one end to end in CI, and the
 value crosses four parsers on its way (the TUI's output file, bash's ``.``,
 install.ps1's read-back regex, and compose's ``.env``). So the couplings

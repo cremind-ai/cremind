@@ -219,7 +219,7 @@ def _clear_in_memory_context(conversation_id: str) -> None:
     except Exception:  # noqa: BLE001
         logger.debug("delete client: activity clear failed", exc_info=True)
     try:
-        from app.userdocs.research import activity as research_activity
+        from app.documents.research import activity as research_activity
 
         research_activity.clear(conversation_id)
     except Exception:  # noqa: BLE001

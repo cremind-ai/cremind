@@ -35,11 +35,12 @@ A CLI feature is three files kept in lockstep (see `calendar`, `files`,
   sub-app with one command per action, registered in
   [app/cli/main.py](app/cli/main.py) via
   `app.add_typer(<feature>_app, name="<feature>")`.
-- **Bundled doc** — `app/documents/bundled/[cli]cremind <feature>.md`: YAML
-  frontmatter whose `description` is the **only** text embedded into the
-  `documentation_search` vector store, plus a Markdown body documenting every
-  subcommand and flag. Follow the shape in
-  [app/documents/bundled/document.md](app/documents/bundled/document.md).
+- **Bundled doc** — `app/cremind_documents/bundled/[cli]cremind <feature>.md`:
+  YAML frontmatter whose `description` is the **only** text embedded into the
+  `cremind_documentation_search` vector store (Cremind's own manual — not the
+  user's files, which `documentation_search` searches), plus a Markdown body
+  documenting every subcommand and flag. Follow the shape in
+  [app/cremind_documents/bundled/document.md](app/cremind_documents/bundled/document.md).
 
 - **Added** feature → add all three (plus a REST endpoint if the command talks
   to the server).
@@ -49,9 +50,15 @@ A CLI feature is three files kept in lockstep (see `calendar`, `files`,
   line in `main.py`, **and** the bundled doc.
 
 Notes:
-- The bundle is authoritative: `app/documents/sync.py` overwrites
-  `~/.cremind/documents/` from `app/documents/bundled/` on every boot, so always
-  edit the bundled copy, never the working copy.
+- The bundle is authoritative: `app/cremind_documents/sync.py` overwrites
+  `~/.cremind/storage/cremind_documents/shared/` from
+  `app/cremind_documents/bundled/` on every boot, so always edit the bundled
+  copy, never the working copy.
+- Two document packages, two concepts — keep them apart:
+  `app/cremind_documents` is Cremind's own manual (tool
+  `cremind_documentation_search`); `app/documents` is the user's own indexed
+  files (tool `documentation_search`, REST `/api/documentation-search/*`, CLI
+  `cremind docs`).
 - CLI import discipline: modules under `app/cli/` must not import from
   `app.server` / `app.api` / `app.tools` / `app.storage` / etc. at top level
   (see the docstring in [app/cli/main.py](app/cli/main.py)) — this keeps the
@@ -67,7 +74,7 @@ The app runs `upgrade head` automatically on boot (`ensure_at_head()` in
 migration will break existing installs on upgrade.
 
 - Migrations live in `app/alembic/versions/` (current head:
-  `20260927_userdocs_research`). Revision ids must be **≤ 32 chars** —
+  `20260928c_search_tools`). Revision ids must be **≤ 32 chars** —
   `alembic_version.version_num` is `VARCHAR(32)`, which Postgres enforces and
   SQLite silently truncates (`tests/storage/test_migrations_graph.py` guards it).
 - Generate and **hand-review** the migration following the checklist in

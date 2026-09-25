@@ -179,7 +179,7 @@ def test_runtime_environment_absent_safe(monkeypatch, clean_runtime_env):
 # Function names the model actually sees. Note the memory tool registers as
 # ``memory_search`` (slug of "Memory Search"), so its function is
 # ``memory_search__search_memory`` -- NOT a bare ``search_memory``.
-_DOC_FN = "documentation_search__search_documentation"
+_DOC_FN = "cremind_documentation_search__search_documentation"
 _MEM_FN = "memory_search__search_memory"
 _WEB_FN = "web_search__search_web"
 
@@ -192,7 +192,7 @@ def _grp(config_name, tool_id):
 
 
 # (module stem == config_name, registry tool_id) for the three search tools.
-_DOC = ("documentation_search", "documentation_search")
+_DOC = ("cremind_documentation_search", "cremind_documentation_search")
 _MEM = ("search_memory", "memory_search")
 _WEB = ("web_search", "web_search")
 
@@ -248,14 +248,14 @@ def test_agent_wires_search_guidance_into_prompt(monkeypatch):
 def test_search_tool_classes_resolve():
     # Guards the lazy imports: a rename/move of any search tool class would make
     # these resolve to the wrong set (or drop one), failing loudly here.
-    from app.tools.builtin.documentation_search import DocumentationSearchTool
+    from app.tools.builtin.cremind_documentation_search import CremindDocumentationSearchTool
     from app.tools.builtin.search_memory import SearchMemoryTool
-    from app.tools.builtin.user_documents import UserDocumentsSearchTool
+    from app.tools.builtin.documentation_search import DocumentsSearchTool
     from app.tools.builtin.web_search import WebSearchTool
 
     local, web = ra._search_tool_classes()
     # The user's own files first (only named when the gate kept the tool).
-    assert local == [UserDocumentsSearchTool, DocumentationSearchTool, SearchMemoryTool]
+    assert local == [DocumentsSearchTool, CremindDocumentationSearchTool, SearchMemoryTool]
     assert web is WebSearchTool
 
 
@@ -266,13 +266,13 @@ def test_exposed_names_match_real_tool_definitions():
     # class ``name`` (changes the leaf, surfaced via _search_tool_classes()).
     from app.tools.ids import slugify
     from app.tools.builtin import (
-        documentation_search as d,
+        cremind_documentation_search as d,
         search_memory as m,
         web_search as w,
     )
 
     groups = [
-        _grp("documentation_search", slugify(d.SERVER_NAME)),
+        _grp("cremind_documentation_search", slugify(d.SERVER_NAME)),
         _grp("search_memory", slugify(m.SERVER_NAME)),
         _grp("web_search", slugify(w.SERVER_NAME)),
     ]

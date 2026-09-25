@@ -199,15 +199,15 @@ def _safe_resolve(
     else:
         target = os.path.realpath(os.path.join(base, raw.lstrip("/\\")))
 
-    # Every profile's User Document Search index (their files' text) lives in
+    # Every profile's Documentation search index (their files' text) lives in
     # the system folder, which is a working directory for some profiles.
     from app.config.settings import BaseConfig
-    from app.utils.credential_paths import is_userdocs_index_path
+    from app.utils.credential_paths import is_documents_index_path
 
-    if is_userdocs_index_path(target, BaseConfig.CREMIND_SYSTEM_DIR):
+    if is_documents_index_path(target, BaseConfig.CREMIND_SYSTEM_DIR):
         raise ValueError(
-            f"Access denied: '{relative_path}' is User Document Search's internal index. "
-            "Use the user_documents tools to search or read the user's files."
+            f"Access denied: '{relative_path}' is Documentation search's internal index. "
+            "Use the documentation_search tools to search or read the user's files."
         )
 
     for root in roots:

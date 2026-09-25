@@ -6,7 +6,7 @@ from typing import (
 import uuid
 
 if TYPE_CHECKING:
-    from app.userdocs.vectors import VectorFilter
+    from app.documents.vectors import VectorFilter
 
 
 @runtime_checkable
@@ -164,12 +164,12 @@ class VectorStoreBase(ABC):
         """Create a uuid."""
         return str(uuid.uuid4()).replace("-", "")
 
-    # ── Pre-embedded primitives (User Document Search) ─────────────────────
+    # ── Pre-embedded primitives (Documentation search) ─────────────────────
     #
     # Deliberately NOT abstract: an adapter that lacks them must still
     # construct, because ``VectorStore(...)`` failing with a TypeError would
     # take the whole embedding subsystem down — and with it documentation
-    # search, memory and every chat turn. Only the userdocs engine calls these,
+    # search, memory and every chat turn. Only the documents engine calls these,
     # and it treats NotImplementedError as "vector search unavailable".
     #
     # Contract shared by every implementation:

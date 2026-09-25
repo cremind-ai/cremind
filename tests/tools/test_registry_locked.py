@@ -133,7 +133,7 @@ def test_converted_shipped_tools_carry_locked_flag() -> None:
     from app.tools.builtin import get_builtin_tool_config
 
     # These three were converted from hidden -> locked: visible but undisableable.
-    for name in ("exec_shell", "system_file", "documentation_search"):
+    for name in ("exec_shell", "system_file", "cremind_documentation_search"):
         tool_cfg = get_builtin_tool_config(name).get("tool", {})
         assert tool_cfg.get("locked") is True, name
         assert tool_cfg.get("hidden") in (None, False), name

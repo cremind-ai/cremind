@@ -147,15 +147,15 @@ def _touch(base: Path, rel: str) -> None:
     path.write_bytes(b"x")
 
 
-def test_rules_exclude_the_userdocs_index_and_model_cache_by_name():
-    assert is_excluded("storage/userdocs", is_dir=True)
-    assert is_excluded("storage/userdocs/k7m2/index.db", is_dir=False)
+def test_rules_exclude_the_documents_index_and_model_cache_by_name():
+    assert is_excluded("storage/documents", is_dir=True)
+    assert is_excluded("storage/documents/k7m2/index.db", is_dir=False)
     assert is_excluded(".cache", is_dir=True)
     assert is_excluded(".cache/huggingface/hub/models--x/blobs/abc", is_dir=False)
     # Only at the top: a profile's own folders with these names are its data.
     assert not is_excluded("storage", is_dir=True)
-    assert not is_excluded("storage/userdocs.md", is_dir=False)
-    assert not is_excluded("admin/storage/userdocs/notes.md", is_dir=False)
+    assert not is_excluded("storage/documents.md", is_dir=False)
+    assert not is_excluded("admin/storage/documents/notes.md", is_dir=False)
     assert not is_excluded("admin/.cache/keep.txt", is_dir=False)
 
 
@@ -164,9 +164,9 @@ def test_iter_backup_files_never_walks_the_index_or_the_model_cache(tmp_path: Pa
     ``storage`` makes the walk start where the index lives — while the rest
     of that profile's files are backed up as usual."""
     for rel in (
-        "storage/userdocs/k7m2/index.db",
-        "storage/userdocs/k7m2/index.db-wal",
-        "storage/userdocs/tmp/extract-1/page.png",
+        "storage/documents/k7m2/index.db",
+        "storage/documents/k7m2/index.db-wal",
+        "storage/documents/tmp/extract-1/page.png",
         ".cache/huggingface/hub/models--intfloat--multilingual-e5/blobs/abc",
         ".cache/sentence-transformers/model/config.json",
         "admin/PERSONA.md",

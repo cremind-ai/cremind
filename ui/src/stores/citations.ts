@@ -6,7 +6,7 @@
  * answer saved before the feature, one whose finalisation failed, and the
  * earlier bubbles of a mid-turn split (only the last segment keeps the row's
  * metadata). For those the bubble asks this store, which resolves the tokens
- * with POST /api/userdocs/citations/resolve and caches the answers.
+ * with POST /api/documentation-search/citations/resolve and caches the answers.
  *
  * Requests made in the same tick are batched per conversation — opening a long
  * history mounts every cited bubble at once, and that should be one request,
@@ -21,7 +21,7 @@
  */
 
 import { defineStore } from 'pinia';
-import { resolveCitations } from '../services/userdocsCitationsApi';
+import { resolveCitations } from '../services/documentsCitationsApi';
 import type { CitationItem } from '../utils/citations';
 import { useSettingsStore } from './settings';
 

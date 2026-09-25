@@ -31,15 +31,15 @@ import { useAuthedBlobUrl } from '../../composables/useAuthedBlobUrl';
 import { citationStatusInfo, tokenParts, type CitationItem } from '../../utils/citations';
 import { iconFor } from '../../utils/fileIcons';
 import {
-  UserDocsApiError,
+  DocumentsApiError,
   fetchCitedText,
-  fetchUserDocFile,
-  fetchUserDocRaw,
-  userDocThumbnailUrl,
+  fetchDocumentFile,
+  fetchDocumentRaw,
+  documentThumbnailUrl,
   type CitedSegment,
   type CitedTextQuery,
-  type UserDocFileDetail,
-} from '../../services/userdocsCitationsApi';
+  type DocumentFileDetail,
+} from '../../services/documentsCitationsApi';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -56,7 +56,7 @@ const emit = defineEmits<{ (e: 'update:modelValue', open: boolean): void }>();
 const settings = useSettingsStore();
 
 // Content is never read for these; the index keeps name, path, size, dates
-// (app/userdocs/types.py METADATA_ONLY_KINDS), plus folder citations.
+// (app/documents/types.py METADATA_ONLY_KINDS), plus folder citations.
 const METADATA_KINDS = new Set([
   'audio', 'video', 'archive', 'executable', 'database', 'font', 'bundle', 'encrypted', 'other', 'folder',
 ]);
@@ -67,7 +67,7 @@ const parts = computed(() => tokenParts(props.token));
 const fid = computed(() => props.item?.file?.fid || parts.value?.citeId || '');
 const citedC8 = computed(() => parts.value?.c8 ?? null);
 
-const detail = ref<UserDocFileDetail | null>(null);
+const detail = ref<DocumentFileDetail | null>(null);
 const detailGone = ref(false);
 const segments = ref<CitedSegment[]>([]);
 const truncated = ref(false);
@@ -183,7 +183,7 @@ async function loadText(query: CitedTextQuery, direction: -1 | 0 | 1 = 0) {
     if (direction === 0) cited?.scrollIntoView({ block: 'center' });
   } catch (e: any) {
     if (gen !== generation) return;
-    textError.value = e instanceof UserDocsApiError && e.status === 404
+    textError.value = e instanceof DocumentsApiError && e.status === 404
       ? (props.item?.status === 'stale'
         ? 'That passage is no longer in the file.'
         : 'The text of this file is not available.')
@@ -208,11 +208,11 @@ async function load() {
   // A folder citation has no file record to fetch; the item says it all.
   if (kind.value === 'folder') return;
 
-  const detailLoad = fetchUserDocFile(settings.agentUrl, settings.authToken, fid.value)
+  const detailLoad = fetchDocumentFile(settings.agentUrl, settings.authToken, fid.value)
     .then(d => { if (gen === generation) detail.value = d; })
     .catch(e => {
       if (gen !== generation) return;
-      if (e instanceof UserDocsApiError && e.status === 404) detailGone.value = true;
+      if (e instanceof DocumentsApiError && e.status === 404) detailGone.value = true;
     });
   // The kind decides what to show; without an item it comes from the record.
   if (!kind.value) await detailLoad;
@@ -238,7 +238,7 @@ function shift(direction: -1 | 1) {
 
 const image = useAuthedBlobUrl(() =>
   props.modelValue && view.value === 'image' && fid.value
-    ? userDocThumbnailUrl(settings.agentUrl, fid.value, 1024)
+    ? documentThumbnailUrl(settings.agentUrl, fid.value, 1024)
     : null,
 );
 
@@ -311,7 +311,7 @@ async function openPdfAtPage(page: number | null) {
     return;
   }
   try {
-    const bytes = await fetchUserDocRaw(settings.agentUrl, settings.authToken, fid.value);
+    const bytes = await fetchDocumentRaw(settings.agentUrl, settings.authToken, fid.value);
     // Forced to PDF whatever the response said, so the browser's PDF viewer
     // — not this origin — is what renders it.
     const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
@@ -325,7 +325,7 @@ async function openPdfAtPage(page: number | null) {
 
 async function downloadOriginal() {
   try {
-    const bytes = await fetchUserDocRaw(settings.agentUrl, settings.authToken, fid.value);
+    const bytes = await fetchDocumentRaw(settings.agentUrl, settings.authToken, fid.value);
     const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
     const a = document.createElement('a');
     a.href = url;
@@ -340,9 +340,9 @@ async function downloadOriginal() {
 }
 
 function notifyOpenFailure(e: any) {
-  if (e instanceof UserDocsApiError && e.code === 'DriveFile') {
+  if (e instanceof DocumentsApiError && e.code === 'DriveFile') {
     ElMessage.info('This file lives in Google Drive — open it there.');
-  } else if (e instanceof UserDocsApiError && e.status === 404) {
+  } else if (e instanceof DocumentsApiError && e.status === 404) {
     ElMessage.warning('This file is no longer available.');
   } else {
     ElMessage.warning(`Could not open the file: ${e?.message || e}`);
@@ -361,52 +361,52 @@ const close = () => emit('update:modelValue', false);
     @update:model-value="(v: boolean) => emit('update:modelValue', v)"
   >
     <template #header>
-      <div class="ud-viewer-head">
-        <span v-if="n" class="ud-viewer-n" :class="`tone-${status.tone}`">{{ n }}</span>
-        <Icon :icon="icon" class="ud-viewer-icon" />
-        <div class="ud-viewer-titles">
-          <div class="ud-viewer-name" :title="name">{{ name }}</div>
-          <div class="ud-viewer-sub">
-            <span v-if="relPath" class="ud-viewer-path" :title="relPath">{{ relPath }}</span>
-            <span class="ud-viewer-source">
+      <div class="doc-viewer-head">
+        <span v-if="n" class="doc-viewer-n" :class="`tone-${status.tone}`">{{ n }}</span>
+        <Icon :icon="icon" class="doc-viewer-icon" />
+        <div class="doc-viewer-titles">
+          <div class="doc-viewer-name" :title="name">{{ name }}</div>
+          <div class="doc-viewer-sub">
+            <span v-if="relPath" class="doc-viewer-path" :title="relPath">{{ relPath }}</span>
+            <span class="doc-viewer-source">
               <Icon :icon="isDrive ? 'mdi:google-drive' : 'mdi:folder-outline'" />
               {{ isDrive ? 'Google Drive' : 'Local folder' }}
             </span>
-            <span v-if="locatorLabel" class="ud-viewer-locator">{{ locatorLabel }}</span>
+            <span v-if="locatorLabel" class="doc-viewer-locator">{{ locatorLabel }}</span>
           </div>
         </div>
       </div>
     </template>
 
-    <div ref="bodyEl" class="ud-viewer-body">
+    <div ref="bodyEl" class="doc-viewer-body">
       <!-- Verification: what the reader should know before trusting the passage.
            (A removed source says so in its own view below.) -->
-      <div v-if="status.note && view !== 'removed'" class="ud-viewer-note" :class="`tone-${status.tone}`">
+      <div v-if="status.note && view !== 'removed'" class="doc-viewer-note" :class="`tone-${status.tone}`">
         <Icon
           :icon="status.tone === 'ok' ? 'mdi:information-outline' : 'mdi:alert-outline'"
-          class="ud-viewer-note-icon"
+          class="doc-viewer-note-icon"
         />
         <div><strong>{{ status.label }}.</strong> {{ status.note }}</div>
       </div>
-      <div v-if="status.quoteNote" class="ud-viewer-note tone-danger">
-        <Icon icon="mdi:format-quote-close" class="ud-viewer-note-icon" />
+      <div v-if="status.quoteNote" class="doc-viewer-note tone-danger">
+        <Icon icon="mdi:format-quote-close" class="doc-viewer-note-icon" />
         <div><strong>Quote mismatch.</strong> {{ status.quoteNote }}</div>
       </div>
 
-      <div class="ud-viewer-actions">
+      <div class="doc-viewer-actions">
         <a
           v-if="isDrive && webLink"
           :href="webLink"
           target="_blank"
           rel="noopener noreferrer"
-          class="ud-viewer-btn"
+          class="doc-viewer-btn"
         >
           <Icon icon="mdi:google-drive" /> Open in Google Drive
         </a>
         <button
           v-else-if="kind === 'pdf' && view !== 'removed'"
           type="button"
-          class="ud-viewer-btn"
+          class="doc-viewer-btn"
           @click="openPdfAtPage(citedPage)"
         >
           <Icon icon="mdi:file-pdf-box" />
@@ -415,7 +415,7 @@ const close = () => emit('update:modelValue', false);
         <button
           v-if="!isDrive && view !== 'removed' && kind !== 'folder' && kind !== 'bundle'"
           type="button"
-          class="ud-viewer-btn subtle"
+          class="doc-viewer-btn subtle"
           @click="downloadOriginal"
         >
           <Icon icon="mdi:download" /> Download
@@ -424,30 +424,30 @@ const close = () => emit('update:modelValue', false);
 
       <!-- Removed: only what the agent saw is left. -->
       <template v-if="view === 'removed'">
-        <div class="ud-viewer-note tone-gone">
-          <Icon icon="mdi:file-remove-outline" class="ud-viewer-note-icon" />
+        <div class="doc-viewer-note tone-gone">
+          <Icon icon="mdi:file-remove-outline" class="doc-viewer-note-icon" />
           <div><strong>Source removed.</strong> The file is no longer in your indexed documents.</div>
         </div>
         <template v-if="snapshot">
-          <div class="ud-viewer-section">As cited</div>
-          <blockquote class="ud-viewer-snapshot">{{ snapshot }}</blockquote>
+          <div class="doc-viewer-section">As cited</div>
+          <blockquote class="doc-viewer-snapshot">{{ snapshot }}</blockquote>
         </template>
       </template>
 
       <!-- Image: the server-made thumbnail, caption and EXIF. -->
       <template v-else-if="view === 'image'">
-        <div class="ud-viewer-image">
+        <div class="doc-viewer-image">
           <img v-if="image.url.value" :src="image.url.value" :alt="name" />
-          <div v-else-if="image.failed.value" class="ud-viewer-empty">The image could not be loaded.</div>
-          <div v-else class="ud-viewer-empty">Loading…</div>
+          <div v-else-if="image.failed.value" class="doc-viewer-empty">The image could not be loaded.</div>
+          <div v-else class="doc-viewer-empty">Loading…</div>
         </div>
         <template v-if="caption">
-          <div class="ud-viewer-section">Caption</div>
-          <p class="ud-viewer-caption">{{ caption }}</p>
+          <div class="doc-viewer-section">Caption</div>
+          <p class="doc-viewer-caption">{{ caption }}</p>
         </template>
         <template v-if="exifRows.length">
-          <div class="ud-viewer-section">Photo details</div>
-          <dl class="ud-viewer-meta">
+          <div class="doc-viewer-section">Photo details</div>
+          <dl class="doc-viewer-meta">
             <template v-for="row in exifRows" :key="row.label">
               <dt>{{ row.label }}</dt><dd>{{ row.value }}</dd>
             </template>
@@ -457,15 +457,15 @@ const close = () => emit('update:modelValue', false);
 
       <!-- Metadata only: content is never read for these kinds. -->
       <template v-else-if="view === 'metadata'">
-        <div class="ud-viewer-card">
-          <Icon :icon="icon" class="ud-viewer-card-icon" />
-          <dl class="ud-viewer-meta">
+        <div class="doc-viewer-card">
+          <Icon :icon="icon" class="doc-viewer-card-icon" />
+          <dl class="doc-viewer-meta">
             <template v-for="row in metaRows" :key="row.label">
               <dt>{{ row.label }}</dt><dd>{{ row.value }}</dd>
             </template>
           </dl>
         </div>
-        <p class="ud-viewer-hint">
+        <p class="doc-viewer-hint">
           Only this file's name and details are indexed — its content is never read.
         </p>
       </template>
@@ -473,16 +473,16 @@ const close = () => emit('update:modelValue', false);
       <!-- Text-like: the passage among its neighbours. -->
       <template v-else>
         <template v-if="item?.status === 'stale' && snapshot">
-          <div class="ud-viewer-section">As cited</div>
-          <blockquote class="ud-viewer-snapshot">{{ snapshot }}</blockquote>
-          <div class="ud-viewer-section">Current text</div>
+          <div class="doc-viewer-section">As cited</div>
+          <blockquote class="doc-viewer-snapshot">{{ snapshot }}</blockquote>
+          <div class="doc-viewer-section">Current text</div>
         </template>
 
-        <div v-if="segments.length" class="ud-viewer-nav">
-          <button type="button" class="ud-viewer-btn subtle" :disabled="loadingText || atStart" @click="shift(-1)">
+        <div v-if="segments.length" class="doc-viewer-nav">
+          <button type="button" class="doc-viewer-btn subtle" :disabled="loadingText || atStart" @click="shift(-1)">
             <Icon icon="mdi:chevron-up" /> Earlier
           </button>
-          <span v-if="loadingText" class="ud-viewer-loading">Loading…</span>
+          <span v-if="loadingText" class="doc-viewer-loading">Loading…</span>
         </div>
 
         <div
@@ -503,36 +503,36 @@ const close = () => emit('update:modelValue', false);
           <div v-else class="seg-text">{{ row.seg.text }}</div>
         </div>
 
-        <div v-if="segments.length" class="ud-viewer-nav">
-          <button type="button" class="ud-viewer-btn subtle" :disabled="loadingText || atEnd" @click="shift(1)">
+        <div v-if="segments.length" class="doc-viewer-nav">
+          <button type="button" class="doc-viewer-btn subtle" :disabled="loadingText || atEnd" @click="shift(1)">
             <Icon icon="mdi:chevron-down" /> Later
           </button>
         </div>
 
-        <p v-if="truncated" class="ud-viewer-hint">Long passages are shortened here.</p>
-        <div v-if="!segments.length && loadingText" class="ud-viewer-empty">Loading…</div>
-        <div v-else-if="textError" class="ud-viewer-empty">{{ textError }}</div>
+        <p v-if="truncated" class="doc-viewer-hint">Long passages are shortened here.</p>
+        <div v-if="!segments.length && loadingText" class="doc-viewer-empty">Loading…</div>
+        <div v-else-if="textError" class="doc-viewer-empty">{{ textError }}</div>
         <template v-if="textError && snapshot && item?.status !== 'stale'">
-          <div class="ud-viewer-section">As cited</div>
-          <blockquote class="ud-viewer-snapshot">{{ snapshot }}</blockquote>
+          <div class="doc-viewer-section">As cited</div>
+          <blockquote class="doc-viewer-snapshot">{{ snapshot }}</blockquote>
         </template>
       </template>
     </div>
 
     <template #footer>
-      <button type="button" class="ud-viewer-btn subtle" @click="close">Close</button>
+      <button type="button" class="doc-viewer-btn subtle" @click="close">Close</button>
     </template>
   </ElDrawer>
 </template>
 
 <style scoped>
-.ud-viewer-head {
+.doc-viewer-head {
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
 }
-.ud-viewer-n {
+.doc-viewer-n {
   flex-shrink: 0;
   min-width: 22px;
   height: 22px;
@@ -546,25 +546,25 @@ const close = () => emit('update:modelValue', false);
   color: var(--primary-color);
   background: color-mix(in srgb, var(--primary-color) 14%, transparent);
 }
-.ud-viewer-n.tone-warn {
+.doc-viewer-n.tone-warn {
   color: var(--warning-color);
   background: color-mix(in srgb, var(--warning-color) 16%, transparent);
 }
-.ud-viewer-n.tone-gone {
+.doc-viewer-n.tone-gone {
   color: var(--text-tertiary);
   background: color-mix(in srgb, var(--text-tertiary) 14%, transparent);
   text-decoration: line-through;
 }
-.ud-viewer-icon { flex-shrink: 0; font-size: 1.5rem; }
-.ud-viewer-titles { min-width: 0; }
-.ud-viewer-name {
+.doc-viewer-icon { flex-shrink: 0; font-size: 1.5rem; }
+.doc-viewer-titles { min-width: 0; }
+.doc-viewer-name {
   font-weight: 600;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ud-viewer-sub {
+.doc-viewer-sub {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -573,21 +573,21 @@ const close = () => emit('update:modelValue', false);
   font-size: 0.75rem;
   color: var(--text-secondary);
 }
-.ud-viewer-path {
+.doc-viewer-path {
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ud-viewer-source { display: inline-flex; align-items: center; gap: 3px; }
-.ud-viewer-locator {
+.doc-viewer-source { display: inline-flex; align-items: center; gap: 3px; }
+.doc-viewer-locator {
   padding: 0 6px;
   border-radius: 8px;
   background: var(--surface-hover);
   color: var(--text-primary);
 }
 
-.ud-viewer-body {
+.doc-viewer-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -595,7 +595,7 @@ const close = () => emit('update:modelValue', false);
   color: var(--text-primary);
 }
 
-.ud-viewer-note {
+.doc-viewer-note {
   display: flex;
   gap: 8px;
   align-items: flex-start;
@@ -605,31 +605,31 @@ const close = () => emit('update:modelValue', false);
   border: 1px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
   background: color-mix(in srgb, var(--primary-color) 8%, transparent);
 }
-.ud-viewer-note.tone-warn {
+.doc-viewer-note.tone-warn {
   border-color: color-mix(in srgb, var(--warning-color) 45%, transparent);
   background: color-mix(in srgb, var(--warning-color) 10%, transparent);
 }
-.ud-viewer-note.tone-gone {
+.doc-viewer-note.tone-gone {
   border-color: var(--border-color);
   background: var(--surface-hover);
   color: var(--text-secondary);
 }
-.ud-viewer-note.tone-danger {
+.doc-viewer-note.tone-danger {
   border-color: color-mix(in srgb, var(--danger-color) 45%, transparent);
   background: color-mix(in srgb, var(--danger-color) 9%, transparent);
 }
-.ud-viewer-note-icon { flex-shrink: 0; margin-top: 1px; font-size: 1.05rem; }
-.tone-warn .ud-viewer-note-icon { color: var(--warning-color); }
-.tone-danger .ud-viewer-note-icon { color: var(--danger-color); }
+.doc-viewer-note-icon { flex-shrink: 0; margin-top: 1px; font-size: 1.05rem; }
+.tone-warn .doc-viewer-note-icon { color: var(--warning-color); }
+.tone-danger .doc-viewer-note-icon { color: var(--danger-color); }
 
-.ud-viewer-actions {
+.doc-viewer-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
-.ud-viewer-actions:empty { display: none; }
+.doc-viewer-actions:empty { display: none; }
 
-.ud-viewer-btn {
+.doc-viewer-btn {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -643,24 +643,24 @@ const close = () => emit('update:modelValue', false);
   text-decoration: none;
   cursor: pointer;
 }
-.ud-viewer-btn:hover { filter: brightness(1.08); }
-.ud-viewer-btn.subtle {
+.doc-viewer-btn:hover { filter: brightness(1.08); }
+.doc-viewer-btn.subtle {
   border-color: var(--border-color);
   background: var(--surface-color);
   color: var(--text-primary);
 }
-.ud-viewer-btn.subtle:hover {
+.doc-viewer-btn.subtle:hover {
   filter: none;
   border-color: var(--primary-color);
   color: var(--primary-color);
 }
-.ud-viewer-btn:disabled {
+.doc-viewer-btn:disabled {
   opacity: 0.5;
   cursor: default;
   pointer-events: none;
 }
 
-.ud-viewer-section {
+.doc-viewer-section {
   font-size: 0.72rem;
   font-weight: 600;
   text-transform: uppercase;
@@ -668,7 +668,7 @@ const close = () => emit('update:modelValue', false);
   color: var(--text-tertiary);
 }
 
-.ud-viewer-snapshot {
+.doc-viewer-snapshot {
   margin: 0;
   padding: 8px 12px;
   border-left: 3px solid var(--border-color);
@@ -679,12 +679,12 @@ const close = () => emit('update:modelValue', false);
   line-height: 1.4;
 }
 
-.ud-viewer-nav {
+.doc-viewer-nav {
   display: flex;
   align-items: center;
   gap: 10px;
 }
-.ud-viewer-loading { font-size: 0.75rem; color: var(--text-tertiary); }
+.doc-viewer-loading { font-size: 0.75rem; color: var(--text-tertiary); }
 
 .seg {
   border: 1px solid var(--border-color);
@@ -735,7 +735,7 @@ const close = () => emit('update:modelValue', false);
   word-break: break-word;
 }
 
-.ud-viewer-image {
+.doc-viewer-image {
   display: flex;
   justify-content: center;
   align-items: center;
@@ -744,15 +744,15 @@ const close = () => emit('update:modelValue', false);
   background: var(--surface-hover);
   overflow: hidden;
 }
-.ud-viewer-image img {
+.doc-viewer-image img {
   max-width: 100%;
   max-height: 60vh;
   object-fit: contain;
   display: block;
 }
-.ud-viewer-caption { margin: 0; line-height: 1.45; white-space: pre-wrap; }
+.doc-viewer-caption { margin: 0; line-height: 1.45; white-space: pre-wrap; }
 
-.ud-viewer-card {
+.doc-viewer-card {
   display: flex;
   gap: 14px;
   align-items: flex-start;
@@ -761,20 +761,20 @@ const close = () => emit('update:modelValue', false);
   border-radius: 8px;
   background: var(--surface-color);
 }
-.ud-viewer-card-icon { font-size: 2.2rem; flex-shrink: 0; }
+.doc-viewer-card-icon { font-size: 2.2rem; flex-shrink: 0; }
 
-.ud-viewer-meta {
+.doc-viewer-meta {
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 4px 12px;
   margin: 0;
   font-size: 0.8rem;
 }
-.ud-viewer-meta dt { color: var(--text-tertiary); }
-.ud-viewer-meta dd { margin: 0; word-break: break-word; }
+.doc-viewer-meta dt { color: var(--text-tertiary); }
+.doc-viewer-meta dd { margin: 0; word-break: break-word; }
 
-.ud-viewer-hint { margin: 0; font-size: 0.75rem; color: var(--text-tertiary); }
-.ud-viewer-empty {
+.doc-viewer-hint { margin: 0; font-size: 0.75rem; color: var(--text-tertiary); }
+.doc-viewer-empty {
   padding: 16px;
   text-align: center;
   color: var(--text-tertiary);

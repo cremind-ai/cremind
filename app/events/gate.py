@@ -156,7 +156,7 @@ async def classify_event_match(
     function_calls: List[Dict[str, Any]] = []
     tokens: Dict[str, int] = done_chunk_token_usage({})
 
-    # tool_choice="auto" mirrors the documentation_search judge (works across all
+    # tool_choice="auto" mirrors the cremind_documentation_search judge (works across all
     # configured providers); the lone tool + strong instruction make a call the
     # overwhelming default, and the no-call branch fails open anyway.
     async for response in llm.chat_completion(

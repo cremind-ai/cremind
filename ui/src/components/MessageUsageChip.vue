@@ -133,7 +133,7 @@ const hasBreakdown = computed(() => bySource.value.length > 0);
 
 // Friendlier badge text for source types whose raw key reads awkwardly.
 const sourceTypeLabel = (t: string) =>
-  (t === 'event_gate' ? 'event filter' : t === 'userdocs' ? 'my documents' : t);
+  (t === 'event_gate' ? 'event filter' : t === 'documents' ? 'documentation search' : t);
 
 const modelLabel = computed(() => request.value?.model ?? '');
 

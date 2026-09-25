@@ -1,1511 +1,728 @@
-"""Documentation Search built-in tool.
+"""Documentation Search built-in tool: the agent's way into the user's own files.
 
-Vector-searches Markdown documentation kept under ``<CREMIND_SYSTEM_DIR>/documents``
-(shared) and ``<CREMIND_SYSTEM_DIR>/<profile>/documents`` (per-profile),
-then runs an internal LLM-as-judge to pick the single most accurate
-candidate before loading that one document's body and returning it to the
-Reasoning Agent.
+Four leaves over the per-profile index that Documentation search keeps in
+sync (see :mod:`app.documents`), exposed as ``documentation_search__<leaf>``:
 
-Why the internal LLM step is required
--------------------------------------
-Vector search ranks candidates by cosine similarity, which is approximate.
-An LLM judge reads the user's query alongside each candidate's name and
-one-line description and picks the document that *actually* answers the
-query (or none, if nothing is on-topic). The result is the body of that
-single document -- reliable enough to hand back to the Reasoning Agent
-verbatim.
+- ``find_files`` — files, folders and projects by name, type, date, folder
+  (the catalog), with counts by type, folder, month or extension;
+- ``search`` — passages by meaning and by keyword (hybrid retrieval, fused),
+  grouped by file, by folder or not at all;
+- ``read`` — the text of one file, by pages, lines, section ("Điều 203"),
+  sheet, rows, slide, or around a phrase or a passage token; and the pages
+  of a research dossier (``file="research:<job id>"``);
+- ``research`` — deep research as a background job (:mod:`app.documents.research`):
+  a verified analysis of a legal, financial or compliance question, or an
+  exhaustive compilation of a folder. The call waits a while for the job and
+  returns its state; a job still running comes back PRELIMINARY, and the
+  agent calls again with ``continue_job``.
 
-Token-frugal contract
----------------------
-- The judge only sees ``name`` + ``description`` for each candidate.
-  Document bodies are NOT sent to the judge.
-- The judge uses **tool calling** (``select_document(index)`` /
-  ``no_relevant_result()``) rather than parsing free-form JSON, so its
-  output is structurally guaranteed.
-- Only AFTER the judge picks does the tool open and read the chosen
-  ``.md`` file's body from disk.
+Every passage is printed with a citation token (``[doc:<file>#<chunk>]``) and
+every token printed is registered for the conversation
+(:func:`app.documents.citations.issue`), so the answer's citations can be
+verified when it is saved. Every result fits the profile's tool-result budget
+by construction (see :mod:`app.documents.query.render`), and everything taken
+from the user's files is wrapped as untrusted data.
 
-Delivery budget
----------------
-The reasoning agent head-clips every tool result to the profile's
-``tool_result.max_tokens`` (4000 by default). A whole document longer than that
-used to arrive as its preamble plus a truncation notice, every single time: in
-one logged conversation the judge picked the right 23k-token CLI reference ten
-times in a row and the agent never once saw the subcommand it asked for, because
-its only knobs -- ``query`` and ``top_k`` -- can re-select a document but never
-reach further into one. So this tool owns its delivery budget. A document that
-fits is returned whole, exactly as before. One that does not comes back as an
-*envelope*: its head, a table of contents with each section's token size, and
-the sections whose headings match the query. A second leaf,
-``read_documentation_section``, returns any single section by name -- no
-embedding, no judge, just a deterministic slice of the file.
+Not Cremind's own documentation — that is ``cremind_documentation_search`` — and not
+a file-system browser: only what Documentation search has indexed for the
+active profile is visible, and another profile's files do not exist here.
 
-Invocation
-----------
-The reasoning model calls ``search_documentation`` directly via native
-function calling, filling the ``query`` argument; there is no per-group
-routing LLM. The tool's INTERNAL judge LLM (below) is the only LLM call it makes.
-
-The leaf ``description`` (what the reasoning model sees) frames this as a
-*document search tool*. The tool's INTERNAL judge LLM, by contrast, is told
-its sole job is to pick the most accurate candidate -- not to reason about
-the user's request more broadly.
+The tool's visibility is decided per run by
+:func:`app.documents.gate.documents_tool_available` (admin gate, the profile's
+opt-in, and where the conversation happens); this module only answers when
+asked, and answers "not available, because …" rather than raising.
 """
 
 from __future__ import annotations
 
 import asyncio
-import difflib
-import importlib.util
-import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import inspect
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
-from app.config.user_config import resolve_group
-from app.constants import ChatCompletionTypeEnum
-from app.documents import get_service
-from app.documents.sections import (
-    Section,
-    SectionSizes,
-    children,
-    find_section,
-    normalize_heading,
-    open_fence_at_end,
-    query_words,
-    rank_sections_for_query,
-    render_toc,
-    section_own_text,
-    section_text,
-    size_sections,
-    split_sections,
-)
-from app.documents.sync import DESCRIPTION_MAX_CHARS, SHARED_SCOPE, _clean_name
-from app.lib.llm.base import done_chunk_token_usage
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
+from app.tools.builtin.external_content import wrap_document_content
 from app.types import ToolConfig
-from app.utils.common import count_content_tokens
+from app.documents.query.filters import DATE_FIELDS, IMAGE_ORIGINS, SOURCES, TYPE_NAMES
 from app.utils.logger import logger
-from app.utils.message_tokens import resolve_system_var_tokens
-
 
 SERVER_NAME = "Documentation Search"
+TOOL_ID = "documentation_search"
 
-DEFAULT_TOP_K = 10
+LEAF_FIND = "find_files"
+LEAF_SEARCH = "search"
+LEAF_READ = "read"
+# Deep research: the agent guidance switches to "legal/financial questions
+# MUST go through research" when a leaf of this name is registered.
+LEAF_RESEARCH = "research"
+# ``read`` with ``file="research:<job id>"`` reads a research dossier's pages.
+RESEARCH_REF_PREFIX = "research:"
 
-NO_RESULT_MESSAGE = "no relevant result found"
-
-# Bundled `cremind` CLI man pages are named ``[cli]cremind <feature>.md``; the
-# stem keeps the bracketed tag in the vector-store payload (``_clean_name`` only
-# strips it from the embedded text, not the ``name`` field), so a simple prefix
-# test identifies a CLI doc in both the vector and degraded full-scan paths.
-_CLI_DOC_PREFIX = "[cli]"
-
-# The group's tool id and the exposed function names of its two leaves. The
-# names mirror ``app.tools.base.make_leaf_name`` (``<tool_id>__<leaf>``), which
-# cannot be imported at module load because of the builtin <-> registry import
-# cycle; a test pins that the two agree.
-_TOOL_ID = "documentation_search"
-SEARCH_LEAF_NAME = "search_documentation"
-SECTION_LEAF_NAME = "read_documentation_section"
-SEARCH_LEAF_FN = f"{_TOOL_ID}__{SEARCH_LEAF_NAME}"
-SECTION_LEAF_FN = f"{_TOOL_ID}__{SECTION_LEAF_NAME}"
-
-# Prepended to a returned CLI-reference body so the reasoning model RUNS the
-# documented command via exec_shell instead of paraphrasing the man page (the
-# incident: the model listed providers from the doc's example table and told the
-# user to run the command). Rides the tool RESULT, not the system prompt —
-# matching the skill-load precedent in reasoning_agent.py, which keeps such
-# contextual guidance out of the (prompt-cached) system prompt. Prepended, not
-# appended, because long tool results are head-truncated. ``{fn}`` is the
-# exposed exec_shell run-leaf function name, derived at serve time.
-#
-# The ``--json`` bullet exists because the agent kept appending ``--json`` to
-# the end of a command: it is a ROOT option of the CLI (app/cli/main.py), so a
-# trailing one is rejected, and on a few commands it is instead that command's
-# own JSON-payload flag. Logged conversations show every such command failing
-# and being re-run with the flag moved.
-_CLI_EXECUTION_DIRECTIVE = (
-    "[Agent directive — run the command, don't recite the doc]\n"
-    "The document below is a `cremind` CLI reference. If the user's question can "
-    "be answered by running one of its commands, do NOT answer from the text: run "
-    "the command yourself with the `{fn}` function and report its REAL output. The "
-    "shell already has CREMIND_SERVER and CREMIND_TOKEN set for the active profile, "
-    "so the command works as-is.\n"
-    "- Machine-readable output: `--json` is a GLOBAL flag and goes right after "
-    "`cremind`, before the command group — `cremind --json <group> <command>`. A "
-    "trailing `--json` is rejected as an unknown option, and on a few commands "
-    "(`channels add`, `channels edit`, `channels notify-filter`, `embedding set`, "
-    "`llm providers configure`, `setup complete`, `tools set-args`) a `--json` "
-    "AFTER the command is that command's own JSON-payload option, not the output "
-    "switch.\n"
-    "- Read-only commands (list / show / get / status / options): run them "
-    "immediately, without asking.\n"
-    "- State-changing commands (configure / set / enable / disable / create / "
-    "delete): run them when the user asked for that change; confirm first only if "
-    "the action is destructive or ambiguous.\n"
-    "- Shell sessions and tables inside the document are illustrative EXAMPLES, not "
-    "live data — never present them as this server's current state. Only real "
-    "command output is live.\n"
-    "- Operating the `cremind` CLI is NOT a coding task — never delegate it to a "
-    "coding agent.\n"
-)
-
-
-_JUDGE_SYSTEM_PROMPT = (
-    "You are the Documentation Search relevance judge. You are given a numbered "
-    "list of candidate documents -- ranked by vector similarity when semantic "
-    "search is available, otherwise every document in the library. Each "
-    "candidate has a short name and a description -- you do NOT see the body.\n"
-    "\n"
-    "Your sole job is to pick the SINGLE candidate that best answers the "
-    "user's query. You MUST decide by calling exactly one of the provided "
-    "tools:\n"
-    "- `select_document(index)` -- when one candidate clearly matches.\n"
-    "- `no_relevant_result()`   -- when every candidate is off-topic or "
-    "only tangentially related.\n"
-    "\n"
-    "Do not write any prose, do not invent indices outside the list, and "
-    "do not call any other tool."
-)
-
-_SELECT_TOOL_NAME = "select_document"
-_NO_MATCH_TOOL_NAME = "no_relevant_result"
-
-
-# ── Delivery budget ─────────────────────────────────────────────────────────
-
-# Used only when the profile's agent config cannot be resolved; mirrors the
-# ``[tool_result].max_tokens`` default in app/config/settings.toml.
-_FALLBACK_CLAMP_TOKENS = 4000
-# Slack for newline joins and tokenizer boundary effects between our count and
-# the agent's own clamp, which measures the joined text.
-_BUDGET_MARGIN_TOKENS = 100
-# The body budget never goes below this, even when the clamp minus the
-# directive would. A result is only guaranteed to survive the agent's clamp
-# when the clamp leaves at least this much after the directive and margin
-# (roughly clamp >= 720 for a CLI reference); below that the operator has
-# chosen a clamp too small for any excerpt, and the agent's clamp cuts it.
-_MIN_BUDGET_TOKENS = 300
-# Envelope layout: the head may use this share of the budget, the table of
-# contents this share; matched sections get what is left.
-_HEAD_SHARE = 0.35
-_TOC_SHARE = 0.25
-# At most this many ranked sections are tried for the envelope.
-_MAX_SECTION_ATTEMPTS = 12
-# An oversized section with subsections keeps at least this much room for its
-# own opening text after the (capped) subsection list.
-_MIN_OWN_TEXT_TOKENS = 150
-# At most this many matching-but-not-shown sections are named in an envelope.
-_MAX_UNSHOWN_MATCHES = 5
-# The text before a document's first heading has no heading of its own; the
-# reader answers to this name (and the aliases) for it, so a head the envelope
-# had to cut is still reachable.
-_INTRO_SECTION = "Introduction"
-_INTRO_ALIASES = frozenset({"introduction", "intro", "head", "preamble"})
-# When a single line does not fit, cut inside it only if at least this much
-# room is left; below that a fragment says nothing useful.
-_MIN_PARTIAL_LINE_TOKENS = 40
-
-# Query words that say nothing about WHICH section is wanted. English function
-# words, their Vietnamese counterparts (most real queries are Vietnamese), and
-# words every document shares. The document's own name is added per call.
-_STOP_WORDS = frozenset({
-    "a", "an", "and", "any", "are", "as", "at", "be", "by", "can", "could",
-    "do", "does", "for", "from", "how", "i", "if", "in", "into", "is", "it",
-    "its", "me", "my", "of", "on", "or", "our", "should", "so", "that", "the",
-    "their", "them", "then", "there", "these", "this", "to", "via", "was",
-    "we", "what", "when", "where", "which", "who", "why", "will", "with",
-    "would", "you", "your",
-    "và", "của", "cho", "trên", "để", "là", "có", "không", "các", "những",
-    "trong", "với", "một", "khi", "nào", "gì", "thế", "như", "được", "này",
-    "đó", "bằng", "cách",
-    "cremind", "doc", "docs", "document", "documentation", "section", "sections",
-})
+DEFAULT_TOP_K = 8
+MAX_TOP_K = 30
+# How long a cancel waits for the job to settle before reporting.
+CANCEL_WAIT_S = 10.0
+_MAX_ANSWERS = 20
 
 
 class Var:
-    DEFAULT_TOP_K_KEY = "DEFAULT_TOP_K"
+    DEFAULT_TOP_K = "DEFAULT_TOP_K"
+    RESEARCH_MODEL_GROUP = "RESEARCH_MODEL_GROUP"
+    RESEARCH_TOKEN_BUDGET = "RESEARCH_TOKEN_BUDGET"
 
 
 TOOL_CONFIG: ToolConfig = {
-    "name": _TOOL_ID,
+    "name": TOOL_ID,
     "display_name": SERVER_NAME,
     "description": (
-        "Semantically searches the user's local Markdown documentation library "
-        "(skills, how-to guides, `cremind` CLI manual pages, user-added docs) and "
-        "returns the single most relevant document, chosen by an internal LLM "
-        "judge — whole when it is short, otherwise its head, a table of contents "
-        "and the sections matching the query, so any other section can be read "
-        "on demand. Try it first for any factual or how-to lookup before "
-        "searching the public web. For a `cremind` CLI manual page, run the "
-        "command it documents with the Shell Executor to get live answers "
-        "instead of quoting the page."
+        "Searches the user's OWN files indexed by Documentation search — their "
+        "documents, notes, reports, spreadsheets, photos and project folders — "
+        "by meaning, keyword, date, type and folder, reads any part of a file, "
+        "runs deep research over them (verified legal/financial analysis, "
+        "exhaustive folder compilations), and returns [doc:…] citation tokens "
+        "to cite in the answer. Not for Cremind's own documentation (use "
+        "Cremind documentation search for that)."
     ),
-    # Visible in Settings (so its top-k can be configured) but locked on —
-    # the agent must always be able to search its own documentation.
-    "locked": True,
+    # On by default; it only appears for a profile that turned Documentation search on, where the conversation's origin is allowed (see gate.py).
+    "default": True,
     "required_config": {
-        Var.DEFAULT_TOP_K_KEY: {
+        Var.DEFAULT_TOP_K: {
             "description": (
-                "Maximum number of documents the vector store returns to "
-                "the relevance judge for each search call. Ignored when Vector "
-                "Embedding is off: the judge then reviews the whole shared "
-                "library plus up to 50 of the profile's own documents."
+                "How many results documentation_search search returns per page when "
+                "the agent does not ask for a number (1-30)."
             ),
             "type": "number",
             "default": DEFAULT_TOP_K,
+        },
+        Var.RESEARCH_MODEL_GROUP: {
+            "description": (
+                "Model group that runs deep research over the user's documents "
+                "(verified legal/financial analysis, exhaustive folder "
+                "compilations): 'high' for the main model, 'low' for the "
+                "cheaper auxiliary model."
+            ),
+            "type": "string",
+            "enum": ["high", "low"],
+            "default": "high",
+        },
+        Var.RESEARCH_TOKEN_BUDGET: {
+            "description": (
+                "Maximum LLM tokens one deep-research job may spend before it "
+                "stops and reports what it covered."
+            ),
+            "type": "number",
+            "default": 250000,
         },
     },
 }
 
 
-class DocumentationSearchTool(BuiltInTool):
-    name: str = SEARCH_LEAF_NAME
+# ── schemas ────────────────────────────────────────────────────────────────
+
+FILTERS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Narrow the files considered. Hard filters: folder, path_glob, "
+        "name_query, types, extensions, source, date_*, size_*, has_gps, "
+        "file_ids. Soft (boost only, never exclude): author, taken_by, "
+        "image_origin."
+    ),
+    "properties": {
+        "folder": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Folder names or paths, matched loosely (case, accents, typos); "
+                           "includes everything beneath them. E.g. [\"MKT-report\"].",
+        },
+        "path_glob": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Glob over the path inside the indexed folder, e.g. \"Clients/*/2025/**\" or \"*.pdf\".",
+        },
+        "name_query": {"type": "string", "description": "Words that must all appear in the file name."},
+        "types": {
+            "type": "array", "items": {"type": "string", "enum": list(TYPE_NAMES)},
+            "description": "File types. 'document' = PDF, Word, text/Markdown, slides, e-books, e-mails.",
+        },
+        "extensions": {"type": "array", "items": {"type": "string"}, "description": "E.g. [\"pdf\", \".docx\"]."},
+        "source": {"type": "string", "enum": list(SOURCES), "description": "Local folder, Google Drive, or both."},
+        "date_field": {
+            "type": "string", "enum": list(DATE_FIELDS),
+            "description": "Which date date_from/date_to apply to. 'any' (default) matches the document's "
+                           "creation date, the file's creation or modification time, or a photo's EXIF date.",
+        },
+        "date_from": {"type": "string", "description": "First day, YYYY-MM-DD (or YYYY-MM, YYYY), user's time zone."},
+        "date_to": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD (or YYYY-MM, YYYY)."},
+        "size_min": {"type": "integer", "description": "Minimum size in bytes."},
+        "size_max": {"type": "integer", "description": "Maximum size in bytes."},
+        "author": {"type": "string", "description": "'me' (the user's configured names) or a name. Soft."},
+        "taken_by": {"type": "string", "description": "'me' (the user's cameras) or a camera make/model. Soft."},
+        "image_origin": {"type": "string", "enum": list(IMAGE_ORIGINS), "description": "Soft."},
+        "has_gps": {"type": "boolean", "description": "Only photos with (true) or without (false) a location."},
+        "file_ids": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Restrict to these files: [doc:…] tokens or file ids from earlier results.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+class DocumentsFindFilesTool(BuiltInTool):
+    name: str = LEAF_FIND
     description: str = (
-        "Search Cremind's documentation and knowledge base by semantic query — "
-        "skills, how-to guides, `cremind` CLI usage, and any documents the user "
-        "has added. Given a natural-language question, this returns the single "
-        f"most relevant document, or \"{NO_RESULT_MESSAGE}\" when nothing matches. "
-        "A long document comes back as its head, a table of contents and the "
-        "sections matching the question; its closing line says how to read any "
-        "other section — follow it rather than repeating the search, which "
-        "returns the same excerpt. When the result is a `cremind` CLI reference, "
-        "follow its embedded agent directive: run the relevant command with the "
-        "Exec Shell tool and report its live output instead of paraphrasing the "
-        "document."
+        "Find the user's own files, folders or project folders by name, type, date, folder or "
+        "what they are about — e.g. last week's photos, the spreadsheets in MKT-report, "
+        "the Python robot project from last year (kind=project). Without a query it lists "
+        "what the filters select (newest first); `aggregate` counts them by type, folder, "
+        "month or extension. Returns [doc:…] tokens; photos come back as thumbnails."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
-            "query": {
-                "type": "string",
-                "description": (
-                    "Natural-language description of what the user wants "
-                    "to learn or build. Example: 'how to write a sample "
-                    "skill for Cremind'."
-                ),
+            "query": {"type": "string", "description": "What the file or folder is called or is about (optional)."},
+            "kind": {
+                "type": "string", "enum": ["file", "folder", "project"],
+                "description": "file (default), folder, or project (folders that are code projects).",
             },
-            "top_k": {
-                "type": "integer",
-                "description": (
-                    "Maximum number of vector-search candidates the LLM "
-                    "judge considers. Defaults to 10 and is capped at 20. "
-                    "Ignored when semantic search is off."
-                ),
-                "minimum": 1,
-                "maximum": 20,
+            "filters": FILTERS_SCHEMA,
+            "sort": {
+                "type": "string", "enum": ["relevance", "newest", "oldest", "name", "largest", "smallest"],
+                "description": "Default: relevance with a query, newest without.",
             },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Results per page (default 20)."},
+            "aggregate": {
+                "type": "string", "enum": ["by_type", "by_folder", "by_month", "by_extension"],
+                "description": "Also count all matching files by this key.",
+            },
+            "page": {"type": "integer", "minimum": 1, "description": "Page of results (default 1)."},
+        },
+        "additionalProperties": False,
+    }
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        return await _tool_result(LEAF_FIND, arguments)
+
+
+class DocumentsSearchTool(BuiltInTool):
+    name: str = LEAF_SEARCH
+    description: str = (
+        "Search inside the user's own files for passages about something — by meaning and "
+        "by exact words (identifiers such as 45/2013/QH13 or 'Điều 203' match exactly). "
+        "Returns the best files (or folders, or passages) with the matching passages, "
+        "each with a [doc:…] citation token to copy into the answer. Use filters for "
+        "dates, folders and types; if a date window finds nothing it is widened and "
+        "the result says so."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to look for, in the user's words."},
+            "filters": FILTERS_SCHEMA,
+            "group_by": {
+                "type": "string", "enum": ["file", "folder", "chunk"],
+                "description": "file (default: up to 2 passages per file), folder (nearest project "
+                               "folder, else parent folder), or chunk (every passage on its own).",
+            },
+            "top_k": {"type": "integer", "minimum": 1, "maximum": MAX_TOP_K,
+                      "description": "Results per page (default from the tool settings, 8)."},
+            "expand": {"type": "boolean",
+                       "description": "Show surrounding context for the best results (default true)."},
+            "thorough": {"type": "boolean",
+                         "description": "Slower, better recall: restore Vietnamese accents, translate the "
+                                        "query, and rerank the best 30 with a model."},
+            "image_objects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}, "count": {"type": "integer"}},
+                    "required": ["label"],
+                    "additionalProperties": False,
+                },
+                "description": "Objects a photo should show, e.g. [{\"label\": \"dog\", \"count\": 2}]. Soft.",
+            },
+            "verify_images": {"type": "boolean",
+                              "description": "Look again at the top 6 photos with the vision model and re-rank "
+                                             "by what it sees (uses the daily image quota). For specific "
+                                             "counts or scenes."},
+            "page": {"type": "integer", "minimum": 1, "description": "Page of results (default 1)."},
         },
         "required": ["query"],
         "additionalProperties": False,
     }
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        # Searches the general (shared + per-profile) documentation corpus via
-        # the shared vector-search + LLM-judge engine below.
-        return await run_doc_search(arguments)
+        return await _tool_result(LEAF_SEARCH, arguments)
 
 
-class ReadDocumentationSectionTool(BuiltInTool):
-    name: str = SECTION_LEAF_NAME
+class DocumentsReadTool(BuiltInTool):
+    name: str = LEAF_READ
     description: str = (
-        "Read one section of a documentation document by name. Use it after "
-        f"`{SEARCH_LEAF_FN}` returned a document's head and table of contents, to "
-        "fetch the part you need instead of searching again. Pass the document "
-        "exactly as the search result's closing line wrote it (e.g. \"[cli]cremind "
-        "channels\", or a scope/path reference such as \"admin/guide.md\" when two "
-        "documents share a name) and a heading from its table of contents; "
-        "backticks, hyphens and a leading \"cremind\" are optional and matching is "
-        "case-insensitive. Pass section=\"Introduction\" for the text before the "
-        "first heading. Omit `section` to get the table of contents, or the whole "
-        "document when it is short."
+        "Read one of the user's indexed files, rebuilt from the index with a [doc:…] token on "
+        "every passage. Choose a part with pages, lines, section (a heading or a legal "
+        "reference like 'Điều 203'), sheet/rows, slide, or around (a phrase). A long file "
+        "without a locator comes back as its beginning, a table of contents with sizes, and "
+        "the parts matching `query`."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
-            "document": {
-                "type": "string",
-                "description": (
-                    "The document as the search result's closing line wrote it: "
-                    "a name such as \"[cli]cremind channels\" (the bracketed tag "
-                    "is optional), or a scope/path reference such as "
-                    "\"admin/guide.md\"."
-                ),
-            },
-            "section": {
-                "type": "string",
-                "description": (
-                    "A heading from the document's table of contents, e.g. "
-                    "\"cremind channels add\". Omit it to get the table of "
-                    "contents."
-                ),
-            },
+            "file": {"type": "string",
+                     "description": "A [doc:…] token (a passage token opens around that passage), a file id, "
+                                    "a path inside the indexed folder, or a file name; or research:<job id> "
+                                    "for a page of a research dossier (with page)."},
+            "pages": {"type": "string", "description": "PDF pages, e.g. \"3\" or \"3-5\"."},
+            "lines": {"type": "string", "description": "Line range in a text file, e.g. \"40-80\"."},
+            "section": {"type": "string",
+                        "description": "A heading, or a legal reference such as \"Điều 203\" or \"khoản 2 Điều 5\"."},
+            "sheet": {"type": "string", "description": "Spreadsheet sheet name."},
+            "rows": {"type": "string", "description": "Spreadsheet or CSV rows, e.g. \"2-40\"."},
+            "slide": {"type": "string", "description": "Slide number or range."},
+            "around": {"type": "string",
+                       "description": "A phrase: return the passage containing it and its neighbours."},
+            "query": {"type": "string", "description": "What you are looking for: ranks the parts of a long file."},
+            "page": {"type": "integer", "minimum": 1,
+                     "description": "Next part of a selection too long for one reply (default 1)."},
         },
-        "required": ["document"],
+        "required": ["file"],
         "additionalProperties": False,
     }
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        return await run_read_section(arguments)
+        return await _tool_result(LEAF_READ, arguments)
 
 
-async def run_doc_search(
-    arguments: Dict[str, Any],
-    *,
-    scopes: Optional[List[str]] = None,
-    log_label: str = "documentation_search",
-) -> BuiltInToolResult:
-    """Shared vector-search + LLM-judge pipeline for documentation-style tools.
+def _scope_schema(description: str) -> Dict[str, Any]:
+    return {**FILTERS_SCHEMA, "description": description}
 
-    ``documentation_search`` calls this with the default scopes (shared + the
-    active profile). ``scopes`` is a generic filter so callers can narrow the
-    corpus if needed; ``log_label`` tags the diagnostic log lines and does not
-    affect behaviour.
-    """
-    tag = f"[{log_label}]"
-    query = (arguments.get("query") or "").strip()
-    profile = arguments.get("_profile") or "admin"
-    llm = arguments.get("_llm")
 
-    variables = arguments.get("_variables") or {}
+class DocumentsResearchTool(BuiltInTool):
+    name: str = LEAF_RESEARCH
+    description: str = (
+        "Deep research over the user's own files, run as a background job. mode=analyze answers a "
+        "legal, financial or compliance question: reads the case files in full, finds the governing "
+        "provisions in the reference files from several angles, picks the edition of each law in force, "
+        "and verifies every quote. mode=compile reads EVERY file in scope and builds one table (with a "
+        "CSV), conflicts kept side by side. Returns a dossier with coverage (what was read, what was not "
+        "and why) and [doc:…] tokens. A job takes minutes: a PRELIMINARY result means call again with "
+        "continue_job; a question for the user is answered with continue_job and answers."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string",
+                         "description": "The research question or compile request, in the user's words (starts "
+                                        "a new job)."},
+            "mode": {"type": "string", "enum": ["compile", "analyze"],
+                     "description": "analyze (default): answer a question with verified evidence. compile: read "
+                                    "every file in scope and extract one table."},
+            "domain": {"type": "string", "enum": ["legal", "financial", "general"],
+                       "description": "legal: choose law editions explicitly, cite articles/clauses. "
+                                      "financial: figures and periods. general (default)."},
+            "scope": _scope_schema("The primary files: the case, the client's folder, the folder to compile. "
+                                   "Default: every indexed file."),
+            "reference_scope": _scope_schema("analyze only: where the authorities are — the laws, policies, "
+                                             "standards (e.g. {\"folder\": [\"Luat\"]}). Default: the whole "
+                                             "index."),
+            "continue_job": {"type": "string",
+                             "description": "The job id of an earlier call: get its current state (waits a while "
+                                            "if it is still running), answer its question, cancel it, or read a "
+                                            "page of its dossier."},
+            "answers": {"type": "object",
+                        "description": "With continue_job: the user's answers, keyed by the answer keys the job "
+                                       "printed, e.g. {\"edition\": \"k7m2xq9a\"} or {\"confirm\": true}. Values "
+                                       "are strings, booleans or numbers."},
+            "cancel": {"type": "boolean", "description": "With continue_job: cancel the job."},
+            "page": {"type": "integer", "minimum": 1,
+                     "description": "With continue_job: a page of a finished job's dossier (default 1)."},
+        },
+        "additionalProperties": False,
+    }
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        return await _tool_result(LEAF_RESEARCH, arguments)
+
+
+# ── execution (shared with the REST query API) ─────────────────────────────
+
+
+@dataclass
+class LeafResult:
+    """One leaf's answer, before it is shaped for the agent or for HTTP."""
+
+    text: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    citations: list[Any] = field(default_factory=list)
+    files: list[dict[str, Any]] = field(default_factory=list)
+    token_usage: dict[str, int] | None = None
+    # {"error": code, "message": …, …} when the leaf could not answer.
+    error: dict[str, Any] | None = None
+    # unavailable | invalid | not_found | busy — lets the API choose a status code.
+    error_kind: str | None = None
+
+
+def render_context(profile: Optional[str], *, budgeted: bool = True):
+    """How results are sized and wrapped. ``budgeted`` sizes them to the
+    profile's ``tool_result.max_tokens`` exactly as cremind_documentation_search
+    does (synchronous: it reads the profile's config); the CLI asks for the
+    whole result instead."""
+    from app.tools.builtin.cremind_documentation_search import _cut_tokens, _delivery_budget, _fit_lines, _tokens
+    from app.documents.query.render import RenderContext
+
+    limit = _delivery_budget(profile or "admin", "") if budgeted else None
+    return RenderContext(limit=limit, tokens=_tokens, fit_lines=_fit_lines, cut_tokens=_cut_tokens,
+                         wrap=wrap_document_content)
+
+
+def _int(value: Any, default: int, lo: int, hi: int) -> int:
     try:
-        default_top_k = int(variables.get(Var.DEFAULT_TOP_K_KEY) or DEFAULT_TOP_K)
+        return max(lo, min(hi, int(value)))
     except (TypeError, ValueError):
-        default_top_k = DEFAULT_TOP_K
-
-    top_k = arguments.get("top_k") or default_top_k
-    try:
-        top_k = max(1, min(int(top_k), 20))
-    except (TypeError, ValueError):
-        top_k = default_top_k
-
-    if not query:
-        return _no_result()
-
-    service = get_service()
-    if service is None:
-        logger.warning(
-            f"{tag} sync service not initialized; vector store unavailable"
-        )
-        return _no_result()
-
-    try:
-        # Off the event loop: ``search`` embeds the query synchronously, and
-        # the shared embedder serialises model calls behind a lock that a
-        # User Document Search batch may be holding. Waiting for it here
-        # would stall every other request on the loop.
-        hits = await asyncio.to_thread(
-            service.search, query=query, profile=profile, limit=top_k, scopes=scopes,
-        )
-        logger.debug(f"vector search hits: {hits}")
-    except Exception:  # noqa: BLE001
-        logger.exception(f"{tag} vector search failed")
-        return _no_result()
-
-    # Which path ``search`` took (vector / one of the fallbacks). Read off the
-    # service rather than returned, so ``search`` keeps its list-of-dicts shape.
-    mode = getattr(service, "last_search_mode", None) or "unknown"
-
-    if not hits:
-        logger.info(
-            f"{tag} query={query!r} ranked=[] decision=no-candidates mode={mode}"
-        )
-        return _no_result()
-
-    # Lightweight candidates: name + description + file_path only. We
-    # deliberately do NOT load bodies here -- the judge picks based on
-    # description alone, and we read the body of the winner only.
-    candidates: List[Dict[str, Any]] = []
-    for hit in hits:
-        file_path = hit.get("file_path")
-        description = hit.get("text") or ""
-        if not file_path or not description:
-            continue
-        candidates.append({
-            "name": hit.get("name") or "",
-            "description": description,
-            "file_path": file_path,
-            "scope": hit.get("scope"),
-            "relpath": hit.get("relpath"),
-            "score": hit.get("score"),
-        })
-
-    if not candidates:
-        logger.info(
-            f"{tag} query={query!r} ranked=[] decision=no-usable-candidates "
-            f"mode={mode}"
-        )
-        return _no_result()
-
-    if llm is None:
-        logger.warning(
-            f"{tag} no internal LLM available; cannot judge relevance, "
-            "returning no-result"
-        )
-        return _no_result()
-
-    chosen_index, judge_usage, judge_errored = await _select_best_candidate(
-        llm=llm, query=query, candidates=candidates, log_label=log_label, mode=mode,
-    )
-    if chosen_index is None:
-        # A judge *error* (e.g. the configured judge model is incompatible with
-        # the provider's auth method) is reported distinctly from a genuine
-        # no-match, so the reasoning agent doesn't read a broken judge as "no doc
-        # matched". Never returns a document on error (the judge exists precisely
-        # to reject off-topic top hits, so a blind top-1 fallback would be wrong).
-        if judge_errored:
-            return _judge_unavailable(token_usage=judge_usage)
-        return _no_result(token_usage=judge_usage)
-
-    chosen = candidates[chosen_index]
-    body = service.read_body(Path(chosen["file_path"]))
-    if body is None:
-        # Source file disappeared between vector search and read.
-        logger.warning(f"{tag} chosen file missing on disk: {chosen['file_path']}")
-        return _no_result(token_usage=judge_usage)
-
-    # Resolve $VAR system-variable tokens in the body for the active
-    # profile (e.g. $CREMIND_SERVER, $CREMIND_PROFILE) — same syntax as
-    # chat; `$$NAME` escapes to a literal `$NAME`. Done here at serving
-    # time only, never during indexing, so resolved values never enter
-    # the vector store or content hash.
-    body = resolve_system_var_tokens(body, profile)
-
-    # CLI reference docs describe live `cremind` commands. Prepend an execution
-    # directive so a weak model runs the command via exec_shell and answers from
-    # real output instead of paraphrasing the man page (and mistaking its example
-    # tables for live data). Gated on exec_shell being callable for this profile
-    # so we never instruct the impossible; prepended because long results are
-    # head-truncated.
-    name = chosen.get("name") or ""
-    directive = _directive_for(name, profile)
-
-    # A body over the delivery budget would be head-clipped by the agent, so it
-    # is delivered as an envelope the agent can navigate instead. Under budget
-    # it goes out exactly as before.
-    budget = _delivery_budget(profile, directive)
-    if budget is not None:
-        body_tokens = _tokens(body)
-        if body_tokens > budget:
-            scope = chosen.get("scope") or SHARED_SCOPE
-            body = _build_envelope(
-                name=name,
-                reference=_document_reference(
-                    service, name=name, scope=scope,
-                    relpath=chosen.get("relpath"), profile=profile,
-                ),
-                scope=scope,
-                body=body,
-                body_tokens=body_tokens,
-                budget=budget,
-                query=query,
-                profile=profile,
-                log_label=log_label,
-            )
-
-    # Kept as a single text item so the adapter's _extract_tool_result unwraps
-    # it to the plain string the Reasoning Agent should see.
-    return BuiltInToolResult(
-        content=[{"type": "text", "text": directive + body}],
-        token_usage=judge_usage,
-    )
+        return default
 
 
-async def run_read_section(arguments: Dict[str, Any]) -> BuiltInToolResult:
-    """Return one section of a document, resolved by document NAME.
-
-    No embedding and no judge: the document is looked up by name within the
-    caller's own ``[shared, profile]`` scopes and sliced deterministically at
-    its headings. Never touches a path the agent supplied.
-    """
-    tag = "[documentation_search]"
-    profile = arguments.get("_profile") or "admin"
-    document = (arguments.get("document") or "").strip()
-    wanted = (arguments.get("section") or "").strip()
-
-    if not document:
-        return _section_error(
-            "MissingDocument",
-            "Pass `document`: the document name exactly as the search result "
-            "showed it, e.g. \"[cli]cremind channels\".",
-        )
-
-    service = get_service()
-    if service is None:
-        return _section_error(
-            "ServiceUnavailable",
-            "The documentation service is not initialized yet; try again shortly.",
-        )
-
-    scopes = [SHARED_SCOPE, profile]
-    rows: Optional[List[Dict[str, Any]]] = None
-    resolve = getattr(service, "resolve_document", None)
-    if resolve is not None:
-        rows = service.list_document_names(scopes)
-        matches = resolve(document, scopes, rows=rows)
-    else:  # a minimal service without ambiguity support
-        found = service.find_document(document, scopes)
-        matches = [found] if found else []
-
-    if len(matches) > 1:
-        references = [service.qualified_reference(r) for r in matches]
-        logger.info(
-            f"{tag} section doc={document!r} decision=ambiguous-document "
-            f"matches={references}"
-        )
-        return _section_error(
-            "AmbiguousDocument",
-            f"{document!r} names {len(matches)} documents. Call again with "
-            "`document` set to one of the candidates.",
-            document=document,
-            candidates=references,
-        )
-    if not matches:
-        if rows is None:
-            rows = service.list_document_names(scopes)
-        names = [row["name"] for row in rows]
-        logger.info(f"{tag} section doc={document!r} decision=document-not-found")
-        return _section_error(
-            "DocumentNotFound",
-            f"No document named {document!r} in this profile's documentation. "
-            "Use a name exactly as the search result showed it, or search again.",
-            document=document,
-            candidates=_close_names(document, names),
-        )
-    doc = matches[0]
-
-    name = doc.get("name") or document
-    doc_scope = doc.get("scope") or SHARED_SCOPE
-    body = service.read_body(Path(doc["file_path"]))
-    if body is None:
-        return _section_error(
-            "DocumentNotFound",
-            f"Document {name!r} is no longer readable; search again.",
-            document=name,
-            candidates=[],
-        )
-
-    # Resolved BEFORE splitting, so headings, sizes and matching all see the
-    # same text the agent will receive.
-    body = resolve_system_var_tokens(body, profile)
-    directive = _directive_for(name, profile)
-    budget = _delivery_budget(profile, directive)
-    lines, head_lines, sections = split_sections(body)
-    sizes = size_sections(lines, sections, _tokens)
-
-    if not wanted:
-        text, decision = _render_document_overview(
-            name=name, scope=doc_scope, body=body, lines=lines, sections=sections,
-            sizes=sizes, budget=budget,
-        )
-        logger.info(
-            f"{tag} section doc={name!r} scope={doc_scope} decision={decision} "
-            f"budget={budget}"
-        )
-        return _text_result(directive + text)
-
-    wants_intro = normalize_heading(wanted) in _INTRO_ALIASES
-    if not sections:
-        if wants_intro:
-            return _text_result(directive + _render_intro(
-                name=name, scope=doc_scope, head_lines=head_lines, budget=budget,
-            ))
-        return _section_error(
-            "SectionNotFound",
-            f"{name!r} has no sections; call again without `section` to read it.",
-            document=name,
-            section=wanted,
-            candidates=[],
-        )
-
-    matches, suggestions = find_section(sections, wanted)
-    if not matches and wants_intro:
-        logger.info(f"{tag} section doc={name!r} scope={doc_scope} decision=introduction")
-        return _text_result(directive + _render_intro(
-            name=name, scope=doc_scope, head_lines=head_lines, budget=budget,
-        ))
-    if not matches:
-        logger.info(
-            f"{tag} section doc={name!r} section={wanted!r} decision=not-found"
-        )
-        return _section_error(
-            "SectionNotFound",
-            f"No section of {name!r} matches {wanted!r}. Call again with "
-            "`section` set to one of the candidates, or omit it for the table "
-            "of contents.",
-            document=name,
-            section=wanted,
-            candidates=suggestions,
-        )
-
-    if len({normalize_heading(m.title) for m in matches}) > 1:
-        logger.info(
-            f"{tag} section doc={name!r} section={wanted!r} decision=ambiguous "
-            f"matches={len(matches)}"
-        )
-        return _section_error(
-            "AmbiguousSection",
-            f"{wanted!r} matches several sections of {name!r}. Call again with "
-            "`section` set to one of the candidates.",
-            document=name,
-            section=wanted,
-            candidates=[m.title for m in matches],
-        )
-
-    target = matches[0]
-    total = sizes[target.index].total
-    note = (
-        f"\n[note: {len(matches)} sections share this heading; showing the first]"
-        if len(matches) > 1
-        else ""
-    )
-    oversized = budget is not None and total > budget
-    if oversized:
-        text = _render_oversized_section(
-            name=name, scope=doc_scope, target=target, lines=lines,
-            sections=sections, sizes=sizes, budget=budget,
-        )
-    else:
-        text = (
-            f"[Section \"{target.title}\" of \"{name}\" ({doc_scope}) — "
-            f"{total} tokens]{note}\n\n{section_text(lines, target)}"
-        )
-    logger.info(
-        f"{tag} section doc={name!r} scope={doc_scope} section={target.title!r} "
-        f"tokens={total} budget={budget} oversized={oversized}"
-    )
-    return _text_result(directive + text)
-
-
-# ── Delivery helpers ────────────────────────────────────────────────────────
-
-
-def _tokens(text: str) -> int:
-    """Token count in the same encoding the agent's clamp uses.
-
-    ``count_content_tokens`` needs tiktoken (an optional extra) and raises
-    without it; fall back to the usual chars/4 estimate rather than failing a
-    search over bookkeeping.
-    """
-    if not text:
-        return 0
-    try:
-        return count_content_tokens(text)
-    except Exception:  # noqa: BLE001
-        return len(text) // 4
-
-
-@dataclass(frozen=True)
-class _ClampConfig:
-    """The two ``tool_result`` settings the delivery budget depends on."""
-
-    tool_result_enabled: bool
-    tool_result_max_tokens: int
-
-
-def _resolve_clamp(profile: str) -> _ClampConfig:
-    """Read the profile's tool-result clamp — and only that.
-
-    ``resolve_agent_config`` would read every agent setting, one synchronous
-    config-store query each, on the event loop, for every search and section
-    read; and a malformed setting that has nothing to do with delivery would
-    make it raise. The ``tool_result`` group is the same source the reasoning
-    agent's clamp reads.
-    """
-    group = resolve_group("tool_result", profile)
-    return _ClampConfig(
-        tool_result_enabled=bool(group["enabled"]),
-        tool_result_max_tokens=int(group["max_tokens"]),
-    )
-
-
-def _agent_clamp_is_active() -> bool:
-    """Whether the reasoning agent's tool-result clamp can cut anything at all.
-
-    The clamp is ``truncate_to_tokens``, which hands text back UNCHANGED when
-    tiktoken is not installed (it ships only in some optional extras). On such
-    an install nothing is ever clipped, so enveloping a document would deliver
-    less than the agent would have received whole.
-    """
-    return importlib.util.find_spec("tiktoken") is not None
-
-
-def _delivery_budget(profile: str, reserved: str) -> Optional[int]:
-    """Tokens a result body may use so the WHOLE result survives the clamp.
-
-    Derived from the same per-profile ``tool_result.max_tokens`` the reasoning
-    agent clamps with; ``reserved`` is the text that rides in front of the body
-    (the CLI directive), measured rather than guessed. ``None`` means there is
-    no effective clamp — the profile turned it off, or tiktoken is missing so
-    the agent's clamp is a no-op — and bodies are delivered whole, exactly as
-    the agent would have received them. The body budget is floored at
-    :data:`_MIN_BUDGET_TOKENS`; see there for when that floor lets a result
-    exceed a very small clamp.
-    """
-    if not _agent_clamp_is_active():
+def _str(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    try:
-        cfg = _resolve_clamp(profile)
-        if not cfg.tool_result_enabled:
-            return None
-        clamp = int(cfg.tool_result_max_tokens)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[documentation_search] could not resolve the agent config for "
-            f"profile {profile!r}; assuming a {_FALLBACK_CLAMP_TOKENS}-token clamp"
-        )
-        clamp = _FALLBACK_CLAMP_TOKENS
-    return max(_MIN_BUDGET_TOKENS, clamp - _tokens(reserved) - _BUDGET_MARGIN_TOKENS)
+    s = str(value).strip()
+    return s or None
 
 
-def _directive_for(name: str, profile: str) -> str:
-    """The CLI execution directive for ``name``, or "" when it does not apply."""
-    if not (name or "").startswith(_CLI_DOC_PREFIX):
-        return ""
-    fn = _exec_shell_fn(profile)
-    if not fn:
-        return ""
-    return _CLI_EXECUTION_DIRECTIVE.format(fn=fn) + "\n"
-
-
-def _stop_words_for(name: str) -> set[str]:
-    """Generic stop words plus the document's own name, singular and plural.
-
-    ``rank_sections_for_query`` matches stop words exactly, and every heading
-    of ``[cli]cremind channels`` repeats "channels": without both forms, a
-    query that says "channel" would match the entire table of contents. A
-    hyphenated name contributes its parts too — every heading of
-    ``[cli]cremind skill-events`` contains "skill-events", which a query
-    saying "skill events" would otherwise prefix-match through "skill".
-    """
-    words = set(_STOP_WORDS)
-    for word in _clean_name(name).casefold().split():
-        for part in {word, *word.split("-")}:
-            if not part:
-                continue
-            words.add(part)
-            if part.endswith("s") and len(part) > 3:
-                words.add(part[:-1])
-            else:
-                words.add(part + "s")
-    return words
-
-
-def _cut_tokens(text: str, max_tokens: int) -> str:
-    """The longest prefix of ``text`` measuring at most ``max_tokens``.
-
-    Measured with :func:`_tokens` — the one measure every budget in this
-    module uses — by binary search over the character length, so a cut can
-    never disagree with the budget it is meant to satisfy (whether tiktoken is
-    installed or the chars/4 fallback is in force). Backs off to a word break
-    when one is close.
-    """
-    if _tokens(text) <= max_tokens:
-        return text
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _tokens(text[:mid]) <= max_tokens:
-            lo = mid
-        else:
-            hi = mid - 1
-    cut = text[:lo]
-    space = cut.rfind(" ")
-    return cut[:space] if space > len(cut) - 40 else cut
-
-
-def _fit_lines(text: str, cap: int, *, split_long_line: bool = True) -> Tuple[str, bool]:
-    """Keep whole lines of ``text`` while they fit in ``cap`` tokens.
-
-    Cutting at a line boundary keeps a table row or a command from being split
-    mid-way. But when the first line that does not fit leaves real room behind
-    (a paragraph written as one long line, a document with no line breaks),
-    stopping there would deliver nothing at all, so that line is cut inside
-    instead — unless ``split_long_line`` is False (a table of contents, where a
-    half entry is worse than none). A code fence left open by the cut is
-    closed, so whatever the caller appends does not read as part of it.
-    Returns ``(text, was_cut)``.
-    """
-    if _tokens(text) <= cap:
-        return text, False
-    kept: List[str] = []
-    used = 0
-    for line in text.split("\n"):
-        cost = _tokens(line) + 1
-        if used + cost > cap:
-            room = cap - used - 4  # the fence closer and the "…" marker
-            if split_long_line and room >= _MIN_PARTIAL_LINE_TOKENS:
-                kept.append(_cut_tokens(line, room).rstrip() + " …")
-            break
-        kept.append(line)
-        used += cost
-    closer = open_fence_at_end(kept)
-    if closer:
-        kept.append(closer)
-    return "\n".join(kept).rstrip(), True
-
-
-def _heading_label(title: str) -> str:
-    """A heading as the agent should type it back: backticks dropped."""
-    return title.replace("`", "")
-
-
-def _render_toc_block(
-    sections: List[Section], sizes: Dict[int, SectionSizes], cap: int,
-) -> Tuple[str, str]:
-    """The table of contents, shrunk to ``cap``. Returns ``(toc, note)``."""
-    toc = render_toc(sections, sizes)
-    note = ""
-    if _tokens(toc) > cap:
-        h2 = [s for s in sections if s.level == 2]
-        if h2 and len(h2) < len(sections):
-            toc = render_toc(h2, sizes)
-            note = (
-                f"({len(sections) - len(h2)} subsections not listed — read an "
-                "H2 section to see its subsections.)"
-            )
-    if _tokens(toc) > cap:
-        full_entries = toc.count("\n") + 1
-        toc, _ = _fit_lines(toc, cap, split_long_line=False)
-        shown = toc.count("\n") + 1 if toc else 0
-        cut_note = (
-            f"(table of contents cut to fit: {full_entries - shown} more entries "
-            "not listed.)"
-        )
-        note = f"{note} {cut_note}" if note else cut_note
-    return toc, note
-
-
-def _document_reference(
-    service, *, name: str, scope: str, relpath: Optional[str], profile: str,
-) -> str:
-    """How the envelope tells the agent to name THIS document to the reader.
-
-    Its bare name normally; its ``scope/relpath`` reference when that name is
-    shared with another document the reader would otherwise have to choose
-    between (a profile doc named like a bundled one, two nested files with the
-    same stem).
-    """
-    reference_for = getattr(service, "reference_for", None)
-    if reference_for is None or not relpath:
-        return name
-    try:
-        return reference_for(scope=scope, relpath=relpath, scopes=[SHARED_SCOPE, profile])
-    except Exception:  # noqa: BLE001
-        logger.exception("[documentation_search] could not build a document reference")
-        return name
-
-
-def _ranking_query(query: str, name: str) -> str:
-    """``query`` without the words that only restate the document's own name.
-
-    Stop words are matched exactly, but ranking prefix-matches, so
-    "conversation" would still hit every `` `cremind conv …` `` heading through
-    "conv" and fill the envelope with unrelated sections. Drop any query word
-    that extends, or is extended by, a name word of four or more characters.
-    """
-    name_words = [w for w in query_words(_clean_name(name)) if len(w) >= 4]
-    kept = [
-        w for w in query_words(query)
-        if not any(
-            w.startswith(n) or (len(w) >= 4 and n.startswith(w)) for n in name_words
-        )
-    ]
-    return " ".join(kept)
-
-
-def _render_beginning(
-    *, name: str, scope: str, body: str, body_tokens: int, budget: int,
-) -> str:
-    """A document over budget with no sections: as much of its beginning as
-    fits. There is no table of contents to offer, so none is pretended."""
-    header = (
-        f"[Document \"{name}\" ({scope}) — {body_tokens} tokens, over the "
-        f"{budget}-token budget and without sections, so only its beginning is "
-        "shown]"
-    )
-    marker = "[… document truncated]"
-    text, _ = _fit_lines(body, max(1, budget - _tokens(header) - _tokens(marker) - 8))
-    return f"{header}\n\n{text}\n{marker}"
-
-
-def _build_envelope(
-    *,
-    name: str,
-    reference: str,
-    scope: str,
-    body: str,
-    body_tokens: int,
-    budget: int,
-    query: str,
+async def execute(
+    leaf: str,
     profile: str,
-    log_label: str,
-) -> str:
-    """Head + table of contents + query-matched sections, within ``budget``.
+    args: Dict[str, Any],
+    *,
+    llm: Any = None,
+    variables: Optional[Dict[str, Any]] = None,
+    budgeted: bool = True,
+    context_id: Optional[str] = None,
+) -> LeafResult:
+    """Run one leaf for ``profile``. Every blocking step (index reads, the
+    query embedding, rendering) runs in a worker thread. "Not available",
+    a bad filter and an unknown file come back as ``LeafResult.error``;
+    store and embedder failures degrade the search mode instead of raising
+    (see :mod:`app.documents.query.engine`).
 
-    ``reference`` is what the footer tells the agent to pass as ``document`` —
-    see :func:`_document_reference`.
-    """
-    lines, head_lines, sections = split_sections(body)
-    if not sections:
-        logger.info(
-            f"[{log_label}] envelope doc={name!r} scope={scope} "
-            f"body_tokens={body_tokens} budget={budget} sections=0 -> beginning"
+    ``research`` and ``read`` of a ``research:<id>`` dossier are answered
+    by the job layer before the index is opened: a job's state is in the
+    main database, and cancelling a job must work even while the index is
+    not. ``context_id`` ties a new job to its conversation."""
+    from app.documents.query import FilterError, ReadError, open_engine
+    from app.documents.query import render as R
+
+    if leaf == LEAF_RESEARCH:
+        return await _research(profile, args, context_id=context_id, variables=variables or {},
+                               budgeted=budgeted)
+    if leaf == LEAF_READ and str(args.get("file") or "").strip().lower().startswith(RESEARCH_REF_PREFIX):
+        return await _research_page(profile, args, budgeted=budgeted)
+
+    access = await asyncio.to_thread(open_engine, profile)
+    if access.engine is None:
+        return LeafResult(
+            text=R.render_status(access.message or "not available", code=access.code),
+            error={"error": "DocumentsUnavailable", "status": access.code, "message": access.message},
+            error_kind="unavailable",
         )
-        return _render_beginning(
-            name=name, scope=scope, body=body, body_tokens=body_tokens, budget=budget,
-        )
-
-    sizes = size_sections(lines, sections, _tokens)
-    section_fn = _section_leaf_fn(profile)
-    ranked = rank_sections_for_query(
-        sections, _ranking_query(query, name), _stop_words_for(name),
-    )
-
-    head_text, head_cut = _fit_lines(
-        "\n".join(head_lines).strip("\n"), int(budget * _HEAD_SHARE),
-    )
-    toc_text, toc_note = _render_toc_block(sections, sizes, int(budget * _TOC_SHARE))
-
-    header = (
-        f"[Document \"{name}\" ({scope}) — {body_tokens} tokens, too long to "
-        f"deliver whole within the {budget}-token budget. Shown below: its head, "
-        "a table of contents with the token size of each section, and the "
-        "section(s) whose heading matches the query.]"
-    )
-    head_marker = (
-        f"[… head truncated — read all of it with section=\"{_INTRO_SECTION}\"]"
-        if section_fn else "[… head truncated]"
-    )
-
-    def footer(included: List[Section]) -> str:
-        if section_fn is None:
-            return (
-                f"[End of excerpt from \"{name}\". The section reader "
-                f"(`{SECTION_LEAF_NAME}`) is disabled for this profile, so other "
-                "sections cannot be fetched directly — a search whose query names "
-                "another heading returns that section instead. The reader can be "
-                "enabled in Settings → Tools & Skills → Documentation Search, or "
-                f"with `cremind tools set-leaf {_TOOL_ID} {SECTION_LEAF_NAME}=true`.]"
+    engine = access.engine
+    variables = variables or {}
+    try:
+        if leaf == LEAF_SEARCH:
+            return await _search(engine, profile, args, llm=llm, variables=variables, budgeted=budgeted)
+        if leaf == LEAF_FIND:
+            outcome = await asyncio.to_thread(
+                engine.find, _str(args.get("query")),
+                kind=_str(args.get("kind")) or "file", filters=args.get("filters"),
+                sort=_str(args.get("sort")), limit=_int(args.get("limit"), 20, 1, 100),
+                aggregate=_str(args.get("aggregate")), page=_int(args.get("page"), 1, 1, 10_000),
             )
-        example = _example_section(sections, ranked, included)
-        example_hint = f", e.g. section=\"{example}\"" if example else ""
-        return (
-            f"[End of excerpt from \"{name}\". To read another section, call "
-            f"`{section_fn}` with document=\"{reference}\" and section set to a "
-            f"heading from the table of contents{example_hint}. Omit section to "
-            "get the table of contents again. Repeating this search returns this "
-            "same excerpt.]"
-        )
-
-    def listing(matches: List[Section]) -> str:
-        return ", ".join(
-            f"{_heading_label(s.title)} ({sizes[s.index].total})" for s in matches
-        )
-
-    def assemble(included: List[Section]) -> str:
-        shown = {s.index for s in included}
-        unshown = [s for s in ranked if s.index not in shown][:_MAX_UNSHOWN_MATCHES]
-        parts = [header, "", head_text]
-        if head_cut:
-            parts.append(head_marker)
-        parts += ["", "## Table of contents (section → tokens when read)", toc_text]
-        if toc_note:
-            parts.append(toc_note)
-        parts += ["", "## Sections matching the query", ""]
-        if included:
-            for section in included:
-                parts += [section_text(lines, section), ""]
-            if unshown:
-                parts += [f"(Also matching, not shown here: {listing(unshown)}.)", ""]
-        elif ranked:
-            # A heading DID match; it just does not fit. Saying "nothing
-            # matched" here would contradict the footer's own suggestion.
-            parts += [
-                "(The section(s) matching the query are too long to include in "
-                f"this excerpt: {listing(unshown)}. Read one on its own.)",
-                "",
-            ]
+            rendered = await asyncio.to_thread(
+                lambda: R.render_find(outcome, render_context(profile, budgeted=budgeted)))
+        elif leaf == LEAF_READ:
+            outcome = await asyncio.to_thread(
+                engine.read, str(args.get("file") or ""),
+                pages=_str(args.get("pages")), lines=_str(args.get("lines")), section=_str(args.get("section")),
+                sheet=_str(args.get("sheet")), rows=_str(args.get("rows")), slide=_str(args.get("slide")),
+                around=_str(args.get("around")), query=_str(args.get("query")),
+                page=_int(args.get("page"), 1, 1, 10_000),
+            )
+            rendered = await asyncio.to_thread(
+                lambda: R.render_read(outcome, render_context(profile, budgeted=budgeted)))
         else:
-            parts += [
-                "(No section heading matched the query. Pick one from the table "
-                "of contents above.)",
-                "",
-            ]
-        parts.append(footer(included))
-        return "\n".join(parts)
+            return LeafResult(error={"error": "UnknownLeaf", "message": f"unknown leaf {leaf!r}"},
+                              error_kind="invalid")
+    except FilterError as exc:
+        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid")
+    except ReadError as exc:
+        kind = "not_found" if exc.code in ("NotFound", "IsAFolder") else "invalid"
+        return LeafResult(error={"error": exc.code, "message": exc.message, "candidates": exc.candidates},
+                          error_kind=kind)
+    return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files)
 
-    included: List[Section] = []
-    text = assemble(included)
-    for section in ranked[:_MAX_SECTION_ATTEMPTS]:
-        if sizes[section.index].total > budget:
+
+async def _search(engine: Any, profile: str, args: Dict[str, Any], *, llm: Any, variables: Dict[str, Any],
+                  budgeted: bool) -> LeafResult:
+    from app.documents.query import render as R
+    from app.documents.query.rerank import RERANK_TOP, add_usage, query_variants, rerank
+
+    query = _str(args.get("query"))
+    if not query:
+        return LeafResult(error={"error": "MissingQuery", "message": "Pass `query`: what to look for."},
+                          error_kind="invalid")
+    default_k = _int(variables.get(Var.DEFAULT_TOP_K), DEFAULT_TOP_K, 1, MAX_TOP_K)
+    top_k = _int(args.get("top_k"), default_k, 1, MAX_TOP_K) if args.get("top_k") is not None else default_k
+    page = _int(args.get("page"), 1, 1, 10_000)
+    group_by = _str(args.get("group_by")) or "file"
+    expand = args.get("expand") is not False
+    thorough = bool(args.get("thorough"))
+    image_objects = args.get("image_objects") if isinstance(args.get("image_objects"), list) else None
+    usage: dict[str, int] = {}
+    variants: list[str] = []
+    notes: list[str] = []
+    if thorough and llm is None:
+        notes.append("thorough mode needs a model (the 'low' group) and none is configured; ran a normal search.")
+        thorough = False
+    if thorough:
+        variants, u = await query_variants(llm, query, db=engine.db)
+        usage = add_usage(usage, u)
+
+    outcome = await asyncio.to_thread(
+        engine.search, query, filters=args.get("filters"), group_by=group_by,
+        top_k=RERANK_TOP if thorough else top_k, page=1 if thorough else page,
+        expand=expand and not thorough, variants=variants, image_objects=image_objects,
+        verify_images=bool(args.get("verify_images")),
+    )
+    if thorough and outcome.groups:
+        candidates = []
+        for g in outcome.groups:
+            owner = g.file if g.file is not None else g.folder
+            title = (owner or {}).get("rel_path") or "(top level)"
+            candidates.append((title, " ".join((g.best.chunk.get("text") or "").split())))
+        order, u = await rerank(llm, query, candidates)
+        usage = add_usage(usage, u)
+        ranked = [outcome.groups[i] for i in order] if order else list(outcome.groups)
+        start = (page - 1) * top_k
+        outcome.groups = ranked[start:start + top_k]
+        outcome.total = min(outcome.total, len(ranked))
+        outcome.page, outcome.top_k = page, top_k
+        if expand:
+            await asyncio.to_thread(engine.expand, outcome.groups)
+        notes.append(f"thorough: {'reranked the best ' + str(len(ranked)) if order else 'rerank unavailable'}"
+                     + (f"; also searched: {', '.join(variants)}" if variants else ""))
+    outcome.notes = notes + outcome.notes
+    rendered = await asyncio.to_thread(lambda: R.render_search(outcome, render_context(profile, budgeted=budgeted)))
+    return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files,
+                      token_usage=usage or None)
+
+
+# ── research ───────────────────────────────────────────────────────────────
+
+
+async def _sync(fn: Any, *args: Any) -> Any:
+    """A job-layer call that may touch the database, off the loop. Awaits
+    the result too, should the job layer answer with a coroutine."""
+    result = await asyncio.to_thread(fn, *args)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _answers(raw: Any) -> Dict[str, Any]:
+    """The agent's ``answers``: string keys, scalar values, bounded — what
+    the job layer can merge into a checkpoint without surprises."""
+    from app.documents.research.errors import InvalidRequest
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise InvalidRequest("`answers` must be an object keyed by the answer keys the job printed.")
+    out: Dict[str, Any] = {}
+    for key, value in list(raw.items())[:_MAX_ANSWERS]:
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            out[str(key)[:64]] = value
+        elif isinstance(value, str):
+            out[str(key)[:64]] = value.strip()[:500]
+        elif value is None:
             continue
-        candidate = assemble(included + [section])
-        if _tokens(candidate) <= budget:
-            included.append(section)
-            text = candidate
-
-    logger.info(
-        f"[{log_label}] envelope doc={name!r} scope={scope} "
-        f"body_tokens={body_tokens} budget={budget} "
-        f"head_tokens={_tokens(head_text)} head_cut={head_cut} "
-        f"toc_entries={len(sections)} "
-        f"matched={[s.title for s in included]} delivered={_tokens(text)}"
-    )
-    return text
+        else:
+            raise InvalidRequest(f"answers[{key!r}] must be a string, a boolean or a number.")
+    return out
 
 
-def _example_section(
-    sections: List[Section], ranked: List[Section], included: List[Section],
-) -> str:
-    """A heading to show in the footer as the argument format: not already
-    shown, preferably the next-best match, then a command-reference heading
-    (one that opens with a backticked command), then any subsection."""
-    shown = {s.index for s in included}
-    pools = (
-        ranked,
-        [s for s in sections if s.level == 3 and s.title.startswith("`")],
-        [s for s in sections if s.level == 3],
-        sections,
-    )
-    for pool in pools:
-        for section in pool:
-            if section.index not in shown:
-                return _heading_label(section.title)
-    return ""
+def _scope(raw: Any, name: str) -> Optional[Dict[str, Any]]:
+    """A scope filter checked now, so a typo is an immediate observation
+    rather than a job that fails a minute later."""
+    from app.documents.query import parse_filters
+    from app.documents.research.errors import InvalidRequest
 
-
-def _render_intro(
-    *, name: str, scope: str, head_lines: List[str], budget: Optional[int],
-) -> str:
-    """The text before a document's first heading — the part no heading names,
-    and the one an envelope may have had to cut."""
-    head = "\n".join(head_lines).strip("\n")
-    head_tokens = _tokens(head)
-    header = (
-        f"[{_INTRO_SECTION} of \"{name}\" ({scope}) — the text before its first "
-        f"section — {head_tokens} tokens]"
-    )
-    if budget is not None and head_tokens > budget:
-        head, _ = _fit_lines(head, max(1, budget - _tokens(header) - 20))
-        head += "\n[… introduction truncated]"
-    return f"{header}\n\n{head}"
-
-
-def _render_document_overview(
-    *,
-    name: str,
-    scope: str,
-    body: str,
-    lines: List[str],
-    sections: List[Section],
-    sizes: Dict[int, SectionSizes],
-    budget: Optional[int],
-) -> Tuple[str, str]:
-    """``read_documentation_section`` without a section: the whole document
-    when it fits, else its table of contents. Returns ``(text, decision)``."""
-    body_tokens = _tokens(body)
-    if budget is None or body_tokens <= budget:
-        return (
-            f"[Document \"{name}\" ({scope}) — {body_tokens} tokens, complete]"
-            f"\n\n{body}",
-            "whole",
-        )
-    if not sections:
-        return (
-            _render_beginning(
-                name=name, scope=scope, body=body, body_tokens=body_tokens,
-                budget=budget,
-            ),
-            "truncated",
-        )
-    header = (
-        f"[Table of contents of \"{name}\" ({scope}) — {body_tokens} tokens in "
-        f"total. Read a section with `{SECTION_LEAF_FN}` and section set to one "
-        "of these headings; the number is what reading it costs.]"
-    )
-    toc, note = _render_toc_block(sections, sizes, budget - _tokens(header) - 40)
-    parts = [header, "", toc]
-    if note:
-        parts.append(note)
-    return "\n".join(parts), "toc"
-
-
-def _render_oversized_section(
-    *,
-    name: str,
-    scope: str,
-    target: Section,
-    lines: List[str],
-    sections: List[Section],
-    sizes: Dict[int, SectionSizes],
-    budget: int,
-) -> str:
-    """A section too big for the budget: its own text plus its subsections,
-    or — when it has none — its beginning."""
-    total = sizes[target.index].total
-    kids = children(sections, target)
-    if kids:
-        header = (
-            f"[Section \"{target.title}\" of \"{name}\" ({scope}) — {total} tokens, "
-            f"over the {budget}-token budget. Showing its own text and a list of "
-            f"its subsections; read any of them with `{SECTION_LEAF_FN}`.]"
-        )
-        # The subsection list is what the agent navigates by, so it gets its
-        # room first — capped, like every other list here, so a section with
-        # hundreds of children cannot push the result past the clamp — and the
-        # section's own prose gets what is left.
-        sub_toc, sub_note = _render_toc_block(
-            kids, sizes, max(1, budget - _tokens(header) - _MIN_OWN_TEXT_TOKENS),
-        )
-        subsections = "## Subsections (section → tokens when read)\n" + sub_toc
-        if sub_note:
-            subsections += "\n" + sub_note
-        room = budget - _tokens(header) - _tokens(subsections) - 40
-        own, cut = _fit_lines(section_own_text(lines, target), max(0, room))
-        own = own + ("\n[… own text truncated]" if cut else "")
-        return f"{header}\n\n{own}\n\n{subsections}"
-
-    header = (
-        f"[Section \"{target.title}\" of \"{name}\" ({scope}) — {total} tokens, "
-        f"over the {budget}-token budget and without subsections, so only its "
-        "beginning is shown]"
-    )
-    text, _ = _fit_lines(
-        section_text(lines, target), max(1, budget - _tokens(header) - 60),
-    )
-    return (
-        f"{header}\n\n{text}\n[… section truncated. Ask the user to narrow the "
-        "question, or read a neighbouring section.]"
-    )
-
-
-def _close_names(query: str, names: List[str], limit: int = 5) -> List[str]:
-    """Document names close to ``query``, by raw and by tag-stripped name."""
-    if not names:
-        return []
-    by_raw = {n.casefold(): n for n in names}
-    by_clean = {_clean_name(n).casefold(): n for n in names}
-    out: List[str] = []
-    for key in difflib.get_close_matches(query.casefold(), list(by_raw), n=limit, cutoff=0.4):
-        out.append(by_raw[key])
-    for key in difflib.get_close_matches(
-        _clean_name(query).casefold(), list(by_clean), n=limit, cutoff=0.4,
-    ):
-        if by_clean[key] not in out:
-            out.append(by_clean[key])
-    return out[:limit] if out else names[:20]
-
-
-def _text_result(text: str) -> BuiltInToolResult:
-    return BuiltInToolResult(content=[{"type": "text", "text": text}], token_usage=None)
-
-
-def _section_error(code: str, message: str, **extra: Any) -> BuiltInToolResult:
-    """Structured error for the section reader (see ``base.py``: error + message)."""
-    return BuiltInToolResult(
-        structured_content={"error": code, "message": message, **extra},
-        token_usage=None,
-    )
-
-
-def _section_leaf_fn(profile: str) -> Optional[str]:
-    """Exposed name of the section-reader leaf, or ``None`` when the profile
-    disabled it (so the envelope never points at a function that is gone).
-
-    Unlike :func:`_exec_shell_fn` this fails OPEN when the registry cannot be
-    consulted (early boot, unit tests): the reader ships in this very group, so
-    whenever search is running it is registered, and only an explicit per-leaf
-    disable — which needs a registry — can take it away.
-    """
-    try:
-        from app.tools.registry import get_tool_registry
-
-        payload = get_tool_registry().leaves_for_profile(profile, _TOOL_ID)
-    except Exception:  # noqa: BLE001 - registry unavailable / group unregistered
-        return SECTION_LEAF_FN
-    for leaf in payload.get("leaves", []):
-        if leaf.get("leaf_name") == SECTION_LEAF_NAME:
-            return SECTION_LEAF_FN if leaf.get("enabled") else None
-    return SECTION_LEAF_FN
-
-
-def _exec_shell_fn(profile: str) -> Optional[str]:
-    """Exposed function name of the exec_shell run-command leaf, or ``None`` when
-    it isn't callable for ``profile`` (so we never tell the model to run a command
-    it can't).
-
-    exec_shell is ``locked`` (its group can't be disabled), but registration can
-    fail (leaving a stub group with no real leaf) and the per-leaf API path can
-    disable the ``exec_shell`` leaf — both are reflected by
-    ``leaves_for_profile``'s per-leaf ``enabled`` flags. Lazy imports avoid a
-    builtin<->registry cycle and make the registry easy to monkeypatch in tests;
-    any failure (registry not initialized in unit tests / early boot) degrades to
-    ``None`` silently. The name is derived via ``make_leaf_name`` — the same way
-    the reasoning agent derives it — so a rename re-derives instead of drifting.
-    """
-    try:
-        from app.tools.base import make_leaf_name
-        from app.tools.registry import get_tool_registry
-
-        registry = get_tool_registry()
-        payload = registry.leaves_for_profile(profile, "exec_shell")
-    except Exception:  # noqa: BLE001 - registry unavailable / group unregistered
+    if raw is None or raw == {}:
         return None
-    leaf_enabled = any(
-        leaf.get("leaf_name") == "exec_shell" and leaf.get("enabled")
-        for leaf in payload.get("leaves", [])
-    )
-    if not leaf_enabled:
-        return None
-    return make_leaf_name("exec_shell", "exec_shell")
+    if not isinstance(raw, dict):
+        raise InvalidRequest(f"`{name}` must be a filters object.")
+    parse_filters(raw)
+    return dict(raw)
 
 
-def _no_result(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResult:
-    return BuiltInToolResult(
-        structured_content={
-            "message": NO_RESULT_MESSAGE,
-            "relevant": False,
-        },
-        token_usage=token_usage,
-    )
+def _research_error(err: Any) -> LeafResult:
+    from app.documents.query import render as R
+
+    kind = {
+        "JobNotFound": "not_found",
+        "InvalidRequest": "invalid",
+        "DocumentsUnavailable": "unavailable",
+        "ResearchBusy": "busy",
+    }.get(getattr(err, "code", ""), "invalid")
+    text = ""
+    if kind == "unavailable":
+        text = R.render_status(err.message, code=err.extra.get("status_code") or err.extra.get("status"))
+    return LeafResult(text=text, error=err.to_dict(), error_kind=kind)
 
 
-def _judge_unavailable(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResult:
-    """Distinct result for when the relevance judge LLM *errored* (as opposed to a
-    genuine no-match). Carries ``error: True`` so the reasoning agent treats it as
-    a transient/config failure to surface or retry — not as a definitive "no
-    documentation matched". Never returns a document body.
-    """
-    return BuiltInToolResult(
-        structured_content={
-            "message": (
-                "Documentation search is temporarily unavailable: the relevance "
-                "judge could not run (check the 'low' model group is compatible "
-                "with the active LLM provider auth method)."
-            ),
-            "relevant": False,
-            "error": True,
-        },
-        token_usage=token_usage,
-    )
+async def _research(profile: str, args: Dict[str, Any], *, context_id: Optional[str], variables: Dict[str, Any],
+                    budgeted: bool) -> LeafResult:
+    """Start, poll, answer, cancel or page a research job, then render it.
 
+    Every wait is on the job's own completion event (``wait_job``), never on
+    its task, so this call timing out or being cancelled never stops the
+    job; it keeps running and the next call (or the delivery turn) picks it
+    up."""
+    from app.documents.query import FilterError
+    from app.documents.research import jobs
+    from app.documents.research.context import ResearchSpec
+    from app.documents.research.errors import InvalidRequest, ResearchError
+    from app.documents.research.types import ACTIVE, DOMAIN_GENERAL, MODE_ANALYZE
+    from app.utils.task_context import current_task_id_var
 
-async def _select_best_candidate(
-    *,
-    llm,
-    query: str,
-    candidates: List[Dict[str, Any]],
-    log_label: str = "documentation_search",
-    mode: str = "unknown",
-) -> Tuple[Optional[int], Dict[str, int], bool]:
-    """Run the LLM judge over ``candidates`` and return ``(index, token_usage,
-    errored)``.
-
-    The judge MUST decide by calling one of two function tools:
-    ``select_document(index)`` or ``no_relevant_result()``. The first element is
-    the chosen 0-based index, or ``None`` for no-match / parse-failure / LLM-error
-    cases (the caller turns ``None`` into the standard "no relevant result found"
-    response). The second element is the four-way token usage the judge call
-    consumed — captured off the terminal ``DONE`` chunk and returned in every case
-    (even no-match / error) so the caller can attribute the cost; all-zero when the
-    call errored before producing usage. The third element is ``True`` only when
-    the judge LLM call itself *errored* (e.g. the configured judge model is
-    incompatible with the provider's auth method) — as opposed to a legitimate
-    no-match — so the caller can tell a broken judge apart from "no doc matched"
-    instead of reporting both as the same "no relevant result found".
-
-    ``mode`` is the retrieval path the candidates came from (``vector`` or a
-    fallback); it only rides the summary log line.
-    """
-    judge_tools = _build_judge_tools(num_candidates=len(candidates))
-    user_message = _format_judge_prompt(query=query, candidates=candidates)
-    messages = [
-        {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
-    logger.debug(f"judge_tools: {judge_tools}")
-    logger.debug(f"user_message: {user_message}")
-    function_calls: List[Dict[str, Any]] = []
-    token_usage: Dict[str, int] = done_chunk_token_usage({})
-
-    # One always-on INFO summary per search, emitted at every return path below.
-    # Lets us tell a ranking miss (target doc never reached top-K) from a judge
-    # miss (target ranked but rejected) without dumping bodies or descriptions,
-    # and — via mode — a ranked search from a degraded full scan.
-    def _fmt_score(v: Any) -> str:
-        return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
-
-    ranked = ", ".join(
-        f"{c.get('name', '')}={_fmt_score(c.get('score'))}" for c in candidates
-    )
-
-    def _log(decision: str) -> None:
-        logger.info(
-            f"[{log_label}] query={query!r} ranked=[{ranked}] "
-            f"decision={decision} mode={mode}"
-        )
-
+    job_id = _str(args.get("continue_job"))
+    page = _int(args.get("page"), 1, 1, 10_000)
     try:
-        async for response in llm.chat_completion(
-            messages=messages,
-            tools=judge_tools,
-            tool_choice="auto",
-            # Relevance judging is a deterministic single-pick classification;
-            # sampling variance (temperature > 0) is pure downside here — it can
-            # flip a borderline-correct pick to no_relevant_result() on retry.
-            temperature=0,
-        ):
-            logger.debug(f"judge response: {response}")
-            rtype = response.get("type")
-            if rtype == ChatCompletionTypeEnum.FUNCTION_CALLING:
-                data = response.get("data")
-                if isinstance(data, dict) and data.get("function"):
-                    function_calls = data["function"]
-            elif rtype == ChatCompletionTypeEnum.DONE:
-                token_usage = done_chunk_token_usage(response)
-                break
-    except Exception:  # noqa: BLE001
-        logger.exception("[documentation_search] judge LLM call failed")
-        _log("error:judge-llm-failed")
-        return None, token_usage, True
-
-    if not function_calls:
-        logger.warning(
-            "[documentation_search] judge produced no tool call; "
-            "treating as no-match"
-        )
-        _log("no-match:no-tool-call")
-        return None, token_usage, False
-
-    call = function_calls[0]
-    name = call.get("name") or ""
-    args = call.get("arguments") or {}
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except (json.JSONDecodeError, TypeError):
-            args = {}
-
-    if name == _NO_MATCH_TOOL_NAME:
-        _log("no_relevant_result")
-        return None, token_usage, False
-
-    if name == _SELECT_TOOL_NAME:
-        raw_index = args.get("index") if isinstance(args, dict) else None
-        try:
-            idx = int(raw_index)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"[documentation_search] judge passed non-integer index: "
-                f"{raw_index!r}"
+        if job_id:
+            if args.get("cancel"):
+                view = await jobs.cancel_job(profile=profile, job_id=job_id)
+                if view.status in ACTIVE:
+                    view = await jobs.wait_job(profile=profile, job_id=job_id,
+                                               timeout=min(jobs.wait_cap(), CANCEL_WAIT_S))
+            else:
+                view = await jobs.continue_job(profile=profile, job_id=job_id, answers=_answers(args.get("answers")),
+                                               variables=variables, collect=True)
+                if view.status in ACTIVE:
+                    view = await jobs.wait_job(profile=profile, job_id=job_id, timeout=jobs.wait_cap(),
+                                               collect=True)
+        else:
+            if args.get("cancel"):
+                raise InvalidRequest("`cancel` needs `continue_job`: the id of the job to cancel.")
+            question = _str(args.get("question"))
+            if not question:
+                raise InvalidRequest("Pass `question` to start a research job, or `continue_job` with the id of "
+                                     "an earlier one.")
+            spec = ResearchSpec(
+                question=question,
+                mode=_str(args.get("mode")) or MODE_ANALYZE,
+                domain=_str(args.get("domain")) or DOMAIN_GENERAL,
+                scope=_scope(args.get("scope"), "scope"),
+                reference_scope=_scope(args.get("reference_scope"), "reference_scope"),
             )
-            _log(f"no-match:non-integer-index:{raw_index!r}")
-            return None, token_usage, False
-        if 0 <= idx < len(candidates):
-            _log(f"select:{candidates[idx].get('name', '')}[{idx}]")
-            return idx, token_usage, False
-        logger.warning(
-            f"[documentation_search] judge index {idx} out of range "
-            f"(have {len(candidates)} candidates)"
+            conversation_id = await _sync(jobs.resolve_conversation_id, profile, context_id) if context_id else None
+            # ``collect``: this call shows the outcome to the agent (and claims
+            # it), so the job must not also report it as an injected turn.
+            view = await jobs.start_job(profile=profile, spec=spec, conversation_id=conversation_id,
+                                        run_id=current_task_id_var.get(), variables=variables, collect=True)
+            if view.status in ACTIVE:
+                view = await jobs.wait_job(profile=profile, job_id=view.job_id, timeout=jobs.wait_cap(),
+                                           collect=True)
+    except ResearchError as err:
+        return _research_error(err)
+    except FilterError as exc:
+        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid")
+    return await _render_research(profile, view, page=page, budgeted=budgeted)
+
+
+async def _research_page(profile: str, args: Dict[str, Any], *, budgeted: bool) -> LeafResult:
+    """``read`` of ``research:<job id>``: a page of the job's dossier (or its
+    current state, when it is not settled yet)."""
+    from app.documents.research import jobs
+    from app.documents.research.errors import InvalidRequest, ResearchError
+
+    ref = str(args.get("file") or "").strip()
+    job_id = ref[len(RESEARCH_REF_PREFIX):].strip()
+    try:
+        if not job_id:
+            raise InvalidRequest("Name the job: file=\"research:<job id>\".")
+        view = await _sync(jobs.get_job, profile, job_id)
+    except ResearchError as err:
+        return _research_error(err)
+    return await _render_research(profile, view, page=_int(args.get("page"), 1, 1, 10_000), budgeted=budgeted)
+
+
+async def _index_db(profile: str) -> Any:
+    """The profile's index, for resolving the tokens a dossier prints; None
+    when it cannot be opened (the page is still shown, its tokens are then
+    not registered)."""
+    from app.documents.query import open_engine
+
+    try:
+        access = await asyncio.to_thread(open_engine, profile)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[documents] research: index not available for {profile}: {exc}")
+        return None
+    return access.engine.db if access.engine is not None else None
+
+
+async def _render_research(profile: str, view: Any, *, page: int, budgeted: bool) -> LeafResult:
+    from app.documents.research import jobs
+    from app.documents.research.render import render_job
+    from app.documents.research.types import FINAL, WAITING
+
+    db = await _index_db(profile)
+    rendered = await asyncio.to_thread(
+        lambda: render_job(view, ctx=render_context(profile, budgeted=budgeted), db=db, page=page))
+    if view.status in FINAL or view.status in WAITING:
+        # The caller is about to see this state: claim its delivery, so no
+        # extra turn is injected to present it again.
+        try:
+            await _sync(jobs.mark_collected, profile, view.job_id)
+        except Exception as exc:  # noqa: BLE001 — delivery bookkeeping never fails the answer
+            logger.warning(f"[documents] research: could not mark job {view.job_id} collected: {exc}")
+    return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files,
+                      token_usage=None)
+
+
+async def _tool_result(leaf: str, arguments: Dict[str, Any]) -> BuiltInToolResult:
+    profile = arguments.get("_profile") or "admin"
+    context_id = arguments.get("_context_id")
+    args = {k: v for k, v in arguments.items() if not k.startswith("_")}
+    try:
+        result = await execute(leaf, profile, args, llm=arguments.get("_llm"),
+                               variables=arguments.get("_variables") or {}, context_id=context_id)
+    except Exception as exc:  # noqa: BLE001 — a search failure is an observation, not a crash
+        logger.exception(f"[documents] {leaf} failed for {profile}")
+        return BuiltInToolResult(structured_content={
+            "error": "SearchFailed", "message": f"User document {leaf} failed: {exc}"})
+    if result.error is not None:
+        if result.error_kind == "unavailable":
+            return BuiltInToolResult(structured_content={**result.error, "text": result.text})
+        return BuiltInToolResult(structured_content=result.error)
+    if result.citations:
+        await _issue(profile, context_id, result.citations)
+    if result.files:
+        return BuiltInToolResult(
+            structured_content={"text": result.text, "_files": result.files},
+            token_usage=result.token_usage,
         )
-        _log(f"no-match:index-out-of-range:{idx}")
-        return None, token_usage, False
-
-    logger.warning(
-        f"[documentation_search] judge called unknown tool {name!r}; "
-        "treating as no-match"
-    )
-    _log(f"no-match:unknown-tool:{name!r}")
-    return None, token_usage, False
+    return BuiltInToolResult(content=[{"type": "text", "text": result.text}], token_usage=result.token_usage)
 
 
-def _build_judge_tools(*, num_candidates: int) -> List[Dict[str, Any]]:
-    """Construct the OpenAI-style function-calling schema for the judge.
+async def _issue(profile: str, context_id: Optional[str], citations: list[Any]) -> None:
+    """Register every printed token for this conversation, off the loop.
+    The registry never raises into a tool; this guards against it anyway."""
+    from app.documents import citations as registry
 
-    Two tools, mutually exclusive: ``select_document(index)`` for picking a
-    candidate by its 0-based index, and ``no_relevant_result()`` for the
-    no-match case. The ``index`` parameter is range-bounded to keep the
-    LLM honest.
-    """
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": _SELECT_TOOL_NAME,
-                "description": (
-                    "Select the candidate document that best answers the "
-                    "user's query."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "index": {
-                            "type": "integer",
-                            "description": (
-                                f"Zero-based index of the chosen candidate "
-                                f"(0 to {max(0, num_candidates - 1)})."
-                            ),
-                            "minimum": 0,
-                            "maximum": max(0, num_candidates - 1),
-                        },
-                    },
-                    "required": ["index"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": _NO_MATCH_TOOL_NAME,
-                "description": (
-                    "Call this when no candidate plausibly answers the "
-                    "user's query."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            },
-        },
-    ]
-
-
-def _judge_description(description: str) -> str:
-    """A candidate's description as the judge sees it: at most
-    :data:`DESCRIPTION_MAX_CHARS`, the same cap the embedder uses.
-
-    Bounds the judge prompt in fallback mode, where EVERY document is a
-    candidate and user-authored descriptions have no size limit of their own.
-    Bundled descriptions all fit (a test pins it), so this only ever trims a
-    profile's own over-long docs.
-    """
-    if len(description) <= DESCRIPTION_MAX_CHARS:
-        return description
-    return description[:DESCRIPTION_MAX_CHARS].rstrip() + "…"
-
-
-def _format_judge_prompt(*, query: str, candidates: List[Dict[str, Any]]) -> str:
-    """Render the judge's user prompt with the query and numbered candidates.
-
-    Bodies are intentionally NOT included -- the judge picks on name +
-    description only. Each description is capped by :func:`_judge_description`.
-    """
-    lines = [f"User query: {query}", "", "Candidates:"]
-    for i, cand in enumerate(candidates):
-        lines.append(f"[{i}] name: {cand.get('name', '')}")
-        lines.append(f"    description: {_judge_description(cand.get('description', ''))}")
-    lines.append("")
-    lines.append(
-        f"Decide by calling `{_SELECT_TOOL_NAME}` with the chosen index, "
-        f"or `{_NO_MATCH_TOOL_NAME}` if nothing is on-topic."
-    )
-    return "\n".join(lines)
+    try:
+        await asyncio.to_thread(registry.issue, profile, context_id, citations)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[documents] could not register {len(citations)} citation(s): {exc}")
 
 
 def get_tools(config: dict) -> list[BuiltInTool]:
-    """Return tool instances for this server: search, and the section reader."""
-    return [DocumentationSearchTool(), ReadDocumentationSectionTool()]
+    """The four leaves. Registering ``research`` is also what switches the
+    agent guidance to "legal/financial questions MUST go through research"."""
+    return [DocumentsFindFilesTool(), DocumentsSearchTool(), DocumentsReadTool(),
+            DocumentsResearchTool()]

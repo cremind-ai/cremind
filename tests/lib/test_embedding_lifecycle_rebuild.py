@@ -1,11 +1,11 @@
 """The embedding rebuild indexes documents while the state is still REBUILDING.
 
-``DocumentSyncService`` resolves its vector store and embedding model from the
+``CremindDocumentSyncService`` resolves its vector store and embedding model from the
 ``embedding_state`` singleton on every call, and only while that state is
 READY. ``apply_embedding_config`` drops the owned collections and calls
 ``_rebuild_caches`` BEFORE ``mark_ready()``, so without help the reconcile
 resolved to no store and silently indexed nothing into the collection it had
-just dropped: documentation search stayed degraded until the next restart.
+just dropped: Cremind documentation search stayed degraded until the next restart.
 ``_rebuild_caches`` now runs the reconcile inside ``service.pinned(...)`` with
 the handles it was given. These pin both halves: the rebuild indexes, and the
 pin never outlives the rebuild (a leaked override would keep the service on a
@@ -18,10 +18,10 @@ from pathlib import Path
 
 import pytest
 
-import app.documents as documents_pkg
+import app.cremind_documents as documents_pkg
 from app.config import embedding_state as embedding_state_module
 from app.config.embedding_state import EmbeddingStatus
-from app.documents.sync import COLLECTION_NAME, SHARED_SCOPE, DocumentSyncService
+from app.cremind_documents.sync import COLLECTION_NAME, SHARED_SCOPE, CremindDocumentSyncService
 from app.lib import embedding_lifecycle
 
 _DOC = '---\ndescription: "How to configure widgets."\n---\n\n# Widgets\n\nBody text.\n'
@@ -105,10 +105,10 @@ def _write(directory: Path, name: str) -> None:
     (directory / name).write_text(_DOC, encoding="utf-8")
 
 
-def _install_service(monkeypatch, tmp_path: Path) -> DocumentSyncService:
-    """A real service over ``tmp_path``, served by ``app.documents.get_service``
+def _install_service(monkeypatch, tmp_path: Path) -> CremindDocumentSyncService:
+    """A real service over ``tmp_path``, served by ``app.cremind_documents.get_service``
     (which ``_rebuild_caches`` imports inside the function, at call time)."""
-    service = DocumentSyncService(working_dir=tmp_path)
+    service = CremindDocumentSyncService(working_dir=tmp_path)
     monkeypatch.setattr(documents_pkg, "get_service", lambda: service)
     return service
 

@@ -116,7 +116,7 @@ export const SETTINGS_ITEM: NavItem = {
     'tools-skills-settings',
     'user-config-settings',
     'embedding-settings',
-    'user-documents-settings',
+    'documents-settings',
     'gsuite-settings',
     'backup-settings',
     'blueprint-settings',

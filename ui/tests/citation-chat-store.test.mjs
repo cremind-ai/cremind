@@ -37,8 +37,8 @@ window.navigator = globalThis.navigator
 const { createPinia, setActivePinia, useChatStore, useSettingsStore, useCitationsStore } =
   await load('tests/entries/citation-stores.ts')
 
-const A = '[ud:k7m2xq9a#3f9c2e1b]'
-const B = '[ud:p4r8st0v]'
+const A = '[doc:k7m2xq9a#3f9c2e1b]'
+const B = '[doc:p4r8st0v]'
 
 const META = {
   v: 1,
@@ -162,18 +162,18 @@ test('tokens asked for in one tick go out as one request, once, scoped to the co
   settings.authToken = 'jwt-alice'
   settings.profileId = 'alice'
   const store = useCitationsStore()
-  env.route('/api/userdocs/citations/resolve', (_url, init) => {
+  env.route('/api/documentation-search/citations/resolve', (_url, init) => {
     const body = JSON.parse(init.body)
     return json({
       items: Object.fromEntries(body.tokens.map(token => [token, { ...META.items[0], token, status: 'verified_elsewhere' }])),
     })
   })
-  const before = env.callsTo('/api/userdocs/citations/resolve').length
+  const before = env.callsTo('/api/documentation-search/citations/resolve').length
 
   await Promise.all([store.ensure('c9', [A]), store.ensure('c9', [B, A])])
   await flush()
 
-  const calls = env.callsTo('/api/userdocs/citations/resolve').slice(before)
+  const calls = env.callsTo('/api/documentation-search/citations/resolve').slice(before)
   assert.equal(calls.length, 1, 'one request for both bubbles')
   assert.deepEqual(JSON.parse(calls[0].init.body), { tokens: [A, B], conversation_id: 'c9' })
   assert.equal(calls[0].init.headers.Authorization, 'Bearer jwt-alice')
@@ -181,7 +181,7 @@ test('tokens asked for in one tick go out as one request, once, scoped to the co
   assert.equal(store.itemFor('c10', A), undefined, 'another conversation is another scope')
 
   await store.ensure('c9', [A, B])
-  assert.equal(env.callsTo('/api/userdocs/citations/resolve').length - before, 1, 'never asked twice')
+  assert.equal(env.callsTo('/api/documentation-search/citations/resolve').length - before, 1, 'never asked twice')
 })
 
 test("a profile switch cannot read the previous profile's answers", async () => {
@@ -190,7 +190,7 @@ test("a profile switch cannot read the previous profile's answers", async () => 
   settings.authToken = 'jwt-bob'
   settings.profileId = 'bob'
   const store = useCitationsStore()
-  env.route('/api/userdocs/citations/resolve', () => json({ items: { [A]: META.items[0] } }))
+  env.route('/api/documentation-search/citations/resolve', () => json({ items: { [A]: META.items[0] } }))
   await store.ensure('shared-id', [A])
   await until(() => store.itemFor('shared-id', A), 'bob resolved')
 

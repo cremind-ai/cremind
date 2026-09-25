@@ -16,8 +16,8 @@
  * embeddingStatus store picks the multiplexed source when a token is
  * present and falls back to the standalone stream otherwise.
  *
- * The `userdocs` topic (User Document Search progress) is consumed only on
- * chat routes; the userDocs store picks its own transport elsewhere.
+ * The `documents` topic (Documentation search progress) is consumed only on
+ * chat routes; the documents store picks its own transport elsewhere.
  */
 
 import type { ConversationSummary } from './conversationApi';
@@ -25,7 +25,7 @@ import type { EmbeddingStateSnapshot } from './embeddingStateStream';
 import type { ProcessRow } from './processApi';
 import type { EventNotificationEntry } from './skillEventsApi';
 import type { TlsTransition } from './configApi';
-import { isStaleSnapshot, type UserDocsSnapshot } from './userdocsApi';
+import { isStaleSnapshot, type DocumentsSnapshot } from './documentsApi';
 import {
   createSharedStream,
   credentialFreeAuthScope,
@@ -50,7 +50,7 @@ type SettingsCallback = (e: { ts: number }) => void;
 type ProcessesCallback = (rows: ProcessRow[]) => void;
 type EmbeddingCallback = (snap: EmbeddingStateSnapshot) => void;
 type TransportCallback = (transition: TlsTransition) => void;
-type UserDocsCallback = (snap: UserDocsSnapshot) => void;
+type DocumentsCallback = (snap: DocumentsSnapshot) => void;
 
 interface NotifFrame { event: 'notification'; data: EventNotificationEntry; }
 interface ConvsFrame { event: 'conversations-list'; data: ConversationsListSnapshot; }
@@ -63,7 +63,7 @@ interface ProcessesFrame { event: 'processes'; data: { processes?: ProcessRow[] 
 interface EmbeddingFrame { event: 'embedding-state'; data: EmbeddingStateSnapshot; }
 interface ReadyFrame { event: 'ready'; data: Record<string, never>; }
 interface TransportFrame { event: 'transport-change'; data: TlsTransition; }
-interface UserDocsFrame { event: 'userdocs'; data: UserDocsSnapshot; }
+interface DocumentsFrame { event: 'documentation_search'; data: DocumentsSnapshot; }
 type ProfileEventsFrame =
   | NotifFrame
   | ConvsFrame
@@ -72,7 +72,7 @@ type ProfileEventsFrame =
   | ProcessesFrame
   | EmbeddingFrame
   | TransportFrame
-  | UserDocsFrame
+  | DocumentsFrame
   | ReadyFrame;
 
 /**
@@ -100,7 +100,7 @@ interface Connection {
   processesSubs: Set<ProcessesCallback>;
   embeddingSubs: Set<EmbeddingCallback>;
   transportSubs: Set<TransportCallback>;
-  userDocsSubs: Set<UserDocsCallback>;
+  documentsSubs: Set<DocumentsCallback>;
   lastSnapshot: ConversationsListSnapshot | null;
   // Last folded-in snapshots, replayed to late subscribers so a component
   // mounting after connect renders immediately instead of waiting for the
@@ -108,7 +108,7 @@ interface Connection {
   lastProcesses: ProcessRow[] | null;
   lastEmbedding: EmbeddingStateSnapshot | null;
   lastTransport: TlsTransition | null;
-  lastUserDocs: UserDocsSnapshot | null;
+  lastDocuments: DocumentsSnapshot | null;
   // Whether at least one settings-state frame has been seen on this
   // connection — gates the synthetic late-subscriber ping (see
   // subscribeSettingsState).
@@ -204,8 +204,8 @@ function openProfileEventsRaw(
                 onEvent({ event: 'embedding-state', data: data as EmbeddingStateSnapshot });
               } else if (eventName === 'transport-change') {
                 onEvent({ event: 'transport-change', data: data as TlsTransition });
-              } else if (eventName === 'userdocs') {
-                onEvent({ event: 'userdocs', data: data as UserDocsSnapshot });
+              } else if (eventName === 'documentation_search') {
+                onEvent({ event: 'documentation_search', data: data as DocumentsSnapshot });
               } else if (eventName === 'ready') {
                 onEvent({ event: 'ready', data: {} });
               }
@@ -321,14 +321,14 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
     for (const cb of conn.transportSubs) {
       try { cb(frame.data); } catch (e) { console.warn('[profileEventsStream] transport sub threw', e); }
     }
-  } else if (frame.event === 'userdocs') {
+  } else if (frame.event === 'documentation_search') {
     // Followers of the shared stream receive the leader's buffered tail on
     // (re)election, so a frame can arrive twice or after a newer one; the
     // server's (boot, seq) says which is which.
-    if (isStaleSnapshot(conn.lastUserDocs, frame.data)) return;
-    conn.lastUserDocs = frame.data;
-    for (const cb of conn.userDocsSubs) {
-      try { cb(frame.data); } catch (e) { console.warn('[profileEventsStream] userdocs sub threw', e); }
+    if (isStaleSnapshot(conn.lastDocuments, frame.data)) return;
+    conn.lastDocuments = frame.data;
+    for (const cb of conn.documentsSubs) {
+      try { cb(frame.data); } catch (e) { console.warn('[profileEventsStream] documents sub threw', e); }
     }
   } else if (frame.event === 'ready') {
     // The replay phase of a (re)connect just ended. The backend replays the
@@ -375,12 +375,12 @@ function ensureConnection(
       processesSubs: new Set(),
       embeddingSubs: new Set(),
       transportSubs: new Set(),
-      userDocsSubs: new Set(),
+      documentsSubs: new Set(),
       lastSnapshot: null,
       lastProcesses: null,
       lastEmbedding: null,
       lastTransport: null,
-      lastUserDocs: null,
+      lastDocuments: null,
       settingsPinged: false,
       notifCursor: sinceMs,
       convBuffers: new Map(),
@@ -412,7 +412,7 @@ function maybeClose(key: string, conn: Connection) {
     || conn.processesSubs.size > 0
     || conn.embeddingSubs.size > 0
     || conn.transportSubs.size > 0
-    || conn.userDocsSubs.size > 0
+    || conn.documentsSubs.size > 0
   ) return;
   if (conn.shared) conn.shared.close();
   connections.delete(key);
@@ -594,28 +594,28 @@ export function subscribeTransportChange(
 }
 
 /**
- * User Document Search snapshots for this profile. Chat routes only — the
- * userDocs store streams or polls on every other page (see App.vue for why the
+ * Documentation search snapshots for this profile. Chat routes only — the
+ * documents store streams or polls on every other page (see App.vue for why the
  * multiplexed connection is not opened there). A late subscriber gets the last
  * frame at once; the server also sends one on every (re)connect.
  */
-export function subscribeUserDocs(
+export function subscribeDocuments(
   agentUrl: string,
   authToken: string,
-  onSnapshot: UserDocsCallback,
+  onSnapshot: DocumentsCallback,
 ): ProfileEventsSubHandle {
   // See subscribeSettingsState — seed the cursor at "now" so opening the
   // shared connection here never replays the notification buffer.
   const { conn, key } = ensureConnection(agentUrl, authToken, undefined, Date.now());
-  conn.userDocsSubs.add(onSnapshot);
-  if (conn.lastUserDocs) {
-    try { onSnapshot(conn.lastUserDocs); } catch (e) {
-      console.warn('[profileEventsStream] userdocs late-replay threw', e);
+  conn.documentsSubs.add(onSnapshot);
+  if (conn.lastDocuments) {
+    try { onSnapshot(conn.lastDocuments); } catch (e) {
+      console.warn('[profileEventsStream] documents late-replay threw', e);
     }
   }
   return {
     close() {
-      conn.userDocsSubs.delete(onSnapshot);
+      conn.documentsSubs.delete(onSnapshot);
       maybeClose(key, conn);
     },
   };

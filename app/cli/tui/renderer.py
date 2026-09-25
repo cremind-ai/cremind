@@ -19,7 +19,7 @@ from app.cli.client._sse import Event
 from app.cli.plan_render import plan_hint_lines, questions_lines, todos_lines
 # Dependency-free on purpose (the CLI must not import the server): the same
 # token grammar and numbering the web UI and the channels use.
-from app.userdocs.cite import parse_tokens
+from app.documents.cite import canonical_token, mentions_citation, parse_tokens
 
 
 # ── ANSI palette (256-color, matching the Go lipgloss palette) ───────────
@@ -85,11 +85,15 @@ class RenderedLine:
     body: str  # ANSI-styled string
 
 
-# ── User Document Search citations ───────────────────────────────────────
+# ── Documentation search citations ───────────────────────────────────────
 
 # What an unfinished citation can look like at the end of a streamed chunk:
-# "[", "[u", "[ud", "[ud:k7m2", "[ud:k7m2xq9a#3f", "[ud:a…; ud:b…".
-_PARTIAL_CITATION_RE = re.compile(r"[\[【]\s*(?:u(?:d(?:\s*:[\s0-9a-z#;,:]*)?)?)?", re.IGNORECASE)
+# "[", "[d", "[doc", "[doc:k7m2", "[doc:k7m2xq9a#3f", "[doc:a…; doc:b…" — and
+# the pre-rename "[u", "[ud:k7m2" spelling, which still parses.
+_PARTIAL_CITATION_RE = re.compile(
+    r"[\[【]\s*(?:d(?:o(?:c(?:\s*:[\s0-9a-z#;,:]*)?)?)?|u(?:d(?:\s*:[\s0-9a-z#;,:]*)?)?)?",
+    re.IGNORECASE,
+)
 _CITATION_STATUS_NOTE = {
     "removed": " (no longer available)",
     "unissued": " (unverified)",
@@ -98,10 +102,10 @@ _CITATION_STATUS_NOTE = {
 
 
 class CitationInlineFilter:
-    """Rewrites the answer's ``[ud:…]`` citation tokens to ``[1]``, ``[2]`` as
+    """Rewrites the answer's ``[doc:…]`` citation tokens to ``[1]``, ``[2]`` as
     the text streams in, and renders the turn's "Sources:" footer.
 
-    A token arrives split across stream chunks ("…see [ud:k7m2" + "xq9a#3f9c2e1b]"),
+    A token arrives split across stream chunks ("…see [doc:k7m2" + "xq9a#3f9c2e1b]"),
     so a chunk's tail that could still become a token is held back — at most
     :data:`HOLD_MAX` characters after the ``[``, so a stray bracket never stalls
     the text for long — and joined with the next chunk. Numbers follow first
@@ -143,7 +147,7 @@ class CitationInlineFilter:
         return i if _PARTIAL_CITATION_RE.fullmatch(tail) else len(buf)
 
     def _rewrite(self, text: str) -> str:
-        if not text or "ud:" not in text.lower():
+        if not mentions_citation(text):
             return text
         parsed = parse_tokens(text)
         groups: dict[tuple[int, int], list[str]] = {}
@@ -166,7 +170,8 @@ class CitationInlineFilter:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            n = self._numbers.get(str(item.get("token") or "")) or item.get("n")
+            raw = str(item.get("token") or "")
+            n = self._numbers.get(canonical_token(raw) or raw) or item.get("n")
             if not isinstance(n, int):
                 continue
             status = str(item.get("status") or "")
@@ -204,8 +209,7 @@ def format_event(
 ) -> Optional[RenderedLine]:
     """Translate one SSE event into a renderable line, or None to skip.
 
-    Mirrors `formatEvent` in events.go. ``citations`` rewrites User Document
-    Search tokens in the streamed answer and renders its "Sources:" footer.
+    Mirrors `formatEvent` in events.go. ``citations`` rewrites Documentation search tokens in the streamed answer and renders its "Sources:" footer.
     """
     data: dict[str, Any] = {}
     if isinstance(event.data, dict):

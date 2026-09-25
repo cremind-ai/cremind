@@ -31,7 +31,7 @@ from app.lib.exception import VectorStoreException
 from .base import VectorStoreBase, EmbeddingProvider, StoredPoint
 
 if TYPE_CHECKING:
-    from app.userdocs.vectors import VectorFilter
+    from app.documents.vectors import VectorFilter
 
 
 class QdrantException(VectorStoreException):
@@ -389,13 +389,13 @@ class QdrantClient(VectorStoreBase):
             out.append(payload)
         return out
 
-    # ── Pre-embedded primitives (User Document Search) ──────────────────────
+    # ── Pre-embedded primitives (Documentation search) ──────────────────────
     #
     # Contract in VectorStoreBase. These call the client directly rather than
     # through the tenacity ``_safe_*`` wrappers: those retry for up to ~6 s on
     # ANY error and then raise ``RetryError``, whose message no longer says
     # "No space left on device" — the one error the storage governor must see.
-    # The userdocs engine has its own backoff.
+    # The documents engine has its own backoff.
 
     @staticmethod
     def _err(e: Exception) -> QdrantException:

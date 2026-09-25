@@ -93,12 +93,12 @@ from app.system.shutdown_watch import (
     clear_stale_shutdown_request,
 )
 from app.constants import INTRODUCE_ASSISTANT
-from app.documents import (
-    DocumentSyncService,
-    set_service as set_document_service,
+from app.cremind_documents import (
+    CremindDocumentSyncService,
+    set_service as set_cremind_document_service,
 )
-from app.documents.sync import SHARED_SCOPE
-from app.documents.watcher import DocumentWatcher
+from app.cremind_documents.sync import SHARED_SCOPE
+from app.cremind_documents.watcher import CremindDocumentWatcher
 from app.lib.embedding import LocalEmbeddings
 from app.lib.llm.model_groups import ModelGroupManager
 from app.databases import create_database_provider, get_database_provider, set_database_provider
@@ -398,11 +398,11 @@ async def _do_shutdown() -> None:
     try:
         # First, and bounded: it kills extractor children and stops folder
         # watchers. Its threads are daemons, so a slow join only costs budget.
-        from app.userdocs.service import stop_service
+        from app.documents.service import stop_service
 
         await asyncio.to_thread(stop_service, 1.5)
     except Exception:  # noqa: BLE001
-        logger.exception("Error stopping User Document Search during shutdown")
+        logger.exception("Error stopping Documentation search during shutdown")
     try:
         from app.events import get_uploads_cleanup_manager
 
@@ -1565,31 +1565,31 @@ async def main(
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to run event-run boot recovery")
 
-            # 6b. Documentation Search
+            # 6b. Cremind Documentation Search
             #
             # The reconcile step embeds existing ``.md`` files; the watcher
             # picks up live edits. They're independent — the reconcile is
             # synchronous and the watcher arms after it returns.
-            document_service = None
+            cremind_document_service = None
             try:
                 # No handles passed on purpose: the service reads the live
                 # embedding model / vector store from ``embedding_state`` on
                 # every call, so a Settings toggle takes effect without a
                 # restart. ``embedding_state`` is already READY or DISABLED by
                 # the time we get here (step 3 above).
-                document_service = DocumentSyncService(
+                cremind_document_service = CremindDocumentSyncService(
                     working_dir=Path(BaseConfig.CREMIND_SYSTEM_DIR),
                 )
-                set_document_service(document_service)
+                set_cremind_document_service(cremind_document_service)
 
-                bundled_docs = Path(__file__).resolve().parent / "documents" / "bundled"
-                document_service.seed_shared_from_app(bundled_docs)
+                bundled_docs = Path(__file__).resolve().parent / "cremind_documents" / "bundled"
+                cremind_document_service.seed_shared_from_app(bundled_docs)
 
-                document_service.full_reconcile(SHARED_SCOPE)
-                DocumentWatcher(
+                cremind_document_service.full_reconcile(SHARED_SCOPE)
+                CremindDocumentWatcher(
                     scope=SHARED_SCOPE,
-                    directory=document_service.shared_dir(),
-                    sync_service=document_service,
+                    directory=cremind_document_service.shared_dir(),
+                    sync_service=cremind_document_service,
                 ).start()
 
                 # One-shot cleanup for upgraded installs: the retired `cli`
@@ -1597,23 +1597,23 @@ async def main(
                 # `cli` scope. They now live in the shared corpus above, so drop
                 # any leftover `cli`-scope points (the on-disk tree is removed by
                 # seed_shared_from_app).
-                document_service.prune_scope("cli")
+                cremind_document_service.prune_scope("cli")
 
                 for profile_name in known_profiles:
                     try:
-                        document_service.full_reconcile(profile_name)
+                        cremind_document_service.full_reconcile(profile_name)
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Document reconcile failed for profile '{profile_name}'")
                     try:
-                        DocumentWatcher(
+                        CremindDocumentWatcher(
                             scope=profile_name,
-                            directory=document_service.profile_dir(profile_name),
-                            sync_service=document_service,
+                            directory=cremind_document_service.profile_dir(profile_name),
+                            sync_service=cremind_document_service,
                         ).start()
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Document watcher failed for profile '{profile_name}'")
             except Exception:  # noqa: BLE001
-                logger.exception("Documentation Search subsystem failed to initialize")
+                logger.exception("Cremind Documentation Search subsystem failed to initialize")
 
             # 7. Single configured model (admin) + CremindAgent
             runner = None
@@ -1744,17 +1744,17 @@ async def main(
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start uploads cleanup manager")
 
-            # 7h. User Document Search. Starting it costs a few idle threads;
+            # 7h. Documentation search. Starting it costs a few idle threads;
             # every profile's runtime is decided by its own settings and the
             # admin gate, so it starts even when nobody uses the feature yet
             # (turning it on later must not need a restart). Its boot catch-up
             # runs on its own threads — never here, never on the event loop.
             try:
-                from app.userdocs.service import start_service
+                from app.documents.service import start_service
 
                 start_service()
             except Exception:  # noqa: BLE001
-                logger.exception("Failed to start User Document Search")
+                logger.exception("Failed to start Documentation search")
 
             # 8. Build the real agent executor and the post-setup callback.
             agent_executor = CremindAgentExecutor(
@@ -1793,16 +1793,16 @@ async def main(
                 except Exception:  # noqa: BLE001
                     logger.exception(f"Post-setup skill init failed for profile '{profile}'")
 
-                if document_service is not None:
+                if cremind_document_service is not None:
                     try:
-                        document_service.full_reconcile(profile)
+                        cremind_document_service.full_reconcile(profile)
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Post-setup document reconcile failed for profile '{profile}'")
                     try:
-                        DocumentWatcher(
+                        CremindDocumentWatcher(
                             scope=profile,
-                            directory=document_service.profile_dir(profile),
-                            sync_service=document_service,
+                            directory=cremind_document_service.profile_dir(profile),
+                            sync_service=cremind_document_service,
                         ).start()
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Post-setup document watcher failed for profile '{profile}'")
@@ -1849,7 +1849,7 @@ async def main(
             state.model_group_mgr = model_group_mgr
             state.cremind_agent = cremind_agent
             state.agent_executor = agent_executor
-            state.document_service = document_service
+            state.cremind_document_service = cremind_document_service
             state.embedding = embedding
             state.vector_store = vector_store
             state.on_first_setup = on_first_setup
@@ -1911,10 +1911,10 @@ async def main(
             #      background: rendering opens a profile's document index, which
             #      must never hold up boot.
             try:
-                from app.userdocs.research import jobs as research_jobs
+                from app.documents.research import jobs as research_jobs
 
                 research_jobs.spawn(
-                    research_jobs.boot_recover(), name="userdocs-research-boot",
+                    research_jobs.boot_recover(), name="documents-research-boot",
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start research job recovery")

@@ -14,7 +14,7 @@ import ResizableDivider from '../components/ResizableDivider.vue';
 import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
 import ConversationUsagePanel from '../components/ConversationUsagePanel.vue';
 import AgentActivityPanel from '../components/agent/AgentActivityPanel.vue';
-import ResearchActivityPanel from '../components/userdocs/ResearchActivityPanel.vue';
+import ResearchActivityPanel from '../components/documents/ResearchActivityPanel.vue';
 import PlanBanner from '../components/plan/PlanBanner.vue';
 import PlanApprovalDialog from '../components/plan/PlanApprovalDialog.vue';
 import AskUserQuestionDialog from '../components/plan/AskUserQuestionDialog.vue';

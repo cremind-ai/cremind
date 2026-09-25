@@ -9,7 +9,7 @@ prevent.
 Everything here is keyed by profile, so the other assertion that matters is that
 eviction is surgical: another profile's cached token must survive.
 
-The Drive half of User Document Search reads through the same link from its own
+The Drive half of Documentation search reads through the same link from its own
 threads, so an unlink also suspends it — for that profile only, and on every
 Google skill's unlink (the engine re-checks the token before resuming).
 """
@@ -25,7 +25,7 @@ import app.calendar.skill_token as calendar_token
 import app.drive.grant_flow as grant_flow
 import app.drive.skill_token as drive_token
 import app.google.unlink as U
-import app.userdocs.state as uds_state
+import app.documents.state as uds_state
 from app.google.registry import by_name
 
 

@@ -604,16 +604,16 @@ embeddings.
 > To instead have `helm uninstall` delete this volume automatically (so a
 > reinstall always starts clean), see [Uninstalling and removing data](#uninstalling-and-removing-data).
 
-## Sizing for User Document Search
+## Sizing for Documentation search
 
-By default User Document Search indexes the agent's working folder,
+By default Documentation search indexes the agent's working folder,
 `/root/Documents`, which is the `work` volume (plus Google Drive, when linked).
 Keep `persistence.work` enabled: without it the folder lives in the pod's
 filesystem and is gone after the next rollout. The feature's own data lands on
 two volumes.
 
 **The system volume** (`persistence.system`) holds the per-profile index
-(`storage/userdocs/`) and the local embedding models, which are downloaded on
+(`storage/documents/`) and the local embedding models, which are downloaded on
 first use (about 1 GB per model). The chart points `HF_HOME` and
 `SENTENCE_TRANSFORMERS_HOME` at `<cremind.systemDir>/.cache/`, so the models
 survive a rollout and move with a custom `systemDir`. The 5Gi default is enough
@@ -642,7 +642,7 @@ instead of finding out when a write fails. Nothing is passed for an external
 service, for persistence turned off or an `existingClaim` (their size is
 unknown to the chart), or when both vector subcharts are enabled. In those
 cases, state the sizes yourself with
-`cremind userdocs admin set --vector-capacity-mb <MB> --db-capacity-mb <MB>`.
+`cremind docs admin set --vector-capacity-mb <MB> --db-capacity-mb <MB>`.
 
 The StatefulSet claim sizes apply at the first install only: changing
 `postgresql.primary.persistence.size` or `qdrant.persistence.size` on an
@@ -664,7 +664,7 @@ existing release fails the upgrade, because a StatefulSet's
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. A `localhost` value sets the Google callback port for every flow; any other value with an explicit port sets it for Calendar connect and the Drive picker only ([Linking Google accounts](#linking-google-accounts)). Naming `cremind.apiPort` (1112) here is refused for those callbacks — that port is the pod's own loopback, never proxied — and the pod logs a warning at boot. An `APP_URL` in `cremind.extraEnv` overrides it. |
 | `cremind.ssl` | `""` | HTTP by default; boolean `false` or string `none` explicitly disables in-pod TLS, while boolean `true` selects `after-setup`. `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both switch the sidecar to an L4 passthrough relay and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
-| `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles; with User Document Search on, also its index and the local embedding models. **8Gi+ recommended for document search** — see [Sizing for User Document Search](#sizing-for-user-document-search). |
+| `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles; with Documentation search on, also its index and the local embedding models. **8Gi+ recommended for document search** — see [Sizing for Documentation search](#sizing-for-user-document-search). |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
 | `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |

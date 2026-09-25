@@ -31,7 +31,7 @@ class BootedState:
     model_group_mgr: Any = None
     cremind_agent: Any = None
     agent_executor: Any = None
-    document_service: Any = None
+    cremind_document_service: Any = None
     embedding: Any = None
     vector_store: Any = None
     on_first_setup: Optional[Callable[[str], Awaitable[None]]] = None
@@ -56,7 +56,7 @@ class BootedState:
         self.model_group_mgr = None
         self.cremind_agent = None
         self.agent_executor = None
-        self.document_service = None
+        self.cremind_document_service = None
         self.embedding = None
         self.vector_store = None
         self.on_first_setup = None

@@ -44,7 +44,7 @@ import type { InstallCatalog } from '../../services/installCatalogApi';
  *   nothing to rebuild yet.
  * - `after-enable` (scoped: `{ enabled }`) — right after the enable switch,
  *   rendered whether or not embedding is enabled. Only Settings fills it, with
- *   the User Document Search admin gate, which saves on its own and so must
+ *   the Documentation search admin gate, which saves on its own and so must
  *   not ride the wizard's setup payload.
  *
  * Note for hosts: slot content is compiled in the *parent's* scope, so a host
@@ -258,7 +258,7 @@ onMounted(() => {
         </slot>
       </ElFormItem>
 
-      <!-- Settings puts the User Document Search admin gate here. Outside the
+      <!-- Settings puts the Documentation search admin gate here. Outside the
            ``form.enabled`` block on purpose: the gate stays visible (read-only)
            while embedding is off. The wizard leaves it empty. -->
       <slot name="after-enable" :enabled="form.enabled" />

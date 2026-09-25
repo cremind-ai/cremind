@@ -147,7 +147,7 @@ export async function fetchResearchActivity(
 }
 
 /**
- * Cancel a User Documents research job. The job acts on the caller's own
+ * Cancel a Documentation Search research job. The job acts on the caller's own
  * profile (the server takes it from the Bearer token). Resolves once the
  * server accepted the cancel; the panel settles when the `research_activity`
  * frame for the cancelled job arrives. Throws with the server's message when
@@ -157,7 +157,7 @@ export async function cancelResearchJob(
   agentUrl: string, authToken: string, jobId: string,
 ): Promise<void> {
   const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/userdocs/research/${encodeURIComponent(jobId)}/cancel`, {
+  const res = await fetch(`${base}/api/documentation-search/research/${encodeURIComponent(jobId)}/cancel`, {
     method: 'POST',
     headers: authHeaders(authToken),
   });

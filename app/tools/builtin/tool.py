@@ -160,7 +160,7 @@ class BuiltInToolGroup(Tool):
         variables: Dict[str, str],
     ) -> AsyncGenerator[ToolEvent, None]:
         # Refresh the child LLM (used by tools with an internal LLM step, e.g.
-        # image_understanding / documentation_search) so config changes apply.
+        # image_understanding / cremind_documentation_search) so config changes apply.
         self.refresh_llm(profile)
 
         yield ToolThinkingEvent()

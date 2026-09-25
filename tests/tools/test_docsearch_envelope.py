@@ -1,4 +1,4 @@
-"""documentation_search delivers a long document as a navigable envelope.
+"""cremind_documentation_search delivers a long document as a navigable envelope.
 
 The reasoning agent head-clips every tool result to the profile's
 ``tool_result.max_tokens``. A document longer than that used to arrive as its
@@ -22,11 +22,11 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from app.constants import ChatCompletionTypeEnum
-from app.documents.sections import rank_sections_for_query, split_sections
-from app.documents.sync import DESCRIPTION_MAX_CHARS
+from app.cremind_documents.sections import rank_sections_for_query, split_sections
+from app.cremind_documents.sync import DESCRIPTION_MAX_CHARS
 from app.utils.logger import logger
 
-import app.tools.builtin.documentation_search as ds
+import app.tools.builtin.cremind_documentation_search as ds
 
 
 # ── Fixtures and fakes ──────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ def _patch_registry(monkeypatch, *, exec_shell: bool = True, section_leaf: Any =
     def _leaves(profile: str, tool_id: str) -> Dict[str, Any]:
         if tool_id == "exec_shell":
             return {"leaves": [{"leaf_name": "exec_shell", "enabled": exec_shell}]}
-        if tool_id == "documentation_search":
+        if tool_id == "cremind_documentation_search":
             enabled = section_leaf.get(profile, True) if isinstance(section_leaf, dict) else section_leaf
             leaves = [{"leaf_name": ds.SEARCH_LEAF_NAME, "enabled": True}]
             if enabled is not None:
@@ -128,7 +128,7 @@ def _patch_registry(monkeypatch, *, exec_shell: bool = True, section_leaf: Any =
 
 
 def _search(query: str, *, profile: str = "admin", llm: Optional[_FakeLLM] = None):
-    return asyncio.run(ds.DocumentationSearchTool().run(
+    return asyncio.run(ds.CremindDocumentationSearchTool().run(
         {"query": query, "_llm": llm or _FakeLLM(), "_profile": profile}
     ))
 
@@ -457,7 +457,7 @@ def test_footer_says_the_reader_is_disabled_when_its_leaf_is_off(monkeypatch):
     footer = _footer(text)
     assert footer.startswith('[End of excerpt from "widgets guide".')
     assert "is disabled for this profile" in footer
-    assert f"cremind tools set-leaf documentation_search {ds.SECTION_LEAF_NAME}=true" in footer
+    assert f"cremind tools set-leaf cremind_documentation_search {ds.SECTION_LEAF_NAME}=true" in footer
     # Nowhere is the gone function offered as callable.
     assert ds.SECTION_LEAF_FN not in text
     assert "To read another section, call" not in text
@@ -611,7 +611,7 @@ def test_envelope_emits_an_info_summary(monkeypatch):
     lines = [m for m in messages if "envelope doc=" in m]
     assert len(lines) == 1, messages
     line = lines[0]
-    assert "[documentation_search] envelope doc='widgets guide' scope=shared" in line
+    assert "[cremind_documentation_search] envelope doc='widgets guide' scope=shared" in line
     assert f"body_tokens={_quarter(body)} budget=1400" in line
     assert "toc_entries=13" in line
     assert "matched=['`cremind widgets add`']" in line
@@ -945,17 +945,17 @@ def test_the_judge_never_receives_more_than_the_capped_description(monkeypatch):
 def test_leaf_function_names_match_make_leaf_name():
     from app.tools.base import make_leaf_name
 
-    assert make_leaf_name("documentation_search", ds.SECTION_LEAF_NAME) == ds.SECTION_LEAF_FN
-    assert make_leaf_name("documentation_search", "search_documentation") == ds.SEARCH_LEAF_FN
+    assert make_leaf_name("cremind_documentation_search", ds.SECTION_LEAF_NAME) == ds.SECTION_LEAF_FN
+    assert make_leaf_name("cremind_documentation_search", "search_documentation") == ds.SEARCH_LEAF_FN
 
 
 def test_the_group_exposes_both_leaves_under_the_pinned_names():
-    assert ds.TOOL_CONFIG["name"] == "documentation_search"
+    assert ds.TOOL_CONFIG["name"] == "cremind_documentation_search"
     assert [tool.name for tool in ds.get_tools({})] == [ds.SEARCH_LEAF_NAME, ds.SECTION_LEAF_NAME]
     # The search leaf's static description must NOT name the reader: a profile
     # can disable that leaf, and a model told to call it would get "Unknown
     # tool". The envelope footer names it — only when it is enabled.
-    assert f"`{ds.SECTION_LEAF_FN}`" not in ds.DocumentationSearchTool.description
+    assert f"`{ds.SECTION_LEAF_FN}`" not in ds.CremindDocumentationSearchTool.description
 
 
 def test_a_small_clamp_keeps_the_whole_cli_result_under_it(monkeypatch):

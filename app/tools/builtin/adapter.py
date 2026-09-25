@@ -298,7 +298,7 @@ class BuiltInToolAdapter:
         def _fold_result_usage(result: Any) -> None:
             """Fold a tool result's internal-LLM token usage into the running totals.
 
-            A built-in tool that makes its own LLM call (e.g. documentation_search's
+            A built-in tool that makes its own LLM call (e.g. cremind_documentation_search's
             judge, image_understanding's vision call) reports it on
             ``BuiltInToolResult.token_usage``; tools that make no LLM call leave it
             ``None`` and contribute nothing. The folded totals flow into the
@@ -358,7 +358,7 @@ class BuiltInToolAdapter:
                 tool_args["_context_id"] = context_id
 
                 # Hand the adapter's child LLM to the tool so an internal
-                # LLM-as-judge step (e.g. ``documentation_search`` picking the
+                # LLM-as-judge step (e.g. ``cremind_documentation_search`` picking the
                 # most accurate vector-search candidate) reuses the same
                 # configured provider/model as the routing pass instead of
                 # re-resolving from settings. Tools that don't need an LLM

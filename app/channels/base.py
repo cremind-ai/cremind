@@ -1809,15 +1809,15 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         pending_files: list[dict] = []
         seen_file_uris: set[str] = set()
         auto_files = self._auto_send_files_enabled()
-        # User Document Search citations. A platform shows plain text, so the
-        # answer's "[ud:…]" tokens go out as "[1]" markers plus a "Sources:"
+        # Documentation search citations. A platform shows plain text, so the
+        # answer's "[doc:…]" tokens go out as "[1]" markers plus a "Sources:"
         # footer. One renderer per turn: an interim reply and the final
         # answer are halves of one message and share one numbering (the web
         # UI's). A room's footer leaves out paths and links — other people
         # read it. Cheap for everything else: it returns at once when a text
-        # has no "ud:", and it never raises, so a reply is never lost to it.
+        # has no citation token, and it never raises, so a reply is never lost to it.
         try:
-            from app.userdocs.citations import CitationRenderer
+            from app.documents.citations import CitationRenderer
 
             citations: Any = CitationRenderer(
                 self.profile, conversation_id, include_paths=not target.is_group,

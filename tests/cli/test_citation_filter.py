@@ -1,7 +1,7 @@
 """The chat TUI's citation filter: "[1]" markers while the answer streams.
 
 The server streams the answer in arbitrary pieces, so a token routinely
-arrives split ("…see [ud:k7m2" + "xq9a#3f9c2e1b]"). The filter holds back a
+arrives split ("…see [doc:k7m2" + "xq9a#3f9c2e1b]"). The filter holds back a
 tail that could still become a token — never more than 32 characters after
 the bracket, so a stray "[" does not stall the text — rewrites whole tokens to
 the same numbers the server and web UI use, and prints the "Sources:" footer
@@ -14,10 +14,10 @@ import re
 
 from app.cli.client._sse import Event
 from app.cli.tui.renderer import CitationInlineFilter, format_event, monochrome_theme
-from app.userdocs.cite import number_tokens
+from app.documents.cite import number_tokens
 
-T1 = "[ud:k7m2xq9a#3f9c2e1b]"
-T2 = "[ud:p4n8wr2c]"
+T1 = "[doc:k7m2xq9a#3f9c2e1b]"
+T2 = "[doc:p4n8wr2c]"
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -31,7 +31,7 @@ def _feed_all(f: CitationInlineFilter, pieces) -> str:
 
 def test_a_token_split_across_chunks_is_held_and_rewritten():
     f = CitationInlineFilter()
-    assert f.feed("Courts decide [ud:k7m2") == "Courts decide "
+    assert f.feed("Courts decide [doc:k7m2") == "Courts decide "
     assert f.feed("xq9a#3f9c") == ""
     assert f.feed("2e1b]. Next") == "[1]. Next"
 
@@ -62,13 +62,13 @@ def test_ordinary_brackets_are_not_held():
     assert f.feed("x]") == "[x]"            # …and was not
     # Never more than 32 characters are held after a bracket.
     f = CitationInlineFilter()
-    out = f.feed("[ud:" + "a" * 40)
-    assert out == "[ud:" + "a" * 40
+    out = f.feed("[doc:" + "a" * 40)
+    assert out == "[doc:" + "a" * 40
 
 
 def test_tolerant_forms_are_rewritten():
     f = CitationInlineFilter()
-    out = _feed_all(f, ["Both 【ud: K7M2XQ9A#3F9C", "2E1B】 and [ud:k7m2xq9a#3f9c2e1b; ud:p4n8wr2c]"])
+    out = _feed_all(f, ["Both 【doc: K7M2XQ9A#3F9C", "2E1B】 and [doc:k7m2xq9a#3f9c2e1b; doc:p4n8wr2c]"])
     assert out == "Both [1] and [1][2]"
 
 
@@ -76,7 +76,7 @@ def test_format_event_streams_then_prints_the_sources_footer():
     theme = monochrome_theme()
     f = CitationInlineFilter()
     lines = [
-        format_event(_ev("text", {"token": "Courts decide [ud:k7m2"}), theme, f),
+        format_event(_ev("text", {"token": "Courts decide [doc:k7m2"}), theme, f),
         format_event(_ev("text", {"token": "xq9a#3f9c2e1b] and "}), theme, f),
         format_event(_ev("text", {"token": f"{T2}."}), theme, f),
         format_event(_ev("citations", {"assistant_id": "m1", "citations": {"v": 1, "unverified": 1, "items": [

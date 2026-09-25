@@ -2,7 +2,7 @@
 
 Those tools report no ``token_usage`` on their result, so the adapter folds zero and
 the reasoning agent records nothing for them — their cost/tokens are surfaced only in
-the Agent Activity panel. Ordinary internal-LLM tools (documentation_search, image
+the Agent Activity panel. Ordinary internal-LLM tools (cremind_documentation_search, image
 understanding) still fold their usage into a ``source_kind="tool"`` record with the
 parent model.
 """
@@ -52,7 +52,7 @@ def test_ordinary_tool_usage_is_recorded():
     the parent model — only claude_code/codex are excluded."""
     agent = _FakeAgent()
     inner = types.SimpleNamespace(provider_name="github-copilot", model_name="gpt-4.1")
-    tool = _tool(ToolType.BUILTIN, "documentation_search", "documentation_search", inner=inner)
+    tool = _tool(ToolType.BUILTIN, "cremind_documentation_search", "cremind_documentation_search", inner=inner)
     agent._record_tool_usage(tool, {
         "input_tokens": 200, "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0, "output_tokens": 6,

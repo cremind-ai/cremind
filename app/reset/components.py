@@ -30,10 +30,11 @@ COMPONENTS: tuple[str, ...] = (
     "oauth_tokens",
     "tool_configs",
     "skills",
-    "documents",
-    # User Document Search: the index of the user's own files (and its
+    # Cremind documentation this profile authored (and its embeddings).
+    "cremind_documents",
+    # Documentation search: the index of the user's own files (and its
     # settings, captions, quota, research jobs). Never the files themselves.
-    "user_documents",
+    "documentation_search",
     "browser_login",
     "app_settings",
 )

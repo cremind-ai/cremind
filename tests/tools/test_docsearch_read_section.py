@@ -1,4 +1,4 @@
-"""The ``read_documentation_section`` leaf of Documentation Search.
+"""The ``read_documentation_section`` leaf of Cremind Documentation Search.
 
 ``run_read_section`` returns one section of a document looked up BY NAME in the
 caller's own ``[shared, profile]`` scopes — no embedding, no judge. These pin:
@@ -27,9 +27,9 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-import app.tools.builtin.documentation_search as ds
-from app.documents.sections import section_text, split_sections
-from app.documents.sync import DocumentSyncService
+import app.tools.builtin.cremind_documentation_search as ds
+from app.cremind_documents.sections import section_text, split_sections
+from app.cremind_documents.sync import CremindDocumentSyncService
 from app.tools.base import ToolResultEvent
 
 
@@ -163,8 +163,8 @@ def _deterministic(monkeypatch):
 
 
 @pytest.fixture
-def svc(tmp_path, monkeypatch) -> DocumentSyncService:
-    service = DocumentSyncService(working_dir=tmp_path)
+def svc(tmp_path, monkeypatch) -> CremindDocumentSyncService:
+    service = CremindDocumentSyncService(working_dir=tmp_path)
     monkeypatch.setattr(ds, "get_service", lambda: service)
     return service
 

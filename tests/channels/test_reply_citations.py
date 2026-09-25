@@ -1,7 +1,7 @@
 """Citations on a messaging platform: "[1]" markers and a "Sources:" footer.
 
 A platform cannot render the web UI's chips, so the reply forwarder rewrites
-the answer's ``[ud:…]`` tokens. What is pinned:
+the answer's ``[doc:…]`` tokens. What is pinned:
 
 - **one numbering per turn**: an interim reply sent at a flow break and the
   final answer are halves of one message, so "[1]" means the same source in
@@ -26,9 +26,9 @@ pytest.importorskip("a2a")
 
 import app.channels.base as base_mod  # noqa: E402
 from app.channels.base import BaseChannelAdapter  # noqa: E402
-from app.userdocs import citations as cit  # noqa: E402
-from app.userdocs.cite import number_tokens  # noqa: E402
-from tests.userdocs._citations_env import build, close  # noqa: E402
+from app.documents import citations as cit  # noqa: E402
+from app.documents.cite import number_tokens  # noqa: E402
+from tests.documents._citations_env import build, close  # noqa: E402
 
 
 class _Bus:
@@ -114,7 +114,7 @@ def test_interim_and_final_share_one_numbering(env, monkeypatch):
 def test_steps_name_the_source_instead_of_a_token(env, monkeypatch):
     events = [
         {"seq": 1, "type": "thinking", "data": {
-            "Step": 1, "Thought": "Search the law.", "Action": "user_documents__search",
+            "Step": 1, "Thought": "Search the law.", "Action": "documentation_search__search",
             "Action_Input": "{}",
         }},
         {"seq": 2, "type": "result", "data": {"Observation": [
@@ -125,7 +125,7 @@ def test_steps_name_the_source_instead_of_a_token(env, monkeypatch):
     ]
     sent = _forward(monkeypatch, events, response_mode="detail")
     step = next(s for s in sent if s.startswith("*Step 1*"))
-    assert "[luat-dat-dai.pdf · p. 1]" in step and "ud:" not in step
+    assert "[luat-dat-dai.pdf · p. 1]" in step and "doc:" not in step
     assert sent[-1].endswith("[1] luat-dat-dai.pdf · p. 1 · Luat")
 
 
@@ -145,7 +145,7 @@ def test_a_rendering_failure_never_drops_the_reply(env, monkeypatch):
 
 
 def test_unverifiable_sources_say_so(env, monkeypatch):
-    answer = f"Invented [ud:zzzzzzzz]. Real {env.t1}. Guessed [ud:{env.law['cite_id']}]."
+    answer = f"Invented [doc:zzzzzzzz]. Real {env.t1}. Guessed [doc:{env.law['cite_id']}]."
     sent = _forward(monkeypatch, [_text(1, answer), {"seq": 2, **_COMPLETE}])
     assert sent == [
         "Invented [1]. Real [2]. Guessed [3].\n\n"

@@ -44,8 +44,8 @@ from app.storage.models import (  # noqa: E402
     ScheduleEventSubscriptionModel,
     SkillEventSubscriptionModel,
     UsageRecordModel,
-    UserDocCitationModel,
-    UserDocResearchJobModel,
+    DocumentCitationModel,
+    DocumentResearchJobModel,
 )
 
 _TABLES = (
@@ -60,8 +60,8 @@ _TABLES = (
     "schedule_event_subscriptions",
     "event_runs",
     "channel_groups",
-    "userdoc_citations",
-    "userdoc_research_jobs",
+    "document_citations",
+    "document_research_jobs",
 )
 
 # Every table that FK-references conversations.id — the rename must move all of
@@ -78,8 +78,8 @@ _CHILD_MODELS = (
     ScheduleEventSubscriptionModel,
     EventRunModel,
     ChannelGroupModel,
-    UserDocCitationModel,
-    UserDocResearchJobModel,
+    DocumentCitationModel,
+    DocumentResearchJobModel,
 )
 
 _OLD = "c1-old"
@@ -153,15 +153,15 @@ async def _seed(store: ConversationStorage) -> None:
             discovered_via="message", conversation_id=_OLD,
             created_at=now, updated_at=now,
         ))
-        # A citation the conversation's tools issued (User Document Search).
-        s.add(UserDocCitationModel(
+        # A citation the conversation's tools issued (Documentation search).
+        s.add(DocumentCitationModel(
             id="udc1", profile="admin", conversation_id=_OLD,
-            token="[ud:k7m2xq9a]", cite_id="k7m2xq9a", target="file",
+            token="[doc:k7m2xq9a]", cite_id="k7m2xq9a", target="file",
             source_kind="local", label="", rel_path="a.txt", snippet="",
             leaf="search", issued_at=now,
         ))
-        # A research job the conversation started (User Document Search).
-        s.add(UserDocResearchJobModel(
+        # A research job the conversation started (Documentation search).
+        s.add(DocumentResearchJobModel(
             id="job1", profile="admin", conversation_id=_OLD, status="complete",
             mode="analyze", domain="general", question="q", created_at=now, updated_at=now,
         ))

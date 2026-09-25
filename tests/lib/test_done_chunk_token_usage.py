@@ -2,7 +2,7 @@
 
 The single place that names the four token fields carried on a provider's
 terminal ``DONE`` chunk. Direct ``chat_completion`` consumers (the skill-event
-gate, the documentation_search judge, image_understanding) read usage through it.
+gate, the cremind_documentation_search judge, image_understanding) read usage through it.
 """
 
 from __future__ import annotations

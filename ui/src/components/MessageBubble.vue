@@ -91,9 +91,9 @@ const modeMeta = computed(() =>
   props.message.mode ? chatModeMeta(props.message.mode) : null,
 );
 
-// ── User Documents citations ────────────────────────────────────────────────
+// ── Documentation Search citations ────────────────────────────────────────────────
 // An answer that cites the user's files carries tokens like
-// "[ud:k7m2xq9a#3f9c2e1b]". They render as numbered chips (utils/citations.ts);
+// "[doc:k7m2xq9a#3f9c2e1b]". They render as numbered chips (utils/citations.ts);
 // hovering one previews the source, clicking opens it in the viewer, and a
 // "Sources" list follows the text. The verified items come with the message
 // (metadata / the live `citations` frame) or, for answers saved without them,
@@ -185,7 +185,7 @@ const schedulePreviewHide = () => {
 onBeforeUnmount(cancelPreviewHide);
 
 const chipFrom = (target: EventTarget | null): HTMLElement | null => {
-  const el = target instanceof Element ? target.closest('button.ud-cite') : null;
+  const el = target instanceof Element ? target.closest('button.doc-cite') : null;
   return el instanceof HTMLElement && contentEl.value?.contains(el) ? el : null;
 };
 const onContentPointerOver = (e: Event) => {
@@ -580,32 +580,32 @@ watch(
         virtual-triggering
         placement="top"
         :width="340"
-        popper-class="ud-cite-popover"
+        popper-class="doc-cite-popover"
       >
         <div
           v-if="previewShown"
-          class="ud-cite-preview"
+          class="doc-cite-preview"
           @mouseenter="cancelPreviewHide"
           @mouseleave="schedulePreviewHide"
         >
-          <div class="ud-cite-preview-head">
-            <span class="ud-cite-preview-n" :class="`tone-${previewStatus.tone}`">{{ previewShown.n }}</span>
-            <span class="ud-cite-preview-name">
+          <div class="doc-cite-preview-head">
+            <span class="doc-cite-preview-n" :class="`tone-${previewStatus.tone}`">{{ previewShown.n }}</span>
+            <span class="doc-cite-preview-name">
               {{ previewItem?.file?.name || previewItem?.file?.rel_path || 'Source' }}
             </span>
-            <span v-if="previewItem?.locator_label" class="ud-cite-preview-loc">
+            <span v-if="previewItem?.locator_label" class="doc-cite-preview-loc">
               {{ previewItem.locator_label }}
             </span>
           </div>
-          <p v-if="previewSnippet" class="ud-cite-preview-snippet">{{ previewSnippet }}</p>
-          <div class="ud-cite-preview-status" :class="`tone-${previewStatus.tone}`">
+          <p v-if="previewSnippet" class="doc-cite-preview-snippet">{{ previewSnippet }}</p>
+          <div class="doc-cite-preview-status" :class="`tone-${previewStatus.tone}`">
             <strong>{{ previewStatus.label }}</strong>
             <span v-if="previewStatus.note"> — {{ previewStatus.note }}</span>
           </div>
-          <div v-if="previewStatus.quoteNote" class="ud-cite-preview-status tone-danger">
+          <div v-if="previewStatus.quoteNote" class="doc-cite-preview-status tone-danger">
             <strong>Quote mismatch</strong> — {{ previewStatus.quoteNote }}
           </div>
-          <button type="button" class="ud-cite-preview-open" @click="openCitation(previewShown.token)">
+          <button type="button" class="doc-cite-preview-open" @click="openCitation(previewShown.token)">
             <Icon icon="mdi:open-in-app" /> Open source
           </button>
         </div>
@@ -1234,7 +1234,7 @@ watch(
 /* ── Citation chips (rendered by utils/citations.ts inside the v-html) ──
    Colours come from the app's tokens, mixed down: Element Plus's tag/button
    colour variants would render their light theme in dark mode. */
-.message-content :deep(.ud-cite) {
+.message-content :deep(.doc-cite) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1254,34 +1254,34 @@ watch(
   cursor: pointer;
   transition: background 0.12s ease;
 }
-.message-content :deep(.ud-cite:hover),
-.message-content :deep(.ud-cite:focus-visible) {
+.message-content :deep(.doc-cite:hover),
+.message-content :deep(.doc-cite:focus-visible) {
   outline: none;
   background: color-mix(in srgb, var(--primary-color) 24%, transparent);
 }
 /* Not verified yet (streaming, or resolving). */
-.message-content :deep(.ud-cite[data-status="pending"]) {
+.message-content :deep(.doc-cite[data-status="pending"]) {
   border-color: color-mix(in srgb, var(--text-secondary) 30%, transparent);
   background: color-mix(in srgb, var(--text-secondary) 10%, transparent);
   color: var(--text-secondary);
 }
 /* Unverified, or the file changed since: readable, but flagged. */
-.message-content :deep(.ud-cite[data-status="unissued"]),
-.message-content :deep(.ud-cite[data-status="stale"]) {
+.message-content :deep(.doc-cite[data-status="unissued"]),
+.message-content :deep(.doc-cite[data-status="stale"]) {
   border-color: color-mix(in srgb, var(--warning-color) 50%, transparent);
   background: color-mix(in srgb, var(--warning-color) 16%, transparent);
   color: var(--warning-color);
 }
 /* Points at nothing (any more). */
-.message-content :deep(.ud-cite[data-status="removed"]),
-.message-content :deep(.ud-cite[data-status="invalid"]) {
+.message-content :deep(.doc-cite[data-status="removed"]),
+.message-content :deep(.doc-cite[data-status="invalid"]) {
   border-color: color-mix(in srgb, var(--text-tertiary) 35%, transparent);
   background: color-mix(in srgb, var(--text-tertiary) 10%, transparent);
   color: var(--text-tertiary);
   text-decoration: line-through;
 }
 /* The quoted words beside the token are not in the source. */
-.message-content :deep(.ud-cite[data-quote="mismatch"]) {
+.message-content :deep(.doc-cite[data-quote="mismatch"]) {
   box-shadow: 0 0 0 1.5px var(--danger-color);
 }
 </style>
@@ -1289,24 +1289,24 @@ watch(
 <!-- Non-scoped: the ElPopover's own wrapper (popper-class) is teleported to
      <body> and belongs to Element Plus, not to this component. -->
 <style>
-.ud-cite-popover.el-popover.el-popper {
+.doc-cite-popover.el-popover.el-popper {
   padding: 10px 12px;
 }
 
-.ud-cite-preview {
+.doc-cite-preview {
   display: flex;
   flex-direction: column;
   gap: 6px;
   font-size: 0.8rem;
   color: var(--text-primary);
 }
-.ud-cite-preview-head {
+.doc-cite-preview-head {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
-.ud-cite-preview-n {
+.doc-cite-preview-n {
   flex-shrink: 0;
   min-width: 18px;
   height: 18px;
@@ -1320,23 +1320,23 @@ watch(
   color: var(--primary-color);
   background: color-mix(in srgb, var(--primary-color) 14%, transparent);
 }
-.ud-cite-preview-n.tone-warn {
+.doc-cite-preview-n.tone-warn {
   color: var(--warning-color);
   background: color-mix(in srgb, var(--warning-color) 16%, transparent);
 }
-.ud-cite-preview-n.tone-gone,
-.ud-cite-preview-n.tone-pending {
+.doc-cite-preview-n.tone-gone,
+.doc-cite-preview-n.tone-pending {
   color: var(--text-secondary);
   background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
 }
-.ud-cite-preview-n.tone-gone { text-decoration: line-through; }
-.ud-cite-preview-name {
+.doc-cite-preview-n.tone-gone { text-decoration: line-through; }
+.doc-cite-preview-name {
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ud-cite-preview-loc {
+.doc-cite-preview-loc {
   flex-shrink: 0;
   margin-left: auto;
   padding: 0 6px;
@@ -1345,7 +1345,7 @@ watch(
   background: var(--surface-hover);
   color: var(--text-secondary);
 }
-.ud-cite-preview-snippet {
+.doc-cite-preview-snippet {
   margin: 0;
   padding: 6px 8px;
   border-left: 3px solid var(--border-color);
@@ -1356,15 +1356,15 @@ watch(
   word-break: break-word;
   color: var(--text-secondary);
 }
-.ud-cite-preview-status {
+.doc-cite-preview-status {
   font-size: 0.75rem;
   line-height: 1.35;
   color: var(--text-secondary);
 }
-.ud-cite-preview-status.tone-ok strong { color: var(--success-color); }
-.ud-cite-preview-status.tone-warn strong { color: var(--warning-color); }
-.ud-cite-preview-status.tone-danger strong { color: var(--danger-color); }
-.ud-cite-preview-open {
+.doc-cite-preview-status.tone-ok strong { color: var(--success-color); }
+.doc-cite-preview-status.tone-warn strong { color: var(--warning-color); }
+.doc-cite-preview-status.tone-danger strong { color: var(--danger-color); }
+.doc-cite-preview-open {
   align-self: flex-start;
   display: inline-flex;
   align-items: center;
@@ -1378,7 +1378,7 @@ watch(
   font-size: 0.75rem;
   cursor: pointer;
 }
-.ud-cite-preview-open:hover {
+.doc-cite-preview-open:hover {
   border-color: var(--primary-color);
   color: var(--primary-color);
 }

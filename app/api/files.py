@@ -49,9 +49,9 @@ from app.utils.working_directory import (
 # because there is one store per profile, they are created on demand, and the
 # same names appear both per profile and at the shared root -- there is no list
 # of live paths to enumerate, so the name is the rule. The set itself lives in
-# :mod:`app.utils.credential_paths` so User Document Search can share it.
+# :mod:`app.utils.credential_paths` so Documentation search can share it.
 from app.utils.credential_paths import CREDENTIAL_DIR_NAMES as _CREDENTIAL_DIR_NAMES  # noqa: E402
-from app.utils.credential_paths import is_userdocs_index_path  # noqa: E402
+from app.utils.credential_paths import is_documents_index_path  # noqa: E402
 
 # Directory names directly under a profile's own directory that only that
 # profile may reach through these routes: ``<system dir>/<profile>/<name>/...``.
@@ -94,10 +94,10 @@ def _is_other_profiles_private_path(target: str, profile: str | None) -> bool:
     return segments[0] != (profile or "")
 
 
-def _is_userdocs_index_path(target: str) -> bool:
-    """User Document Search's index store — every profile's indexed text —
-    is never served here, to anyone (see ``is_userdocs_index_path``)."""
-    return is_userdocs_index_path(target, BaseConfig.CREMIND_SYSTEM_DIR)
+def _is_documents_index_path(target: str) -> bool:
+    """Documentation search's index store — every profile's indexed text —
+    is never served here, to anyone (see ``is_documents_index_path``)."""
+    return is_documents_index_path(target, BaseConfig.CREMIND_SYSTEM_DIR)
 
 
 def _shared_credential_homes() -> tuple[str, ...]:
@@ -291,7 +291,7 @@ def _is_inside_allowed(
         return False
     if _is_other_profiles_private_path(target, profile):
         return False
-    if _is_userdocs_index_path(target):
+    if _is_documents_index_path(target):
         return False
     for base in _allowed_bases_for_conversation(context_key):
         if target == base or target.startswith(base + os.sep):
@@ -363,7 +363,7 @@ def _safe_resolve(relative_path: str, profile: str | None = None) -> str | None:
         return None
     if _is_other_profiles_private_path(target, profile):
         return None
-    if _is_userdocs_index_path(target):
+    if _is_documents_index_path(target):
         return None
     return target
 
@@ -511,7 +511,7 @@ async def _list_directory(request: Request):
                 # install browsing the user's home, is an ordinary entry here.
                 if de.name in _CREDENTIAL_DIR_NAMES or is_credential(
                     os.path.join(target, de.name)
-                ) or _is_userdocs_index_path(os.path.join(target, de.name)):
+                ) or _is_documents_index_path(os.path.join(target, de.name)):
                     continue
                 entries.append({
                     "name": de.name,

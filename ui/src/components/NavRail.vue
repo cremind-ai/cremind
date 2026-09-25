@@ -8,7 +8,7 @@ import { useChatStore } from '../stores/chat';
 import { useNotificationsStore } from '../stores/notifications';
 import AgentCard from './AgentCard.vue';
 import NotificationList from './NotificationList.vue';
-import UserDocsSyncChip from './userdocs/UserDocsSyncChip.vue';
+import DocumentsSyncChip from './documents/DocumentsSyncChip.vue';
 import { openNotificationsStream, type NotificationStreamHandle } from '../services/notificationsStream';
 import { NAV_ITEMS, SETTINGS_ITEM, type NavItem } from '../constants/navigation';
 
@@ -456,8 +456,8 @@ onBeforeUnmount(closeNotificationsStream);
         </ElPopover>
       </template>
 
-      <!-- User Document Search: only while it is indexing or needs the user. -->
-      <UserDocsSyncChip />
+      <!-- Documentation search: only while it is indexing or needs the user. -->
+      <DocumentsSyncChip />
 
       <ElTooltip
         :content="settingsStore.theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"

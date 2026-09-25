@@ -1425,7 +1425,7 @@ async function handleFinish() {
   if (embeddingFailed.value) {
     ElMessage.error(
       `Vector embedding failed to initialize: ${embeddingError.value ?? 'unknown error'}. ` +
-      'You can still proceed without semantic ranking: documentation search and long-term memory search keep working, and Google Places falls back to a small static type list.'
+      'You can still proceed without semantic ranking: Cremind documentation search and long-term memory search keep working, and Google Places falls back to a small static type list.'
     );
   }
 
@@ -2218,7 +2218,7 @@ async function downloadConfigFile(format: ExportFormat) {
             <p class="hint">
               You can still proceed — semantic ranking stays unavailable until
               you fix the backing service or disable Vector Embedding from
-              Settings. Documentation search and long-term memory search keep
+              Settings. Cremind documentation search and long-term memory search keep
               working without it, and Google Places falls back to a small
               static type list.
             </p>

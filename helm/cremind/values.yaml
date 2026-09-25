@@ -199,7 +199,7 @@ cremind:
 # Three volumes keep the pod's important data across restarts/reschedules:
 #   system: CREMIND_SYSTEM_DIR (/root/.cremind) — bootstrap.toml, tokens/,
 #           per-profile state (PERSONA.md, skills/, browser-profile/), backups.
-#           With User Document Search on, also its index (storage/userdocs/)
+#           With Documentation search on, also its index (storage/documents/)
 #           and the local embedding models (.cache/, about 1 GB per model):
 #           size it 8Gi or more for document search.
 #   venv:   /opt/cremind/venv — Python deps the Setup Wizard installs at runtime
@@ -445,8 +445,7 @@ postgresql:
       whenScaled: Retain
       whenDeleted: Retain
     # The data volume's size: the subchart's own default, stated here because
-    # the chart also hands it to the app (CREMIND_DB_CAPACITY) so User Document
-    # Search's storage governor knows how much room the database has. Pick it
+    # the chart also hands it to the app (CREMIND_DB_CAPACITY) so Documentation search's storage governor knows how much room the database has. Pick it
     # before the first install. A StatefulSet's claim template is immutable,
     # so changing this on an existing release fails the upgrade; grow the PVC
     # itself instead (needs a StorageClass with allowVolumeExpansion).
@@ -458,7 +457,7 @@ qdrant:
   enabled: false
   fullnameOverride: cremind-qdrant
   # The vector volume's size (the subchart's default), also handed to the app
-  # as CREMIND_VECTORSTORE_CAPACITY for User Document Search's storage
+  # as CREMIND_VECTORSTORE_CAPACITY for Documentation search's storage
   # governor. The same StatefulSet caveat as postgresql above applies: pick it
   # before the first install.
   persistence:

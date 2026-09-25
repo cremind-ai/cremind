@@ -55,7 +55,7 @@ function onUpdate(next: EmbeddingConfigPayload) {
         <div class="benefits-box">
           <strong>What enabling improves:</strong>
           <ul>
-            <li><strong>Documentation search</strong> ranks candidate documents by semantic similarity before the relevance judge reads them, instead of handing it the whole library.</li>
+            <li><strong>Cremind documentation search</strong> ranks candidate documents by semantic similarity before the relevance judge reads them, instead of handing it the whole library.</li>
             <li><strong>Long-term memory search</strong> returns the facts most relevant to the query, so the memory store can grow without every fact riding along.</li>
             <li><strong>Google Places</strong> filters 336 place types down to the most relevant for your query, reducing tokens.</li>
           </ul>
@@ -69,7 +69,7 @@ function onUpdate(next: EmbeddingConfigPayload) {
         <div class="field-hint">
           {{ enabled
             ? 'Configure the embedding model and vector store below.'
-            : 'Skip this step. Documentation search and long-term memory search keep working without semantic ranking; Google Places will use a small static type list.' }}
+            : 'Skip this step. Cremind documentation search and long-term memory search keep working without semantic ranking; Google Places will use a small static type list.' }}
         </div>
       </template>
     </EmbeddingConfigForm>

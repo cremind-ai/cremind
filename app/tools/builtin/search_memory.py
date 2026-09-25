@@ -83,8 +83,8 @@ class SearchMemoryTool(BuiltInTool):
         )
         if memory_vectorstore.vector_long_term_available(shim):
             # Off the event loop: this embeds the query synchronously, and the
-            # shared embedder serialises model calls behind a lock that a User
-            # Document Search batch may be holding.
+            # shared embedder serialises model calls behind a lock that a Documentation
+            # search batch may be holding.
             rows = await asyncio.to_thread(
                 memory_vectorstore.retrieve_long_term,
                 agent=shim, profile=profile, query_text=query, limit=_DEFAULT_LIMIT,

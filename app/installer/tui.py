@@ -1143,7 +1143,7 @@ def screen_vnc_password(state: TuiResult, ctx: "Context") -> ScreenResult:
 # ── documents folder (docker mode) ───────────────────────────────────────
 #
 # The host folder bind-mounted at /root/Documents: the agent's default working
-# folder and the root User Document Search indexes. Without the mount it lives
+# folder and the root Documentation search indexes. Without the mount it lives
 # on the container's writable layer and is lost when the container is
 # recreated. Kubernetes has its own answer (the chart's `persistence.work`
 # volume), so this is asked in docker mode only.

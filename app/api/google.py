@@ -171,10 +171,10 @@ def _drive_gone(profile: str, rows: List[Dict[str, Any]]) -> bool:
 
 
 def _purge_drive_index(profile: str) -> None:
-    """Delete the profile's Drive index for User Document Search. Queued on the
+    """Delete the profile's Drive index for Documentation search. Queued on the
     engine and never waited for; a no-op on a server without one."""
     try:
-        from app.userdocs import state as uds_state
+        from app.documents import state as uds_state
 
         if uds_state.request_purge(profile, "drive"):
             logger.info(f"[google] {profile}: gdrive unlinked, Drive index purge requested")

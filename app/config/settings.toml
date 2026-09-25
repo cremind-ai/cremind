@@ -30,10 +30,10 @@ ssl = false
 api_key = ""
 persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/storage/chroma when blank
 
-[userdocs]
-# User Document Search — the admin gate. Server-wide because the embedding
+[documentation_search]
+# Documentation search — the admin gate. Server-wide because the embedding
 # model and vector store are; each profile then opts in on its own My
-# Documents page. Written via PUT /api/userdocs/admin (app/userdocs/settings.py),
+# Documents page. Written via PUT /api/documentation-search/admin (app/documents/settings.py),
 # never via the embedding PUT, which would force a chat-blocking rebuild.
 allowed = false
 storage_budget_mb = 10240        # all profiles' indexes together (vectors + text)

@@ -22,7 +22,7 @@ import {
 import { fetchInstallCatalog, type InstallCatalog } from '../services/installCatalogApi';
 import { useServerRestart } from '../composables/useServerRestart';
 import EmbeddingConfigForm from '../components/shared/EmbeddingConfigForm.vue';
-import UserDocsAdminGate from '../components/userdocs/UserDocsAdminGate.vue';
+import DocumentsAdminGate from '../components/documents/DocumentsAdminGate.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -144,7 +144,7 @@ watch(status, (curr) => {
 // embedding providers always are) or retry the apply automatically
 // (vectorstore-only installs are hot-reloadable).
 //
-// The same dialog serves the User Document Search admin gate, whose save can
+// The same dialog serves the Documentation search admin gate, whose save can
 // also answer FeatureNotInstalled. That caller passes its own wording and an
 // ``onInstalled`` that retries *its* save; without one, a finished install
 // runs the embedding apply exactly as before.
@@ -209,16 +209,16 @@ const featureInstallTitle = computed(() =>
 const featureInstallPurpose = computed(() =>
   featureInstallOptions.value?.purpose ?? 'Enabling Vector Embedding');
 
-// ── User Document Search admin gate ───────────────────────────────────────
-const userDocsGate = ref<InstanceType<typeof UserDocsAdminGate> | null>(null);
+// ── Documentation search admin gate ───────────────────────────────────────
+const documentsGate = ref<InstanceType<typeof DocumentsAdminGate> | null>(null);
 
-function onUserDocsFeatureMissing(detail: EmbeddingFeaturesNotInstalledDetail) {
+function onDocumentsFeatureMissing(detail: EmbeddingFeaturesNotInstalledDetail) {
   openFeatureInstallDialog(detail, {
     title: 'Install document readers?',
-    purpose: 'Allowing User Document Search',
+    purpose: 'Allowing Documentation search',
     // The gate kept its unsaved "allowed" switch, so saving again now that
     // the readers are importable completes what the admin asked for.
-    onInstalled: async () => { await userDocsGate.value?.save(); },
+    onInstalled: async () => { await documentsGate.value?.save(); },
   });
 }
 
@@ -251,7 +251,7 @@ async function confirmFeatureInstall() {
     }
     const options = featureInstallOptions.value;
     if (options) {
-      // Another caller's install (the User Document Search gate): run its
+      // Another caller's install (the Documentation search gate): run its
       // follow-up, never the embedding apply below.
       await options.onInstalled();
       featureInstallBusy.value = false;
@@ -417,7 +417,7 @@ async function restartFromInstallDialog() {
             <div class="field-hint">
               {{ enabled
                   ? 'Configure the model and vector store below. Applying changes will reload + rebuild caches.'
-                  : 'Semantic ranking is off. Documentation search still works, but its relevance judge reviews the whole shared library plus up to 50 per-profile documents instead of a vector-ranked shortlist; long-term memory search returns the stored facts unranked; Google Places uses a fixed list of common place types.' }}
+                  : 'Semantic ranking is off. Cremind documentation search still works, but its relevance judge reviews the whole shared library plus up to 50 per-profile documents instead of a vector-ranked shortlist; long-term memory search returns the stored facts unranked; Google Places uses a fixed list of common place types.' }}
             </div>
           </template>
 
@@ -427,10 +427,10 @@ async function restartFromInstallDialog() {
             </div>
           </template>
 
-          <!-- Saves on its own (PUT /api/userdocs/admin), never through Apply
+          <!-- Saves on its own (PUT /api/documentation-search/admin), never through Apply
                below — Apply rebuilds every embedding cache and blocks chat. -->
           <template #after-enable>
-            <UserDocsAdminGate ref="userDocsGate" @feature-missing="onUserDocsFeatureMissing" />
+            <DocumentsAdminGate ref="documentsGate" @feature-missing="onDocumentsFeatureMissing" />
           </template>
         </EmbeddingConfigForm>
 

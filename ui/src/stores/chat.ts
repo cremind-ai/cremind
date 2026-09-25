@@ -224,7 +224,7 @@ export interface ChatMessage {
   // live on `complete`. Absent on turns that never drove a todo list.
   planTodos?: TodoItem[];
   planStage?: 'executing' | 'completed';
-  // The answer's User Documents citations as the server verified them when it
+  // The answer's Documentation Search citations as the server verified them when it
   // was saved (`metadata.citations`, or the live `citations` frame). Absent on
   // answers that cite nothing and on older ones — the bubble resolves those on
   // demand (stores/citations.ts).
@@ -451,7 +451,7 @@ export interface AgentActivityState extends AgentActivitySnapshot {
   updateSeq: number;
 }
 
-// ── Research activity (User Documents deep research) ──────────────────────
+// ── Research activity (Documentation Search deep research) ──────────────────────
 // Live state of the conversation's research job, rendered in the floating
 // Research activity panel: the question, phase, progress, latest steps and
 // tokens against the budget. Published from the job's own task, so frames
@@ -542,7 +542,7 @@ interface ChatState {
   todosByConversation: Record<string, TodoState | null>;
   /** Coding sub-agent (Claude Code / future Codex) live activity per conversation. */
   agentActivityByConversation: Record<string, AgentActivityState | null>;
-  /** User Documents research job live activity per conversation. */
+  /** Documentation Search research job live activity per conversation. */
   researchActivityByConversation: Record<string, ResearchActivityState | null>;
   agentCard: AgentCard | null;
   agentName: string;
