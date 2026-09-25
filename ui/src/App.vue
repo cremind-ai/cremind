@@ -5,6 +5,7 @@ import { useChatStore } from './stores/chat';
 import { useGroupChatStore } from './stores/groupChat';
 import { useSettingsStore } from './stores/settings';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
+import { useUserDocsStore } from './stores/userDocs';
 import { checkSetupStatus } from './services/configApi';
 import { PROFILE_ROUTES, CHAT_ROUTES } from './router/profileRoutes';
 import NavRail from './components/NavRail.vue';
@@ -81,6 +82,7 @@ const chatStore = useChatStore();
 const groupChatStore = useGroupChatStore();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
+const userDocsStore = useUserDocsStore();
 let stopHttpsCoordinator: (() => void) | null = null;
 let stopElectronMigrationGuard: (() => void) | null = null;
 let stopElectronMigrationRelease: (() => void) | null = null;
@@ -224,8 +226,18 @@ watch(
   },
 );
 
+// User Document Search progress follows the same chat-route rule: the store
+// rides profile-events only where chat already holds it, and streams or polls
+// elsewhere — so it needs to know where we are.
+watch(
+  () => route.name,
+  (name) => userDocsStore.setRoute(typeof name === 'string' ? name : ''),
+  { immediate: true },
+);
+
 onUnmounted(() => {
   embeddingStatusStore.disconnect();
+  userDocsStore.disconnect();
   stopHttpsCoordinator?.();
   stopElectronMigrationGuard?.();
   stopElectronMigrationRelease?.();
@@ -262,6 +274,10 @@ onMounted(async () => {
   // streams, and the underlying connection is shared across browser
   // tabs by `createSharedStream`.
   embeddingStatusStore.connect(settingsStore.agentUrl);
+  // Once, like the embedding store: it opens nothing until a profile token
+  // exists, and follows token and route changes on its own. Its NavRail chip
+  // never uses the embedding overlay above.
+  userDocsStore.connect(settingsStore.agentUrl);
 
   // Handle OAuth callback redirect
   const params = new URLSearchParams(window.location.search);

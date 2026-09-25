@@ -22,6 +22,7 @@ import {
 import { fetchInstallCatalog, type InstallCatalog } from '../services/installCatalogApi';
 import { useServerRestart } from '../composables/useServerRestart';
 import EmbeddingConfigForm from '../components/shared/EmbeddingConfigForm.vue';
+import UserDocsAdminGate from '../components/userdocs/UserDocsAdminGate.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -142,12 +143,27 @@ watch(status, (curr) => {
 // (when ``requires_restart=True`` features were installed — the
 // embedding providers always are) or retry the apply automatically
 // (vectorstore-only installs are hot-reloadable).
+//
+// The same dialog serves the User Document Search admin gate, whose save can
+// also answer FeatureNotInstalled. That caller passes its own wording and an
+// ``onInstalled`` that retries *its* save; without one, a finished install
+// runs the embedding apply exactly as before.
+interface FeatureInstallOptions {
+  /** Dialog title. */
+  title: string;
+  /** What needs the dependencies, as the sentence's subject. */
+  purpose: string;
+  /** What to do once the install succeeded. */
+  onInstalled: () => Promise<unknown>;
+}
+
 const featureInstallOpen = ref(false);
 const featureInstallDetail = ref<EmbeddingFeaturesNotInstalledDetail | null>(null);
 const featureInstallBusy = ref(false);
 const featureInstallLog = ref<string[]>([]);
 const featureInstallError = ref<string | null>(null);
 const featureInstallRestartRequired = ref(false);
+const featureInstallOptions = ref<FeatureInstallOptions | null>(null);
 
 const featureInstallExtras = computed(() => {
   const detail = featureInstallDetail.value;
@@ -165,8 +181,12 @@ const featureInstallExtras = computed(() => {
   return out;
 });
 
-function openFeatureInstallDialog(detail: EmbeddingFeaturesNotInstalledDetail) {
+function openFeatureInstallDialog(
+  detail: EmbeddingFeaturesNotInstalledDetail,
+  options: FeatureInstallOptions | null = null,
+) {
   featureInstallDetail.value = detail;
+  featureInstallOptions.value = options;
   featureInstallLog.value = [];
   featureInstallError.value = null;
   featureInstallRestartRequired.value = false;
@@ -177,9 +197,29 @@ function openFeatureInstallDialog(detail: EmbeddingFeaturesNotInstalledDetail) {
 function closeFeatureInstallDialog() {
   featureInstallOpen.value = false;
   featureInstallDetail.value = null;
+  featureInstallOptions.value = null;
   featureInstallLog.value = [];
   featureInstallError.value = null;
   featureInstallRestartRequired.value = false;
+}
+
+const featureInstallTitle = computed(() =>
+  featureInstallOptions.value?.title
+  ?? (featureInstallDetail.value ? 'Install vector embedding dependencies?' : 'Install dependencies'));
+const featureInstallPurpose = computed(() =>
+  featureInstallOptions.value?.purpose ?? 'Enabling Vector Embedding');
+
+// ── User Document Search admin gate ───────────────────────────────────────
+const userDocsGate = ref<InstanceType<typeof UserDocsAdminGate> | null>(null);
+
+function onUserDocsFeatureMissing(detail: EmbeddingFeaturesNotInstalledDetail) {
+  openFeatureInstallDialog(detail, {
+    title: 'Install document readers?',
+    purpose: 'Allowing User Document Search',
+    // The gate kept its unsaved "allowed" switch, so saving again now that
+    // the readers are importable completes what the admin asked for.
+    onInstalled: async () => { await userDocsGate.value?.save(); },
+  });
 }
 
 async function confirmFeatureInstall() {
@@ -207,6 +247,19 @@ async function confirmFeatureInstall() {
       featureInstallError.value =
         result.error || `Install failed for: ${result.failed.join(', ')}`;
       featureInstallBusy.value = false;
+      return;
+    }
+    const options = featureInstallOptions.value;
+    if (options) {
+      // Another caller's install (the User Document Search gate): run its
+      // follow-up, never the embedding apply below.
+      await options.onInstalled();
+      featureInstallBusy.value = false;
+      if (result.restart_required) {
+        featureInstallRestartRequired.value = true;
+        return;
+      }
+      closeFeatureInstallDialog();
       return;
     }
     if (result.restart_required) {
@@ -373,6 +426,12 @@ async function restartFromInstallDialog() {
               Switching stores triggers a full rebuild — the new store starts empty.
             </div>
           </template>
+
+          <!-- Saves on its own (PUT /api/userdocs/admin), never through Apply
+               below — Apply rebuilds every embedding cache and blocks chat. -->
+          <template #after-enable>
+            <UserDocsAdminGate ref="userDocsGate" @feature-missing="onUserDocsFeatureMissing" />
+          </template>
         </EmbeddingConfigForm>
 
         <!-- Outside the shared form on purpose: the form owns the fields, not
@@ -398,7 +457,7 @@ async function restartFromInstallDialog() {
          on the Agents & Tools page. -->
     <ElDialog
       v-model="featureInstallOpen"
-      :title="featureInstallDetail ? 'Install vector embedding dependencies?' : 'Install dependencies'"
+      :title="featureInstallTitle"
       width="560px"
       :close-on-click-modal="!featureInstallBusy"
       :close-on-press-escape="!featureInstallBusy"
@@ -406,7 +465,7 @@ async function restartFromInstallDialog() {
     >
       <div v-if="featureInstallDetail" class="feature-install-body">
         <p>
-          Enabling Vector Embedding requires the following optional
+          {{ featureInstallPurpose }} requires the following optional
           dependency group<span v-if="featureInstallExtras.length !== 1">s</span>:
           <code>cremind[{{ featureInstallExtras.join(',') }}]</code>.
         </p>
@@ -427,7 +486,10 @@ async function restartFromInstallDialog() {
           {{ featureInstallError }}
         </p>
 
-        <p v-if="featureInstallRestartRequired" class="feature-install-restart">
+        <p v-if="featureInstallRestartRequired && featureInstallOptions" class="feature-install-restart">
+          Install complete. Restart the Cremind server so the new components load.
+        </p>
+        <p v-else-if="featureInstallRestartRequired" class="feature-install-restart">
           Install complete. Your settings have been saved. Restart the
           Cremind server — the embedding model will load automatically on
           startup and this page will report "Success" when it's ready.

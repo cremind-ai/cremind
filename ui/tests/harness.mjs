@@ -23,6 +23,16 @@ const STUBS = {
       (globalThis.__transportSubscribers ||= []).push(onChange)
       return { close() {} }
     }
+    export function subscribeUserDocs(agentUrl, token, onSnapshot) {
+      const subs = (globalThis.__userDocsSubscribers ||= [])
+      subs.push(onSnapshot)
+      return {
+        close() {
+          const i = subs.indexOf(onSnapshot)
+          if (i >= 0) subs.splice(i, 1)
+        },
+      }
+    }
   `,
 }
 
@@ -172,6 +182,7 @@ export function installBrowser({ href = 'http://localhost:1515/#/alice/c/42' } =
   globalThis.sessionStorage = new MemoryStorage()
   globalThis.BroadcastChannel = SilentBroadcastChannel
   globalThis.__transportSubscribers = []
+  globalThis.__userDocsSubscribers = []
   globalThis.fetch = async (input, init = {}) => {
     const requested = String(input)
     calls.push({ url: requested, init })

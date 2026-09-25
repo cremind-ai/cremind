@@ -214,6 +214,15 @@ const routes = [
     },
   },
   {
+    // User Document Search for this profile. No admin guard: every profile
+    // owns its own index, and the page itself explains an admin-disabled gate.
+    path: '/:profile/settings/documents',
+    name: 'user-documents-settings',
+    component: () => import('../views/UserDocumentsSettings.vue'),
+    props: true,
+    meta: { title: 'My Documents' },
+  },
+  {
     path: '/:profile/settings/gsuite',
     name: 'gsuite-settings',
     component: () => import('../views/GSuiteSettings.vue'),

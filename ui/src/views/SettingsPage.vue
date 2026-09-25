@@ -44,6 +44,13 @@ const allCards: SettingsCard[] = [
     adminOnly: true,
   },
   {
+    // Every profile: each one has its own folder and its own index.
+    title: 'My Documents',
+    description: 'Let the agent search your own files — choose a folder and watch indexing progress',
+    icon: 'mdi:file-search-outline',
+    route: 'documents',
+  },
+  {
     title: 'Channels',
     description: 'Connect Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo',
     icon: 'mdi:link-variant',
