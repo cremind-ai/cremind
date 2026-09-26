@@ -119,49 +119,64 @@ TOOL_CONFIG: ToolConfig = {
 
 # ── schemas ────────────────────────────────────────────────────────────────
 
-FILTERS_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "description": (
-        "Narrow the files considered. Hard filters: folder, path_glob, "
-        "name_query, types, extensions, source, date_*, size_*, has_gps, "
-        "file_ids. Soft (boost only, never exclude): author, taken_by, "
-        "image_origin."
-    ),
-    "properties": {
-        "folder": {
-            "type": "array", "items": {"type": "string"},
-            "description": "Folder names or paths, matched loosely (case, accents, typos); "
-                           "includes everything beneath them. E.g. [\"MKT-report\"].",
-        },
-        "path_glob": {
-            "type": "array", "items": {"type": "string"},
-            "description": "Glob over the path inside the indexed folder, e.g. \"Clients/*/2025/**\" or \"*.pdf\".",
-        },
-        "name_query": {"type": "string", "description": "Words that must all appear in the file name."},
-        "types": {
-            "type": "array", "items": {"type": "string", "enum": list(TYPE_NAMES)},
-            "description": "File types. 'document' = PDF, Word, text/Markdown, slides, e-books, e-mails.",
-        },
-        "extensions": {"type": "array", "items": {"type": "string"}, "description": "E.g. [\"pdf\", \".docx\"]."},
-        "source": {"type": "string", "enum": list(SOURCES), "description": "Local folder, Google Drive, or both."},
-        "date_field": {
-            "type": "string", "enum": list(DATE_FIELDS),
-            "description": "Which date date_from/date_to apply to. 'any' (default) matches the document's "
-                           "creation date, the file's creation or modification time, or a photo's EXIF date.",
-        },
-        "date_from": {"type": "string", "description": "First day, YYYY-MM-DD (or YYYY-MM, YYYY), user's time zone."},
-        "date_to": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD (or YYYY-MM, YYYY)."},
-        "size_min": {"type": "integer", "description": "Minimum size in bytes."},
-        "size_max": {"type": "integer", "description": "Maximum size in bytes."},
-        "author": {"type": "string", "description": "'me' (the user's configured names) or a name. Soft."},
-        "taken_by": {"type": "string", "description": "'me' (the user's cameras) or a camera make/model. Soft."},
-        "image_origin": {"type": "string", "enum": list(IMAGE_ORIGINS), "description": "Soft."},
-        "has_gps": {"type": "boolean", "description": "Only photos with (true) or without (false) a location."},
-        "file_ids": {
-            "type": "array", "items": {"type": "string"},
-            "description": "Restrict to these files: [doc:…] tokens or file ids from earlier results.",
-        },
+def _nullable(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """``schema`` that also takes ``null``: "no constraint", exactly like
+    leaving the field out (``parse_filters`` reads both alike). A provider
+    that makes every field required then has a neutral value to send instead
+    of inventing a restriction such as ``size_max: 0``."""
+    out = {**schema, "type": [schema["type"], "null"]}
+    if "enum" in schema:
+        out["enum"] = [*schema["enum"], None]
+    return out
+
+
+_FILTER_FIELDS: Dict[str, Dict[str, Any]] = {
+    "folder": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Folder names or paths, matched loosely (case, accents, typos); "
+                       "includes everything beneath them. E.g. [\"MKT-report\"].",
     },
+    "path_glob": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Glob over the path inside the indexed folder, e.g. \"Clients/*/2025/**\" or \"*.pdf\".",
+    },
+    "name_query": {"type": "string", "description": "Words that must all appear in the file name."},
+    "types": {
+        "type": "array", "items": {"type": "string", "enum": list(TYPE_NAMES)},
+        "description": "File types. 'document' = PDF, Word, text/Markdown, slides, e-books, e-mails.",
+    },
+    "extensions": {"type": "array", "items": {"type": "string"}, "description": "E.g. [\"pdf\", \".docx\"]."},
+    "source": {"type": "string", "enum": list(SOURCES), "description": "Local folder, Google Drive, or both."},
+    "date_field": {
+        "type": "string", "enum": list(DATE_FIELDS),
+        "description": "Which date date_from/date_to apply to. 'any' (default) matches the document's "
+                       "creation date, the file's creation or modification time, or a photo's EXIF date.",
+    },
+    "date_from": {"type": "string", "description": "First day, YYYY-MM-DD (or YYYY-MM, YYYY), user's time zone."},
+    "date_to": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD (or YYYY-MM, YYYY)."},
+    "size_min": {"type": "integer", "description": "Minimum size in bytes; null for no minimum."},
+    "size_max": {"type": "integer",
+                 "description": "Maximum size in bytes; null for no maximum (0 keeps only empty files)."},
+    "author": {"type": "string", "description": "'me' (the user's configured names) or a name. Soft."},
+    "taken_by": {"type": "string", "description": "'me' (the user's cameras) or a camera make/model. Soft."},
+    "image_origin": {"type": "string", "enum": list(IMAGE_ORIGINS), "description": "Soft."},
+    "has_gps": {"type": "boolean",
+                "description": "Only photos with (true) or without (false) a location; null for any file."},
+    "file_ids": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Restrict to these files: [doc:…] tokens or file ids from earlier results.",
+    },
+}
+
+FILTERS_SCHEMA: Dict[str, Any] = {
+    "type": ["object", "null"],
+    "description": (
+        "Narrow the files considered — set only what the user's request asks for. Omitted, "
+        "null or {} (and any field left out or null) means no constraint. Hard filters: "
+        "folder, path_glob, name_query, types, extensions, source, date_*, size_*, has_gps, "
+        "file_ids. Soft (boost only, never exclude): author, taken_by, image_origin."
+    ),
+    "properties": {name: _nullable(spec) for name, spec in _FILTER_FIELDS.items()},
     "additionalProperties": False,
 }
 

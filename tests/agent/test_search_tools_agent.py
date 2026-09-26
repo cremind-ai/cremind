@@ -295,6 +295,58 @@ def test_the_same_selection_on_two_profiles_renders_the_same_search_text(env):
     assert _specs(alice)[0] == _specs(bob)[0]
 
 
+class _RealDocsGroup(_Group):
+    """Documentation search with its real leaf schemas, so what the model is
+    sent for the user's files can be compared byte for byte."""
+
+    def __init__(self) -> None:
+        from app.tools.builtin import documentation_search as ds
+
+        self._real = {t.name: t for t in ds.get_tools({})}
+        super().__init__("documentation_search", *self._real)
+
+    def leaf_function_specs(self, *, context_id, profile, query="", arguments=None):
+        out = []
+        for leaf, tool in self._real.items():
+            name = make_leaf_name(self.tool_id, leaf)
+            out.append(FunctionSpec(name=name, leaf_name=leaf, schema={
+                "type": "function",
+                "function": {"name": name, "description": tool.description, "parameters": tool.parameters},
+            }))
+        return out
+
+
+def test_the_users_files_look_the_same_with_two_or_four_search_sources(env):
+    """Turning Memory and Web search on beside Documentation search must not
+    change how the user's files are searched: the same schemas, and the same
+    rules — including "set only the filters asked for; retry a filtered miss
+    before looking elsewhere" — whichever sources sit next to it."""
+
+    def groups():
+        return [_RealDocsGroup()] + _search_groups()[1:]
+
+    registry = _Registry({"alice": groups(), "bob": groups()})
+    two = _agent(registry=registry, snapshot=st.Snapshot.of(
+        ["documentation_search", "cremind_documentation_search"], 1))
+    four = _agent(registry=registry, snapshot=None)
+    assert "web_search" not in two._tools_by_id and "web_search" in four._tools_by_id
+
+    def docs_specs(agent):
+        return [s for s in _specs(agent)[0] if s["function"]["name"].startswith("documentation_search__")]
+
+    assert len(docs_specs(two)) == 4
+    assert json.dumps(docs_specs(two), sort_keys=True) == json.dumps(docs_specs(four), sort_keys=True)
+    rules = two._documentation_search_guidance
+    assert rules == four._documentation_search_guidance
+    assert "Set only the filters the user's request calls for" in rules
+    assert "call again without the filters the user did not ask for" in rules
+    assert rules in two._build_instruction() and rules in four._build_instruction()
+    # Another profile with the same selection is sent the very same thing.
+    bob = _agent(registry=registry, profile="bob", snapshot=None)
+    assert json.dumps(docs_specs(bob), sort_keys=True) == json.dumps(docs_specs(four), sort_keys=True)
+    assert bob._documentation_search_guidance == rules
+
+
 @pytest.mark.parametrize("chosen", [
     list(c) for n in range(len(st.SEARCH_TOOL_IDS) + 1)
     for c in itertools.combinations(st.SEARCH_TOOL_IDS, n)

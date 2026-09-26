@@ -1143,6 +1143,12 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
     against that registry, so an invented or edited token shows up as
     unverified. The research sentence names ``research`` only when that leaf
     is exposed; otherwise legal/financial questions are sent to ``read``.
+
+    The filter sentence exists because a model filling the ``filters`` object
+    tends to invent restrictions nobody asked for (``size_max: 0``,
+    ``has_gps: true``) that exclude every file, and then to conclude the files
+    are not there and fall back to web search. It names no sibling source, so
+    the text is the same whichever other search tools the run exposes.
     """
     by_id = {getattr(t, "tool_id", None): t for t in tools}
     group = by_id.get(st.DOCUMENTATION_SEARCH)
@@ -1205,6 +1211,11 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
         f"spreadsheets, photos and project folders). Use them — {not_these} — whenever the user "
         "refers to their own files or what those files say. Resolve relative dates (\"2 days "
         f"ago\", \"last year\") to calendar dates {when}, and widen a fuzzy date by ±1 day. "
+        "Set only the filters the user's request calls for (a folder, type, date or size they "
+        "named) and leave every other filter out — never add a size, location, source or date "
+        "limit of your own. If a filtered call finds nothing, call again without the filters "
+        "the user did not ask for before saying their files do not have it or searching "
+        "anywhere else; keep the restrictions the user did ask for. "
         "Cite every claim taken from these results by copying the [doc:…] token printed next to "
         "its passage exactly, right after the claim; never invent or alter a token. Quote only "
         "text that appears in the results, in quotation marks, followed by its token. " + research

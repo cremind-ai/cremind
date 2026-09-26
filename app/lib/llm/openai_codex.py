@@ -21,7 +21,8 @@ required headers and over mid-stream transient-error detection.
 Backend quirks required by the ChatGPT Codex Responses endpoint: ``store``
 forced false, ``stream`` forced true, non-empty ``instructions`` required,
 ``system`` role rewritten to ``developer``, server-generated item ids stripped,
-sampling params dropped, and a strict body key allowlist applied last.
+sampling params dropped, function tools sent non-strict unless they ask for
+strict, and a strict body key allowlist applied last.
 
 Known limitation: the encrypted reasoning items the backend returns are not
 threaded back across turns (Cremind's persisted history is chat.completions
@@ -219,8 +220,14 @@ def _convert_tools(tools: Optional[List[Any]]) -> list[dict]:
             "description": func.get("description", ""),
             "parameters": func.get("parameters") or {"type": "object", "properties": {}},
         }
-        if "strict" in func:
-            entry["strict"] = func.get("strict")
+        # Responses treats a function tool without ``strict`` as strict: every
+        # property becomes required, so the model must invent a value for each
+        # optional argument (a ``size_max`` of 0, ``has_gps: true``) and those
+        # silently narrow the call. Cremind's schemas mark optional arguments by
+        # leaving them out of ``required``, so a tool is sent non-strict unless
+        # it asks otherwise. The schema itself is passed through untouched.
+        strict = func.get("strict")
+        entry["strict"] = strict if isinstance(strict, bool) else False
         out.append(entry)
     return out
 

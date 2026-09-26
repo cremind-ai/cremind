@@ -51,6 +51,19 @@ Identifiers such as `45/2013/QH13` or `Điều 203` are matched as exact
 phrases. When a date window finds nothing, it is widened (±3 days, ±14 days,
 then no date) and the output says so.
 
+Every flag is optional, and a flag you leave off is no constraint: the
+command sends only the filters you give. Size and location filters have no
+flags; the endpoint behind these commands (`POST
+/api/documentation-search/query/search`, or `…/query/find`) takes the agent's
+whole `filters` object, where a field left out or `null` is also no
+constraint and a value (`"size_max": 0`, `"has_gps": true`) always restricts:
+
+```bash
+cremind docs search "OpenClaw installation" --type pdf
+# the same search over the endpoint — null size and GPS limits change nothing:
+#   {"query": "OpenClaw installation", "filters": {"types": ["pdf"], "size_max": null, "has_gps": null}}
+```
+
 ```bash
 $ cremind docs search "AI challenges" --type document --from 2026-09-22 --to 2026-09-24
 [Documentation Search · search · "AI challenges" · mode: hybrid · 1,240 files · 100% synced]

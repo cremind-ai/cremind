@@ -274,7 +274,7 @@ class Filters:
         size, …) — then a folder's own card cannot qualify as a hit."""
         return bool(
             self.path_globs or self.name_query or self.types or self.extensions or self.has_date
-            or self.size_min is not None or self.size_max is not None or self.has_gps
+            or self.size_min is not None or self.size_max is not None or self.has_gps is not None
             or self.file_ids
         )
 

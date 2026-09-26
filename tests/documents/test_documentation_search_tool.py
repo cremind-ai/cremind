@@ -474,6 +474,69 @@ def test_invalid_filters_are_an_observation_not_a_crash(corpus):
     assert (result.structured_content or {}).get("error") == "InvalidFilter"
 
 
+# ── neutral filters: left out, {} or null are no constraint ───────────────
+
+_ALL_NULL = {name: None for name in tool.FILTERS_SCHEMA["properties"]}
+_NEUTRAL = [("omitted", ...), ("null", None), ("empty", {}), ("all fields null", _ALL_NULL)]
+
+
+def _key(group) -> tuple[str, str]:
+    return ("file", group.file["rel_path"]) if group.file else ("folder", group.folder["rel_path"])
+
+
+@pytest.mark.parametrize("filters", [f for _, f in _NEUTRAL], ids=[n for n, _ in _NEUTRAL])
+def test_neutral_filters_find_the_document_through_search_and_find(corpus, filters):
+    args = {} if filters is ... else {"filters": filters}
+    searched = _text(_run(tool.DocumentsSearchTool, query="AI challenges hallucination", **args))
+    assert "Reports/AI-challenges.md" in searched
+    assert "Filters:" not in searched
+    found = _text(_run(tool.DocumentsFindFilesTool, query="AI challenges", **args))
+    assert "Reports/AI-challenges.md" in found
+    assert "Filters:" not in found
+
+
+def test_neutral_filters_rank_exactly_like_no_filters(corpus):
+    engine = _engine("alice")
+    query = "AI challenges hallucination"
+    base = [_key(g) for g in engine.search(query).groups]
+    listed = [it.row["rel_path"] for it in engine.find(None, limit=100).items]
+    assert base and listed
+    for filters in (None, {}, _ALL_NULL):
+        assert [_key(g) for g in engine.search(query, filters=filters).groups] == base
+        assert [it.row["rel_path"] for it in engine.find(None, filters=filters, limit=100).items] == listed
+
+
+def test_real_size_and_location_values_still_restrict(corpus):
+    engine = _engine("alice")
+    query = "AI challenges hallucination"
+    size = (corpus.alice / "Reports" / "AI-challenges.md").stat().st_size
+
+    def hits(filters):
+        return {g.file["rel_path"] for g in engine.search(query, filters=filters).groups if g.file}
+
+    assert not engine.search(query, filters={"size_max": 0}).groups
+    assert "Reports/AI-challenges.md" in hits({"size_min": size, "size_max": size})
+    assert "Reports/AI-challenges.md" not in hits({"size_max": size - 1})
+    assert "Reports/AI-challenges.md" not in hits({"size_min": size + 1})
+    assert "Reports/AI-challenges.md" not in hits({"has_gps": True})
+    assert "Reports/AI-challenges.md" in hits({"has_gps": False})
+    # Beside nulls a value still applies, and the leaf says which one did.
+    text_out = _text(_run(tool.DocumentsSearchTool, query=query, filters={**_ALL_NULL, "size_max": 0}))
+    assert "Reports/AI-challenges.md" not in text_out
+    assert "Filters: size 0..0 B" in text_out
+
+
+def test_neutral_filters_never_reach_another_profiles_files(corpus):
+    bob = _engine("bob")
+    for filters in (None, {}, _ALL_NULL):
+        out = bob.search("AI challenges hallucination", filters=filters)
+        assert {_key(g) for g in out.groups if g.file} == {("file", "bob-notes.txt")}
+        assert {it.row["rel_path"] for it in bob.find(None, filters=filters, limit=100).items} == {"bob-notes.txt"}
+    result = asyncio.run(tool.DocumentsSearchTool().run(
+        {"_profile": "bob", "_context_id": "ctx-bob", "query": "AI challenges hallucination", "filters": _ALL_NULL}))
+    assert "bob-notes.txt" in _text(result) and "AI-challenges.md" not in _text(result)
+
+
 def test_document_text_cannot_plant_a_citation(corpus):
     engine = _engine("alice")
     rt = corpus.svc.runtime("alice")

@@ -365,7 +365,7 @@ def _drop_date(f: F.Filters) -> F.Filters:
 def _content_filters(f: F.Filters) -> bool:
     """File-level filters other than the date window."""
     return bool(f.types or f.extensions or f.name_query or f.path_globs or f.size_min is not None
-                or f.size_max is not None or f.has_gps or f.file_ids)
+                or f.size_max is not None or f.has_gps is not None or f.file_ids)
 
 
 # ── aggregates ─────────────────────────────────────────────────────────────

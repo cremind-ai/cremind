@@ -241,6 +241,11 @@ One `filters` object serves all three sub-tools.
 | `has_gps` | Photos with (or without) a location. |
 | `file_ids` | Tokens or file ids from earlier results. |
 
+A field left out or `null` (or `filters` left out, `null`, `{}`) is **no
+constraint**: `{"types": ["pdf"], "size_max": null}` is every PDF, while
+`size_max: 0` is only empty files. The agent sets only the filters asked for,
+and retries a filtered miss without its own before looking elsewhere.
+
 ## Results, modes and citations
 
 Every result starts with a header such as `12,480 files · 97% synced · 312
