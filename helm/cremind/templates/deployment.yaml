@@ -177,8 +177,9 @@ spec:
               mountPath: /opt/cremind/venv
             {{- end }}
             {{- if .Values.persistence.work.enabled }}
-            # Persist the agent's User Working Directory so files it creates
-            # survive restarts. mountPath must match the wizard's working dir.
+            # Persist the profiles' working directories
+            # (<mountPath>/cremind-workspaces, CREMIND_WORKSPACES_DIR in the env
+            # ConfigMap) so files the agents create survive restarts.
             - name: work
               mountPath: {{ .Values.persistence.work.mountPath }}
             {{- end }}

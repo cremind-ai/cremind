@@ -74,7 +74,11 @@ def validate_profile_name(name: str) -> str | None:
         return "Profile names cannot start with an underscore."
     if not _PROFILE_NAME_RE.match(name):
         return "Profile name may contain only lowercase letters, numbers, hyphens, and underscores."
-    return None
+    # ``shared`` / ``cli``: scope names of Cremind's own manual, which a
+    # profile of that name would share (app/cremind_documents/paths.py).
+    from app.cremind_documents.paths import reserved_profile_name_error
+
+    return reserved_profile_name_error(name)
 
 
 async def create_target_profile(session: ImportSession, profile_name: str, deps: Deps) -> dict:
@@ -89,6 +93,15 @@ async def create_target_profile(session: ImportSession, profile_name: str, deps:
 
     await deps.conversation_storage.create_profile(profile_name)
     ensure_persona_file(profile_name)
+    # Its own working directory, exactly as ``POST /api/profiles`` gives one:
+    # the default, or a fresh ``<name>-2`` when a folder of that name already
+    # holds files; the change listeners hear of the new profile either way.
+    try:
+        from app.api.profiles import provision_new_profile_working_dir
+
+        provision_new_profile_working_dir(profile_name)
+    except Exception:  # noqa: BLE001 — the profile exists; the folder is made on first use
+        logger.exception(f"[blueprint] working-directory setup failed for new profile '{profile_name}'")
     if deps.registry is not None:
         try:
             await initialize_profile_skills(
@@ -124,12 +137,21 @@ async def delete_target_profile(profile_name: str, deps: Deps) -> None:
         )
         return
 
+    from app.config import working_dirs
+
+    # Read before the row goes: a folder the admin chose is stored on it.
+    try:
+        old_working_dir: str | None = working_dirs.profile_working_dir(profile_name, create=False)
+    except ValueError:
+        old_working_dir = None
+
     try:
         await teardown_processes_for_dir(profile_skills_dir(profile_name), profile=profile_name)
     except Exception:  # noqa: BLE001
         logger.exception(f"[blueprint] listener teardown failed for '{profile_name}'")
+    deleted = False
     try:
-        await deps.conversation_storage.delete_profile(profile_name)
+        deleted = bool(await deps.conversation_storage.delete_profile(profile_name))
     except Exception:  # noqa: BLE001
         logger.exception(f"[blueprint] delete_profile failed for '{profile_name}'")
 
@@ -169,6 +191,21 @@ async def delete_target_profile(profile_name: str, deps: Deps) -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception(f"[blueprint] skill teardown failed for '{profile_name}'")
+
+    # The working directory, last, as ``handle_delete_profile`` does it: the
+    # listeners hear of the deletion first (they let go of the folder), then a
+    # Cremind-made folder is archived under ``<workspaces>/.deleted`` — never
+    # deleted, a rollback keeps files — so a later profile of this name starts
+    # empty. Only once the row is really gone.
+    if deleted:
+        try:
+            working_dirs.notify_changed(profile_name)
+            if old_working_dir:
+                from app.api.profiles import retire_working_dir
+
+                await asyncio.to_thread(retire_working_dir, profile_name, old_working_dir, delete=False)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"[blueprint] working-directory cleanup failed for '{profile_name}'")
 
 
 # ── settings ─────────────────────────────────────────────────────────────────
@@ -285,6 +322,19 @@ def _apply_tool_config_bundle(mgr, tool_id: str, profile: str, entry: dict, secr
 
 
 def apply_tools(session: ImportSession, inputs: dict, deps: Deps) -> dict:
+    """Apply the tools component to the target profile.
+
+    ``load_component`` hands over the CURRENT document shape: a v1 document's
+    ids were already mapped (see :mod:`app.blueprint.compat`), so the two
+    document searches land on the right tools.
+
+    A tool this install does not have — a built-in from a newer build, a
+    feature that is not installed, an A2A/MCP server never added here — is
+    skipped with a warning instead of written: ``tool_configs.tool_id`` is a
+    foreign key to ``tools``, so writing it would raise and abort every entry
+    after it. One entry failing for any other reason is reported the same way
+    and the rest still apply.
+    """
     from app.tools.config_manager import ToolConfigManager
 
     data = load_component(session.payload_dir, "tools") or {}
@@ -297,17 +347,36 @@ def apply_tools(session: ImportSession, inputs: dict, deps: Deps) -> dict:
     for tool in data.get("tools") or []:
         tool_id = tool.get("tool_id")
         kind = tool.get("kind")
-        if kind in ("a2a", "mcp"):
-            enabled = tool.get("enabled")
-            if enabled is not None:
-                if ts.get_tool(tool_id) is not None:
+        if not tool_id or ts.get_tool(tool_id) is None:
+            if kind in ("a2a", "mcp"):
+                warnings.append(
+                    f"tool {tool_id!r} ({kind}) is not installed here — its settings were not applied"
+                )
+            else:
+                warnings.append(
+                    f"tool {tool_id!r} is not available on this install — its settings were not applied"
+                )
+            continue
+        # Secrets keyed by the id the (older) manifest printed still apply.
+        secrets = per_tool_secrets.get(tool_id)
+        if secrets is None and tool.get("legacy_tool_id"):
+            secrets = per_tool_secrets.get(tool["legacy_tool_id"])
+        try:
+            if kind in ("a2a", "mcp"):
+                enabled = tool.get("enabled")
+                if enabled is not None:
                     ts.set_profile_tool(profile, tool_id, bool(enabled))
                     applied.append(f"{tool_id} enabled={enabled}")
-                else:
-                    warnings.append(
-                        f"tool {tool_id!r} ({kind}) is not installed here — enable state not applied"
-                    )
-        _apply_tool_config_bundle(mgr, tool_id, profile, tool, per_tool_secrets.get(tool_id, {}))
+            _apply_tool_config_bundle(mgr, tool_id, profile, tool, secrets or {})
+        except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the step
+            # The class name only: a DB error's text carries the statement's
+            # parameters — possibly a secret value being written — and this
+            # warning is persisted in session.json.
+            logger.warning(
+                f"[blueprint] applying tool {tool_id!r} failed: {type(exc).__name__}"
+            )
+            warnings.append(f"tool {tool_id!r} could not be configured ({type(exc).__name__})")
+            continue
         applied.append(f"configured {tool_id}")
 
     return _result(applied=applied, warnings=warnings)
@@ -382,7 +451,7 @@ async def apply_events(session: ImportSession, inputs: dict, deps: Deps) -> dict
     import os
     from datetime import datetime
 
-    from app.backup.paths import build_path_map, relocate_path
+    from app.backup.paths import build_path_map
     from app.blueprint.manifest import BlueprintManifest
     from app.calendar import feature as calendar_feature
     from app.calendar import recurrence as R
@@ -439,11 +508,20 @@ async def apply_events(session: ImportSession, inputs: dict, deps: Deps) -> dict
 
     # File watchers — relocate root_path (or use a user-supplied override);
     # insert + arm even if the path is missing (skip still applies the design).
+    # A root in the SOURCE profile's own working directory lands in the target
+    # profile's; one inside ANOTHER profile's working directory is never
+    # imported (the admin is not exempt).
     watchers = data.get("file_watcher") or []
     if watchers:
+        from app.blueprint.plan import load_payload_manifest, relocate_watcher_root
+        from app.config.working_dirs import is_foreign
         from app.events import get_file_watcher_manager
 
-        manifest = BlueprintManifest.from_dict(session.manifest) if session.manifest else None
+        # The staged archive's full manifest: the session's copy is only the
+        # summary, which carries no source roots to relocate from.
+        manifest = load_payload_manifest(session.payload_dir) or (
+            BlueprintManifest.from_dict(session.manifest) if session.manifest else None
+        )
         pm = build_path_map(manifest, _system_dir(), os.path.expanduser("~")) if manifest else None
         overrides = inputs.get("watcher_paths") or {}
         fw_store = FileWatcherSubscriptionStorage()
@@ -451,11 +529,15 @@ async def apply_events(session: ImportSession, inputs: dict, deps: Deps) -> dict
             name = w.get("name") or "watcher"
             root = overrides.get(name)
             if not root:
-                root = w.get("root_path") or ""
-                if pm is not None:
-                    relocated, changed, _abs = relocate_path(pm, root)
-                    if changed:
-                        root = relocated
+                root, _changed = relocate_watcher_root(
+                    manifest, pm, w.get("root_path") or "", profile, create=True,
+                )
+            if root and is_foreign(root, profile):
+                needs_attention.append(
+                    f"file watcher '{name}' path {root!r} is inside another profile's "
+                    "working directory — not imported; set a folder of your own in Events"
+                )
+                continue
             conv = await deps.conversation_storage.create_conversation(
                 profile=profile, title=f"File Watcher: {name}"
             )

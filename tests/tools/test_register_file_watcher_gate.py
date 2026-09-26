@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 import app.events.action_check as ac
 import app.tools.builtin.register_file_watcher as RFW
 from app.events.action_check import ActionCheckResult
@@ -87,3 +89,10 @@ def test_gate_fail_open_when_no_agent(monkeypatch, tmp_path):
 
 async def _noop(**kw):
     return None
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

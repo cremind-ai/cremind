@@ -1,12 +1,21 @@
 import { defineStore } from 'pinia';
+import { watch, type WatchStopHandle } from 'vue';
 import { useChatStore, type TerminalAttachment } from './chat';
 import { useSettingsStore } from './settings';
 import { listTerminals, spawnTerminal } from '../services/terminalApi';
-import type { FileWatchEvent } from '../services/filesApi';
+import { getInitialCwd, type FileWatchEvent } from '../services/filesApi';
 
 // Guards restoreTerminals() to a single run per page load (module scope: the
 // SPA loads this module once).
 let _terminalsRestored = false;
+
+// The in-flight ``GET /api/files/cwd`` of seedUserCwd(), keyed by the token it
+// was sent with, so concurrent mounts share one request per profile. Every
+// reset starts a new epoch: an answer sent in an older one names a folder the
+// panel has since forgotten — another profile's, or this one's before the
+// admin moved it — and is dropped.
+let _cwdSeed: { token: string; promise: Promise<void> } | null = null;
+let _cwdEpoch = 0;
 
 const WIDTH_STORAGE_KEY = 'terminalPanelWidth';
 const SPLIT_RATIO_STORAGE_KEY = 'rightPanelSplitRatio';
@@ -68,15 +77,18 @@ interface State {
   // chat store's active conversation.
   cwdByConversation: Record<string, string>;
   // Fallback cwd used when no conversation is active (e.g. the brand-new
-  // chat slot before the user sends their first message). Seeded once from
-  // ``GET /api/files/cwd``.
+  // chat slot before the user sends their first message). Seeded from
+  // ``GET /api/files/cwd`` — the signed-in profile's own working directory —
+  // and cleared on a profile switch, logout or a move of that folder, so the
+  // panel re-seeds.
   userDefaultCwd: string;
-  // The user working directory the panel was seeded with — an allowed read
-  // base on the backend. Unlike ``userDefaultCwd`` (which follows no-
-  // conversation navigation), this stays fixed so the breadcrumb knows the
-  // floor below which it must not navigate while no conversation is active:
-  // without a conversation there's no cwd override to widen the backend's
-  // read allowlist, so leaving this subtree would 403 and strand the tree.
+  // The profile's working directory the panel was seeded with — an allowed
+  // read base on the backend, and private to that profile. Unlike
+  // ``userDefaultCwd`` (which follows no-conversation navigation), this stays
+  // fixed so the breadcrumb knows the floor below which it must not navigate
+  // while no conversation is active: without a conversation there's no cwd
+  // override to widen the backend's read allowlist, so leaving this subtree
+  // would 403 and strand the tree.
   userWorkingRoot: string;
   splitRatio: number;
   showHiddenFiles: boolean;
@@ -321,8 +333,68 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
       this.cwdByConversation[conversationId] = path;
     },
 
+    // Seed ``userDefaultCwd`` + ``userWorkingRoot`` from ``GET
+    // /api/files/cwd`` — the signed-in profile's own working directory. A
+    // no-op once seeded (resetForProfileSwitch clears both, so the next call
+    // fetches the new profile's folder). An answer that arrives after a reset
+    // or a token change names a forgotten folder and is dropped. Errors are
+    // swallowed: a conversation's ``ready`` event populates the cwd anyway.
+    seedUserCwd(): Promise<void> {
+      if (this.userDefaultCwd) return Promise.resolve();
+      const settings = useSettingsStore();
+      const token = settings.authToken;
+      if (!token) return Promise.resolve();
+      if (_cwdSeed && _cwdSeed.token === token) return _cwdSeed.promise;
+      const epoch = _cwdEpoch;
+      const seed = { token, promise: Promise.resolve() };
+      seed.promise = (async () => {
+        try {
+          const cwd = await getInitialCwd(settings.agentUrl, token);
+          if (epoch !== _cwdEpoch || useSettingsStore().authToken !== token || this.userDefaultCwd) return;
+          this.setUserDefaultCwd(cwd);
+          this.setUserWorkingRoot(cwd);
+        } catch {
+          /* fall through — a ready event will populate eventually */
+        } finally {
+          if (_cwdSeed === seed) _cwdSeed = null;
+        }
+      })();
+      _cwdSeed = seed;
+      return seed.promise;
+    },
+
+    // Forget everything the file panel learned about the previous profile's
+    // files: its working directory (the default cwd and the navigation floor),
+    // every conversation's cwd, the selection and the last watch event. Each
+    // profile's working directory is its own, so keeping any of it would root
+    // the next profile's panel in a folder it may not read. Called whenever
+    // the signed-in profile changes (followSignedInProfile below: a switch,
+    // logout) and when its folder moves (workingDirChanged).
+    resetForProfileSwitch() {
+      _cwdEpoch += 1;
+      _cwdSeed = null;
+      this.userDefaultCwd = '';
+      this.userWorkingRoot = '';
+      this.cwdByConversation = {};
+      this.selectedFilePath = null;
+      this.lastFileEvent = null;
+    },
+
+    // A profile's working directory was changed (by the admin, on Settings →
+    // Profiles). Only the signed-in profile's own concerns this session: its
+    // panel — default cwd, navigation floor, every conversation's cwd — is
+    // rooted in the old folder, so it is dropped and re-seeded as on a profile
+    // switch, and the settings store's copy is re-read. Another profile's
+    // change leaves this session alone.
+    async workingDirChanged(profile: string): Promise<void> {
+      const settings = useSettingsStore();
+      if (!profile || profile !== settings.profileId) return;
+      this.resetForProfileSwitch();
+      await Promise.all([this.seedUserCwd(), settings.refreshWorkingDir()]);
+    },
+
     // Set the fallback cwd used when no conversation is active. Seeded by
-    // FileTreePanel from ``GET /api/files/cwd`` on first mount.
+    // seedUserCwd() from ``GET /api/files/cwd``.
     setUserDefaultCwd(path: string) {
       if (!path || this.userDefaultCwd === path) return;
       this.userDefaultCwd = path;
@@ -399,3 +471,23 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
     },
   },
 });
+
+/**
+ * Keep the file panel on the signed-in profile's own folder: whenever the
+ * signed-in profile changes, whatever route the change took, forget the
+ * previous one's. Keyed on identity, not the route: NavRail's "Switch profile"
+ * passes through the profile picker ('/'), a route with no profile param, so a
+ * route watch sees `undefined → bob` and the next profile would inherit
+ * admin's folder (seedUserCwd is a no-op while one is set). Installed once by
+ * App.vue; returns the stop handle.
+ */
+export function followSignedInProfile(): WatchStopHandle {
+  const settings = useSettingsStore();
+  const panel = useTerminalPanelStore();
+  return watch(
+    () => settings.profileId,
+    (profile, previous) => {
+      if (profile !== previous) panel.resetForProfileSwitch();
+    },
+  );
+}

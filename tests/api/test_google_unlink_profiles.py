@@ -26,6 +26,7 @@ import app.calendar.skill_token as calendar_token
 import app.drive.grant_flow as grant_flow
 import app.drive.skill_token as drive_token
 import app.google.unlink as U
+import app.documents.state as uds_state
 
 SKILLS = ("gcalendar", "gdrive", "gmail")
 
@@ -41,11 +42,11 @@ def _req(profile: str, skill: str):
     )
 
 
-def _endpoint():
+def _endpoint(path: str = "/api/google/accounts/{skill}/unlink"):
     for route in G.get_google_routes():
-        if route.path == "/api/google/accounts/{skill}/unlink":
+        if route.path == path:
             return route.endpoint
-    raise AssertionError("unlink route missing")
+    raise AssertionError(f"{path} route missing")
 
 
 @pytest.fixture
@@ -62,6 +63,12 @@ def two_profiles(tmp_path, monkeypatch):
         return {"stopped": [], "removed_autostart": 0}
 
     published: List[str] = []
+    # The Drive index of Documentation search: purge requests and suspensions,
+    # recorded per profile (no engine runs here).
+    purged: List[tuple] = []
+    suspended: List[str] = []
+    uds_state.set_purge_handler(lambda profile, kind: purged.append((profile, kind)))
+    monkeypatch.setattr(uds_state, "suspend_drive", suspended.append, raising=False)
 
     monkeypatch.setattr(U, "_teardown_listener", fake_teardown)
     monkeypatch.setattr(U, "_stop_watch", lambda spec, data, state: (True, None))
@@ -111,8 +118,11 @@ def two_profiles(tmp_path, monkeypatch):
         }
         grant_flow._pending[f"state-{profile}"] = {"profile": profile, "ts": time.time()}
 
-    yield SimpleNamespace(root=tmp_path, teardowns=teardowns, published=published)
+    yield SimpleNamespace(
+        root=tmp_path, teardowns=teardowns, published=published, purged=purged, suspended=suspended,
+    )
 
+    uds_state.set_purge_handler(None)
     calendar_token._access_cache.clear()
     drive_token._access_cache.clear()
     grant_flow._pending.clear()
@@ -220,3 +230,42 @@ def test_one_profiles_shared_grant_never_implicates_anothers(two_profiles):
     result = asyncio.run(U.unlink_skill("alice", U.GOOGLE_SKILLS[0]))
 
     assert sorted(result["siblings_sharing_grant"]) == ["gdrive", "gmail"]
+
+
+# ── the Drive index of Documentation search ──────────────────────────────────
+
+
+def test_a_gdrive_unlink_purges_only_that_profiles_drive_index(two_profiles):
+    resp = asyncio.run(_endpoint()(_req("alice", "gdrive")))
+
+    assert resp.status_code == 200
+    assert two_profiles.purged == [("alice", "drive")]
+    assert two_profiles.suspended == ["alice"]
+    assert _token(two_profiles.root, "bob", "gdrive").exists()
+
+
+def test_a_calendar_only_unlink_never_purges_drive(two_profiles):
+    asyncio.run(_endpoint()(_req("alice", "gcalendar")))
+    asyncio.run(_endpoint()(_req("bob", "gmail")))
+
+    assert two_profiles.purged == []
+    # Drive indexing is paused for each acting profile until the engine
+    # re-checks the token — which is still there.
+    assert two_profiles.suspended == ["alice", "bob"]
+    assert _token(two_profiles.root, "alice", "gdrive").exists()
+
+
+def test_unlink_all_purges_the_acting_profiles_drive_only(two_profiles):
+    resp = asyncio.run(_endpoint("/api/google/unlink-all")(_req("bob", "")))
+
+    assert resp.status_code == 200
+    assert two_profiles.purged == [("bob", "drive")]
+    assert two_profiles.suspended == ["bob"]
+    assert _token(two_profiles.root, "alice", "gdrive").exists()
+
+
+def test_each_profile_purges_its_own_drive_index(two_profiles):
+    for profile in ("alice", "bob"):
+        asyncio.run(_endpoint()(_req(profile, "gdrive")))
+
+    assert two_profiles.purged == [("alice", "drive"), ("bob", "drive")]

@@ -426,7 +426,7 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                         "probe": True,
                         "_profile": profile,
                         "_variables": variables,
-                        "_working_directory": get_user_working_directory(),
+                        "_working_directory": get_user_working_directory(profile),
                     })
                     payload = result.structured_content or {}
                     _probe_cache[key] = (time.monotonic(), payload)
@@ -673,7 +673,7 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
         try:
             info = await create_terminal(
                 profile,
-                cwd=get_user_working_directory(),
+                cwd=get_user_working_directory(profile),
                 cols=cols,
                 rows=rows,
                 extra_env=env,

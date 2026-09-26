@@ -158,7 +158,99 @@ def _allowed_roots(arguments: Dict[str, Any], data_dir: str) -> List[str]:
     sys_dir = env.get("CREMIND_SYSTEM_DIR")
     if sys_dir and profile:
         roots.append(os.path.join(sys_dir, profile))
+        # The profile's own Cremind manual pages moved out of that slice to
+        # ``storage/cremind_documents/profiles/<uuid>``. Not listed here (that
+        # would cost a profile-row lookup on every file call): ``_safe_resolve``
+        # admits a path there once it has checked the caller owns it.
     return roots
+
+
+def _document_tree_guard(profile: Optional[str]):
+    """The per-entry rule for the document trees, for ``profile``: the index
+    store is hidden from everyone, and under the manual root only the
+    caller's own uuid directory shows (no profile known → none does). The
+    same :class:`~app.utils.credential_paths.DocumentTreeGuard` the file
+    API's listing uses, so the tool and the API hide exactly the same
+    entries. The caller's uuid is looked up only if an entry needs it."""
+    from app.config.settings import BaseConfig
+    from app.utils.credential_paths import DocumentTreeGuard
+
+    def own_uid() -> Optional[str]:
+        if not profile:
+            return None
+        from app.cremind_documents.paths import resolve_profile_uid
+
+        return resolve_profile_uid(profile)
+
+    return DocumentTreeGuard(BaseConfig.CREMIND_SYSTEM_DIR, own_uid=own_uid)
+
+
+def _normcase_dir(path: str) -> str:
+    """Case-folded, no trailing separator (a bare root keeps its own) — the
+    shape :func:`app.config.working_dirs.foreign_dirs_inside` returns."""
+    return os.path.normcase(path).rstrip("\\/") or os.path.normcase(path)
+
+
+def _foreign_working_dirs(root: str, profile: Optional[str]) -> set:
+    """Other profiles' working directories (and unowned workspaces entries)
+    strictly inside ``root``, normcased — what a walk or listing of ``root``
+    must not show ``profile``. Empty when ownership is unknown."""
+    from app.config.working_dirs import foreign_dirs_inside
+
+    try:
+        return set(foreign_dirs_inside(root, profile or ""))
+    except Exception:  # noqa: BLE001 — a failed lookup must not break the walk
+        logger.debug("system_file: foreign working-dir lookup failed", exc_info=True)
+        return set()
+
+
+def _protected_tree_pruner(root: str, profile: Optional[str] = None):
+    """``prune(dirpath, dirnames, filenames=None)`` for a recursive walk of
+    ``root``: drops the Documentation search index store (current and
+    pre-rename roots) and every other profile's Cremind manual directory, so
+    a search or grep never reads the index or another profile's pages —
+    whether it is rooted above them (the system folder is some profiles'
+    working directory) or AT ``storage/cremind_documents/profiles``, which
+    ``_safe_resolve`` lets through because that directory belongs to nobody.
+    A walk that reaches the manual root descends only into ``profile``'s own
+    uuid directory; with no profile known, into none. ``filenames`` is
+    filtered the same way when given (a stray file directly in ``profiles/``
+    is nobody's to read either).
+
+    It also drops every OTHER profile's working directory (and unowned
+    workspaces entry) inside ``root`` — an admin whose folder contains the
+    workspaces root must not walk into the others' (the admin is not
+    exempt). Those are looked up once per walk; only a directory that is the
+    parent of one pays for the per-entry test.
+
+    ``os.walk`` builds every ``dirpath`` by joining onto ``root`` and never
+    descends a symlinked directory, so one ``realpath`` of the root places
+    every directory it visits — none per directory. Only directories on the
+    way to (or inside) a protected tree pay for the per-entry test."""
+    guard = _document_tree_guard(profile)
+    real_root = os.path.realpath(root)
+    foreign = _foreign_working_dirs(real_root, profile)
+    foreign_parents = {_normcase_dir(os.path.dirname(f)) for f in foreign}
+
+    def prune(dirpath: str, dirnames: List[str], filenames: Optional[List[str]] = None) -> None:
+        real_dir = real_root + dirpath[len(root):] if dirpath.startswith(root) else os.path.realpath(dirpath)
+        if foreign_parents and _normcase_dir(real_dir) in foreign_parents:
+            dirnames[:] = [
+                d for d in dirnames
+                if os.path.normcase(os.path.join(real_dir, d)) not in foreign
+            ]
+            if filenames is not None:
+                filenames[:] = [
+                    f for f in filenames
+                    if os.path.normcase(os.path.join(real_dir, f)) not in foreign
+                ]
+        if not guard.near(real_dir):
+            return
+        dirnames[:] = [d for d in dirnames if not guard.hides(os.path.join(real_dir, d))]
+        if filenames is not None:
+            filenames[:] = [f for f in filenames if not guard.hides(os.path.join(real_dir, f))]
+
+    return prune
 
 
 def _report_path(full_path: str, base: str) -> str:
@@ -170,10 +262,34 @@ def _report_path(full_path: str, base: str) -> str:
     return full_path.replace(os.sep, "/")
 
 
+def _foreign_to_caller(target: str, profile: Optional[str], base: str) -> bool:
+    """Whether ``target`` lies in a working directory the caller may not reach.
+
+    ``profile`` decides when given — and every tool passes it (these file
+    tools, image and audio understanding through :func:`_safe_resolve`, the
+    markdown converter's own resolver). A caller without one (no profile in
+    the call's context) is judged by its working directory ``base``, which
+    the adapter never points into another profile's folder: a target in a
+    zone that ``base``'s owners do not share is refused, and with ``base`` in
+    no zone every owned target is (fail closed — pass the profile to reach
+    your own folder from elsewhere)."""
+    from app.config.working_dirs import is_foreign, owners_of
+
+    if profile:
+        return is_foreign(target, profile)
+    owners = owners_of(target)
+    if owners is None:
+        return False
+    base_owners = owners_of(base) or frozenset()
+    return not (owners & base_owners)
+
+
 def _safe_resolve(
     data_dir: str,
     relative_path: str,
     allowed_roots: Optional[List[str]] = None,
+    *,
+    profile: Optional[str] = None,
 ) -> str:
     """Resolve *relative_path* and confirm it stays inside an allowed root.
 
@@ -182,6 +298,11 @@ def _safe_resolve(
     within ``data_dir`` or one of ``allowed_roots`` (e.g. a loaded skill's own
     directory) — matching the paths ``exec_shell`` already accepts. Raises
     ValueError with actionable guidance on a true escape.
+
+    ``profile`` is the calling profile, for the manual-pages rule: only a
+    profile's own ``storage/cremind_documents/profiles/<uuid>`` is reachable,
+    and with no profile known every such directory is refused (fail closed,
+    as the file API does).
     """
     base = os.path.realpath(data_dir)
     os.makedirs(base, exist_ok=True)
@@ -198,6 +319,50 @@ def _safe_resolve(
         target = os.path.realpath(raw)
     else:
         target = os.path.realpath(os.path.join(base, raw.lstrip("/\\")))
+
+    # Every profile's Documentation search index (their files' text) lives in
+    # the system folder, which is a working directory for some profiles.
+    from app.config.settings import BaseConfig
+    from app.utils.credential_paths import is_documents_index_path
+
+    if is_documents_index_path(target, BaseConfig.CREMIND_SYSTEM_DIR):
+        # Names no function: whether Documentation search is exposed depends on
+        # the conversation's search-tool selection, which this file tool cannot
+        # see, and a refusal must never point the model at a missing function.
+        raise ValueError(
+            f"Access denied: '{relative_path}' is Documentation search's internal index. "
+            "The user's indexed files are searched and read through Documentation search, "
+            "when it is available in this conversation — not through file tools."
+        )
+
+    # Every profile's Cremind manual pages sit side by side in the system
+    # folder, keyed by profile uuid; only the caller's own directory is open —
+    # from any working directory, since it no longer sits in the profile's
+    # own slice of the system folder. The row lookup happens only for a path
+    # that actually lands there.
+    from app.utils.credential_paths import authored_docs_owner, same_uid
+
+    owner = authored_docs_owner(target, BaseConfig.CREMIND_SYSTEM_DIR)
+    if owner is not None:
+        from app.cremind_documents.paths import resolve_profile_uid
+
+        if not same_uid(owner, resolve_profile_uid(profile) if profile else None):
+            raise ValueError(
+                f"Access denied: '{relative_path}' holds another profile's Cremind manual "
+                "pages. Only this profile's own manual folder is reachable."
+            )
+        return target
+
+    # Another profile's working directory (or an unowned workspaces entry) is
+    # off-limits under ANY root — an admin whose folder contains the
+    # workspaces root included. After the manual-pages rule: those pages sit
+    # in the system folder, which a legacy working directory may contain.
+    if _foreign_to_caller(target, profile, base):
+        raise ValueError(
+            f"Access denied: '{relative_path}' is inside another profile's working "
+            "directory. That folder belongs to another profile; each profile's "
+            "working directory is private to it."
+        )
 
     for root in roots:
         if target == root or target.startswith(root + os.sep):
@@ -710,7 +875,10 @@ class SearchFilesTool(BuiltInTool):
             })
 
         try:
-            search_root = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            search_root = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -737,6 +905,7 @@ class SearchFilesTool(BuiltInTool):
             pattern=pattern,
             type_filter=type_filter,
             max_results=max_results,
+            profile=arguments.get("_profile"),
         )
         return BuiltInToolResult(structured_content=payload)
 
@@ -750,6 +919,7 @@ class SearchFilesTool(BuiltInTool):
         pattern: Optional[str],
         type_filter: Optional[str],
         max_results: int,
+        profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Walk *search_root* for name matches. Synchronous; runs in a thread."""
         keywords = query.lower().split()
@@ -759,7 +929,9 @@ class SearchFilesTool(BuiltInTool):
         truncated = False
         budget_exhausted = False
 
+        prune = _protected_tree_pruner(search_root, profile)
         for dirpath, dirnames, filenames in os.walk(search_root, followlinks=False):
+            prune(dirpath, dirnames, filenames)
             entries = []
             if type_filter != "file":
                 entries.extend((d, True) for d in dirnames)
@@ -1064,7 +1236,10 @@ class GrepFilesTool(BuiltInTool):
             })
 
         try:
-            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -1100,10 +1275,11 @@ class GrepFilesTool(BuiltInTool):
             show_line_numbers=show_line_numbers,
             max_results=max_results,
             limits=limits,
+            profile=arguments.get("_profile"),
         )
         return BuiltInToolResult(structured_content=payload)
 
-    def _walk_files(self, root, glob_variants, type_exts):
+    def _walk_files(self, root, glob_variants, type_exts, profile: Optional[str] = None):
         """Yield candidate file paths under *root*, applying name filters.
 
         ``followlinks=False`` (the os.walk default) prevents directory-symlink
@@ -1113,9 +1289,14 @@ class GrepFilesTool(BuiltInTool):
         counts files that got past these name filters — a glob matching nothing
         walks the whole tree before yielding once. ``MAX_SCAN_ENTRIES`` bounds
         the traversal itself so that case terminates too.
+
+        ``profile`` is the caller: the walk enters only its own Cremind manual
+        directory (see ``_protected_tree_pruner``).
         """
         scanned = 0
-        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        prune = _protected_tree_pruner(root, profile)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            prune(dirpath, dirnames, filenames)
             for name in filenames:
                 scanned += 1
                 if scanned > MAX_SCAN_ENTRIES:
@@ -1266,6 +1447,7 @@ class GrepFilesTool(BuiltInTool):
         show_line_numbers: bool,
         max_results: int,
         limits: Dict[str, int],
+        profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Synchronous traversal + matching; builds the full structured payload."""
         base = os.path.realpath(data_dir)
@@ -1288,7 +1470,7 @@ class GrepFilesTool(BuiltInTool):
         if os.path.isfile(target):
             candidates: Any = [target]
         else:
-            candidates = self._walk_files(target, glob_variants, type_exts)
+            candidates = self._walk_files(target, glob_variants, type_exts, profile)
 
         def _rel(p: str) -> str:
             return _report_path(p, base)
@@ -1420,7 +1602,10 @@ class ListFilesTool(BuiltInTool):
         pattern = arguments.get("pattern")
 
         try:
-            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -1430,11 +1615,25 @@ class ListFilesTool(BuiltInTool):
                 "message": f"'{rel_path}' is not a directory.",
             })
 
+        # The same per-entry rule as /api/files/list: a listing of
+        # ``storage`` does not name the index store, and a listing of
+        # ``storage/cremind_documents/profiles`` (nobody's directory, so
+        # ``_safe_resolve`` lets it through) names only the caller's own uuid.
+        # ``target`` is resolved, so entries are placed without a realpath.
+        guard = _document_tree_guard(arguments.get("_profile"))
+        filter_entries = guard.near(target)
+        # Nor does it name another profile's working directory (a folder that
+        # contains the workspaces root lists the others' workspaces).
+        foreign = _foreign_working_dirs(target, arguments.get("_profile"))
         entries = []
         try:
             with os.scandir(target) as it:
                 for entry in it:
                     if pattern and not fnmatch.fnmatch(entry.name, pattern):
+                        continue
+                    if filter_entries and guard.hides(os.path.join(target, entry.name)):
+                        continue
+                    if foreign and os.path.normcase(os.path.join(target, entry.name)) in foreign:
                         continue
                     try:
                         stat = entry.stat()
@@ -1494,7 +1693,10 @@ class GetFileInfoTool(BuiltInTool):
             return BuiltInToolResult(structured_content={"error": "Missing parameter", "message": "path is required."})
 
         try:
-            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -1577,7 +1779,10 @@ class ReadFileTool(BuiltInTool):
             return BuiltInToolResult(structured_content={"error": "Missing parameter", "message": "path is required."})
 
         try:
-            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -1723,7 +1928,10 @@ class WriteFileTool(BuiltInTool):
             })
 
         try:
-            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -1861,7 +2069,10 @@ class OverwriteFileTool(BuiltInTool):
 
         # --- Resolve path ---
         try:
-            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, rel_path, _allowed_roots(arguments, data_dir),
+                profile=arguments.get("_profile"),
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -2002,9 +2213,10 @@ def _resolve_relocation(
     ``BuiltInToolResult``; on success ``error`` is ``None``.
     """
     roots = _allowed_roots(arguments, data_dir)
+    profile = arguments.get("_profile")
 
     try:
-        src = _safe_resolve(data_dir, source_path, roots)
+        src = _safe_resolve(data_dir, source_path, roots, profile=profile)
     except ValueError as e:
         return None, None, BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -2015,8 +2227,33 @@ def _resolve_relocation(
                        + _relative_abs_hint(source_path, data_dir, arguments),
         })
 
+    # A parent of the document trees (``storage``, ``storage/cremind_documents``
+    # …) carries every profile's manual pages or indexes with it: moving it
+    # would take them out from under the rules above, whoever asks.
+    from app.config.settings import BaseConfig
+    from app.utils.credential_paths import holds_authored_docs, holds_documents_index
+
+    if os.path.isdir(src) and (
+        holds_authored_docs(src, BaseConfig.CREMIND_SYSTEM_DIR)
+        or holds_documents_index(src, BaseConfig.CREMIND_SYSTEM_DIR)
+    ):
+        return None, None, BuiltInToolResult(structured_content={
+            "error": "Access denied",
+            "message": f"'{source_path}' holds other profiles' documents and cannot be moved.",
+        })
+    # Likewise a folder holding another profile's working directory (the
+    # workspaces root inside an admin's folder): it is not the caller's to move.
+    if os.path.isdir(src) and _foreign_working_dirs(src, profile):
+        return None, None, BuiltInToolResult(structured_content={
+            "error": "Access denied",
+            "message": (
+                f"'{source_path}' holds other profiles' working directories and "
+                "cannot be moved."
+            ),
+        })
+
     try:
-        dst = _safe_resolve(data_dir, destination_path, roots)
+        dst = _safe_resolve(data_dir, destination_path, roots, profile=profile)
     except ValueError as e:
         return None, None, BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -2025,7 +2262,7 @@ def _resolve_relocation(
         # keeping its name. Re-validate the joined path stays inside a root.
         try:
             final_target = _safe_resolve(
-                data_dir, os.path.join(dst, os.path.basename(src)), roots)
+                data_dir, os.path.join(dst, os.path.basename(src)), roots, profile=profile)
         except ValueError as e:
             return None, None, BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
     else:

@@ -16,8 +16,9 @@ The helpers below keep the two in sync:
 * :func:`hydrate_working_directory` — called when a conversation becomes
   active (SSE subscribe, agent loop start). Loads the persisted value into
   ContextStorage if it isn't already there, validating that the path still
-  exists on disk. Stale entries (target deleted) are cleared and the
-  conversation transparently falls back to the user default.
+  exists on disk and is not inside another profile's working directory. Stale
+  entries (target deleted, or now another profile's) are cleared and the
+  conversation transparently falls back to its profile's own folder.
 
 * :func:`persist_working_directory` — called by the writers (HTTP endpoint
   and tool) after they update ContextStorage, so the change survives a
@@ -41,6 +42,7 @@ import os
 from typing import Any
 
 from app.config.settings import get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.utils.context_storage import (
     clear_context,
     get_context,
@@ -50,6 +52,39 @@ from app.utils.logger import logger
 
 
 WORKING_DIR_OVERRIDE_KEY = "_working_directory_override"
+
+# The one sentence every surface answers with when a directory it was handed
+# lies inside another profile's working directory.
+FOREIGN_WORKING_DIR_MESSAGE = "That folder belongs to another profile."
+
+
+def resolve_tool_cwd(
+    arguments: dict,
+    *,
+    explicit_key: str | None = "working_directory",
+) -> tuple[str | None, str | None]:
+    """``(cwd, error)`` for a built-in tool that runs a process in a directory
+    (the coding agents): the model's explicit ``arguments[explicit_key]``, else
+    the adapter-injected ``_working_directory``, else the calling profile's own
+    folder. Absolute and ``~``-expanded, not created.
+
+    ``error`` (and no cwd) when nothing names a directory and no ``_profile``
+    says whose folder to use, or when the directory lies inside ANOTHER
+    profile's working directory — the admin is not exempt. The process itself
+    runs as the server's OS user and cannot be sandboxed; this only stops the
+    tool from being pointed there."""
+    profile = arguments.get("_profile") or None
+    raw = (arguments.get(explicit_key) if explicit_key else None) or arguments.get(
+        "_working_directory"
+    )
+    if not raw:
+        if not profile:
+            return None, "No working directory was given and the calling profile is unknown."
+        raw = get_user_working_directory(profile)
+    cwd = os.path.abspath(os.path.expanduser(str(raw)))
+    if is_foreign(cwd, profile):
+        return None, f"Cannot use '{cwd}' as the working directory: {FOREIGN_WORKING_DIR_MESSAGE}"
+    return cwd, None
 
 
 async def _try_load(conv_storage: Any, method: str, *args: Any) -> dict | None:
@@ -121,11 +156,36 @@ async def resolve_cwd_scope(
     return context_id, context_id
 
 
+async def _load_conversation(conv_storage: Any, conversation_id: str) -> dict | None:
+    if conv_storage is None:
+        return None
+    try:
+        return await conv_storage.get_conversation(conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"hydrate_working_directory: get_conversation failed for "
+            f"{conversation_id}"
+        )
+        return None
+
+
+def _profile_default(profile: str | None, conversation_id: str | None) -> str:
+    """The owning profile's own folder. With no profile there is no folder to
+    fall back to — guessing ``admin`` would hand one profile another's files."""
+    if not profile:
+        raise ValueError(
+            f"hydrate_working_directory: no profile for conversation "
+            f"{conversation_id!r}; cannot resolve its working directory"
+        )
+    return get_user_working_directory(profile)
+
+
 async def hydrate_working_directory(
     conversation_id: str,
     conv_storage: Any,
     *,
     context_key: str | None = None,
+    profile: str | None = None,
 ) -> str:
     """Ensure ContextStorage holds the conversation's persisted override and
     return the conversation's effective working directory.
@@ -134,9 +194,14 @@ async def hydrate_working_directory(
 
     1. Existing in-memory ContextStorage value (already hydrated this boot).
     2. ``conversations.working_directory`` from the DB.
-    3. ``get_user_working_directory()`` (the profile default).
+    3. ``get_user_working_directory(profile)`` (the profile's own folder).
 
-    A persisted override that no longer points at a real directory is
+    The owning profile is the conversation row's ``profile``, else the
+    ``profile`` argument; with neither the fallback raises ``ValueError``
+    rather than guess one.
+
+    An override that no longer points at a real directory, or that now lies
+    inside ANOTHER profile's working directory (the admin moved a folder), is
     cleared from both stores so the next reasoning step sees the default.
 
     The DB row is always addressed by ``conversation_id``; ``context_key``
@@ -148,36 +213,47 @@ async def hydrate_working_directory(
     directory.
     """
     if not conversation_id:
-        return get_user_working_directory()
+        return _profile_default(profile, conversation_id)
 
     key = context_key or conversation_id
+    owner = profile
+    conv: dict | None = None
+    loaded = False
     in_memory = get_context(key, WORKING_DIR_OVERRIDE_KEY)
     if isinstance(in_memory, str) and in_memory:
-        return in_memory
+        if not owner:
+            conv, loaded = await _load_conversation(conv_storage, conversation_id), True
+            owner = (conv or {}).get("profile") or None
+        if not is_foreign(in_memory, owner):
+            return in_memory
+        logger.info(
+            f"hydrate_working_directory: cwd {in_memory!r} of {conversation_id} "
+            f"is inside another profile's working directory; dropping it"
+        )
+        clear_context(key, WORKING_DIR_OVERRIDE_KEY)
+
+    if not loaded:
+        conv = await _load_conversation(conv_storage, conversation_id)
+    owner = (conv or {}).get("profile") or owner
 
     persisted: str | None = None
-    if conv_storage is not None:
-        try:
-            conv = await conv_storage.get_conversation(conversation_id)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                f"hydrate_working_directory: get_conversation failed for "
-                f"{conversation_id}"
-            )
-            conv = None
-        if conv:
-            wd = conv.get("working_directory")
-            if isinstance(wd, str) and wd:
-                persisted = wd
+    if conv:
+        wd = conv.get("working_directory")
+        if isinstance(wd, str) and wd:
+            persisted = wd
 
     if persisted:
-        if os.path.isdir(persisted):
+        if not os.path.isdir(persisted):
+            reason = "no longer exists"
+        elif is_foreign(persisted, owner):
+            reason = "is inside another profile's working directory"
+        else:
             set_context(key, WORKING_DIR_OVERRIDE_KEY, persisted)
             return persisted
-        # Stale: directory is gone. Clear so we don't keep retrying it.
+        # Stale: clear so we don't keep retrying it.
         logger.info(
             f"hydrate_working_directory: persisted cwd {persisted!r} for "
-            f"{conversation_id} no longer exists; falling back to user default"
+            f"{conversation_id} {reason}; falling back to the profile's own folder"
         )
         if conv_storage is not None:
             try:
@@ -190,7 +266,7 @@ async def hydrate_working_directory(
                     f"{conversation_id}"
                 )
 
-    return get_user_working_directory()
+    return _profile_default(owner, conversation_id)
 
 
 async def persist_working_directory(

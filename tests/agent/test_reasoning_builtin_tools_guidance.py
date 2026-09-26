@@ -146,7 +146,7 @@ def test_agent_wires_builtin_tools_guidance_into_prompt(monkeypatch):
     # STEP block is absent and the section is byte-identical across steps.
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
     llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")  # native reasoning

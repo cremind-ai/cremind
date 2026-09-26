@@ -129,6 +129,64 @@ def test_gate_skips_too_new_component_version():
     assert "tools" not in rep.supported_components
 
 
+def test_gate_reads_tools_v1_and_v2():
+    for version in (1, 2):
+        m = _manifest()
+        m.components = {"tools": ComponentEntry(version, "components/tools.json", {})}
+        assert check_importable(m).supported_components == ["tools"]
+
+
+def test_tools_v2_raises_the_min_app_version():
+    assert M.SUPPORTED_COMPONENT_VERSIONS["tools"] == 2
+    comps = {
+        "persona": ComponentEntry(1, "components/persona.json", {}),
+        "tools": ComponentEntry(2, "components/tools.json", {}),
+    }
+    assert M.compute_min_app_version(comps) == "0.0.19"
+
+
+# ── compat: older component documents ─────────────────────────────────────────
+
+
+def test_tools_v1_ids_are_mapped_once_not_chained():
+    from app.blueprint.compat import upgrade_component
+
+    data = {"tools": [
+        {"tool_id": "documentation_search", "kind": "builtin"},
+        {"tool_id": "user_documents", "kind": "builtin"},
+        {"tool_id": "user_documents"},  # a v1 entry predating ``kind``
+        {"tool_id": "web_search", "kind": "builtin"},
+        # Only built-ins were renamed: a user's MCP server keeps its id.
+        {"tool_id": "documentation_search", "kind": "mcp"},
+    ]}
+    got = upgrade_component("tools", 1, data)
+    assert [t["tool_id"] for t in got["tools"]] == [
+        "cremind_documentation_search",
+        "documentation_search",
+        "documentation_search",
+        "web_search",
+        "documentation_search",
+    ]
+    assert got["tools"][1]["legacy_tool_id"] == "user_documents"
+    assert "legacy_tool_id" not in got["tools"][3]
+    # The input document is not mutated.
+    assert data["tools"][0]["tool_id"] == "documentation_search"
+    # A document without a version is v1.
+    assert upgrade_component("tools", None, data)["tools"][0]["tool_id"] == "cremind_documentation_search"
+
+
+def test_tools_v2_passes_through():
+    from app.blueprint.compat import upgrade_component
+
+    data = {"tools": [
+        {"tool_id": "documentation_search", "kind": "builtin"},
+        {"tool_id": "cremind_documentation_search", "kind": "builtin"},
+    ]}
+    assert upgrade_component("tools", 2, data) == data
+    # Other components have no steps yet.
+    assert upgrade_component("persona", 1, {"x": 1}) == {"x": 1}
+
+
 # ── export audit (fail-closed) ────────────────────────────────────────────────
 
 
@@ -305,3 +363,11 @@ def test_rollback_still_deletes_an_imported_profile(torn_down):
     asyncio.run(delete_target_profile("imported", _deps(storage)))
     assert storage.deleted == ["imported"]
     assert torn_down == ["listeners:imported", "skills:imported"]
+
+
+@pytest.mark.parametrize("name", ["shared", "cli"])
+def test_an_imported_profile_may_not_take_a_name_the_manual_reserves(name):
+    from app.blueprint.apply import validate_profile_name
+
+    assert "reserved" in (validate_profile_name(name) or "")
+    assert validate_profile_name("shared-team") is None, "only the exact names are reserved"

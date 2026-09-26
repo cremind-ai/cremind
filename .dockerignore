@@ -57,10 +57,10 @@ ui/dist-electron/
 !README.md
 # Bundled system docs that ``cremind serve`` seeds into
 # <CREMIND_SYSTEM_DIR>/documents on boot (app/server.py ->
-# DocumentSyncService.seed_shared_from_app). Production images get these
+# CremindDocumentSyncService.seed_shared_from_app). Production images get these
 # via the wheel, but the ``-e /src`` dev image installs from this build
 # context, so they must survive the ``*.md`` exclusion above.
-!app/documents/bundled/**
+!app/cremind_documents/bundled/**
 docs/
 
 # Tests

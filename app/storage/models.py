@@ -10,7 +10,9 @@ Tables
 - channels            : per-profile messaging channels; one ``main`` row per
                         profile is auto-created. UNIQUE(profile, channel_type).
                         (FK profile, CASCADE)
-- conversations       : chat threads (FK profile CASCADE, FK channel CASCADE)
+- conversations       : chat threads (FK profile CASCADE, FK channel CASCADE);
+                        carries the conversation's search-tool selection, its
+                        CAS version and the last request's cache baseline
 - messages            : per-conversation messages (FK conversation, CASCADE)
 - channel_senders     : external sender state per channel — auth + per-sender
                         conversation pointer (FK channel CASCADE,
@@ -26,7 +28,8 @@ Tables
 - user_config         : per-profile general application settings (FK profile, CASCADE)
 - group_chats         : a room several profiles' agents share. SYSTEM-WIDE by
                         design (a shared resource), with per-profile membership
-                        below (FK created_by SET NULL)
+                        below (FK created_by SET NULL); carries the room's
+                        shared search-tool selection + CAS version
 - group_chat_members  : which profiles sit in a group + the hidden per-profile
                         "shadow" conversation that is that agent's seat
                         (FK group CASCADE, FK profile CASCADE)
@@ -39,6 +42,22 @@ Tables
 - channel_group_members : who is in such a group, from the platform's roster or
                         from having posted (FK channel group CASCADE).
                         UNIQUE(group_id, member_id)
+- document_sources     : Documentation search settings per profile and source
+                        (local folder / Google Drive). UNIQUE(profile, kind)
+                        (FK profile CASCADE). The index itself is a separate
+                        per-profile SQLite file, see app/documents/index
+- document_captions    : vision-model captions keyed by image sha256, so a
+                        rebuilt index never pays for a caption twice
+                        (FK profile CASCADE)
+- document_vision_usage : per-profile, per-local-day captioning counters behind
+                        the daily cap (FK profile CASCADE)
+- document_citations   : every citation token a Documentation Search tool printed, so
+                        an answer's tokens can be checked against what was
+                        really issued. UNIQUE(conversation_id, token)
+                        (FK profile CASCADE, FK conversation CASCADE)
+- document_research_jobs : deep-research jobs over the user's documents — the
+                        question, the checkpoint, the dossier, and the delivery
+                        counters (FK profile CASCADE, FK conversation CASCADE)
 """
 
 import uuid
@@ -66,6 +85,9 @@ class ProfileModel(Base):
     token_serial: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    # The profile's User Working Directory when the admin chose one; NULL is
+    # the default ``<workspaces root>/<name>`` (see app/config/working_dirs.py).
+    working_dir: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
 
 class ChannelModel(Base):
@@ -153,6 +175,31 @@ class ConversationModel(Base):
     )
     compaction_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     compaction_last_compacted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Which of the four search sources this conversation lets the agent use
+    # (see :mod:`app.agent.search_tools`). ``NULL`` = the default, every
+    # source; ``[]`` = none; a list = those ids, in priority order. "All four"
+    # is stored as ``NULL`` too, so Reset and Select-all compare equal.
+    # ``none_as_null``: a Python ``None`` is SQL ``NULL``, not the JSON text
+    # ``'null'`` (SQLAlchemy's default for an explicit ``None``), so "the
+    # default" is one value in SQL too. Python-side only — the DDL is JSON.
+    search_tools: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    # Compare-and-set counter for ``search_tools``: an edit names the version
+    # it read and loses (409) when another tab saved first. A no-op keeps it.
+    # ``server_default`` is the STRING "0" on purpose — an expression default
+    # would make Alembic rebuild ``conversations`` on SQLite, and that rebuild
+    # cascade-deletes every message.
+    search_tools_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # What the last main-model request actually sent for search (effective
+    # ids + a fingerprint of their schemas and guidance, and the selection
+    # version it ran on), recorded at the request itself. Drives the
+    # prompt-cache warning and "saved for the next response". Kept out of
+    # the generic conversation dict — read it with
+    # ``ConversationStorage.get_search_tools_row``.
+    search_cache_baseline: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -774,6 +821,14 @@ class GroupChatModel(Base):
     created_by: Mapped[str | None] = mapped_column(
         String(128), ForeignKey("profiles.name", ondelete="SET NULL"), nullable=True
     )
+    # The room's search-source selection, shared by every seat (same shape and
+    # CAS rules as ``conversations.search_tools``). Each seat keeps its own
+    # cache baseline on its seat conversation row, because each member agent
+    # sends its own request. ``none_as_null`` as on the conversation column.
+    search_tools: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    search_tools_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -972,4 +1027,248 @@ class ChannelGroupMemberModel(Base):
 
     __table_args__ = (
         UniqueConstraint("group_id", "member_id", name="uq_channel_group_members"),
+    )
+
+
+# ── Documentation search ───────────────────────────────────────────────────
+#
+# Only the small, durable half of the feature lives in the main database. The
+# bulk of it — the file manifest, chunk text, the full-text index, runtime sync
+# state — is a per-profile SQLite file under
+# ``<SYSTEM_DIR>/storage/documents/<profile uuid>/`` owned by
+# :mod:`app.documents.index`. That split is deliberate: the index is derived
+# data that can run to gigabytes, and anything in the main database is copied
+# by every backup and by every upgrade's pre-flight snapshot.
+
+
+class DocumentSourceModel(Base):
+    """One indexed source of one profile: its local folder, or its Google Drive.
+
+    Settings only. Where the sync *is* (state, the Drive changes cursor,
+    counters) is kept in the profile's index file next to the data it
+    describes, so restoring a backup can never pair a restored cursor with an
+    index that no longer exists — a Drive source would otherwise skip every
+    file that did not change after the snapshot.
+
+    ``root_path`` is the resolved absolute folder even when ``root_mode`` is
+    ``inherit``: the working directory it inherits is server-wide, and storing
+    what it resolved to is how a later change to it is noticed rather than
+    silently re-pointing every profile's index at another folder.
+    """
+
+    __tablename__ = "document_sources"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # local | drive
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false(),
+    )
+    # inherit | custom (local sources only)
+    root_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="inherit", server_default=text("'inherit'"),
+    )
+    root_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Normalized by ``app.documents.settings.normalize_excludes``:
+    #   [{"pattern": str, "type": "glob"|"dir"|"ext", "mode": "skip"|"metadata_only"}]
+    excludes: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # Normalized by ``app.documents.settings.normalize_options`` — caption,
+    # caption_consent, identity, allow_in, observer, reconcile_interval_min,
+    # include_folders.
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    first_sync_confirmed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("profile", "kind", name="uq_document_sources_profile_kind"),
+    )
+
+
+class DocumentCaptionModel(Base):
+    """What the vision model said about one image (or one scanned page).
+
+    Content-addressed by the bytes' sha256, so a copy of a photo is never sent
+    to the vision provider twice. Kept in the main database rather than the
+    index file on purpose: a caption costs money, and an index rebuilt after a
+    restore, a model change or a corrupted file should get it back for free.
+    """
+
+    __tablename__ = "document_captions"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # image | ocr
+    variant: Mapped[str] = mapped_column(String(8), nullable=False)
+    caption_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    caption_text: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1"),
+    )
+    tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class DocumentVisionUsageModel(Base):
+    """How much captioning a profile has spent today, for the daily cap.
+
+    ``day`` is the local date in the profile's own timezone, so the cap resets
+    at the user's midnight rather than UTC's. The cap is enforced with one
+    conditional ``UPDATE … WHERE captions < :cap`` so two workers can never
+    both take the last slot.
+    """
+
+    __tablename__ = "document_vision_usage"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    captions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ocr_pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+
+
+class DocumentCitationModel(Base):
+    """One citation token a Documentation Search tool printed in one conversation.
+
+    The registry is what makes a citation *verifiable*: when an answer is
+    saved, every ``[doc:…]`` token in it is looked up here, so a token the model
+    invented, altered or carried over from another conversation is flagged
+    instead of rendered as a trustworthy source (see
+    :mod:`app.documents.citations`).
+
+    Each row is also a **snapshot** of what the token pointed at when it was
+    issued — path, locator, a short snippet. The index it points into is
+    derived data that is rebuilt, edited and purged; the snapshot is what an
+    old answer can still show once the chunk it quoted has changed ("stale")
+    or the file is gone ("removed").
+
+    ``ref_id`` is the file/folder row id inside the profile's *index* file, a
+    different database, so it carries no foreign key. ``conversation_id`` is
+    NULL only on the A2A path, where a first message's conversation row does
+    not exist yet while its tools run (bound at finalization).
+    """
+
+    __tablename__ = "document_citations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True,
+    )
+    # Canonical form, "[doc:<cite_id>]" or "[doc:<cite_id>#<c8>]" (23 chars max; rows
+    # issued before the rename hold the same identity as "[ud:…]").
+    token: Mapped[str] = mapped_column(String(32), nullable=False)
+    cite_id: Mapped[str] = mapped_column(String(8), nullable=False)
+    # file | folder
+    target: Mapped[str] = mapped_column(String(8), nullable=False, default="file")
+    ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    text_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # local | drive — purge set D deletes the drive rows.
+    source_kind: Mapped[str] = mapped_column(String(8), nullable=False, default="local")
+    locator: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    label: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    rel_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # At most 800 characters of the chunk as it read when issued.
+    snippet: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # find_files | search | read | research
+    leaf: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    web_link: Mapped[str | None] = mapped_column(Text, nullable=True)
+    issued_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        # One row per token per conversation: re-printing a token (the same
+        # search twice) is a no-op, not a second row.
+        UniqueConstraint("conversation_id", "token", name="uq_document_citations_conv_token"),
+        # Lookups go by (profile, cite_id); it also serves the profile cascade.
+        Index("ix_document_citations_profile_cite", "profile", "cite_id"),
+    )
+
+
+class DocumentResearchJobModel(Base):
+    """One deep-research job over a profile's documents (see
+    :mod:`app.documents.research`).
+
+    The row is the job's durable half: what was asked, where the pipeline is
+    (``state``, its own checkpoint), what it found so far (``dossier``), and
+    what it cost. The running half — the asyncio task, the live progress — is
+    in memory and dies with the process; ``state`` is what lets
+    ``continue_job`` pick the job up again after a restart or after the user
+    answered a clarification, without redoing the files already read.
+
+    **Delivery is a counter pair, not a timestamp.** A job can become
+    deliverable more than once (it asks a question, is answered, then
+    finishes), so every transition into a state the user must hear about bumps
+    ``rev``, and whoever shows that state claims it by raising
+    ``delivered_rev`` to ``rev`` in one conditional UPDATE. Exactly one of the
+    tool's own reply, a REST read, the turn-end hook and the boot sweep wins
+    each ``rev``.
+
+    ``conversation_id`` is NULL for jobs started over REST/CLI: they have no
+    conversation to report back to. Deleting the conversation deletes the job.
+    """
+
+    __tablename__ = "document_research_jobs"
+
+    # uuid4().hex[:12] — short enough to type in the CLI.
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True,
+    )
+    # The stream run that started (or last continued) the job.
+    run_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # queued | planning | running | needs_clarification | needs_confirmation |
+    # interrupted | complete | partial | failed | cancelled
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    phase: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # compile | analyze
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    # legal | financial | general
+    domain: Mapped[str] = mapped_column(String(16), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    reference_scope: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # What the user answered to the job's clarifications, merged across turns.
+    answers: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # The pipeline's checkpoint (its own keys).
+    state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    dossier: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # high | low
+    model_group: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    budget: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    # Seconds the job has run, summed over every resume (the time limit is
+    # on this, not on the wall clock: time spent waiting for an answer is free).
+    elapsed_s: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default=text("0"))
+    rev: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    delivered_rev: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        # The job list (newest first per profile), the retention prune, and
+        # the profile cascade.
+        Index("ix_document_research_jobs_profile_created", "profile", "created_at"),
+        # The turn-end delivery hook and the conversation cascade.
+        Index("ix_document_research_jobs_conversation", "conversation_id"),
     )

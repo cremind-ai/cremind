@@ -4,7 +4,7 @@ Registered in pyproject.toml as `cremind = "app.cli.main:app"`.
 
 Discipline: this module and any module under `app/cli/` MUST NOT import from
 `app.server`, `app.api`, `app.tools`, `app.agent`, `app.skills`, `app.events`,
-`app.documents`, `app.channels`, `app.databases`, or `app.storage` at module
+`app.cremind_documents`, `app.channels`, `app.databases`, or `app.storage` at module
 top level. The only exception is `app/cli/commands/serve.py`, which imports
 `app.server.main` inside the function body. This keeps the slim install
 (`pip install cremind`) from needing server dependencies.
@@ -62,6 +62,7 @@ from app.cli.commands.skills import skills_app
 from app.cli.commands.tls import tls_app
 from app.cli.commands.tools import tools_app
 from app.cli.commands.upgrade import upgrade_app
+from app.cli.commands.docs import docs_app
 
 
 app = typer.Typer(
@@ -269,6 +270,7 @@ app.add_typer(blueprint_app, name="blueprint")
 app.add_typer(skills_app, name="skills")
 app.add_typer(features_app, name="features")
 app.add_typer(embedding_app, name="embedding")
+app.add_typer(docs_app, name="docs")
 app.add_typer(logs_app, name="logs")
 app.add_typer(server_app, name="server")
 app.add_typer(tls_app, name="tls")

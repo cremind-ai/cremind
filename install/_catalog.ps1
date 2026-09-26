@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  918c3655f0cf44a166d84e0964d05463ea9d0d2de58f3d5bce1c0b736879f81a
+# Source SHA-256:  2a4a0f3a9f726e7b0e74ba10ab15ace8d2f5916e9fe1a3ea2f9f8768f14121df
 
 $script:CatalogSchema = 1
 
@@ -109,6 +109,20 @@ $script:DockerDesktop = [ordered]@{
 $script:VncPasswordPrompt = [ordered]@{
     Prompt = 'Choose a password for the VNC Desktop'
     Hint   = '6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password.'
+}
+
+# ── Docker documents folder ──
+$script:DockerDocuments = [ordered]@{
+    Prompt           = 'Which folder should Cremind use as your Documents folder?'
+    Hint             = 'The container sees it as /root/Documents. Each profile works in its own folder inside it, cremind-workspaces/<profile>: the agent reads and saves files there by default, and document search indexes it. It is created if it does not exist. The path cannot contain $, # or double quotes.'
+    AccessPrompt     = 'Can Cremind change files in this folder?'
+    RwLabel          = 'Read-write'
+    RwDisclosure     = 'The agent''s file tools write to your real folder: files it creates, edits or deletes there change on this machine.'
+    RoLabel          = 'Read-only'
+    RoDisclosure     = 'Cremind can read the folder, but the agent cannot save files there. The profiles'' own working folders then live inside Cremind''s data volume instead, where you cannot see them from this computer.'
+    LinuxOwnerNote   = 'On Linux the container runs as root, so files the agent creates in this folder are owned by root on the host (sudo chown -R $USER <folder> takes them back).'
+    MacosPrivacyNote = 'macOS will ask whether Docker may access your Documents folder. Allow it: if you deny it, the folder looks empty inside the container and nothing is indexed.'
+    WslNote          = 'Inside WSL, ~/Documents is your Linux home, not your Windows Documents folder. For the Windows one, use /mnt/c/Users/<you>/Documents.'
 }
 
 # ── Kubernetes prompts ──

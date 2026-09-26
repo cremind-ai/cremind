@@ -208,6 +208,8 @@ def setup_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> _FakeConfigStorage:
     touch the real filesystem or network; stub them so the handler runs to the
     end and the recorded ``llm_config`` writes are the only thing under test.
     """
+    # Setup creates the profile's working directory; keep it out of the real one.
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))
     monkeypatch.setattr(config_api, "require_admin", lambda _req: None)
     monkeypatch.setattr(config_api, "_features_required_by_setup_payload", lambda _b: [])
     monkeypatch.setattr(config_api, "ensure_persona_file", lambda _p: None)

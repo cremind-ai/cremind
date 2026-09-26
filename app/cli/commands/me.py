@@ -36,14 +36,20 @@ def me(ctx: typer.Context) -> None:
         print_json(me_info.to_dict())
         return
 
-    print_kv([
+    rows = [
         ("profile", me_info.profile),
         ("subject", me_info.subject),
         ("issued_at", _format_unix(me_info.issued_at)),
         ("expires_at", _format_unix(me_info.expires_at)),
         ("system_dir", me_info.system_dir),
         ("user_working_dir", me_info.user_working_dir),
-    ])
+    ]
+    default = me_info.user_working_dir_default
+    if isinstance(default, bool):
+        rows.append(("user_working_dir_default", "yes" if default else "no"))
+    elif isinstance(default, str) and default:
+        rows.append(("user_working_dir_default", default))
+    print_kv(rows)
 
 
 def _format_unix(ts: int) -> str:

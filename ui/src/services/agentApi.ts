@@ -70,7 +70,17 @@ export async function getAuthUrl(agentUrl: string, token: string, agentName: str
 export async function fetchMe(
   agentUrl: string,
   token: string
-): Promise<{ sub: string; profile: string; exp: number | null; iat: number | null; working_dir?: string }> {
+): Promise<{
+  sub: string;
+  profile: string;
+  exp: number | null;
+  iat: number | null;
+  system_dir?: string;
+  /** This profile's own working directory (each profile has its own). */
+  user_working_dir?: string | null;
+  /** Whether that is the profile's default folder, ``<workspaces>/<profile>``. */
+  user_working_dir_default?: boolean | null;
+}> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/me`, {
     headers: { 'Authorization': `Bearer ${token}` },

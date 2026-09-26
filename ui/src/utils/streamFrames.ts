@@ -59,7 +59,46 @@ export function thinkingStepFromFrame(data: any): ThinkingStep {
     elapsedMs: typeof data.Elapsed_Ms === 'number' ? data.Elapsed_Ms : undefined,
     modelLabel: data.Model_Label || null,
     tokenUsage: mapStepTokenUsage(data.Token_Usage),
+    origin: data.Origin || null,
   };
+}
+
+/** One row of the Thinking Process timeline: the tool calls of one step. */
+export interface ThinkingGroup {
+  step: number | null;
+  // Who made the calls when it was not the model ('document_review': the
+  // agent's automatic reads of the sources a document search returned).
+  origin: string | null;
+  tools: ThinkingStep[];
+  // The reasoning call's token usage for the step (null for the agent's own
+  // calls, which had no reasoning call, and for steps from older runs).
+  tokens: StepTokenUsage | null;
+}
+
+/**
+ * Group per-tool thinking steps by ``step`` so parallel tool calls in one model
+ * turn render together under a single "Step N". Every tool call in a group
+ * shares the one reasoning call, so the first tool with usage is authoritative.
+ *
+ * Calls the agent made itself (``origin``) are grouped apart from the model's
+ * calls of the same step: they had no reasoning call of their own, and the
+ * timeline should say who made them.
+ */
+export function groupThinkingSteps(steps: ThinkingStep[]): ThinkingGroup[] {
+  const groups: ThinkingGroup[] = [];
+  for (const s of steps) {
+    const last = groups[groups.length - 1];
+    const origin = s.origin ?? null;
+    if (last && s.step != null && last.step === s.step && last.origin === origin) {
+      last.tools.push(s);
+    } else {
+      groups.push({ step: s.step ?? null, origin, tools: [s], tokens: null });
+    }
+  }
+  for (const g of groups) {
+    g.tokens = g.tools.find(t => t.tokenUsage)?.tokenUsage ?? null;
+  }
+  return groups;
 }
 
 /**
@@ -180,5 +219,6 @@ export function thinkingStepsFromRecord(
     elapsedMs: typeof (s as any).elapsed_ms === 'number' ? (s as any).elapsed_ms : undefined,
     modelLabel: s.model_label || null,
     tokenUsage: mapStepTokenUsage((s as any).token_usage),
+    origin: s.origin || null,
   }));
 }

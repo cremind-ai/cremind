@@ -5,11 +5,12 @@ import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import {
   listDirectory,
-  getInitialCwd,
   watchDirectory,
   parentDir,
   uploadFiles,
   DirectoryAccessError,
+  FOREIGN_WORKSPACE_MESSAGE,
+  isForeignWorkspaceError,
   type DirectoryEntry,
   type FileWatchHandle,
 } from '../services/filesApi';
@@ -45,7 +46,15 @@ function showTreeToast(msg: string) {
 }
 
 async function loadRoot() {
-  if (!panel.cwd) return;
+  if (!panel.cwd) {
+    // No cwd yet — e.g. just after a profile switch cleared the previous
+    // profile's, before the new one's is seeded. Show nothing of the old tree.
+    abortCtl?.abort();
+    rootEntries.value = [];
+    truncated.value = false;
+    errorMessage.value = null;
+    return;
+  }
   abortCtl?.abort();
   abortCtl = new AbortController();
   loading.value = true;
@@ -68,11 +77,13 @@ async function loadRoot() {
   } catch (e: unknown) {
     if ((e as Error)?.name === 'AbortError') return;
     // Without a conversation, a 403/404 means the target resolves outside the
-    // allowlist (e.g. a symlink/junction pointing out of the working tree) or
-    // has vanished — there's no override to widen the allowlist and no async
-    // race. Roll the cwd back to the last good directory and toast, instead of
-    // stranding the tree on an error screen. (With a conversation, a transient
-    // 403 is the override-not-yet-set race, so we must NOT roll back.)
+    // allowlist (e.g. a symlink/junction pointing out of the working tree, or
+    // into another profile's working directory) or has vanished — there's no
+    // override to widen the allowlist and no async race. Roll the cwd back to
+    // the last good directory and toast, instead of stranding the tree on an
+    // error screen. (With a conversation, a transient 403 is the override-not-
+    // yet-set race, so we must NOT roll back.)
+    const foreign = isForeignWorkspaceError(e);
     if (
       e instanceof DirectoryAccessError &&
       (e.status === 403 || e.status === 404) &&
@@ -81,10 +92,14 @@ async function loadRoot() {
       lastGoodCwd.value !== panel.cwd
     ) {
       panel.setUserDefaultCwd(lastGoodCwd.value);
-      showTreeToast("That folder isn't accessible");
+      showTreeToast(foreign ? FOREIGN_WORKSPACE_MESSAGE : "That folder isn't accessible");
       return; // the cwd change re-triggers loadRoot for the restored directory
     }
-    if (e instanceof DirectoryAccessError) {
+    if (foreign) {
+      // Another profile's working directory — e.g. a group-room seat whose
+      // agent works in its own profile's folder. A rule, not a failure.
+      errorMessage.value = FOREIGN_WORKSPACE_MESSAGE;
+    } else if (e instanceof DirectoryAccessError) {
       if (e.status === 403) {
         errorMessage.value = 'Path is outside accessible bases';
       } else if (e.status === 404) {
@@ -186,22 +201,28 @@ async function onPanelDrop(ev: DragEvent) {
   }
 }
 
-onMounted(async () => {
-  // Seed the fallback cwd used when no conversation is active. Per-
-  // conversation cwds arrive through the chat SSE stream's ``ready`` and
-  // ``cwd`` events and are written into the panel store from there.
-  if (!panel.userDefaultCwd) {
-    try {
-      const cwd = await getInitialCwd(settings.agentUrl, settings.authToken);
-      panel.setUserDefaultCwd(cwd);
-      // Pin the working-dir root too — it's an allowed read base and the
-      // floor for no-conversation breadcrumb navigation.
-      panel.setUserWorkingRoot(cwd);
-    } catch {
-      /* fall through — a ready event will populate eventually */
-    }
-  }
+onMounted(() => {
+  // Seed the fallback cwd used when no conversation is active — the
+  // profile's own working directory, also pinned as the no-conversation
+  // navigation floor. Per-conversation cwds arrive through the chat SSE
+  // stream's ``ready`` and ``cwd`` events and are written into the panel store
+  // from there.
+  void panel.seedUserCwd();
 });
+
+// The panel stays mounted across a profile switch (same route, new profile
+// param): the switch clears the previous profile's working directory from the
+// store, and this re-seeds it for the new token. The rollback target belongs
+// to the previous profile too.
+watch(
+  () => [settings.authToken, panel.userWorkingRoot] as const,
+  ([, root]) => {
+    if (!root) {
+      lastGoodCwd.value = '';
+      void panel.seedUserCwd();
+    }
+  },
+);
 
 watch(
   // Re-fetch when the cwd changes OR the scope conversation changes (e.g. the

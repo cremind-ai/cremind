@@ -340,3 +340,79 @@ def test_admin_can_create_profile(system_dir):
     assert resp.status_code == 201
     assert _body(resp)["profile"] == "sam"
     assert created == ["sam"]
+
+
+# ── names Cremind's manual reserves ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", ["shared", "cli"])
+def test_create_refuses_a_name_the_manual_uses_as_a_scope(system_dir, name):
+    """A manual scope is a profile NAME except for ``shared`` (the bundled
+    manual) and ``cli`` (the retired CLI corpus, pruned at every boot): a
+    profile carrying one would share that scope."""
+    created: list[str] = []
+    storage = _storage()
+
+    async def create_profile(n: str) -> dict:
+        created.append(n)
+        return {"name": n}
+
+    storage.create_profile = create_profile
+    post = _handler(_PROFILES_PATH, "POST", storage)
+
+    req = _auth(username="admin")
+    req.json = _json_body({"name": name})
+    resp = asyncio.run(post(req))
+
+    assert resp.status_code == 400
+    assert "reserved" in _body(resp)["error"] and name in _body(resp)["error"]
+    assert created == []
+
+
+class _ManualService:
+    def __init__(self) -> None:
+        self.pruned: list[str] = []
+        self.forgotten: list[str] = []
+
+    def prune_scope(self, scope: str) -> None:
+        self.pruned.append(scope)
+
+    def forget_profile(self, profile: str) -> None:
+        self.forgotten.append(profile)
+
+
+@pytest.fixture
+def manual(monkeypatch):
+    """The Cremind manual's service and watcher registry, recorded."""
+    import app.cremind_documents as manual_pkg
+    from app.cremind_documents import watcher
+
+    service = _ManualService()
+    stopped: list[str] = []
+    monkeypatch.setattr(manual_pkg, "get_service", lambda: service)
+    monkeypatch.setattr(watcher, "stop_scope_watcher", lambda scope: stopped.append(scope) or True)
+    return SimpleNamespace(service=service, stopped=stopped)
+
+
+def test_deleting_a_profile_named_shared_never_touches_the_shared_manual(system_dir, manual):
+    """A ``shared`` profile from before the name was reserved: deleting it
+    must not stop the bundled manual's watcher nor prune its points — that
+    would empty the manual for every profile until the next restart."""
+    delete = _handler(_DELETE_PATH, "DELETE", _storage())
+
+    resp = asyncio.run(delete(_auth(username="admin", path_params={"profile_name": "shared"})))
+
+    assert resp.status_code == 200
+    assert manual.stopped == []
+    assert manual.service.pruned == []
+    assert manual.service.forgotten == ["shared"]
+
+
+def test_deleting_an_ordinary_profile_still_stops_and_prunes_its_own_scope(system_dir, manual):
+    delete = _handler(_DELETE_PATH, "DELETE", _storage())
+
+    resp = asyncio.run(delete(_auth(username="admin", path_params={"profile_name": "lee"})))
+
+    assert resp.status_code == 200
+    assert manual.stopped == ["lee"]
+    assert manual.service.pruned == ["lee"]

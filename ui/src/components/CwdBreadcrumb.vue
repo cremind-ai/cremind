@@ -6,6 +6,7 @@ import { useTerminalPanelStore } from '../stores/terminalPanel';
 import {
   listDirectory,
   DirectoryAccessError,
+  isForeignWorkspaceError,
   type DirectoryEntry,
 } from '../services/filesApi';
 import { useCwdNavigation } from '../composables/useCwdNavigation';
@@ -76,9 +77,12 @@ async function startEdit() {
   // Seed with a trailing separator so the initial autocomplete lists the
   // children of the *current* directory rather than its parent. Without it,
   // ``editParentAndFragment`` parses the cwd as <parent>/<leaf> and lists the
-  // parent — which, when the cwd is the user working dir, sits outside the
-  // read allowlist and 403s with a spurious "Access denied". A trailing sep
-  // makes the cwd itself the parent; typing a leaf then narrows as before.
+  // parent instead. When the cwd is the profile's own working dir that parent
+  // is either the workspaces folder (the default location — it lists only
+  // this profile's own folder) or, for a folder the admin chose elsewhere, a
+  // directory outside the read allowlist that 403s with a spurious "Access
+  // denied". A trailing sep makes the cwd itself the parent; typing a leaf
+  // then narrows as before.
   const sep = detectSep(cwd);
   editValue.value = cwd && !cwd.endsWith(sep) ? cwd + sep : cwd;
   editing.value = true;
@@ -166,8 +170,9 @@ async function refreshSuggestions() {
   } catch (e: unknown) {
     if ((e as Error)?.name === 'AbortError') return;
     dropdownEntries.value = [];
-    dropdownError.value =
-      e instanceof DirectoryAccessError && e.status === 403
+    dropdownError.value = isForeignWorkspaceError(e)
+      ? "Another profile's folder"
+      : e instanceof DirectoryAccessError && e.status === 403
         ? 'Outside accessible folders'
         : (e as Error)?.message || 'Failed to load';
   } finally {

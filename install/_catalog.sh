@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  918c3655f0cf44a166d84e0964d05463ea9d0d2de58f3d5bce1c0b736879f81a
+# Source SHA-256:  2a4a0f3a9f726e7b0e74ba10ab15ace8d2f5916e9fe1a3ea2f9f8768f14121df
 
 CATALOG_SCHEMA=1
 
@@ -70,6 +70,18 @@ DOCKER_DESKTOP_DEFAULT=1
 # ── VNC password ──
 VNC_PASSWORD_PROMPT="Choose a password for the VNC Desktop"
 VNC_PASSWORD_HINT="6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password."
+
+# ── Docker documents folder ──
+DOCKER_DOCUMENTS_PROMPT="Which folder should Cremind use as your Documents folder?"
+DOCKER_DOCUMENTS_HINT="The container sees it as /root/Documents. Each profile works in its own folder inside it, cremind-workspaces/<profile>: the agent reads and saves files there by default, and document search indexes it. It is created if it does not exist. The path cannot contain \$, # or double quotes."
+DOCKER_DOCUMENTS_ACCESS_PROMPT="Can Cremind change files in this folder?"
+DOCKER_DOCUMENTS_RW_LABEL="Read-write"
+DOCKER_DOCUMENTS_RW_DISCLOSURE="The agent's file tools write to your real folder: files it creates, edits or deletes there change on this machine."
+DOCKER_DOCUMENTS_RO_LABEL="Read-only"
+DOCKER_DOCUMENTS_RO_DISCLOSURE="Cremind can read the folder, but the agent cannot save files there. The profiles' own working folders then live inside Cremind's data volume instead, where you cannot see them from this computer."
+DOCKER_DOCUMENTS_LINUX_OWNER_NOTE="On Linux the container runs as root, so files the agent creates in this folder are owned by root on the host (sudo chown -R \$USER <folder> takes them back)."
+DOCKER_DOCUMENTS_MACOS_PRIVACY_NOTE="macOS will ask whether Docker may access your Documents folder. Allow it: if you deny it, the folder looks empty inside the container and nothing is indexed."
+DOCKER_DOCUMENTS_WSL_NOTE="Inside WSL, ~/Documents is your Linux home, not your Windows Documents folder. For the Windows one, use /mnt/c/Users/<you>/Documents."
 
 # ── Kubernetes prompts ──
 K8S_CONTEXT_PROMPT="Which kubeconfig context should Cremind be installed into?"

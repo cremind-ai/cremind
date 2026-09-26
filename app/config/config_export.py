@@ -255,6 +255,7 @@ class ConfigSnapshotSources:
     #: :func:`gather_install_secrets` output, or ``None`` for a reduced export.
     install_secrets: Mapping[str, Any] | None
     db_provider: str
+    #: The exporting profile's own working directory (each profile has one).
     user_working_dir: str
     system_dir: str
     sqlite_db_path: str
@@ -562,7 +563,7 @@ def render_markdown(s: Mapping[str, Any]) -> str:
 
     lines.append("## Project Paths")
     lines.append("")
-    lines.append(f"- **User working directory:** `{s['workingDir']}`")
+    lines.append(f"- **Your working directory:** `{s['workingDir']}`")
     lines.append(f"- **System directory:** `{s['systemDir']}`")
     lines.append("")
 

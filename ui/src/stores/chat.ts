@@ -6,6 +6,7 @@ import { getA2AClient, getApiOrigin } from '../services/a2aClient';
 import { useSettingsStore } from './settings';
 import { useNotificationsStore } from './notifications';
 import { useTerminalPanelStore } from './terminalPanel';
+import { useSearchToolsStore } from './searchTools';
 import {
   fetchConversations as apiFetchConversations,
   fetchConversationMessages,
@@ -18,6 +19,7 @@ import {
   updateConversationTitle as apiUpdateConversationTitle,
   updateConversationId as apiUpdateConversationId,
   fetchAgentActivity,
+  fetchResearchActivity,
 } from '../services/conversationApi';
 import type { MessageRecord } from '../services/conversationApi';
 import type { ChatMode } from '../constants/chatModes';
@@ -34,6 +36,7 @@ import { useTodoPanelsStore, livePanelKey } from './todoPanels';
 import { normalizeTodos, allTodosCompleted } from '../utils/todos';
 import { splitMidTurnSegments } from '../utils/midTurnSplit';
 import { backfillLegacyTotals } from '../utils/latencyLabels';
+import { normalizeCitationsMeta, type CitationsMeta } from '../utils/citations';
 import {
   attachResultToSteps,
   terminalAttachmentFromFrame,
@@ -222,6 +225,11 @@ export interface ChatMessage {
   // live on `complete`. Absent on turns that never drove a todo list.
   planTodos?: TodoItem[];
   planStage?: 'executing' | 'completed';
+  // The answer's Documentation Search citations as the server verified them when it
+  // was saved (`metadata.citations`, or the live `citations` frame). Absent on
+  // answers that cite nothing and on older ones — the bubble resolves those on
+  // demand (stores/citations.ts).
+  citations?: CitationsMeta;
 }
 
 export interface ObservationPart {
@@ -260,6 +268,10 @@ export interface ThinkingStep {
   elapsedMs?: number;
   modelLabel?: string | null;
   tokenUsage?: StepTokenUsage | null;
+  // Set on a call the agent made itself rather than the model:
+  // 'document_review' = an automatic read of a source a document search
+  // returned. Undefined for ordinary model tool calls.
+  origin?: string | null;
 }
 
 export interface ArtifactInfo {
@@ -444,6 +456,84 @@ export interface AgentActivityState extends AgentActivitySnapshot {
   updateSeq: number;
 }
 
+// ── Research activity (Documentation Search deep research) ──────────────────────
+// Live state of the conversation's research job, rendered in the floating
+// Research activity panel: the question, phase, progress, latest steps and
+// tokens against the budget. Published from the job's own task, so frames
+// keep arriving after the turn that started it has ended. For the user's
+// eyes only — the agent reads the job through its tool.
+export type ResearchActivityStatus =
+  | 'queued' | 'planning' | 'running'
+  | 'needs_clarification' | 'needs_confirmation'
+  | 'complete' | 'partial' | 'failed' | 'cancelled' | 'interrupted';
+
+/** Statuses in which the job is still working (anything else is settled). */
+export const RESEARCH_WORKING_STATUSES: readonly string[] = ['queued', 'planning', 'running'];
+
+export interface ResearchActivityStep {
+  id: string;
+  ts: number;
+  kind: string;
+  label: string;
+  detail?: string | null;
+  status?: 'running' | 'done' | 'failed' | 'stopped' | null;
+}
+
+export interface ResearchActivitySnapshot {
+  job_id: string;
+  conversation_id?: string | null;
+  status: ResearchActivityStatus;
+  title: string;
+  mode: 'compile' | 'analyze' | string;
+  phase?: string | null;
+  started_at: number;
+  updated_at: number;
+  progress?: { done: number; total: number } | null;
+  steps: ResearchActivityStep[];
+  total_steps: number;
+  usage?: { tokens_in: number; tokens_out: number; budget: number } | null;
+  summary?: string | null;
+  error?: string | null;
+}
+
+export interface ResearchActivityState extends ResearchActivitySnapshot {
+  changedIds: string[];
+  updateSeq: number;
+}
+
+/**
+ * Whether `snap` is older than what the panel already shows: an earlier
+ * snapshot of the same job (SSE replay after a reconnect), or a snapshot of
+ * an earlier job. Snapshots are whole states, so the newer one simply wins.
+ */
+export function isStaleResearchSnapshot(
+  prev: ResearchActivitySnapshot | null | undefined,
+  snap: ResearchActivitySnapshot,
+): boolean {
+  if (!prev) return false;
+  if (prev.job_id === snap.job_id) return (snap.updated_at ?? 0) < (prev.updated_at ?? 0);
+  return (snap.started_at ?? 0) < (prev.started_at ?? 0);
+}
+
+function researchState(
+  snap: ResearchActivitySnapshot,
+  prev: ResearchActivityState | null | undefined,
+): ResearchActivityState {
+  const steps: ResearchActivityStep[] = Array.isArray(snap.steps) ? snap.steps : [];
+  const prevById = new Map(
+    (prev && prev.job_id === snap.job_id ? prev.steps : []).map(s => [s.id, s]),
+  );
+  const changedIds = prev
+    ? steps
+      .filter(s => {
+        const p = prevById.get(s.id);
+        return !p || p.status !== s.status || p.detail !== s.detail;
+      })
+      .map(s => s.id)
+    : [];
+  return { ...snap, steps, changedIds, updateSeq: (prev?.updateSeq ?? 0) + 1 };
+}
+
 interface ChatState {
   messagesByConversation: Record<string, ChatMessage[]>;
   runtimes: Record<string, ConversationRuntime>;
@@ -457,6 +547,8 @@ interface ChatState {
   todosByConversation: Record<string, TodoState | null>;
   /** Coding sub-agent (Claude Code / future Codex) live activity per conversation. */
   agentActivityByConversation: Record<string, AgentActivityState | null>;
+  /** Documentation Search research job live activity per conversation. */
+  researchActivityByConversation: Record<string, ResearchActivityState | null>;
   agentCard: AgentCard | null;
   agentName: string;
   isConnected: boolean;
@@ -502,6 +594,7 @@ export const useChatStore = defineStore('chat', {
     pendingPlanByConversation: {},
     todosByConversation: {},
     agentActivityByConversation: {},
+    researchActivityByConversation: {},
     agentCard: null,
     agentName: 'Agent',
     isConnected: false,
@@ -564,6 +657,11 @@ export const useChatStore = defineStore('chat', {
     activeAgentActivity(state): AgentActivityState | null {
       if (!state.activeConversationId) return null;
       return state.agentActivityByConversation[state.activeConversationId] ?? null;
+    },
+    /** Research job activity for the active conversation, or null. */
+    activeResearchActivity(state): ResearchActivityState | null {
+      if (!state.activeConversationId) return null;
+      return state.researchActivityByConversation[state.activeConversationId] ?? null;
     },
     /**
      * Map of conversationId -> isStreaming, used by the sidebar to show
@@ -644,8 +742,15 @@ export const useChatStore = defineStore('chat', {
       const settings = useSettingsStore();
       const agentUrl = settings.agentUrl;
       const authToken = settings.authToken;
+      // The new-chat slot's search-tools draft rides the create, so the
+      // conversation exists with the selection already saved — no follow-up
+      // save for the first message to wait on or race.
+      const searchTools = useSearchToolsStore();
       try {
-        const conv = await apiCreateConversation(agentUrl, authToken);
+        const conv = await apiCreateConversation(agentUrl, authToken, undefined, {
+          searchTools: searchTools.newChatSelection(),
+        });
+        searchTools.clearNewChatDraft();
         this.conversations = [
           {
             id: conv.id,
@@ -699,8 +804,14 @@ export const useChatStore = defineStore('chat', {
       let cid = options?.conversationId ?? this.activeConversationId ?? null;
       let createdNew = false;
       if (!cid) {
+        // Carry the new-chat search-tools draft into the create (see
+        // ensureConversation); the message POST below never resends it.
+        const searchTools = useSearchToolsStore();
         try {
-          const conv = await apiCreateConversation(agentUrl, authToken);
+          const conv = await apiCreateConversation(agentUrl, authToken, undefined, {
+            searchTools: searchTools.newChatSelection(),
+          });
+          searchTools.clearNewChatDraft();
           cid = conv.id;
           createdNew = true;
           // Inject into the saved-conversations list so the sidebar shows it
@@ -1074,6 +1185,62 @@ export const useChatStore = defineStore('chat', {
       this.agentActivityByConversation[conversationId] = null;
     },
 
+    /**
+     * Restore the Research activity panel after a reload from the newest
+     * message carrying `metadata.research_activity`. A saved snapshot that
+     * says the job is still working is checked against the server: a live
+     * snapshot is adopted (later frames keep it fresh); none means a restart
+     * cut the job short, so the panel shows 'interrupted' — the agent resumes
+     * it with continue_job. Panel-only — never touches message bubbles.
+     */
+    restoreResearchActivityState(conversationId: string, messages: MessageRecord[]) {
+      this.researchActivityByConversation[conversationId] = null;
+      if (!messages || !messages.length) return;
+
+      let snap: ResearchActivitySnapshot | null = null;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const ra = (messages[i]?.metadata?.research_activity ?? null) as any;
+        if (ra && typeof ra === 'object' && ra.job_id) {
+          snap = ra as ResearchActivitySnapshot;
+          break;
+        }
+      }
+      if (!snap) return;
+      const saved = snap;
+      this.researchActivityByConversation[conversationId] = {
+        ...researchState(saved, null),
+        updateSeq: 0,
+      };
+      if (!RESEARCH_WORKING_STATUSES.includes(saved.status)) return;
+
+      const settingsStore = useSettingsStore();
+      fetchResearchActivity(settingsStore.agentUrl, settingsStore.authToken, conversationId)
+        .then(live => {
+          const current = this.researchActivityByConversation[conversationId];
+          // Act only if the panel still shows the saved job and no live frame
+          // has moved it on meanwhile.
+          if (!current || current.job_id !== saved.job_id || current.updated_at !== saved.updated_at) return;
+          if (live && live.job_id && !isStaleResearchSnapshot(current, live as ResearchActivitySnapshot)) {
+            this.researchActivityByConversation[conversationId] =
+              researchState(live as ResearchActivitySnapshot, current);
+          } else {
+            // Nothing live, or only an older job: the saved one is gone.
+            this.researchActivityByConversation[conversationId] = {
+              ...current,
+              status: 'interrupted',
+              updateSeq: current.updateSeq + 1,
+            };
+          }
+        })
+        .catch(() => {});
+    },
+
+    /** Dismiss (close) the Research activity panel for a conversation. */
+    dismissResearchActivity(conversationId: string) {
+      if (!conversationId) return;
+      this.researchActivityByConversation[conversationId] = null;
+    },
+
     // ── stream lifecycle (ref-counted) ────────────────────────────────
 
     /**
@@ -1245,7 +1412,11 @@ export const useChatStore = defineStore('chat', {
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
       this.agentActivityByConversation = {};
+      this.researchActivityByConversation = {};
       useTodoPanelsStore().closeAll();
+      // Search-tool selections (and the new-chat draft) are the previous
+      // profile's; nothing of them may show under the next one.
+      useSearchToolsStore().resetForProfileSwitch();
       this.error = null;
 
       if (this.isConnected) {
@@ -1365,6 +1536,7 @@ export const useChatStore = defineStore('chat', {
           // dropped on `complete`).
           this.restorePlanModeState(id, messages);
           this.restoreAgentActivityState(id, messages);
+          this.restoreResearchActivityState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -1407,6 +1579,7 @@ export const useChatStore = defineStore('chat', {
             backfillLegacyTotals(splitMidTurnSegments(messages, this.mapBackendMessage));
           this.restorePlanModeState(id, messages);
           this.restoreAgentActivityState(id, messages);
+          this.restoreResearchActivityState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -1482,6 +1655,10 @@ export const useChatStore = defineStore('chat', {
         // for runs we kicked off ourselves (sendMessage already sets this),
         // but matters for skill-event runs we discover via the stream.
         this.trackConversation(conversationId, 'streaming');
+        // The model has answered, so this response's request — the moment a
+        // saved search-tools change is adopted — has been made. A no-op
+        // unless a change is waiting for exactly that.
+        useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
         return bucket[bucket.length - 1];
       };
 
@@ -1514,6 +1691,22 @@ export const useChatStore = defineStore('chat', {
               conversationId, data.working_directory,
             );
           }
+          return;
+
+        case 'search_tools':
+          // Someone saved this conversation's search tools — another tab, the
+          // CLI, or this tab's own save echoing back. Carries only the new
+          // version; the store re-reads the state unless it already holds it.
+          // Never touches the run in progress (it froze its selection).
+          // `adopted: true` is the server saying a new response just started
+          // on that version: the "next response" indicator can clear now.
+          if (data?.adopted) {
+            useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
+            return;
+          }
+          useSearchToolsStore().noteRemoteVersion(
+            { kind: 'conversation', id: conversationId }, data.version,
+          );
           return;
 
         case 'user_message': {
@@ -1847,6 +2040,20 @@ export const useChatStore = defineStore('chat', {
           return;
         }
 
+        case 'research_activity': {
+          // A research job's full snapshot. Panel-only (return before
+          // ensureAssistant) and accepted outside a turn: the job outlives
+          // the call that started it. A frame naming another conversation, or
+          // older than what the panel shows (a replay), changes nothing.
+          const snap = data as ResearchActivitySnapshot;
+          if (!snap || !snap.job_id) return;
+          if (snap.conversation_id && snap.conversation_id !== conversationId) return;
+          const prev = this.researchActivityByConversation[conversationId];
+          if (isStaleResearchSnapshot(prev, snap)) return;
+          this.researchActivityByConversation[conversationId] = researchState(snap, prev);
+          return;
+        }
+
         case 'todos': {
           // Plan mode: a full todo snapshot. Diff against the prior list to mark
           // which items changed (drives the highlight-then-fade).
@@ -1900,6 +2107,46 @@ export const useChatStore = defineStore('chat', {
           // Compaction ran — clear any pending suggestion.
           this.compactionByConversation[conversationId] = null;
           return;
+
+        case 'citations': {
+          // The answer's citations, verified when it was saved. Attach-only:
+          // it arrives as a turn finishes, so it must never open a bubble of
+          // its own the way ensureAssistant would.
+          const meta = normalizeCitationsMeta(data.citations);
+          if (!meta) return;
+          const assistantId =
+            typeof data.assistant_id === 'string' && data.assistant_id ? data.assistant_id : null;
+          // By persisted id first: `complete` records it as `backendId` (the
+          // live bubble keeps its optimistic `id`), and a bubble loaded from
+          // history carries it as `id`.
+          let target: ChatMessage | null = null;
+          if (assistantId) {
+            for (let i = bucket.length - 1; i >= 0; i--) {
+              const m = bucket[i];
+              if (m.role === 'assistant' && (m.backendId === assistantId || m.id === assistantId)) {
+                target = m;
+                break;
+              }
+            }
+          }
+          // Then the bubble still streaming — the usual case, since the frame
+          // is published before `complete` hands out the persisted id.
+          if (!target) target = findAssistant();
+          // Without an id to go by, a frame that lands after `complete` belongs
+          // to the answer that just finished: the newest assistant bubble. With
+          // an id that matched nothing, it is some other answer — drop it
+          // rather than badge the wrong bubble; a reload reads it from metadata.
+          if (!target && !assistantId) {
+            for (let i = bucket.length - 1; i >= 0; i--) {
+              if (bucket[i].role === 'assistant') {
+                target = bucket[i];
+                break;
+              }
+            }
+          }
+          if (target) target.citations = meta;
+          return;
+        }
 
         case 'complete': {
           const message = findAssistant();
@@ -1999,6 +2246,10 @@ export const useChatStore = defineStore('chat', {
           if (!followupQueued) {
             this.untrackConversation(conversationId, 'streaming');
           }
+          // A saved search-tools change counts as adopted once a response has
+          // run on it; re-read so the "applies from the next response" marker
+          // clears (no-op when nothing is pending).
+          useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
           // Sidebar refresh is handled by the conversations-list SSE stream
           // — the backend's stream_runner publishes a list-changed event on
           // the same `complete` it just emitted.
@@ -2026,6 +2277,7 @@ export const useChatStore = defineStore('chat', {
           runtime.requestSentAt = undefined;
           scratch.currentTextPart = '';
           this.untrackConversation(conversationId, 'streaming');
+          useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
           // Surface a top-level notification. Setup-required errors include
           // a settings_path so we can offer a one-click jump straight to the
           // page that fixes them; generic agent errors just show the text.
@@ -2195,6 +2447,9 @@ export const useChatStore = defineStore('chat', {
         latency: msg.role === 'agent'
           ? latencyFromServer((msg.metadata as any)?.latency)
           : undefined,
+        citations: msg.role === 'agent'
+          ? normalizeCitationsMeta((msg.metadata as any)?.citations)
+          : undefined,
       };
     },
 
@@ -2244,7 +2499,9 @@ export const useChatStore = defineStore('chat', {
       delete this.pendingPlanByConversation[id];
       delete this.todosByConversation[id];
       delete this.agentActivityByConversation[id];
+      delete this.researchActivityByConversation[id];
       useTodoPanelsStore().closeForConversation(id);
+      useSearchToolsStore().forget({ kind: 'conversation', id });
       const settingsStore = useSettingsStore();
       if (settingsStore.profileId) {
         useNotificationsStore().clearForConversation(settingsStore.profileId, id);
@@ -2313,6 +2570,7 @@ export const useChatStore = defineStore('chat', {
         this.pendingPlanByConversation,
         this.todosByConversation,
         this.agentActivityByConversation,
+        this.researchActivityByConversation,
       ] as Record<string, unknown>[]) {
         if (oldId in map) {
           map[newId] = map[oldId];
@@ -2362,6 +2620,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
       this.agentActivityByConversation = {};
+      this.researchActivityByConversation = {};
       useTodoPanelsStore().closeAll();
       this.error = null;
     },

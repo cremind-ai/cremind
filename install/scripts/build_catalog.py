@@ -47,6 +47,23 @@ OUT_PKG_TOML = REPO_ROOT / "app" / "config" / "install_catalog.toml"
 OUT_UI_JSON = REPO_ROOT / "ui" / "src" / "services" / "installCatalogData.json"
 
 
+# The [docker_documents] keys, in the order both includes render them. Fixed
+# here rather than read from the table so a key missing from catalog.toml
+# still renders (as empty) instead of vanishing from the shells.
+_DOCKER_DOCUMENTS_KEYS = (
+    "prompt",
+    "hint",
+    "access_prompt",
+    "rw_label",
+    "rw_disclosure",
+    "ro_label",
+    "ro_disclosure",
+    "linux_owner_note",
+    "macos_privacy_note",
+    "wsl_note",
+)
+
+
 # ── helpers ─────────────────────────────────────────────────────────────
 
 def _ordered(items: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
@@ -164,6 +181,15 @@ def render_bash(catalog: dict[str, Any], digest: str) -> str:
     add("# ── VNC password ──")
     add("VNC_PASSWORD_PROMPT=" + _bash_quote(vp.get("prompt", "")))
     add("VNC_PASSWORD_HINT=" + _bash_quote(vp.get("hint", "")))
+    add("")
+
+    # Docker documents folder (asked only when mode == docker). Every key is
+    # emitted, even when the table is absent, so install.sh's plain
+    # ``$DOCKER_DOCUMENTS_*`` reads never trip ``set -u``.
+    ddoc = catalog.get("docker_documents", {}) or {}
+    add("# ── Docker documents folder ──")
+    for key in _DOCKER_DOCUMENTS_KEYS:
+        add(f"DOCKER_DOCUMENTS_{key.upper()}=" + _bash_quote(ddoc.get(key, "")))
     add("")
 
     # Kubernetes prompts (asked only when mode == kubernetes). The advanced
@@ -313,6 +339,18 @@ def render_powershell(catalog: dict[str, Any], digest: str) -> str:
     add("$script:VncPasswordPrompt = [ordered]@{")
     add(f"    Prompt = {_ps_quote(vp.get('prompt', ''))}")
     add(f"    Hint   = {_ps_quote(vp.get('hint', ''))}")
+    add("}")
+    add("")
+
+    # Docker documents folder (asked only when mode == docker). Every key is
+    # emitted, even when the table is absent: Set-StrictMode faults on a
+    # missing property.
+    ddoc = catalog.get("docker_documents", {}) or {}
+    add("# ── Docker documents folder ──")
+    add("$script:DockerDocuments = [ordered]@{")
+    for key in _DOCKER_DOCUMENTS_KEYS:
+        name = "".join(part.capitalize() for part in key.split("_"))
+        add(f"    {name.ljust(16)} = {_ps_quote(ddoc.get(key, ''))}")
     add("}")
     add("")
 

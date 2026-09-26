@@ -218,6 +218,12 @@ def _clear_in_memory_context(conversation_id: str) -> None:
         agent_activity.clear(conversation_id)
     except Exception:  # noqa: BLE001
         logger.debug("delete client: activity clear failed", exc_info=True)
+    try:
+        from app.documents.research import activity as research_activity
+
+        research_activity.clear(conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("delete client: research activity clear failed", exc_info=True)
 
 
 async def _prune_target_chat_id(

@@ -523,6 +523,18 @@ def _delete_files(profile: str, spec: GoogleSkill) -> Tuple[List[str], List[str]
     return cleaned, failed
 
 
+def _suspend_documents_drive(profile: str) -> None:
+    """Stop the Drive half of Documentation search from reading through the
+    link right now. In memory only, and a no-op without a running engine: the
+    engine re-checks the token itself before resuming, since a gmail unlink
+    lands here too and leaves gdrive linked."""
+    from app.documents import state as uds_state
+
+    suspend = getattr(uds_state, "suspend_drive", None)
+    if suspend is not None:
+        suspend(profile)
+
+
 def _forget(profile: str) -> None:
     """Evict every per-profile cache that reads through to the deleted token.
 
@@ -538,6 +550,7 @@ def _forget(profile: str) -> None:
         ("calendar access cache", lambda: calendar_token.forget_access_token(profile)),
         ("drive access cache", lambda: drive_token.forget_access_token(profile)),
         ("drive grant rounds", lambda: grant_flow.abandon_rounds(profile)),
+        ("documents drive", lambda: _suspend_documents_drive(profile)),
     ):
         try:
             call()

@@ -10,7 +10,13 @@ observing its runtime behaviour:
 
 Long-running processes are tracked in ``_process_registry``; their post-
 classification stdout/stderr is streamed to incrementally numbered ``.log``
-files under ``<user_working_dir>/tools/builtin/exec_shell/stdout/<process_id>/``.
+files under ``<CREMIND_SYSTEM_DIR>/<profile>/tools/builtin/exec_shell/stdout/<process_id>/``.
+
+Commands start in the conversation's working directory (by default the calling
+profile's own User Working Directory). They run as the server's OS user and are
+NOT sandboxed: nothing stops a command from reading another profile's working
+directory, so the per-profile privacy of working directories is enforced by
+Cremind's file surfaces, not here.
 """
 
 import asyncio

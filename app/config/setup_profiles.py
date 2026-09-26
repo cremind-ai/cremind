@@ -48,7 +48,6 @@ _DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
             "sqlite_db_path": "cremind.db",
             "service_name": "cremind-agent",
             "agent_name": "Cremind Agent",
-            "user_working_dir": "~/.cremind",
         },
         "embedding_config": {
             "enabled": False,

@@ -9,7 +9,9 @@ import {
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useUsageStore } from '../stores/usage';
-import { formatTokens, formatUsd, formatPercent, formatTimestamp } from '../utils/usageFormat';
+import {
+  formatTokens, formatUsd, formatPercent, formatTimestamp, usageSourceTypeLabel,
+} from '../utils/usageFormat';
 import type { ConversationUsage, RequestUsage } from '../services/usageApi';
 
 const props = defineProps<{
@@ -47,7 +49,7 @@ const tagType = (t: string) =>
     : t === 'event_gate' ? 'info' : 'warning';
 
 // Friendlier badge text for source types whose raw key reads awkwardly.
-const sourceTypeLabel = (t: string) => (t === 'event_gate' ? 'event filter' : t);
+const sourceTypeLabel = usageSourceTypeLabel;
 
 // Requests are sortable from the column headers (When / Model / Tokens / Est.
 // cost), defaulting to newest-first — which also fixes the unordered rows the

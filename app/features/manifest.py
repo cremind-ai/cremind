@@ -151,6 +151,19 @@ FEATURES: dict[str, Feature] = {
         probes=("markitdown", "pandas"),
     ),
 
+    # ── Documentation search (indexing the user's own files) ────────────────
+    # Rides on the ``documents`` extra (markitdown[all] brings pdfplumber,
+    # pypdfium2, openpyxl, python-pptx, olefile, xlrd) plus its own: Pillow for
+    # EXIF (only transitive until now) and pillow-heif so iPhone HEIC photos are
+    # not silently metadata-only. (.cremindignore matching is built in; see
+    # app/documents/discovery/ignore.py for why it is not pathspec.)
+    # Hot-installable: every import happens inside the extractor subprocess.
+    "documentation_search": Feature(
+        key="documentation_search",
+        extras=("documents", "documentation-search"),
+        probes=("markitdown", "pdfplumber", "PIL", "pillow_heif"),
+    ),
+
     # ── Postgres back-end (alternative to bundled SQLite) ───────────────────
     "postgres": Feature(
         key="postgres",

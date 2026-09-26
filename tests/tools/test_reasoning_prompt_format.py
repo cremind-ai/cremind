@@ -106,7 +106,7 @@ class _ScriptedLLM:
 
 def _build_agent(monkeypatch) -> tuple[ra.ReasoningAgent, _FakeLeafTool]:
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
 
     tool = _FakeLeafTool()
     agent = ra.ReasoningAgent.__new__(ra.ReasoningAgent)

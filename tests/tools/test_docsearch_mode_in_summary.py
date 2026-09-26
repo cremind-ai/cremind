@@ -1,6 +1,6 @@
-"""The retrieval mode rides documentation_search's per-search INFO summary.
+"""The retrieval mode rides cremind_documentation_search's per-search INFO summary.
 
-``DocumentSyncService.search`` records which path it took (``vector`` or one of
+``CremindDocumentSyncService.search`` records which path it took (``vector`` or one of
 the full-scan fallbacks) on ``last_search_mode``. The tool reads it off the
 service right after searching and appends ``mode=<path>`` to the one INFO
 summary line it emits per search, so ``logs/app.log`` can tell a ranked search
@@ -19,7 +19,7 @@ import pytest
 from app.constants import ChatCompletionTypeEnum
 from app.utils.logger import logger
 
-import app.tools.builtin.documentation_search as ds
+import app.tools.builtin.cremind_documentation_search as ds
 
 
 _NAME = "widgets guide"
@@ -142,7 +142,7 @@ def test_summary_line_carries_the_services_search_mode(monkeypatch):
     assert res.content[0]["text"] == _BODY
     assert len(lines) == 1, lines  # one summary per search
     line = lines[0]
-    assert f"[documentation_search] query={_QUERY!r} ranked=[{_NAME}=0.9000]" in line
+    assert f"[cremind_documentation_search] query={_QUERY!r} ranked=[{_NAME}=0.9000]" in line
     assert f"decision=select:{_NAME}[0] mode=fallback-disabled" in line
 
 
@@ -180,7 +180,7 @@ def test_no_candidates_logs_the_mode_and_returns_the_no_result_payload(monkeypat
     assert res.token_usage is None
     assert llm.calls == 0  # nothing to judge
     assert len(lines) == 1
-    assert f"[documentation_search] query={_QUERY!r} ranked=[] decision=no-candidates mode=fallback-no-collection" in lines[0]
+    assert f"[cremind_documentation_search] query={_QUERY!r} ranked=[] decision=no-candidates mode=fallback-no-collection" in lines[0]
 
 
 def test_no_usable_candidates_logs_the_mode(monkeypatch):
@@ -225,8 +225,21 @@ def test_log_label_tags_the_summary_line(monkeypatch):
 
     assert len(lines) == 1
     assert lines[0].count("[custom_docs] query=") == 1
-    assert "[documentation_search] query=" not in lines[0]
+    assert "[cremind_documentation_search] query=" not in lines[0]
     assert "mode=vector" in lines[0]
+
+
+def test_a_candidate_only_the_keyword_ranking_found_is_labelled(monkeypatch):
+    """A keyword seat has no vector score; the summary says where it came
+    from, so a ranking miss rescued by keywords reads as one."""
+    keyword_hit = {
+        "file_path": "/docs/llm.md", "text": "Configure LLM providers.", "name": "llm",
+        "scope": "shared", "score": None, "match": "keyword",
+    }
+    _, lines = _run(_SvcWithMode(mode="vector", hits=[dict(_HIT), keyword_hit]), monkeypatch)
+
+    assert len(lines) == 1
+    assert f"ranked=[{_NAME}=0.9000, llm=keyword]" in lines[0]
 
 
 def test_select_best_candidate_defaults_the_mode_to_unknown():

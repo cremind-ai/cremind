@@ -23,6 +23,7 @@ from app.config.tls_transition import (
     origin,
     port_facts,
 )
+from app.middleware.client_protocol import CLIENT_PROTOCOL_HEADER
 
 #: Google's loopback OAuth callbacks (app/api/oauth_callback.py), plus the page
 #: they send the consent window on to (app/api/oauth_close.py). The shared
@@ -194,9 +195,14 @@ class TlsHandoffCors:
         if not allowed:
             await JSONResponse({"error": "This origin is not allowed to perform an HTTPS handoff."}, status_code=403)(scope, receive, send)
             return
+        # The client-protocol marker is listed because updated clients send it
+        # on every request: a fixed list without it would fail the preflight of
+        # a cross-origin handoff and strand the switch. These paths are never
+        # gated on it (app/middleware/client_protocol.py).
         headers = {"Access-Control-Allow-Origin": supplied, "Vary": "Origin",
                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                   "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                   "Access-Control-Allow-Headers":
+                       f"Authorization, Content-Type, {CLIENT_PROTOCOL_HEADER}",
                    "Cache-Control": "no-store"}
         if request.method == "OPTIONS":
             await JSONResponse({}, headers=headers)(scope, receive, send)

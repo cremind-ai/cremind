@@ -49,7 +49,7 @@ _ALL_TOOLS = ["reasoning", "ask_user_question", "write_plan", "update_todos", "c
 def _build(monkeypatch, provider="fake", model="fake-model", *, mode="reasoning", plan_phase=None, event_run=False):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     llm = SimpleNamespace(provider_name=provider, model_name=model)
     registry = _FakeRegistry([_FakeTool(t) for t in _ALL_TOOLS])
@@ -243,6 +243,9 @@ _ALLOWED_CREMIND_COMMANDS = [
     "cremind profile persona get",
     "cremind setup server-config get",
     "cremind agents config get",
+    # The reading forms of a leaf that also writes: no PATH, no --default.
+    "cremind profile working-dir",
+    "cremind profile working-dir bob",
 ]
 
 
@@ -279,6 +282,12 @@ _BLOCKED_CREMIND_COMMANDS = [
     "cremind profile wizard skip javis tools",
     "cremind profile wizard finish javis",
     "cremind profile wizard cancel javis",
+    # `profile working-dir` moves a profile's folder when given a PATH or
+    # --default — its file panel, tool directory and search index with it.
+    "cremind profile working-dir /srv/work",
+    "cremind profile working-dir bob /srv/work",
+    "cremind profile working-dir --default",
+    "cremind profile working-dir bob --default",
     # `config export` writes a file that embeds a live JWT. `export` is not a
     # read-only verb, and `--out` is a rejected option, so it is blocked twice
     # over — pinned here because both halves are easy to undo by accident.
@@ -474,6 +483,10 @@ def test_no_unruled_boolean_flag_rides_an_admitted_command():
             if any(opt in ra._PLAN_REJECTED_CLI_OPTIONS for opt in param.opts):
                 continue
             for opt in param.opts:
+                # A flag the predicate already refuses on THIS command has its
+                # ruling (`profile working-dir --default` is the setter form).
+                if not ra._is_readonly_cremind_command(f"{command} {opt}"):
+                    continue
                 if opt.startswith("--") and opt not in _REVIEWED_PLANNING_FLAGS:
                     unruled.append(f"{command} {opt}")
 
@@ -496,6 +509,67 @@ def test_a_setter_wearing_a_read_only_verb_is_blocked():
     # The pair's genuine reader still works — dropping the whole pair would have
     # been the lazy fix and would have cost the planner a real listing.
     assert ra._is_readonly_cremind_command("cremind calendar schedule list") is True
+
+
+def test_profile_working_dir_reads_but_never_moves_a_folder():
+    # One leaf, both a reader and a setter: `working-dir [NAME]` shows, and a
+    # PATH or --default moves the profile's working directory (its file panel,
+    # tool directory and Documentation search index go with it). A lone word is
+    # a NAME only when the CLI's own profile-name test says so; anything else is
+    # a PATH, i.e. a write.
+    for command in (
+        "cremind profile working-dir",
+        "cremind profile working-dir admin",
+        "cremind profile working-dir bob_2",
+        "cremind --json profile working-dir bob",
+        "cremind -p bob profile working-dir",
+        "cremind profile working-dir -- bob",
+    ):
+        assert ra._is_readonly_cremind_command(command) is True, command
+    for command in (
+        "cremind profile working-dir /srv/work",
+        "cremind profile working-dir ~/work",
+        "cremind profile working-dir C:/Work",
+        "cremind profile working-dir Work",         # upper case: a PATH to the CLI
+        "cremind profile working-dir bob /srv/work",
+        "cremind profile working-dir bob C:/Work",
+        "cremind profile working-dir --default",
+        "cremind profile working-dir bob --default",
+        "cremind profile working-dir --default bob",
+        "cremind profile working-dir -- --default",  # fail closed on a dash word
+        "cremind profile working-dir bob --json",   # no option rides along
+        "cremind profile working-dir bob carol",
+        "cremind -p bob profile working-dir /srv/work",
+    ):
+        assert ra._is_readonly_cremind_command(command) is False, command
+
+
+def test_profile_working_dir_judge_matches_the_real_cli():
+    # Drift guard: the judge's picture of the leaf — a real depth-2 command
+    # with two optional positionals and a `--default` setter flag — and its
+    # profile-name test must stay the CLI's own, or a PATH could read as a
+    # NAME (admitting a write) or a NAME as a PATH (costing a read).
+    import click
+
+    from app.cli.commands.profile import _looks_like_profile_name
+
+    commands = {" ".join(path): cmd for path, cmd in _cli_commands()}
+    for leaf in ra._PLAN_READONLY_CLI_ARG_LEAVES:
+        assert leaf in commands, f"argument-judged leaf no longer exists: {leaf}"
+    cmd = commands["profile working-dir"]
+    args = [p for p in cmd.params if isinstance(p, click.Argument)]
+    assert [p.name for p in args] == ["name", "path"]
+    assert not any(p.required for p in args)
+    flags = {o for p in cmd.params if isinstance(p, click.Option) for o in p.opts}
+    assert "--default" in flags
+    for opt in flags:
+        assert not ra._is_readonly_cremind_command(f"cremind profile working-dir {opt}"), opt
+
+    for sample in (
+        "admin", "bob", "bob_2", "a-b", "x" * 64, "x" * 65, "Bob", "bob.smith",
+        "/srv", "~", "~/w", "C:", "C:/w", "work/x", "", "é",
+    ):
+        assert (ra._PLAN_PROFILE_NAME_RE.match(sample) is not None) == _looks_like_profile_name(sample), sample
 
 
 def test_streaming_and_file_writing_options_are_rejected():
@@ -1155,7 +1229,7 @@ class _FakeSkillTool:
 def _build_dispatch_agent(monkeypatch, tools, *, event_run, loaded_skill_ids=()):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     llm = SimpleNamespace(provider_name="fake", model_name="fake-model")
     agent = ra.ReasoningAgent(

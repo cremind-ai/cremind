@@ -1,4 +1,5 @@
 import type { ChatMode } from '../constants/chatModes';
+import type { SearchToolId } from './searchToolsApi';
 
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
@@ -53,6 +54,8 @@ export interface MessageRecord {
       cache_read_input_tokens?: number;
       cache_creation_input_tokens?: number;
     } | null;
+    // A call the agent made itself ('document_review': an automatic read).
+    origin?: string | null;
   }[] | null;
   token_usage: {
     input_tokens: number;
@@ -119,6 +122,57 @@ export async function fetchAgentActivity(
     return body?.activity ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Fetch the live Research-activity snapshot for a conversation (a User
+ * Documents research job). Returns the snapshot while the job's panel is held
+ * in memory, or null when it is gone (the server restarted, or the
+ * conversation was cleared). Used only to disambiguate a persisted "running"
+ * snapshot on reload; never throws (returns null on any error).
+ */
+export async function fetchResearchActivity(
+  agentUrl: string, authToken: string, conversationId: string,
+): Promise<any | null> {
+  try {
+    const base = resolveBaseUrl(agentUrl);
+    const res = await fetch(
+      `${base}/api/conversations/${encodeURIComponent(conversationId)}/research-activity`,
+      { headers: authHeaders(authToken) },
+    );
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body?.activity ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cancel a Documentation Search research job. The job acts on the caller's own
+ * profile (the server takes it from the Bearer token). Resolves once the
+ * server accepted the cancel; the panel settles when the `research_activity`
+ * frame for the cancelled job arrives. Throws with the server's message when
+ * the cancel was refused (e.g. the job is not this profile's).
+ */
+export async function cancelResearchJob(
+  agentUrl: string, authToken: string, jobId: string,
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/documentation-search/research/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+    headers: authHeaders(authToken),
+  });
+  if (!res.ok) {
+    let message = res.statusText;
+    try {
+      const body = await res.json();
+      message = body?.message || body?.error || message;
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(`Could not cancel the research job: ${message}`);
   }
 }
 
@@ -190,14 +244,27 @@ export async function updateConversationId(
   return { ...data.conversation, message_count: 0 };
 }
 
+export interface CreateConversationOptions {
+  /**
+   * The new-chat slot's search-tools draft, saved with the row so the very
+   * first response already runs on it. `null` means the defaults; omit the
+   * option entirely to send nothing (a server that predates the field ignores
+   * it either way).
+   */
+  searchTools?: SearchToolId[] | null;
+}
+
 export async function createConversation(
   agentUrl: string, authToken: string, title?: string,
+  options: CreateConversationOptions = {},
 ): Promise<ConversationSummary> {
   const base = resolveBaseUrl(agentUrl);
+  const body: Record<string, unknown> = { title: title ?? 'Untitled Chat' };
+  if ('searchTools' in options) body.search_tools = options.searchTools ?? null;
   const res = await fetch(`${base}/api/conversations`, {
     method: 'POST',
     headers: authHeaders(authToken),
-    body: JSON.stringify({ title: title ?? 'Untitled Chat' }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Failed to create conversation: ${res.statusText}`);
   const data = await res.json();

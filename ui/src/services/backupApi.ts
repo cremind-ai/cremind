@@ -40,6 +40,12 @@ export interface ManifestSummary {
   encrypted: boolean;
   alembic_revision: string | null;
   db_row_total: number;
+  // Whether the archive carries the profiles' working directories. Absent
+  // (→ not included) on archives made before per-profile working directories.
+  workspaces_included?: boolean;
+  // Profiles whose working directory an admin chose outside the workspaces
+  // folder: never in the archive, whatever workspaces_included says.
+  working_dirs_elsewhere?: string[];
 }
 
 export interface BackupEntry {
@@ -116,11 +122,17 @@ export async function listBackups(agentUrl: string, authToken: string): Promise<
   return body.backups ?? [];
 }
 
-export async function createBackup(agentUrl: string, authToken: string, passphrase?: string): Promise<void> {
+export async function createBackup(
+  agentUrl: string, authToken: string, passphrase?: string, includeWorkspaces = true,
+): Promise<void> {
+  const body: Record<string, unknown> = {};
+  if (passphrase) body.passphrase = passphrase;
+  // Only the opt-out is sent: the server includes the working directories by default.
+  if (!includeWorkspaces) body.include_workspaces = false;
   const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/backup/create`, {
     method: 'POST',
     headers: authHeaders(authToken),
-    body: JSON.stringify(passphrase ? { passphrase } : {}),
+    body: JSON.stringify(body),
   });
   await jsonOrThrow(res, 'Failed to start backup');
 }

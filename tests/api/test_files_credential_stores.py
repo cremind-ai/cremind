@@ -39,6 +39,7 @@ the recursive change-stream re-advertised every name the listing filter hides.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 from types import SimpleNamespace
@@ -49,6 +50,7 @@ pytest.importorskip("a2a")
 
 from app.api import files as files_api  # noqa: E402
 from app.config import coding_cli_homes as homes  # noqa: E402
+from app.config import working_dirs  # noqa: E402
 from app.config.settings import BaseConfig  # noqa: E402
 from app.utils.context_storage import clear_context, get_context  # noqa: E402
 from app.utils.working_directory import WORKING_DIR_OVERRIDE_KEY  # noqa: E402
@@ -100,8 +102,12 @@ def system_dir(monkeypatch, tmp_path):
     resolved = os.path.realpath(str(root))
     monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", resolved)
     monkeypatch.setattr(
-        files_api, "get_user_working_directory", lambda: str(tmp_path / "work"),
+        files_api, "get_user_working_directory", lambda profile: str(tmp_path / "work"),
     )
+    # No profile rows, so no path is anyone's working directory: this suite is
+    # about the credential rule (ownership: test_files_working_dirs.py).
+    monkeypatch.setattr(importlib.import_module("app.config.settings"), "_dynamic_config_storage", None)
+    working_dirs.invalidate()
     (tmp_path / "work").mkdir()
     work = os.path.realpath(str(tmp_path / "work"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", os.path.join(work, ".claude"))
@@ -290,7 +296,7 @@ def test_a_directory_holding_a_store_cannot_be_moved_out(system_dir, tmp_path):
 
 
 def test_the_system_directory_itself_cannot_be_moved_out(system_dir, tmp_path):
-    """One level up is the same attack; ``_is_allowed_base`` already refuses it."""
+    """One level up is the same attack; ``_is_protected_root`` already refuses it."""
     seeded = _seed_alice_logins(system_dir)
 
     response = _move(system_dir, os.path.join(_work(tmp_path), "everything"))

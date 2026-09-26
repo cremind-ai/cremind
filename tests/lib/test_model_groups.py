@@ -68,7 +68,7 @@ def test_documentation_search_resolves_low_model(monkeypatch):
         "model_group.high": "anthropic/claude-opus-4-8",
         "model_group.low": "groq/llama-3.1-8b-instant",
     }))
-    mgr.create_llm_for_tool("documentation_search")
+    mgr.create_llm_for_tool("cremind_documentation_search")
     assert (captured["provider"], captured["model"]) == ("groq", "llama-3.1-8b-instant")
 
 
@@ -88,7 +88,7 @@ def test_documentation_search_falls_back_to_high_when_low_unset(monkeypatch):
         "model_group.high": "anthropic/claude-opus-4-8",
     }))
     # No model_group.low configured → judge transparently uses the main model.
-    mgr.create_llm_for_tool("documentation_search")
+    mgr.create_llm_for_tool("cremind_documentation_search")
     assert (captured["provider"], captured["model"]) == ("anthropic", "claude-opus-4-8")
 
 
@@ -118,7 +118,7 @@ def test_documentation_search_falls_back_when_low_incompatible(monkeypatch):
         "model_group.low": "openai/gpt-4.1-mini",
         "openai.auth_method": "codex_oauth",
     }))
-    mgr.create_llm_for_tool("documentation_search")
+    mgr.create_llm_for_tool("cremind_documentation_search")
     assert (captured["provider"], captured["model"]) == ("github-copilot", "gpt-5.5")
 
 

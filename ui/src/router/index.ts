@@ -2,8 +2,11 @@ import {
   createRouter, createWebHashHistory,
   type RouteLocationGeneric, type RouteLocationNormalized,
 } from 'vue-router';
+import { ElMessage } from 'element-plus';
 import ChatView from '../views/ChatView.vue';
 import { useSettingsStore } from '../stores/settings';
+import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
+import { myDocumentsClosedMessage, myDocumentsRouteDecision } from '../utils/myDocumentsAccess';
 import { PROFILE_ROUTES } from './profileRoutes';
 import { redeemTlsHandoff, TlsHandoffSessionError } from '../services/configApi';
 import { restoreTransitionState } from '../services/httpsTransition';
@@ -211,6 +214,27 @@ const routes = [
         return { path: `/${profile}/settings`, replace: true };
       }
       return true;
+    },
+  },
+  {
+    // Documentation search for this profile. No admin guard: every profile
+    // owns its own index, and the page itself explains an admin-disabled gate
+    // (and gives the admin the gate's settings).
+    path: '/:profile/settings/documents',
+    name: 'documents-settings',
+    component: () => import('../views/DocumentsSettings.vue'),
+    props: true,
+    meta: { title: 'My Documents' },
+    // The page exists only while Vector Embedding is on (utils/myDocumentsAccess.ts);
+    // a bookmark or a stale link lands on the Settings list instead. On a
+    // fresh load this runs before App.vue connects the embedding stream, so
+    // it waits for the real state — an unknown one lets the page open, and
+    // the page leaves by itself if the state then says off.
+    beforeEnter: async (to: RouteLocationNormalized) => {
+      const profile = to.params.profile as string;
+      const decision = myDocumentsRouteDecision(await useEmbeddingStatusStore().whenKnown(), profile);
+      if (decision !== true) ElMessage.info(myDocumentsClosedMessage(false));
+      return decision;
     },
   },
   {

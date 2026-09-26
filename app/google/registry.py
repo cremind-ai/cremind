@@ -119,7 +119,8 @@ GOOGLE_SKILLS: Tuple[GoogleSkill, ...] = (
         label="Google Drive",
         consequence=(
             "Cremind loses access to every Drive file you granted it. Re-linking does "
-            "not bring the grants back — you have to pick the files again."
+            "not bring the grants back — you have to pick the files again. Drive files "
+            "indexed for search are removed."
         ),
         watch_base=DRIVE_API_BASE,
         has_listener=True,

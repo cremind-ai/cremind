@@ -1,0 +1,807 @@
+{
+  "_comment": "Shared by ui/tests/citation-grammar.test.mjs and tests/documents/test_cite_ui_parity.py: the tolerant citation grammar and first-appearance numbering, which the web UI (ui/src/utils/citations.ts) must reproduce from app/documents/cite.py exactly. Every case exists twice: with today's doc: prefix and with the pre-rename ud: prefix, which both parsers still read into the same canonical [doc:…] token. Offsets are code points in Python and UTF-16 units in JS, so keep every case inside the BMP.",
+  "cases": [
+    {
+      "name": "chunk and file tokens",
+      "text": "See [doc:k7m2xq9a#3f9c2e1b] and the whole file [doc:k7m2xq9a].",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 4,
+          "end": 27
+        },
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 47,
+          "end": 61
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "chunk and file tokens (legacy ud: prefix)",
+      "text": "See [ud:k7m2xq9a#3f9c2e1b] and the whole file [ud:k7m2xq9a].",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 4,
+          "end": 26
+        },
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 46,
+          "end": 59
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "full-width brackets",
+      "text": "Theo 【doc:k7m2xq9a#3f9c2e1b】 thì…",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 28
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "full-width brackets (legacy ud: prefix)",
+      "text": "Theo 【ud:k7m2xq9a#3f9c2e1b】 thì…",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 27
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "spaces inside the bracket",
+      "text": "Quoted [ doc: k7m2xq9a#3f9c2e1b ] here.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 7,
+          "end": 33
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "spaces inside the bracket (legacy ud: prefix)",
+      "text": "Quoted [ ud: k7m2xq9a#3f9c2e1b ] here.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 7,
+          "end": 32
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "upper case is canonicalised",
+      "text": "Shouted [DOC:K7M2XQ9A#3F9C2E1B] and mixed [Doc:k7M2xq9A].",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 8,
+          "end": 31
+        },
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 42,
+          "end": 56
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "upper case is canonicalised (legacy ud: prefix)",
+      "text": "Shouted [UD:K7M2XQ9A#3F9C2E1B] and mixed [Ud:k7M2xq9A].",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 8,
+          "end": 30
+        },
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 41,
+          "end": 54
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "several tokens in one bracket",
+      "text": "Both [doc:k7m2xq9a#3f9c2e1b; doc:p4r8st0v#0a1b2c3d] agree.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 51
+        },
+        {
+          "token": "[doc:p4r8st0v#0a1b2c3d]",
+          "cite_id": "p4r8st0v",
+          "c8": "0a1b2c3d",
+          "start": 5,
+          "end": 51
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:p4r8st0v#0a1b2c3d]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "several tokens in one bracket (legacy ud: prefix)",
+      "text": "Both [ud:k7m2xq9a#3f9c2e1b; ud:p4r8st0v#0a1b2c3d] agree.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 49
+        },
+        {
+          "token": "[doc:p4r8st0v#0a1b2c3d]",
+          "cite_id": "p4r8st0v",
+          "c8": "0a1b2c3d",
+          "start": 5,
+          "end": 49
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:p4r8st0v#0a1b2c3d]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "comma separated, newline inside",
+      "text": "Both [doc:k7m2xq9a#3f9c2e1b,\ndoc:p4r8st0v] agree.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 42
+        },
+        {
+          "token": "[doc:p4r8st0v]",
+          "cite_id": "p4r8st0v",
+          "c8": null,
+          "start": 5,
+          "end": 42
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:p4r8st0v]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "comma separated, newline inside (legacy ud: prefix)",
+      "text": "Both [ud:k7m2xq9a#3f9c2e1b,\nud:p4r8st0v] agree.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 40
+        },
+        {
+          "token": "[doc:p4r8st0v]",
+          "cite_id": "p4r8st0v",
+          "c8": null,
+          "start": 5,
+          "end": 40
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:p4r8st0v]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "trailing separator",
+      "text": "Odd [doc:k7m2xq9a; ] but fine.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 4,
+          "end": 20
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "trailing separator (legacy ud: prefix)",
+      "text": "Odd [ud:k7m2xq9a; ] but fine.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 4,
+          "end": 19
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "mixed bracket kinds",
+      "text": "Mixed [doc:k7m2xq9a#3f9c2e1b】 close.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 6,
+          "end": 29
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "mixed bracket kinds (legacy ud: prefix)",
+      "text": "Mixed [ud:k7m2xq9a#3f9c2e1b】 close.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 6,
+          "end": 28
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "numbering is by first appearance",
+      "text": "A [doc:bbbbbbbb] B [doc:aaaaaaaa#00000000] C [doc:bbbbbbbb] D [doc:cccccccc; doc:aaaaaaaa#00000000]",
+      "tokens": [
+        {
+          "token": "[doc:bbbbbbbb]",
+          "cite_id": "bbbbbbbb",
+          "c8": null,
+          "start": 2,
+          "end": 16
+        },
+        {
+          "token": "[doc:aaaaaaaa#00000000]",
+          "cite_id": "aaaaaaaa",
+          "c8": "00000000",
+          "start": 19,
+          "end": 42
+        },
+        {
+          "token": "[doc:bbbbbbbb]",
+          "cite_id": "bbbbbbbb",
+          "c8": null,
+          "start": 45,
+          "end": 59
+        },
+        {
+          "token": "[doc:cccccccc]",
+          "cite_id": "cccccccc",
+          "c8": null,
+          "start": 62,
+          "end": 99
+        },
+        {
+          "token": "[doc:aaaaaaaa#00000000]",
+          "cite_id": "aaaaaaaa",
+          "c8": "00000000",
+          "start": 62,
+          "end": 99
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:bbbbbbbb]",
+          1
+        ],
+        [
+          "[doc:aaaaaaaa#00000000]",
+          2
+        ],
+        [
+          "[doc:cccccccc]",
+          3
+        ]
+      ]
+    },
+    {
+      "name": "numbering is by first appearance (legacy ud: prefix)",
+      "text": "A [ud:bbbbbbbb] B [ud:aaaaaaaa#00000000] C [ud:bbbbbbbb] D [ud:cccccccc; ud:aaaaaaaa#00000000]",
+      "tokens": [
+        {
+          "token": "[doc:bbbbbbbb]",
+          "cite_id": "bbbbbbbb",
+          "c8": null,
+          "start": 2,
+          "end": 15
+        },
+        {
+          "token": "[doc:aaaaaaaa#00000000]",
+          "cite_id": "aaaaaaaa",
+          "c8": "00000000",
+          "start": 18,
+          "end": 40
+        },
+        {
+          "token": "[doc:bbbbbbbb]",
+          "cite_id": "bbbbbbbb",
+          "c8": null,
+          "start": 43,
+          "end": 56
+        },
+        {
+          "token": "[doc:cccccccc]",
+          "cite_id": "cccccccc",
+          "c8": null,
+          "start": 59,
+          "end": 94
+        },
+        {
+          "token": "[doc:aaaaaaaa#00000000]",
+          "cite_id": "aaaaaaaa",
+          "c8": "00000000",
+          "start": 59,
+          "end": 94
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:bbbbbbbb]",
+          1
+        ],
+        [
+          "[doc:aaaaaaaa#00000000]",
+          2
+        ],
+        [
+          "[doc:cccccccc]",
+          3
+        ]
+      ]
+    },
+    {
+      "name": "inside a code span still counts",
+      "text": "`[doc:k7m2xq9a]` then [doc:p4r8st0v]",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 1,
+          "end": 15
+        },
+        {
+          "token": "[doc:p4r8st0v]",
+          "cite_id": "p4r8st0v",
+          "c8": null,
+          "start": 22,
+          "end": 36
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a]",
+          1
+        ],
+        [
+          "[doc:p4r8st0v]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "inside a code span still counts (legacy ud: prefix)",
+      "text": "`[ud:k7m2xq9a]` then [ud:p4r8st0v]",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 1,
+          "end": 14
+        },
+        {
+          "token": "[doc:p4r8st0v]",
+          "cite_id": "p4r8st0v",
+          "c8": null,
+          "start": 21,
+          "end": 34
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a]",
+          1
+        ],
+        [
+          "[doc:p4r8st0v]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "letters outside the alphabet parse (and fail verification later)",
+      "text": "Bad [doc:ILOUilou]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "letters outside the alphabet parse (and fail verification later) (legacy ud: prefix)",
+      "text": "Bad [ud:ILOUilou]",
+      "tokens": [
+        {
+          "token": "[doc:ilouilou]",
+          "cite_id": "ilouilou",
+          "c8": null,
+          "start": 4,
+          "end": 17
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:ilouilou]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "Vietnamese text before the token",
+      "text": "Điều 12, khoản 2 [doc:k7m2xq9a#3f9c2e1b]",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 17,
+          "end": 40
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "Vietnamese text before the token (legacy ud: prefix)",
+      "text": "Điều 12, khoản 2 [ud:k7m2xq9a#3f9c2e1b]",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 17,
+          "end": 39
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "markup is not a token",
+      "text": "[doc:<script>] and [doc:<img src=x onerror=alert(1)>]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "markup is not a token (legacy ud: prefix)",
+      "text": "[ud:<script>] and [ud:<img src=x onerror=alert(1)>]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "too short / too long / bad hash",
+      "text": "[doc:short] [doc:k7m2xq9ab] [doc:k7m2xq9a#zzzzzzzz] [doc:k7m2xq9a#3f9c2e1]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "too short / too long / bad hash (legacy ud: prefix)",
+      "text": "[ud:short] [ud:k7m2xq9ab] [ud:k7m2xq9a#zzzzzzzz] [ud:k7m2xq9a#3f9c2e1]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "no brackets, no token",
+      "text": "doc:k7m2xq9a alone",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "no brackets, no token (legacy ud: prefix)",
+      "text": "ud:k7m2xq9a alone",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "the neutralised document form is not a token",
+      "text": "[doc：k7m2xq9a#3f9c2e1b]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "the neutralised document form is not a token (legacy ud: prefix)",
+      "text": "[ud：k7m2xq9a#3f9c2e1b]",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "empty",
+      "text": "",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "empty (legacy ud: prefix)",
+      "text": "",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "unicode look-alikes are not letters (long s)",
+      "text": "[doc:ſkkkkkkk] then [doc:k7m2xq9a]",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 20,
+          "end": 34
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "unicode look-alikes are not letters (long s) (legacy ud: prefix)",
+      "text": "[ud:ſkkkkkkk] then [ud:k7m2xq9a]",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 19,
+          "end": 32
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a]",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "doc: in ordinary prose is not a citation",
+      "text": "See [doc:overview] and [doc: readme#12345678] in the guide.",
+      "tokens": [],
+      "numbers": []
+    },
+    {
+      "name": "one citation under both prefixes numbers once",
+      "text": "First [ud:k7m2xq9a#3f9c2e1b], again [doc:k7m2xq9a#3f9c2e1b], file [DOC:K7M2XQ9A].",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 6,
+          "end": 28
+        },
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 36,
+          "end": 59
+        },
+        {
+          "token": "[doc:k7m2xq9a]",
+          "cite_id": "k7m2xq9a",
+          "c8": null,
+          "start": 66,
+          "end": 80
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:k7m2xq9a]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "mixed prefixes in one bracket",
+      "text": "Both [doc:k7m2xq9a#3f9c2e1b; ud:abcd1234] here.",
+      "tokens": [
+        {
+          "token": "[doc:k7m2xq9a#3f9c2e1b]",
+          "cite_id": "k7m2xq9a",
+          "c8": "3f9c2e1b",
+          "start": 5,
+          "end": 41
+        },
+        {
+          "token": "[doc:abcd1234]",
+          "cite_id": "abcd1234",
+          "c8": null,
+          "start": 5,
+          "end": 41
+        }
+      ],
+      "numbers": [
+        [
+          "[doc:k7m2xq9a#3f9c2e1b]",
+          1
+        ],
+        [
+          "[doc:abcd1234]",
+          2
+        ]
+      ]
+    },
+    {
+      "name": "neutralised prefixes stay inert",
+      "text": "Planted [doc：k7m2xq9a] and [ud：k7m2xq9a].",
+      "tokens": [],
+      "numbers": []
+    }
+  ]
+}

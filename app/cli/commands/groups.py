@@ -405,6 +405,37 @@ def group_set(
     ])
 
 
+@group_app.command("search-tools")
+@graceful_errors
+def group_search_tools(
+    ctx: typer.Context,
+    group: str = typer.Argument(..., help="Group id or unique name."),
+    enable: Optional[list[str]] = typer.Option(
+        None, "--enable",
+        help="Enable exactly these sources for the room, replacing the selection (repeatable or "
+             "comma-separated): documentation_search, cremind_documentation_search, memory_search, web_search.",
+    ),
+    all_: bool = typer.Option(False, "--all", help="Restore the defaults: every search source."),
+    none_: bool = typer.Option(False, "--none", help="Turn every search source off for the room."),
+) -> None:
+    """Show or set the room's shared search sources (any member or the admin).
+
+    Each member agent still keeps its own tool settings and document access, so
+    availability can vary by agent. Saved at once; an agent already answering
+    keeps its search tools, the next response adopts the new choice.
+    """
+    from app.cli.client.groups import resolve_group_id
+    from app.cli.client.search_tools import group_path
+    from app.cli.commands import _search_tools
+
+    async def _path(client: Any) -> str:
+        return group_path(await resolve_group_id(client, group))
+
+    _search_tools.run(
+        ctx, subject=f"group {group}", enable=enable, all_=all_, none_=none_, resolve_path=_path,
+    )
+
+
 @group_app.command("delete")
 @graceful_errors
 def group_delete(

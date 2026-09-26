@@ -26,12 +26,20 @@ _DST_SECRET = "dst-secret-" + "0" * 32
 @pytest.fixture
 def restore_env(tmp_path, monkeypatch):
     """Yield a helper that points BaseConfig/env at a given system dir and
-    resets the global DB provider so each side of the round-trip is isolated."""
+    resets the global DB provider so each side of the round-trip is isolated.
+
+    ``workspaces`` sets CREMIND_WORKSPACES_DIR for that side (a container's
+    root outside the system dir); by default it is unset, so the profiles'
+    working directories live in ``<system dir>/workspaces``."""
     from app.config.settings import BaseConfig
 
-    def use(system_dir: Path):
+    def use(system_dir: Path, *, workspaces: Path | None = None):
         monkeypatch.setenv("CREMIND_SYSTEM_DIR", str(system_dir))
         monkeypatch.delenv("CREMIND_DB_PROVIDER", raising=False)
+        if workspaces is None:
+            monkeypatch.delenv("CREMIND_WORKSPACES_DIR", raising=False)
+        else:
+            monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(workspaces))
         monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(system_dir), raising=False)
         monkeypatch.setattr(
             BaseConfig, "SQLITE_DB_PATH", str(system_dir / "storage" / "cremind.db"), raising=False
@@ -318,3 +326,380 @@ def test_a_rollback_keeps_the_results_this_install_still_owes(restore_env, tmp_p
             "SELECT origin_delivered_at FROM event_runs WHERE id='r-owed'"
         )).scalar()
     assert owed is None
+
+
+# ── Cremind manual pages and document indexes ───────────────────────────────
+
+
+def _two_profiles() -> None:
+    now = time.time()
+    with get_database_provider().sync_engine().begin() as c:
+        for pid, name in (("p1", "admin"), ("p2", "bob")):
+            c.execute(
+                text("INSERT INTO profiles (id, name, created_at, updated_at) VALUES (:i, :n, :t, :t)"),
+                {"i": pid, "n": name, "t": now},
+            )
+
+
+def _put(path: Path, text_: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text_, encoding="utf-8")
+
+
+def test_manual_pages_travel_by_uuid_and_indexes_stay_behind(restore_env, tmp_path):
+    """A profile's own manual pages live outside its name-keyed tree, at
+    ``storage/cremind_documents/profiles/<uuid>``: the archive must carry them
+    (for both profiles, each to its own uuid) — and never the derived index
+    store, the pre-rename index root, or the re-seeded shared mirror."""
+    import tarfile
+
+    from app.backup import engine as be
+    from app.backup.manifest import FILES_PREFIX
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    manual = src / "storage" / "cremind_documents"
+    _put(manual / "profiles" / "p1" / "mine.md", "admin's page")
+    _put(manual / "profiles" / "p2" / "bob.md", "bob's page")
+    _put(manual / "shared" / "document.md", "bundled")
+    _put(src / "storage" / "documents" / "p1" / "index.db", "index")
+    _put(src / "storage" / "userdocs" / "p2" / "index.db", "old index")
+
+    archive = be.create_backup(be.BackupOptions()).path
+    with tarfile.open(str(archive), "r:gz") as tf:
+        names = set(tf.getnames())
+    assert f"{FILES_PREFIX}storage/cremind_documents/profiles/p1/mine.md" in names
+    assert f"{FILES_PREFIX}storage/cremind_documents/profiles/p2/bob.md" in names
+    assert not any(
+        n.startswith(f"{FILES_PREFIX}{p}")
+        for n in names
+        for p in ("storage/documents", "storage/userdocs", "storage/cremind_documents/shared")
+    ), names
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(archive, target_system_dir=str(dst))
+    assert report.ok
+
+    restored = dst / "storage" / "cremind_documents" / "profiles"
+    assert (restored / "p1" / "mine.md").read_text(encoding="utf-8") == "admin's page"
+    assert (restored / "p2" / "bob.md").read_text(encoding="utf-8") == "bob's page"
+    assert not (restored / "p1" / "bob.md").exists()
+    assert not (dst / "storage" / "documents").exists()
+
+
+def test_an_archive_from_before_the_move_restores_pages_to_the_new_place(restore_env, tmp_path):
+    """An archive made before the manual moved carries a profile's pages at
+    ``<profile>/documents``. The restore copies them there, then relocates
+    them to the uuid directory of the restored profile row."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    # The pre-move layout, as an older install's archive holds it.
+    _put(src / "admin" / "documents" / "note.md", "admin's old-layout page")
+    _put(src / "bob" / "documents" / "guides" / "g.md", "bob's old-layout page")
+    _put(src / "admin" / "PERSONA.md", "persona")
+
+    archive = be.create_backup(be.BackupOptions()).path
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(archive, target_system_dir=str(dst))
+    assert report.ok, report.error
+
+    pages = dst / "storage" / "cremind_documents" / "profiles"
+    assert (pages / "p1" / "note.md").read_text(encoding="utf-8") == "admin's old-layout page"
+    assert (pages / "p2" / "guides" / "g.md").read_text(encoding="utf-8") == "bob's old-layout page"
+    assert not (dst / "admin" / "documents").exists()
+    assert not (dst / "bob" / "documents").exists()
+    assert (dst / "admin" / "PERSONA.md").exists(), "the rest of the tree is restored as before"
+
+
+# ── the profiles' working directories ───────────────────────────────────────
+
+
+def _seed_workspaces(root: Path) -> None:
+    """Two profiles' default folders plus a deleted profile's kept one —
+    with the files a system-tree prune would wrongly drop."""
+    _put(root / "admin" / "notes.md", "admin's notes")
+    _put(root / "bob" / "app" / "poetry.lock", "lock")
+    _put(root / "bob" / "draft.tmp", "draft")
+    # Looks like a pre-move manual page, but it is bob's own file: the
+    # post-restore relocation must leave it where it is.
+    _put(root / "bob" / "documents" / "report.md", "bob's report")
+    _put(root / "bob" / "app" / "node_modules" / "left-pad" / "index.js", "dep")
+    _put(root / "bob" / "app" / ".venv" / "pyvenv.cfg", "venv")
+    _put(root / ".deleted" / "carol-20260101-000000" / "kept.md", "carol's")
+
+
+def _set_working_dir(name: str, value: str) -> None:
+    with get_database_provider().sync_engine().begin() as c:
+        c.execute(text("UPDATE profiles SET working_dir = :v WHERE name = :n"), {"v": value, "n": name})
+
+
+def _archive_names(archive: Path) -> set[str]:
+    import tarfile
+
+    with tarfile.open(str(archive), "r:gz") as tf:
+        return set(tf.getnames())
+
+
+def test_the_working_directories_travel_by_default(restore_env, tmp_path):
+    """Every profile's default folder (and a deleted profile's kept one) is
+    archived under ``workspaces/`` and restored into the target's workspaces
+    root — lock and tmp files included, dependency folders not — without the
+    manual relocation mistaking a workspace's ``documents`` for a manual."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    _put(src / "bob" / "PERSONA.md", "persona")
+    _seed_workspaces(src / "workspaces")
+    # A folder an admin chose INSIDE the root (a new profile that found its
+    # default taken gets <name>-2): stored explicitly, relocated on restore.
+    _set_working_dir("bob", str(src / "workspaces" / "bob-2"))
+
+    result = be.create_backup(be.BackupOptions())
+    assert result.manifest.workspaces_included is True
+    assert result.manifest.source_paths.workspaces_root == str(src / "workspaces")
+    assert result.workspaces_file_count == 5
+    names = _archive_names(result.path)
+    for rel in ("admin/notes.md", "bob/app/poetry.lock", "bob/draft.tmp",
+                "bob/documents/report.md", ".deleted/carol-20260101-000000/kept.md"):
+        assert f"workspaces/{rel}" in names, rel
+    assert not [n for n in names if "node_modules" in n or ".venv" in n]
+    # Never a second copy through the system-dir walk.
+    assert not [n for n in names if n.startswith("files/workspaces")]
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(result.path, target_system_dir=str(dst))
+    assert report.ok, report.error
+
+    ws = dst / "workspaces"
+    assert (ws / "admin" / "notes.md").read_text(encoding="utf-8") == "admin's notes"
+    assert (ws / "bob" / "app" / "poetry.lock").is_file()
+    assert (ws / "bob" / "draft.tmp").is_file()
+    assert (ws / ".deleted" / "carol-20260101-000000" / "kept.md").is_file()
+    assert (ws / "bob" / "documents" / "report.md").read_text(encoding="utf-8") == "bob's report"
+    assert not (dst / "storage" / "cremind_documents" / "profiles" / "p2" / "report.md").exists()
+    assert (dst / "bob" / "PERSONA.md").is_file()
+
+    set_database_provider(None)
+    set_database_provider(create_database_provider())
+    with get_database_provider().sync_engine().connect() as c:
+        rows = dict(c.execute(text("SELECT name, working_dir FROM profiles")).all())
+    assert rows["bob"] == str(dst / "workspaces" / "bob-2")
+    assert rows["admin"] is None
+
+
+def test_no_workspaces_leaves_them_out_and_the_restore_leaves_them_alone(restore_env, tmp_path):
+    """``--no-workspaces``: nothing under ``workspaces/``, the manifest says
+    so, and restoring it deletes nothing already in the target's folders."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    _seed_workspaces(src / "workspaces")
+
+    result = be.create_backup(be.BackupOptions(include_workspaces=False))
+    assert result.manifest.workspaces_included is False
+    assert be.read_manifest(result.path).workspaces_included is False
+    assert result.workspaces_file_count == 0
+    assert not [n for n in _archive_names(result.path) if n.startswith("workspaces/")]
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    _put(dst / "workspaces" / "bob" / "mine.md", "already here")
+    report = be.restore_backup(result.path, target_system_dir=str(dst))
+    assert report.ok, report.error
+    assert (dst / "workspaces" / "bob" / "mine.md").read_text(encoding="utf-8") == "already here"
+    assert not (dst / "workspaces" / "admin" / "notes.md").exists()
+    assert any("does not include the profiles' working directories" in w for w in report.warnings)
+
+
+def test_a_restore_merges_into_existing_working_directories(restore_env, tmp_path):
+    """Files the archive carries overwrite theirs; files it does not are kept."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    _put(src / "workspaces" / "bob" / "shared.md", "from the backup")
+    archive = be.create_backup(be.BackupOptions()).path
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    _put(dst / "workspaces" / "bob" / "shared.md", "local edit")
+    _put(dst / "workspaces" / "bob" / "local-only.md", "keep me")
+    assert be.restore_backup(archive, target_system_dir=str(dst)).ok
+    assert (dst / "workspaces" / "bob" / "shared.md").read_text(encoding="utf-8") == "from the backup"
+    assert (dst / "workspaces" / "bob" / "local-only.md").read_text(encoding="utf-8") == "keep me"
+
+
+def test_workspaces_outside_the_system_dir_restore_into_the_current_root(restore_env, tmp_path):
+    """A container keeps them in the documents mount (CREMIND_WORKSPACES_DIR);
+    a native target keeps them in its system dir. Each side's own root is
+    used, and stored paths inside the root follow it."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    mount = tmp_path / "mount" / "workspaces"
+    restore_env(src, workspaces=mount)
+    migrations.upgrade("head")
+    _two_profiles()
+    _seed_workspaces(mount)
+    _set_working_dir("bob", str(mount / "bob-2"))
+
+    result = be.create_backup(be.BackupOptions())
+    assert result.manifest.source_paths.workspaces_root == str(mount)
+    assert "workspaces/admin/notes.md" in _archive_names(result.path)
+
+    restore_env(dst)  # native: <dst>/workspaces
+    migrations.upgrade("head")
+    report = be.restore_backup(result.path, target_system_dir=str(dst))
+    assert report.ok, report.error
+    assert (dst / "workspaces" / "admin" / "notes.md").is_file()
+    assert any(str(mount) in w and str(dst / "workspaces") in w for w in report.warnings), report.warnings
+
+    set_database_provider(None)
+    set_database_provider(create_database_provider())
+    with get_database_provider().sync_engine().connect() as c:
+        bob = c.execute(text("SELECT working_dir FROM profiles WHERE name='bob'")).scalar()
+    assert bob == str(dst / "workspaces" / "bob-2")
+
+    # And the other way round: into a target whose root is outside its
+    # system dir.
+    dst2, mount2 = tmp_path / "dst2", tmp_path / "mount2" / "workspaces"
+    restore_env(dst2, workspaces=mount2)
+    migrations.upgrade("head")
+    assert be.restore_backup(result.path, target_system_dir=str(dst2)).ok
+    assert (mount2 / "bob" / "app" / "poetry.lock").is_file()
+    assert not (dst2 / "workspaces").exists()
+
+
+def test_an_archive_from_before_the_working_directories_moves_the_folder_to_the_admin(restore_env, tmp_path):
+    """Older archives carry the server-wide ``server_config.user_working_dir``:
+    it is relocated on load and handed to the admin by the migration."""
+    from app.backup import engine as be
+    from app.backup.manifest import Manifest
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("20260928c_search_tools")
+    with get_database_provider().sync_engine().begin() as c:
+        c.execute(text("INSERT INTO profiles (id, name, created_at, updated_at) VALUES ('p1','admin',0,0)"))
+        c.execute(text(
+            "INSERT INTO server_config (key, value, is_secret, updated_at) "
+            "VALUES ('user_working_dir', :v, 0, 0)"
+        ), {"v": str(src / "work")})
+    archive = be.create_backup(be.BackupOptions()).path
+    man = be.read_manifest(archive)
+    assert man.alembic_revision == "20260928c_search_tools"
+    assert isinstance(man, Manifest)
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(archive, target_system_dir=str(dst))
+    assert report.ok, report.error
+
+    set_database_provider(None)
+    set_database_provider(create_database_provider())
+    with get_database_provider().sync_engine().connect() as c:
+        admin = c.execute(text("SELECT working_dir FROM profiles WHERE name='admin'")).scalar()
+        legacy = c.execute(text("SELECT value FROM server_config WHERE key='user_working_dir'")).scalar()
+    assert admin == str(dst / "work")
+    assert legacy is None
+
+
+def test_the_manifest_names_each_folder_and_the_restore_the_missing_chosen_ones(restore_env, tmp_path):
+    """Each profile's folder is recorded; a folder an admin chose outside the
+    workspaces root is never archived, and a restore onto a machine where
+    its relocated path does not exist names the profile."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    chosen = src / "chosen"  # under the system dir only so it relocates to dst
+    _put(chosen / "mine.md", "the admin's own file")
+    _put(src / "workspaces" / "bob" / "notes.md", "bob's notes")
+    _set_working_dir("admin", str(chosen))
+
+    result = be.create_backup(be.BackupOptions())
+    wd = result.manifest.working_dirs
+    assert wd["admin"] == {"path": str(chosen), "default": False, "in_workspaces": False, "archived": False}
+    assert wd["bob"] == {"path": str(src / "workspaces" / "bob"), "default": True,
+                         "in_workspaces": True, "archived": True}
+    assert result.manifest.source_paths.user_working_dir == str(chosen)
+    assert be.read_manifest(result.path).summary()["working_dirs_elsewhere"] == ["admin"]
+    assert not [n for n in _archive_names(result.path) if n.endswith("mine.md")]
+
+    no_ws = be.create_backup(be.BackupOptions(
+        dest=tmp_path / "no-ws.cremind-backup", include_workspaces=False,
+    )).manifest.working_dirs
+    assert no_ws["bob"]["in_workspaces"] is True and no_ws["bob"]["archived"] is False
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(result.path, target_system_dir=str(dst))
+    assert report.ok, report.error
+    assert (dst / "workspaces" / "bob" / "notes.md").is_file()
+    notes = [w for w in report.warnings if "does not exist on this machine" in w]
+    assert len(notes) == 1 and f"'admin' ({dst / 'chosen'})" in notes[0], report.warnings
+    assert "'bob'" not in notes[0]
+
+
+def test_staging_refuses_links_and_paths_that_leave_the_staging_dir(tmp_path):
+    """A backup only ever holds regular files. A crafted archive's link (or an
+    absolute / ``..`` / drive-letter name) is never staged, so neither a later
+    member nor the copy into the workspaces root can write outside."""
+    import io
+    import json
+    import tarfile
+
+    from app.backup import engine as be
+
+    archive = tmp_path / "crafted.cremind-backup"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    def add(tf, name: str, data: bytes) -> None:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    with tarfile.open(str(archive), "w:gz") as tf:
+        add(tf, "manifest.json", json.dumps({"format": "cremind-backup"}).encode())
+        link = tarfile.TarInfo("workspaces/bob/escape")
+        link.type = tarfile.SYMTYPE
+        link.linkname = str(outside)
+        tf.addfile(link)
+        hard = tarfile.TarInfo("workspaces/bob/hard")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "manifest.json"
+        tf.addfile(hard)
+        add(tf, "workspaces/bob/escape/pwned.md", b"x")
+        add(tf, "workspaces/../../evil.md", b"x")
+        add(tf, "C:/evil.md", b"x")
+        add(tf, "workspaces/bob/notes.md", b"bob's notes")
+
+    staged = tmp_path / "staged"
+    be.stage_backup(archive, None, staged)
+    assert (staged / "workspaces" / "bob" / "notes.md").read_bytes() == b"bob's notes"
+    assert not (staged / "workspaces" / "bob" / "hard").exists()
+    escape = staged / "workspaces" / "bob" / "escape"
+    assert not escape.is_symlink()
+    assert list(outside.iterdir()) == []
+    assert not (tmp_path / "evil.md").exists()

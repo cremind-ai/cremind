@@ -809,6 +809,9 @@ export interface CompleteSetupResponse {
   token: string;
   expires_at?: string;
   profile: string;
+  /** The profile's own working directory (null if it could not be set up —
+   *  see ``warnings``). */
+  working_dir?: string | null;
   /** A newly-installed feature (torch, a DB driver, …) needs a fresh
    *  process before it can be activated. Unrelated to the TLS switch. */
   restart_required?: boolean;
@@ -831,6 +834,9 @@ export async function completeSetup(
   agentUrl: string,
   config: {
     profile: string;
+    /** First setup: the admin's own working directory. Later: the folder the
+     *  admin picked for the profile being created. Omitted → its default. */
+    working_dir?: string;
     server_config?: Record<string, string>;
     embedding_config?: EmbeddingSetupConfig;
     llm_config?: Record<string, string>;
@@ -2567,34 +2573,111 @@ export async function listProfiles(
 export async function createProfile(
   agentUrl: string,
   token: string,
-  name: string
-): Promise<{ success: boolean; profile: string }> {
+  name: string,
+  /** Admin's choice of folder; omitted → the profile's default. */
+  workingDir?: string,
+): Promise<{ success: boolean; profile: string; working_dir?: { path?: string; is_default?: boolean; error?: string } }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/profiles`, {
     method: 'POST',
     headers: authHeaders(token),
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(workingDir ? { name, working_dir: workingDir } : { name }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Failed to create profile: ${res.statusText}`);
+    throw new Error(data.message || data.error || `Failed to create profile: ${res.statusText}`);
   }
   return res.json();
+}
+
+/** What deleting a profile did with its working directory. */
+export interface RetiredWorkingDir {
+  /** ``archived`` (moved to ``archived_to``), ``deleted``, ``none`` (missing
+   *  or empty), ``untouched`` (a folder chosen elsewhere), ``failed``. */
+  action: 'archived' | 'deleted' | 'none' | 'untouched' | 'failed';
+  path: string | null;
+  archived_to?: string;
+  error?: string;
 }
 
 export async function deleteProfile(
   agentUrl: string,
   token: string,
-  name: string
-): Promise<{ success: boolean }> {
+  name: string,
+  /** ``keep`` moves a Cremind-made folder to ``<workspaces>/.deleted``;
+   *  ``delete`` removes it with its files. */
+  workingDir: 'keep' | 'delete' = 'keep',
+): Promise<{ success: boolean; working_dir?: RetiredWorkingDir | null }> {
   const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(name)}`, {
+  const query = `working_dir=${encodeURIComponent(workingDir)}`;
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(name)}?${query}`, {
     method: 'DELETE',
     headers: authHeaders(token),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || `Failed to delete profile: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** ``GET /api/profiles/{name}/working-dir``. */
+export interface ProfileWorkingDir {
+  profile: string;
+  path: string;
+  default_path: string;
+  is_default: boolean;
+  exists: boolean;
+}
+
+/** A refused working directory: ``code`` is the server's reason
+ *  (``not_absolute``, ``inside_system_dir``, …), ``message`` its sentence. */
+export class WorkingDirError extends Error {
+  code: string | null;
+  constructor(message: string, code: string | null) {
+    super(message);
+    this.name = 'WorkingDirError';
+    this.code = code;
+  }
+}
+
+/** The profile's own folder — its owner, or admin, may read it. */
+export async function getProfileWorkingDir(
+  agentUrl: string,
+  token: string,
+  profileName: string,
+): Promise<ProfileWorkingDir> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/working-dir`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to load the working directory: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Admin only. ``path`` null (or blank) → the profile's default folder.
+ *  Throws a {@link WorkingDirError} carrying the server's reason on a 400. */
+export async function setProfileWorkingDir(
+  agentUrl: string,
+  token: string,
+  profileName: string,
+  path: string | null,
+): Promise<ProfileWorkingDir> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/working-dir`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify({ path: path && path.trim() ? path.trim() : null }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new WorkingDirError(
+      data.message || data.error || `Failed to set the working directory: ${res.statusText}`,
+      typeof data.code === 'string' ? data.code : null,
+    );
   }
   return res.json();
 }

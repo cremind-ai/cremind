@@ -46,7 +46,8 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path):
     )
     monkeypatch.setattr(config_api.BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
     monkeypatch.setattr(
-        "app.config.settings.get_user_working_directory", lambda: str(tmp_path / "work"),
+        # The exporting profile's own folder: the export asks for the caller's.
+        "app.config.settings.get_user_working_directory", lambda profile: str(tmp_path / "work" / profile),
     )
     monkeypatch.setattr(
         "app.lib.embedding_lifecycle.read_embedding_config",
@@ -131,6 +132,13 @@ def test_an_unknown_format_is_refused_by_name() -> None:
     response = _call(_state(), params={"format": "pdf"})
     assert response.status_code == 400
     assert "md, json, env" in json.loads(response.body)["error"]
+
+
+def test_the_file_names_the_exporting_profiles_own_working_directory() -> None:
+    """Each profile has its own folder; the file must never name another's."""
+    response = _call(_state(), params={"format": "json"})
+    assert response.status_code == 200
+    assert json.loads(response.body)["workingDir"].endswith("/work/li")
 
 
 # ── scope ────────────────────────────────────────────────────────────────

@@ -24,6 +24,35 @@
 # is invoked from the host or from inside the cremind container — the
 # named volumes (cremind-data, pg-data, …) only line up when the
 # project name matches.
+#
+# The cremind service mounts your Documents folder from the host as
+# /root/Documents. Each profile works in its own folder inside it,
+# /root/Documents/cremind-workspaces/<profile>
+# (``<your folder>/cremind-workspaces/<profile>`` on the host): the agent's
+# working folder for that profile, and what its Documentation search indexes.
+# Everything in cremind-workspaces/ is treated as some profile's, so keep your
+# own files out of it. An install made before profiles had their own
+# folders keeps the admin on /root/Documents itself; the admin can point any
+# profile at another folder (``cremind profile working-dir``). The installer
+# asks which folder and whether the agent may write to it, and records the
+# answers in ``.env``:
+#
+#   CREMIND_HOST_DOCUMENTS       the host folder, as an absolute path with
+#                                forward slashes (also on Windows).
+#   CREMIND_DOCUMENTS_READ_ONLY  true mounts it read-only: the agent can
+#                                read and search your files but not save any.
+#                                The profiles' own folders cannot live in a
+#                                read-only mount, so the installer then also
+#                                writes CREMIND_DOCKER_WORKSPACES_DIR (below).
+#   CREMIND_COMPOSE_HOST_DIR     this bundle's own folder on the host, which
+#                                the app cannot see from inside the container
+#                                and names in its setup instructions.
+#
+# To change the folder later, edit those lines and run ``docker compose up -d``
+# from this folder, or re-run the installer and pick another one. The
+# installer reads the previous answers back, so a hand edit survives a re-run.
+# Moving it does not move the files: copy ``cremind-workspaces/`` across
+# yourself.
 
 services:
   cremind:
@@ -121,6 +150,25 @@ services:
       # /opt/cremind-compose below.
       CREMIND_COMPOSE_FILE: /opt/cremind-compose/docker-compose.yml
       CREMIND_COMPOSE_ENV_FILE: /opt/cremind-compose/.env
+      # Documentation search. BIND is a literal like INSTALL_MODE above: it
+      # says THIS file mounts the documents folder (see ``volumes:``), so a
+      # /root/Documents that is not a mount reads as a lost mount rather than
+      # as an install that predates it. The other two only repeat the
+      # installer's answers for the app's instructions — the host paths are
+      # invisible from inside the container.
+      CREMIND_DOCUMENTS_BIND: "1"
+      CREMIND_HOST_DOCUMENTS_HINT: ${CREMIND_HOST_DOCUMENTS:-}
+      CREMIND_COMPOSE_HOST_DIR: ${CREMIND_COMPOSE_HOST_DIR:-}
+      # Where every profile's own working directory lives:
+      # <this>/<profile name>. Inside the documents mount, so the files are
+      # on the host and survive a recreate. A read-only mount cannot hold
+      # them, so the installer then writes
+      # CREMIND_DOCKER_WORKSPACES_DIR=/root/.cremind/workspaces (the
+      # cremind-data volume: writable, not visible on the host) into .env.
+      # Not named CREMIND_WORKSPACES_DIR on this side on purpose: compose
+      # reads ``${VAR}`` from the invoking shell first, and a native
+      # install's host path under that name must not reach the container.
+      CREMIND_WORKSPACES_DIR: ${CREMIND_DOCKER_WORKSPACES_DIR:-/root/Documents/cremind-workspaces}
       # >>> desktop-only >>>
       VNC_PASSWORD: ${VNC_PASSWORD}
       RESOLUTION: ${RESOLUTION:-1280x720}
@@ -139,6 +187,29 @@ services:
       # paths. Not needed for CREMIND_SSL=auto / after-setup, which generate
       # into the cremind-data volume above.
       # - ./certs:/certs:ro
+      # Your Documents folder (see the top of this file), with every
+      # profile's working directory in its cremind-workspaces/ subfolder.
+      # Without it, /root/Documents is a plain folder in the container's own
+      # layer, and everything the agent saved there is gone when the container
+      # is recreated (an image upgrade, a ``down && up``).
+      #   - Long syntax: the short ``host:container:mode`` form splits the
+      #     line on colons, and a host path (C:/...) is safer kept out of that.
+      #   - create_host_path: a missing folder is created instead of failing
+      #     ``up``. A mistyped path therefore shows up as an empty folder.
+      #   - The ./documents fallback (a folder inside this bundle, removed by
+      #     an uninstall — all but its cremind-workspaces/ subfolder, which an
+      #     uninstall keeps unless told otherwise) applies to a ``.env``
+      #     written before the installer asked for a folder, and to a folder
+      #     path the ``.env`` cannot carry (the installer warns when it falls
+      #     back).
+      #   - On an SELinux host (Fedora, RHEL), add ``selinux: z`` under
+      #     ``bind:`` or the container cannot read the folder.
+      - type: bind
+        source: ${CREMIND_HOST_DOCUMENTS:-./documents}
+        target: /root/Documents
+        read_only: ${CREMIND_DOCUMENTS_READ_ONLY:-false}
+        bind:
+          create_host_path: true
       # The runtime venv lives in a named volume so wizard-installed
       # extras (sentence-transformers, qdrant-client, anthropic, ...)
       # persist across ``docker compose down && up``. The entrypoint

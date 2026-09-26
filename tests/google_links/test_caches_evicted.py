@@ -8,6 +8,10 @@ prevent.
 
 Everything here is keyed by profile, so the other assertion that matters is that
 eviction is surgical: another profile's cached token must survive.
+
+The Drive half of Documentation search reads through the same link from its own
+threads, so an unlink also suspends it — for that profile only, and on every
+Google skill's unlink (the engine re-checks the token before resuming).
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import app.calendar.skill_token as calendar_token
 import app.drive.grant_flow as grant_flow
 import app.drive.skill_token as drive_token
 import app.google.unlink as U
+import app.documents.state as uds_state
 from app.google.registry import by_name
 
 
@@ -33,6 +38,17 @@ def clean_caches():
     calendar_token._access_cache.clear()
     drive_token._access_cache.clear()
     grant_flow._pending.clear()
+
+
+@pytest.fixture(autouse=True)
+def suspended(monkeypatch):
+    """Records each profile whose Drive indexing an unlink suspended.
+
+    Replaces the module-level hook, so no engine is needed (and none would be
+    running in a unit test)."""
+    calls: list[str] = []
+    monkeypatch.setattr(uds_state, "suspend_drive", calls.append, raising=False)
+    return calls
 
 
 def _seed(profile: str) -> None:
@@ -92,6 +108,49 @@ def test_every_google_skill_evicts_the_caches_not_just_drive(google):
         assert "alice" not in drive_token._access_cache, skill
         assert "alice" not in calendar_token._access_cache, skill
         assert grant_flow._pending == {}, skill
+
+
+def test_unlinking_suspends_drive_indexing_for_that_profile_only(google, suspended):
+    google.link("alice", "gdrive")
+    google.link("bob", "gdrive")
+
+    asyncio.run(U.unlink_skill("alice", by_name("gdrive")))
+
+    assert suspended == ["alice"]
+
+
+def test_every_google_skill_suspends_drive_indexing(google, suspended):
+    """The engine re-checks the gdrive token itself, so a gmail unlink that
+    leaves gdrive linked only pauses Drive until that check."""
+    for skill in ("gmail", "gsheets", "gdocs", "gcalendar", "gdrive"):
+        google.link("alice", skill)
+        asyncio.run(U.unlink_skill("alice", by_name(skill)))
+    assert suspended == ["alice"] * 5
+
+
+def test_unlink_all_suspends_once(google, suspended):
+    for skill in ("gcalendar", "gdrive", "gmail"):
+        google.link("alice", skill)
+    asyncio.run(U.unlink_all("alice"))
+    assert suspended == ["alice"]
+
+
+def test_a_failing_or_missing_suspend_hook_never_blocks_the_other_evictions(google, monkeypatch):
+    def boom(profile):
+        raise RuntimeError("engine gone")
+
+    monkeypatch.setattr(uds_state, "suspend_drive", boom, raising=False)
+    _seed("alice")
+    google.link("alice", "gdrive")
+    result = asyncio.run(U.unlink_skill("alice", by_name("gdrive")))
+    assert result["unlinked"] is True
+    assert "alice" not in drive_token._access_cache
+
+    # A state module without the hook (an older engine) is simply skipped.
+    monkeypatch.delattr(uds_state, "suspend_drive", raising=False)
+    _seed("alice")
+    U._forget("alice")
+    assert "alice" not in drive_token._access_cache
 
 
 def test_abandon_rounds_reports_what_it_dropped():

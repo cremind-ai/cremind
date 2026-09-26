@@ -25,6 +25,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
+from app.config.working_dirs import is_foreign
 from app.utils.logger import logger
 from app.utils.uploads_tmp import (
     conversation_tmp_dir,
@@ -235,6 +236,13 @@ def validate_outbound_paths(
                 {"path": path, "reason": "outside this profile's allowed directories"},
             )
             continue
+        # Inside a root is not enough: an admin's folder may contain the
+        # workspaces root, and every other profile's folder in it stays theirs.
+        if is_foreign(target, profile):
+            rejected.append(
+                {"path": path, "reason": "inside another profile's working directory"},
+            )
+            continue
         if not os.path.isfile(target):
             rejected.append({"path": path, "reason": "not an existing file"})
             continue
@@ -255,7 +263,10 @@ def validate_outbound_paths(
 def _profile_roots(
     profile: str, extra_roots: Optional[Sequence[str]] = None,
 ) -> list[str]:
-    """The profile-scoped roots an outbound file may come from (realpaths)."""
+    """The profile-scoped roots an outbound file may come from (realpaths).
+
+    An ``extra_roots`` entry inside another profile's working directory (a
+    stale turn cwd, say) is dropped — the caller vouches only for its own."""
     candidates: list[str] = []
     try:
         from app.config.system_vars import build_system_env
@@ -272,7 +283,7 @@ def _profile_roots(
     if sys_dir and profile:
         candidates.append(os.path.join(sys_dir, profile))
     for extra in extra_roots or ():
-        if extra:
+        if extra and not is_foreign(str(extra), profile):
             candidates.append(str(extra))
     return [os.path.realpath(c) for c in candidates if c]
 

@@ -127,6 +127,38 @@ def test_powershell_include_renders_the_kubernetes_block() -> None:
     assert "Choices = @()" in ps_text
 
 
+# ── docker documents block ────────────────────────────────────────────────
+
+
+def test_includes_render_the_docker_documents_block() -> None:
+    """install.sh reads DOCKER_DOCUMENTS_* and install.ps1 reads
+    $script:DockerDocuments.<Key> directly — one variable per catalog key."""
+    mod = _load_module()
+    _digest, bash_text, ps_text, _json, _toml, _ui = mod.build()
+
+    for key in mod._DOCKER_DOCUMENTS_KEYS:
+        assert f"\nDOCKER_DOCUMENTS_{key.upper()}=\"" in bash_text, key
+    assert "$script:DockerDocuments = [ordered]@{" in ps_text
+    for name in ("Prompt", "AccessPrompt", "RwDisclosure", "RoDisclosure",
+                 "LinuxOwnerNote", "MacosPrivacyNote", "WslNote"):
+        assert f"\n    {name} " in ps_text, name
+    # The hint names $ — escaped for bash, literal in a PowerShell '...' string.
+    assert "cannot contain \\$, #" in bash_text
+    assert "cannot contain $, #" in ps_text
+
+
+def test_renderers_tolerate_a_catalog_without_docker_documents() -> None:
+    """Every key is still emitted (empty), so ``set -u`` and StrictMode never
+    see a missing name."""
+    mod = _load_module()
+    bash_text = mod.render_bash({}, "deadbeef")
+    ps_text = mod.render_powershell({}, "deadbeef")
+    assert 'DOCKER_DOCUMENTS_PROMPT=""' in bash_text
+    assert 'DOCKER_DOCUMENTS_WSL_NOTE=""' in bash_text
+    assert "$script:DockerDocuments = [ordered]@{" in ps_text
+    assert "    WslNote          = ''" in ps_text
+
+
 def test_renderers_tolerate_a_catalog_without_kubernetes() -> None:
     """The generator must not require the table it renders."""
     mod = _load_module()

@@ -14,6 +14,7 @@ import ResizableDivider from '../components/ResizableDivider.vue';
 import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
 import ConversationUsagePanel from '../components/ConversationUsagePanel.vue';
 import AgentActivityPanel from '../components/agent/AgentActivityPanel.vue';
+import ResearchActivityPanel from '../components/documents/ResearchActivityPanel.vue';
 import PlanBanner from '../components/plan/PlanBanner.vue';
 import PlanApprovalDialog from '../components/plan/PlanApprovalDialog.vue';
 import AskUserQuestionDialog from '../components/plan/AskUserQuestionDialog.vue';
@@ -314,13 +315,19 @@ const cancelPlan = async () => {
       />
 
       <div
-        v-if="chatStore.activeAgentActivity"
+        v-if="chatStore.activeAgentActivity || chatStore.activeResearchActivity"
         class="floating-panels"
       >
         <AgentActivityPanel
           v-if="chatStore.activeAgentActivity"
           :state="chatStore.activeAgentActivity"
           @dismiss="chatStore.dismissAgentActivity(chatStore.activeConversationId!)"
+        />
+        <ResearchActivityPanel
+          v-if="chatStore.activeResearchActivity"
+          :key="chatStore.activeResearchActivity.job_id"
+          :state="chatStore.activeResearchActivity"
+          @dismiss="chatStore.dismissResearchActivity(chatStore.activeConversationId!)"
         />
       </div>
 
@@ -381,7 +388,7 @@ const cancelPlan = async () => {
   overflow: hidden;
 }
 
-/* Floating stack for the Agent Activity panel. Absolutely positioned top-right
+/* Floating stack for the Agent Activity and Research activity panels. Absolutely positioned top-right
    of the chat column. (The todo panels moved to the app-global
    FloatingTodoLayer window manager, which supports multiple overlapping
    panels + per-turn history chips.) */

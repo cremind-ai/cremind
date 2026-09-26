@@ -44,6 +44,20 @@ export interface ConversationStreamEvent {
     | 'plan_decision'
     | 'todos'
     | 'agent_activity'
+    // A Documentation Search research job's live snapshot (the Research activity
+    // panel): full-snapshot semantics like `agent_activity`, published from
+    // the job's own task, so frames keep coming after the turn has ended.
+    | 'research_activity'
+    // The answer's Documentation Search citations, checked against what the tools
+    // issued: `{citations: {v, items, unverified}, assistant_id}`. Published
+    // when the answer is saved, so it attaches to the finishing bubble and
+    // never opens one. The multiplexer forwards conversation-event frames of
+    // any type, so this needed no change in profileEventsStream.ts.
+    | 'citations'
+    // The conversation's search-tool selection was saved: `{version}`. Transient
+    // (never replayed); the chat store re-reads the state when the version is
+    // one it does not hold.
+    | 'search_tools'
     | 'complete'
     | 'error'
     | 'cwd';

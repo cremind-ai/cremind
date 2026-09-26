@@ -31,6 +31,27 @@
 #                               --unattended, this flag wins, else the
 #                               previous install's password is kept, else one
 #                               is generated and printed at the end.
+#   --documents-dir PATH        (Docker mode) The folder on this machine the
+#                               container sees as /root/Documents. Each
+#                               profile's working directory (where its agent
+#                               works and what its document search indexes)
+#                               is PATH/cremind-workspaces/<profile>; an
+#                               install that predates per-profile folders
+#                               keeps the admin on PATH itself. Created if
+#                               missing. A leading ~ is expanded and a
+#                               relative path is made absolute; $, #,
+#                               double quotes and leading/trailing whitespace
+#                               are refused (compose's .env would mangle
+#                               them). Default: $CREMIND_DOCUMENTS_DIR, else
+#                               the previous install's folder, else
+#                               ~/Documents. Interactive installs ask.
+#   --documents-access rw|ro    (Docker mode) Mount that folder read-write
+#                               (default; the agent's file tools change your
+#                               real files) or read-only (the agent cannot
+#                               save there; the profiles' working directories
+#                               then live in the cremind-data volume instead).
+#                               Default: $CREMIND_DOCUMENTS_ACCESS, else the
+#                               previous install's choice, else rw.
 #   --mode docker|native|kubernetes
 #                               Skip the mode prompt. ``--docker``,
 #                               ``--native`` and ``--kubernetes`` are aliases.
@@ -160,7 +181,17 @@
 #                               ``docker compose down -v`` to drop volumes;
 #                               for kubernetes installs, deletes the bundled
 #                               PostgreSQL/vector-store volumes and the
-#                               namespace if the installer created it.
+#                               namespace if the installer created it. Keeps
+#                               the profiles' working directories (the
+#                               workspaces folder: <System Dir>/workspaces or
+#                               $CREMIND_WORKSPACES_DIR, and a Docker
+#                               install's <documents>/cremind-workspaces)
+#                               and says where; folders an admin chose
+#                               elsewhere are never touched.
+#   --purge-workspaces          (with --uninstall; implies --purge) Delete the
+#                               workspaces folder too. Asks to confirm on a
+#                               terminal; without one (or with --unattended)
+#                               the flag is the confirmation.
 #   --help                      Show this message.
 #
 # Service selection (database, vector store, …) is no longer made here —
@@ -236,6 +267,15 @@ PREV_VNC_PASSWORD=""
 # passes through `sed s|__VNC_PASSWORD__|...|g` below, an unquoted compose
 # .env, and a TOML basic string in credentials.toml.
 VNC_PASSWORD_RE='^[A-Za-z0-9@%_+=:,.-]{6,8}$'
+# Docker mode only: the host folder mounted at /root/Documents, and "rw" /
+# "ro" for how. From --documents-dir / --documents-access, else
+# $CREMIND_DOCUMENTS_DIR / $CREMIND_DOCUMENTS_ACCESS, else the TUI / fallback
+# prompt. Named like the TUI's output keys on purpose — the TUI echoes a
+# forwarded value back, so sourcing its file keeps a flag — and NOT like
+# CREMIND_HOST_DOCUMENTS / DOCUMENTS_DIR, which the docker branch resolves
+# itself from these plus the previous install and the default.
+DOCUMENTS_DIR_INPUT=""
+DOCUMENTS_ACCESS_INPUT=""
 # TLS on the public origin, from --ssl. SSL_MODE holds the flag's raw value
 # until the ── ssl mode ── block resolves it (fresh installs default to
 # plain HTTP); SSL_EXPLICIT records whether the operator actually asked,
@@ -264,6 +304,9 @@ NO_TUI="${CREMIND_NO_TUI:-0}"
 # UNINSTALL_MODE is read from --keep / --purge; empty = interactive prompt.
 UNINSTALL=0
 UNINSTALL_MODE=""        # keep | purge | empty (interactive)
+# --purge-workspaces: a purge deletes the profiles' working directories too.
+# Without it a purge keeps them (see the uninstall flow).
+PURGE_WORKSPACES=0
 AUTO_INSTALL_PYTHON=""   # "" = ask interactively; "1" = yes; "0" = no
 MODIFY_PATH=""           # "" = auto (1 for canonical home, 0 otherwise); 0/1 explicit
 # Explicit cremind version to install. Empty = resolve channel default
@@ -351,6 +394,10 @@ while [ $# -gt 0 ]; do
         --no-desktop)             DESKTOP_UI=0; shift ;;
         --vnc-password)           VNC_PASSWORD_INPUT="$2"; shift 2 ;;
         --vnc-password=*)         VNC_PASSWORD_INPUT="${1#*=}"; shift ;;
+        --documents-dir)          DOCUMENTS_DIR_INPUT="$2"; shift 2 ;;
+        --documents-dir=*)        DOCUMENTS_DIR_INPUT="${1#*=}"; shift ;;
+        --documents-access)       DOCUMENTS_ACCESS_INPUT="$2"; shift 2 ;;
+        --documents-access=*)     DOCUMENTS_ACCESS_INPUT="${1#*=}"; shift ;;
         --listen-host)            CUSTOM_listen_host="$2"; shift 2 ;;
         --listen-host=*)          CUSTOM_listen_host="${1#*=}"; shift ;;
         --public-url)             CUSTOM_public_url="$2"; shift 2 ;;
@@ -379,6 +426,7 @@ while [ $# -gt 0 ]; do
         --uninstall)              UNINSTALL=1; shift ;;
         --keep)                   UNINSTALL_MODE="keep"; shift ;;
         --purge)                  UNINSTALL_MODE="purge"; shift ;;
+        --purge-workspaces)       PURGE_WORKSPACES=1; shift ;;
         --no-tui)                 NO_TUI=1; shift ;;
         --help|-h)
             sed -n '1,/^set -e/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -e/d'
@@ -410,9 +458,15 @@ done
 # Detection: $INSTALL_DIR/docker/docker-compose.yml -> Docker; else
 #            $SYSTEM_DIR/venv -> Native; else partial-install -> Native.
 #
-# The User Working Directory (server_config.user_working_dir, picked in
-# the Setup Wizard) is NEVER touched directly. When it resolves inside
-# the System Dir, --purge takes it along with the rest.
+# The profiles' working directories. Each profile's default folder lives in
+# the workspaces folder — $CREMIND_WORKSPACES_DIR, else <System Dir>/workspaces
+# (native), and <documents folder>/cremind-workspaces for a Docker install —
+# which --purge KEEPS (everything else goes) unless --purge-workspaces. The
+# Docker name is not plain "workspaces": the user's own <documents
+# folder>/workspaces is theirs, and --purge-workspaces must never delete it. A
+# folder an admin chose for a profile elsewhere (profiles.working_dir; before
+# per-profile folders, server_config.user_working_dir) is NEVER touched; when
+# it resolves inside the System Dir, --purge takes it along with the rest.
 if [ "$UNINSTALL" -eq 1 ]; then
     # Resolve System / Install Dir before the install path's own resolution
     # block runs. Defaults must match the install side below.
@@ -463,7 +517,86 @@ if [ "$UNINSTALL" -eq 1 ]; then
         exit 1
     fi
 
+    # --purge-workspaces is a purge that deletes the working directories too.
+    if [ "$PURGE_WORKSPACES" -eq 1 ]; then
+        if [ "$UNINSTALL_MODE" = "keep" ]; then
+            echo "--purge-workspaces deletes the profiles' working directories; it cannot be combined with --keep." >&2
+            exit 2
+        fi
+        UNINSTALL_MODE=purge
+    fi
+
+    # CHILD equals PARENT or lies inside it (plain string paths, no resolving).
+    path_inside() {
+        local c="${1%/}" p="${2%/}"
+        [ -n "$c" ] && [ -n "$p" ] || return 1
+        [ "$c" = "$p" ] && return 0
+        case "$c" in "$p"/*) return 0 ;; esac
+        return 1
+    }
+    # An absolute spelling of a stored or configured path (~ expanded).
+    abs_path() {
+        case "$1" in
+            "~")   printf '%s' "$HOME" ;;
+            "~/"*) printf '%s' "$HOME/${1#\~/}" ;;
+            /*)    printf '%s' "$1" ;;
+            "")    ;;
+            *)     printf '%s' "$PWD/$1" ;;
+        esac
+    }
+    # rm -rf DIR except KEEP, a path inside it that stays where it is with its
+    # parent folders; every sibling on the way down to KEEP goes. A KEEP that
+    # is empty, missing or outside DIR removes DIR whole; KEEP = DIR keeps it
+    # all. A symlink on the way down is kept whole, never followed.
+    remove_tree_except() {
+        local dir="${1%/}" keep="${2%/}" cur rest next entry
+        [ -e "$dir" ] || [ -L "$dir" ] || return 0
+        if [ -z "$keep" ] || [ ! -e "$keep" ] || ! path_inside "$keep" "$dir"; then
+            rm -rf "$dir"
+            return 0
+        fi
+        [ "$keep" = "$dir" ] && return 0
+        cur="$dir"
+        rest="${keep#"$dir"/}"
+        while [ -n "$rest" ]; do
+            if [ "$cur" != "$dir" ] && [ -L "$cur" ]; then
+                break
+            fi
+            next="${rest%%/*}"
+            for entry in "$cur"/* "$cur"/.[!.]* "$cur"/..?*; do
+                [ -e "$entry" ] || [ -L "$entry" ] || continue
+                [ "${entry##*/}" = "$next" ] && continue
+                rm -rf "$entry"
+            done
+            cur="$cur/$next"
+            case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+        done
+    }
+
+    # Where the working directories are. The native root is a candidate for
+    # every kind (a Docker host may have run a native install before).
+    UNINSTALL_WS_NATIVE="$(abs_path "${CREMIND_WORKSPACES_DIR:-$UNINSTALL_SYSTEM_DIR/workspaces}")"
+    UNINSTALL_WS_NATIVE="${UNINSTALL_WS_NATIVE%/}"
+    UNINSTALL_WS_DOCKER=""
+    UNINSTALL_WS_IN_VOLUME=0
+    if [ "$KIND" = "docker" ]; then
+        _ws_env="$UNINSTALL_INSTALL_DIR/docker/.env"
+        _ws_docs="$(sed -n 's/^CREMIND_HOST_DOCUMENTS=//p' "$_ws_env" 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+        [ -n "$_ws_docs" ] || _ws_docs="$UNINSTALL_INSTALL_DIR/docker/documents"
+        UNINSTALL_WS_DOCKER="${_ws_docs%/}/cremind-workspaces"
+        # A read-only documents mount puts them in the cremind-data volume.
+        if [ -n "$(sed -n 's/^CREMIND_DOCKER_WORKSPACES_DIR=//p' "$_ws_env" 2>/dev/null | head -n 1 || true)" ]; then
+            UNINSTALL_WS_IN_VOLUME=1
+        fi
+        unset _ws_env _ws_docs
+    fi
+    uninstall_ws_present() {
+        [ -d "$UNINSTALL_WS_NATIVE" ] || { [ -n "$UNINSTALL_WS_DOCKER" ] && [ -d "$UNINSTALL_WS_DOCKER" ]; } \
+            || [ "$UNINSTALL_WS_IN_VOLUME" -eq 1 ]
+    }
+
     # Interactive prompt if no mode flag passed.
+    UNINSTALL_ASKED_WS=0
     if [ -z "$UNINSTALL_MODE" ]; then
         printf 'Uninstall Cremind (%s):\n' "$KIND"
         printf '  System Dir:  %s\n' "$UNINSTALL_SYSTEM_DIR"
@@ -488,6 +621,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
             printf ' (incl. the cluster volumes)'
         fi
         printf '\n'
+        printf '                     except the profiles'"'"' working directories (asked next)\n'
         printf '  [c] Cancel\n\n> '
         read -r ans
         case "$ans" in
@@ -498,15 +632,51 @@ if [ "$UNINSTALL" -eq 1 ]; then
                 exit 0
                 ;;
         esac
+        if [ "$UNINSTALL_MODE" = "purge" ] && uninstall_ws_present; then
+            printf '\nThe profiles'"'"' working directories are kept unless you delete them too:\n'
+            [ -d "$UNINSTALL_WS_NATIVE" ] && printf '  %s\n' "$UNINSTALL_WS_NATIVE"
+            [ -n "$UNINSTALL_WS_DOCKER" ] && [ -d "$UNINSTALL_WS_DOCKER" ] && printf '  %s\n' "$UNINSTALL_WS_DOCKER"
+            [ "$UNINSTALL_WS_IN_VOLUME" -eq 1 ] && printf '  (the ones in the cremind-data volume)\n'
+            printf 'Delete them as well? This cannot be undone. [y/N] '
+            read -r ans
+            case "$ans" in
+                y|Y|yes|YES) PURGE_WORKSPACES=1 ;;
+                *) PURGE_WORKSPACES=0 ;;
+            esac
+            UNINSTALL_ASKED_WS=1
+        fi
     fi
 
-    # Pre-purge guard: probe user_working_dir for the post-purge note.
-    # Best-effort — only runs when sqlite3 is on PATH.
-    USER_DIR=""
-    if [ "$UNINSTALL_MODE" = "purge" ] && command -v sqlite3 >/dev/null 2>&1; then
-        USER_DIR=$(sqlite3 "$UNINSTALL_SYSTEM_DIR/storage/cremind.db" \
-            "select value from server_config where key='user_working_dir'" 2>/dev/null || true)
+    # --purge-workspaces asks once more on a terminal; with no terminal (the
+    # desktop app, CI) or --unattended the flag is the confirmation.
+    if [ "$UNINSTALL_MODE" = "purge" ] && [ "$PURGE_WORKSPACES" -eq 1 ] \
+       && [ "$UNINSTALL_ASKED_WS" -eq 0 ] && [ "$UNATTENDED" -eq 0 ] && [ -t 0 ] \
+       && uninstall_ws_present; then
+        printf '\n--purge-workspaces deletes every profile'"'"'s working directory:\n'
+        [ -d "$UNINSTALL_WS_NATIVE" ] && printf '  %s\n' "$UNINSTALL_WS_NATIVE"
+        [ -n "$UNINSTALL_WS_DOCKER" ] && [ -d "$UNINSTALL_WS_DOCKER" ] && printf '  %s\n' "$UNINSTALL_WS_DOCKER"
+        printf 'Type "delete" to confirm; anything else keeps them: '
+        read -r ans
+        if [ "$ans" != "delete" ]; then
+            PURGE_WORKSPACES=0
+            echo "Keeping the working directories."
+        fi
     fi
+
+    # Folders an admin chose for a profile outside the workspaces folder:
+    # never touched, and named after a purge so nobody wonders where they
+    # went. Best-effort — a native SQLite install, sqlite3 on PATH. An install
+    # from before per-profile folders kept its one folder in server_config.
+    UNINSTALL_CHOSEN_DIRS=""
+    _ws_db="$UNINSTALL_SYSTEM_DIR/storage/cremind.db"
+    if [ "$UNINSTALL_MODE" = "purge" ] && [ -f "$_ws_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+        UNINSTALL_CHOSEN_DIRS="$(sqlite3 -separator '|' "$_ws_db" \
+            "select name, working_dir from profiles where working_dir is not null and working_dir <> ''" 2>/dev/null)" \
+            || UNINSTALL_CHOSEN_DIRS="$(sqlite3 "$_ws_db" \
+            "select 'admin|' || value from server_config where key='user_working_dir'" 2>/dev/null)" \
+            || UNINSTALL_CHOSEN_DIRS=""
+    fi
+    unset _ws_db
 
     # ── Docker pre-check (Docker-mode installs only) ─────────────────────
     #
@@ -631,9 +801,24 @@ if [ "$UNINSTALL" -eq 1 ]; then
 
     # Docker container/volume cleanup. Only runs when the daemon is reachable
     # AND the user didn't pick force-remove at the pre-check above.
+    UNINSTALL_WS_COPIED=""
     if [ "$KIND" = "docker" ] && [ "$DOCKER_INSTALLED" -eq 1 ] && [ "$FORCE_REMOVE" -eq 0 ]; then
         if [ -d "$UNINSTALL_INSTALL_DIR/docker" ]; then
             if [ "$UNINSTALL_MODE" = "purge" ]; then
+                # With a read-only documents folder the working directories
+                # live in the cremind-data volume, which `down -v` deletes:
+                # copy them out first so a purge keeps them there too.
+                if [ "$UNINSTALL_WS_IN_VOLUME" -eq 1 ] && [ "$PURGE_WORKSPACES" -eq 0 ]; then
+                    _ws_copy="$HOME/cremind-workspaces-$(date +%Y%m%d-%H%M%S)"
+                    if (cd "$UNINSTALL_INSTALL_DIR/docker" \
+                        && docker compose -p cremind cp cremind:/root/.cremind/workspaces "$_ws_copy") >/dev/null 2>&1 \
+                       && [ -d "$_ws_copy" ]; then
+                        UNINSTALL_WS_COPIED="$_ws_copy"
+                    else
+                        echo "Could not copy the working directories out of the cremind-data volume; they are removed with it." >&2
+                    fi
+                    unset _ws_copy
+                fi
                 echo "Stopping containers and removing volumes..."
                 (cd "$UNINSTALL_INSTALL_DIR/docker" && docker compose -p cremind down -v --remove-orphans) || true
             else
@@ -782,13 +967,62 @@ if [ "$UNINSTALL" -eq 1 ]; then
                 exit 1
                 ;;
         esac
-        [ -d "$UNINSTALL_SYSTEM_DIR" ]  && rm -rf "$UNINSTALL_SYSTEM_DIR"  && echo "Removed $UNINSTALL_SYSTEM_DIR."
-        [ -d "$UNINSTALL_INSTALL_DIR" ] && rm -rf "$UNINSTALL_INSTALL_DIR" && echo "Removed $UNINSTALL_INSTALL_DIR."
-        if [ -n "$USER_DIR" ]; then
-            case "$USER_DIR" in
-                "$UNINSTALL_SYSTEM_DIR"|"$UNINSTALL_SYSTEM_DIR"/*) ;;
-                *) echo "User Working Directory preserved at: $USER_DIR" ;;
-            esac
+        # The workspaces folders survive a purge unless --purge-workspaces:
+        # inside the System / Install Dir everything else there goes around
+        # them; outside, they are simply not touched (or deleted with it).
+        _keep_sys=""
+        _keep_inst=""
+        if [ "$PURGE_WORKSPACES" -eq 0 ]; then
+            path_inside "$UNINSTALL_WS_NATIVE" "$UNINSTALL_SYSTEM_DIR" && _keep_sys="$UNINSTALL_WS_NATIVE"
+            [ -n "$UNINSTALL_WS_DOCKER" ] && path_inside "$UNINSTALL_WS_DOCKER" "$UNINSTALL_INSTALL_DIR" \
+                && _keep_inst="$UNINSTALL_WS_DOCKER"
+        fi
+        if [ -d "$UNINSTALL_SYSTEM_DIR" ]; then
+            remove_tree_except "$UNINSTALL_SYSTEM_DIR" "$_keep_sys"
+            if [ -n "$_keep_sys" ] && [ -d "$_keep_sys" ]; then
+                echo "Removed $UNINSTALL_SYSTEM_DIR, except the profiles' working directories."
+            else
+                echo "Removed $UNINSTALL_SYSTEM_DIR."
+            fi
+        fi
+        if [ -d "$UNINSTALL_INSTALL_DIR" ]; then
+            remove_tree_except "$UNINSTALL_INSTALL_DIR" "$_keep_inst"
+            echo "Removed $UNINSTALL_INSTALL_DIR."
+        fi
+        unset _keep_sys _keep_inst
+        for _ws in "$UNINSTALL_WS_NATIVE" "$UNINSTALL_WS_DOCKER"; do
+            [ -n "$_ws" ] && [ -d "$_ws" ] || continue
+            if [ "$PURGE_WORKSPACES" -eq 1 ]; then
+                # Only ever a folder of its own: never / or one that holds
+                # the home folder (a stray CREMIND_WORKSPACES_DIR=~).
+                if [ "$_ws" = "/" ] || path_inside "$HOME" "$_ws"; then
+                    echo "Not deleting $_ws: it contains your home folder. Delete the working directories in it by hand." >&2
+                    continue
+                fi
+                if rm -rf "$_ws" 2>/dev/null; then
+                    echo "Removed the profiles' working directories at $_ws."
+                else
+                    echo "Could not delete everything in $_ws (files the container created may be owned by root): sudo rm -rf '$_ws'" >&2
+                fi
+            else
+                echo "Kept the profiles' working directories at: $_ws"
+                echo "  (delete them with --uninstall --purge-workspaces, or by hand)"
+            fi
+        done
+        unset _ws
+        if [ -n "$UNINSTALL_WS_COPIED" ]; then
+            echo "Kept the profiles' working directories (copied out of the cremind-data volume) at: $UNINSTALL_WS_COPIED"
+        fi
+        # Folders an admin chose elsewhere, one "name|path" per line.
+        if [ -n "$UNINSTALL_CHOSEN_DIRS" ]; then
+            printf '%s\n' "$UNINSTALL_CHOSEN_DIRS" | while IFS='|' read -r _name _dir; do
+                _dir="$(abs_path "$(printf '%s' "$_dir" | tr -d '\r')")"
+                [ -n "$_dir" ] || continue
+                path_inside "$_dir" "$UNINSTALL_SYSTEM_DIR" && continue
+                path_inside "$_dir" "$UNINSTALL_WS_NATIVE" && continue
+                [ -n "$UNINSTALL_WS_DOCKER" ] && path_inside "$_dir" "$UNINSTALL_WS_DOCKER" && continue
+                echo "Working directory of profile '$_name' preserved at: $_dir"
+            done
         fi
     else
         # Keep mode: remove install scratch + Native binaries; preserve System
@@ -805,8 +1039,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
             K8S_KEEP_TMP="$(mktemp 2>/dev/null || true)"
             [ -n "$K8S_KEEP_TMP" ] && cp "$UNINSTALL_K8S_ENV" "$K8S_KEEP_TMP"
         fi
-        # Wipe the Install Dir wholesale — it's all install scratch.
-        [ -d "$UNINSTALL_INSTALL_DIR" ] && rm -rf "$UNINSTALL_INSTALL_DIR" && echo "Removed install scratch at $UNINSTALL_INSTALL_DIR."
+        # Wipe the Install Dir wholesale — it's all install scratch, but for
+        # the working directories a Docker install without a recorded
+        # documents folder keeps in its ./documents fallback.
+        _keep_inst=""
+        [ -n "$UNINSTALL_WS_DOCKER" ] && path_inside "$UNINSTALL_WS_DOCKER" "$UNINSTALL_INSTALL_DIR" \
+            && _keep_inst="$UNINSTALL_WS_DOCKER"
+        [ -d "$UNINSTALL_INSTALL_DIR" ] && remove_tree_except "$UNINSTALL_INSTALL_DIR" "$_keep_inst" \
+            && echo "Removed install scratch at $UNINSTALL_INSTALL_DIR."
+        if [ -n "$_keep_inst" ] && [ -d "$_keep_inst" ]; then
+            echo "Kept the profiles' working directories at: $_keep_inst"
+        fi
+        unset _keep_inst
         if [ -n "$K8S_KEEP_TMP" ] && [ -f "$K8S_KEEP_TMP" ]; then
             mkdir -p "$UNINSTALL_INSTALL_DIR/k8s"
             chmod 700 "$UNINSTALL_INSTALL_DIR/k8s" 2>/dev/null || true
@@ -855,6 +1099,83 @@ if [ -n "$VNC_PASSWORD_INPUT" ] \
     err "(VNC itself ignores anything past the 8th character.)"
     exit 2
 fi
+
+# The one rule for a Docker documents folder, mirrored in install.ps1
+# (Resolve-DocumentsDir) and app/installer/tui.py.
+#
+# documents_dir_normalize RAW → exit 0 with the absolute path on stdout, or
+# exit 1 with the reason RAW cannot be used on stdout (one channel, so a
+# caller captures either with a single ``$(...)``).
+#
+# The path is appended UNQUOTED to docker/.env as CREMIND_HOST_DOCUMENTS, and
+# compose's .env parser expands $, reads # as a comment, treats " as quoting
+# and trims surrounding whitespace. Escaping would have to match that parser
+# exactly, so those are refused instead — naming the character, because a
+# "valid path" error for a real folder is baffling otherwise. Apostrophes and
+# inner spaces are fine unquoted. The checks run on the RESULT too, since
+# $HOME or $PWD can carry the same characters.
+documents_dir_normalize() {
+    local raw="$1" path home="${HOME:-}" nl=$'\n' cr=$'\r'
+    if [ -z "$raw" ]; then
+        printf '%s' "it is empty"; return 1
+    fi
+    case "$raw" in
+        [[:space:]]*|*[[:space:]])
+            printf '%s' "it starts or ends with whitespace, which docker compose would drop"; return 1 ;;
+    esac
+    case "$raw" in
+        "~"|"~/"*)
+            if [ -z "$home" ]; then
+                printf '%s' "\$HOME is not set, so ~ cannot be expanded"; return 1
+            fi
+            if [ "$raw" = "~" ]; then path="$home"; else path="${home%/}/${raw#\~/}"; fi
+            ;;
+        "~"*)  printf '%s' "~user paths are not supported; write the full path"; return 1 ;;
+        /*)    path="$raw" ;;
+        *)     path="${PWD%/}/$raw" ;;
+    esac
+    case "$path" in
+        /*) ;;
+        *)  printf '%s' "it does not resolve to an absolute path"; return 1 ;;
+    esac
+    case "$path" in
+        *'$'*)             printf '%s' "it contains \$, which docker compose would expand as a variable"; return 1 ;;
+        *'#'*)             printf '%s' "it contains #, which docker compose would read as the start of a comment"; return 1 ;;
+        *'"'*)             printf '%s' "it contains a double quote (\"), which docker compose would read as quoting"; return 1 ;;
+        *"$nl"*|*"$cr"*)   printf '%s' "it contains a line break"; return 1 ;;
+    esac
+    while [ "$path" != "/" ] && [ "${path%/}" != "$path" ]; do
+        path="${path%/}"
+    done
+    printf '%s' "$path"
+}
+
+# --documents-dir / --documents-access, else the environment. Checked now, in
+# every mode, like --vnc-password above: an unattended install must fail on a
+# folder it cannot mount rather than write a .env compose misreads. The
+# normalized value is what the TUI is handed, so it sees an absolute path.
+DOCUMENTS_DIR_SOURCE="--documents-dir"
+if [ -z "$DOCUMENTS_DIR_INPUT" ] && [ -n "${CREMIND_DOCUMENTS_DIR:-}" ]; then
+    DOCUMENTS_DIR_INPUT="$CREMIND_DOCUMENTS_DIR"
+    DOCUMENTS_DIR_SOURCE="CREMIND_DOCUMENTS_DIR"
+fi
+if [ -n "$DOCUMENTS_DIR_INPUT" ]; then
+    if ! _docs_out="$(documents_dir_normalize "$DOCUMENTS_DIR_INPUT")"; then
+        err "Invalid $DOCUMENTS_DIR_SOURCE '$DOCUMENTS_DIR_INPUT': $_docs_out"
+        exit 2
+    fi
+    DOCUMENTS_DIR_INPUT="$_docs_out"
+    unset _docs_out
+fi
+DOCUMENTS_ACCESS_SOURCE="--documents-access"
+if [ -z "$DOCUMENTS_ACCESS_INPUT" ] && [ -n "${CREMIND_DOCUMENTS_ACCESS:-}" ]; then
+    DOCUMENTS_ACCESS_INPUT="$CREMIND_DOCUMENTS_ACCESS"
+    DOCUMENTS_ACCESS_SOURCE="CREMIND_DOCUMENTS_ACCESS"
+fi
+case "$DOCUMENTS_ACCESS_INPUT" in
+    ""|rw|ro) ;;
+    *) err "Invalid $DOCUMENTS_ACCESS_SOURCE: $DOCUMENTS_ACCESS_INPUT (must be rw or ro)"; exit 2 ;;
+esac
 
 # Kubernetes flag shapes. Checked here, before anything reaches helm: a bad
 # namespace or release name is a template error several minutes into an
@@ -982,6 +1303,13 @@ IN_CONTAINER=0
 if [ -f /.dockerenv ] || [ -f /run/.containerenv ] \
         || (grep -qE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null); then
     IN_CONTAINER=1
+fi
+# WSL, where ~/Documents is the distro's Linux home rather than the Windows
+# Documents folder a user usually means. Only used to print the catalog's
+# wsl_note next to the documents-folder question.
+IS_WSL=0
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    IS_WSL=1
 fi
 
 # Kubernetes has no host to bind — the chart sets HOST and APP_URL on the pod
@@ -1506,6 +1834,43 @@ read_prev_vnc_password() {
 
 read_prev_vnc_password
 
+# The documents folder and access a previous Docker install recorded in the
+# same file, read here for the same reason: the TUI and the fallback prompt
+# offer them as the default, and an unattended re-run keeps them. A recorded
+# folder that no longer passes documents_dir_normalize (hand-edited) is
+# dropped with a warning rather than failing a re-install over it.
+PREV_DOCUMENTS_DIR=""
+PREV_DOCUMENTS_ACCESS=""
+read_prev_documents() {
+    local prev_env="$CREMIND_INSTALL_DIR/docker/.env" prev_dir prev_ro out
+    [ -f "$prev_env" ] || return 0
+    prev_dir="$(sed -n 's/^CREMIND_HOST_DOCUMENTS=//p' "$prev_env" | head -n 1 | tr -d '\r')"
+    prev_ro="$(sed -n 's/^CREMIND_DOCUMENTS_READ_ONLY=//p' "$prev_env" | head -n 1 | tr -d '\r')"
+    if [ -n "$prev_dir" ]; then
+        if out="$(documents_dir_normalize "$prev_dir")"; then
+            PREV_DOCUMENTS_DIR="$out"
+        else
+            warn "Ignoring the previous documents folder '$prev_dir': $out"
+        fi
+    fi
+    case "$prev_ro" in
+        true)  PREV_DOCUMENTS_ACCESS="ro" ;;
+        false) PREV_DOCUMENTS_ACCESS="rw" ;;
+    esac
+}
+
+read_prev_documents
+
+# What the documents folder is when nobody says otherwise: the previous
+# install's, else ~/Documents. Empty only when $HOME itself holds a character
+# the .env cannot carry — the docker branch then leaves CREMIND_HOST_DOCUMENTS
+# unset and compose falls back to a folder inside the bundle. Handed to the
+# TUI as --documents-default, which only prefills: it never counts as an answer.
+DOCUMENTS_DEFAULT="$PREV_DOCUMENTS_DIR"
+if [ -z "$DOCUMENTS_DEFAULT" ]; then
+    DOCUMENTS_DEFAULT="$(documents_dir_normalize "${HOME:-}/Documents")" || DOCUMENTS_DEFAULT=""
+fi
+
 # ── previous kubernetes release ───────────────────────────────────────────
 #
 # A kubernetes install records what it did in k8s/release.env so a re-run can
@@ -1622,6 +1987,9 @@ tui_run_bootstrap() {
             --desktop "$DESKTOP_UI" \
             --vnc-password "$VNC_PASSWORD_INPUT" \
             --vnc-password-set "$vnc_pw_preset" \
+            --documents-dir "$DOCUMENTS_DIR_INPUT" \
+            --documents-access "$DOCUMENTS_ACCESS_INPUT" \
+            --documents-default "$DOCUMENTS_DEFAULT" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -1648,6 +2016,9 @@ tui_run_bootstrap() {
             --desktop "$DESKTOP_UI" \
             --vnc-password "$VNC_PASSWORD_INPUT" \
             --vnc-password-set "$vnc_pw_preset" \
+            --documents-dir "$DOCUMENTS_DIR_INPUT" \
+            --documents-access "$DOCUMENTS_ACCESS_INPUT" \
+            --documents-default "$DOCUMENTS_DEFAULT" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -2057,6 +2428,138 @@ if { [ "$MODE" = "docker" ] || [ "$MODE" = "kubernetes" ]; } && [ "$DESKTOP_UI" 
         warn "No VNC password entered; generating one and printing it at the end."
     fi
     unset vnc_pw vnc_pw2 vnc_tries
+fi
+
+# ── documents folder (docker mode only) ───────────────────────────────────
+#
+# The host folder the container sees as /root/Documents — what Documentation search indexes and where the agent works by default. Without the bind it
+# lives on the container's own layer and vanishes whenever compose recreates
+# the container. Kubernetes never gets here: the chart's persistence.work
+# volume is mounted at the same path.
+#
+# Precedence: --documents-dir → $CREMIND_DOCUMENTS_DIR (both folded into
+# DOCUMENTS_DIR_INPUT and validated up front) → the TUI's or the prompt's
+# answer → the previous install's folder → ~/Documents. Access runs the same
+# chain from --documents-access / $CREMIND_DOCUMENTS_ACCESS, default rw. Each
+# question is asked only when its value is still open and someone can answer
+# (not --unattended, a /dev/tty to read), the same gate as the VNC prompt.
+DOCUMENTS_DIR=""
+DOCUMENTS_READ_ONLY="false"
+if [ "$MODE" = "docker" ]; then
+    if [ -z "$DOCUMENTS_DIR_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+        echo
+        printf '%s%s%s\n' "$BOLD" "$DOCKER_DOCUMENTS_PROMPT" "$RESET"
+        [ -n "$DOCKER_DOCUMENTS_HINT" ] && printf '  %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_HINT" "$RESET"
+        if [ "$IS_WSL" -eq 1 ] && [ -n "$DOCKER_DOCUMENTS_WSL_NOTE" ]; then
+            printf '  %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_WSL_NOTE" "$RESET"
+        fi
+        # Bounded for the same reason as the VNC loop: a tty that only returns
+        # EOF would re-read forever. Giving up keeps the default.
+        docs_tries=0
+        while [ "$docs_tries" -lt 5 ]; do
+            docs_tries=$((docs_tries + 1))
+            read -r -p "  [$DOCUMENTS_DEFAULT]: " docs_ans </dev/tty || docs_ans=""
+            [ -z "$docs_ans" ] && docs_ans="$DOCUMENTS_DEFAULT"
+            if [ -z "$docs_ans" ]; then
+                warn "Type the full path of a folder."
+                continue
+            fi
+            if docs_out="$(documents_dir_normalize "$docs_ans")"; then
+                DOCUMENTS_DIR_INPUT="$docs_out"
+                break
+            fi
+            warn "That folder can't be used: $docs_out"
+        done
+        unset docs_ans docs_out docs_tries
+    fi
+
+    docs_access_default="${PREV_DOCUMENTS_ACCESS:-rw}"
+    if [ -z "$DOCUMENTS_ACCESS_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+        echo
+        printf '%s%s%s\n' "$BOLD" "$DOCKER_DOCUMENTS_ACCESS_PROMPT" "$RESET"
+        printf '  1) %s\n' "$DOCKER_DOCUMENTS_RW_LABEL"
+        printf '     %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_RW_DISCLOSURE" "$RESET"
+        printf '  2) %s\n' "$DOCKER_DOCUMENTS_RO_LABEL"
+        printf '     %s%s%s\n' "$DIM" "$DOCKER_DOCUMENTS_RO_DISCLOSURE" "$RESET"
+        docs_choice_default=1
+        [ "$docs_access_default" = "ro" ] && docs_choice_default=2
+        docs_tries=0
+        while [ "$docs_tries" -lt 5 ]; do
+            docs_tries=$((docs_tries + 1))
+            read -r -p "Choose [1-2] [$docs_choice_default]: " docs_ans </dev/tty || docs_ans=""
+            case "${docs_ans:-$docs_choice_default}" in
+                1|rw) DOCUMENTS_ACCESS_INPUT="rw"; break ;;
+                2|ro) DOCUMENTS_ACCESS_INPUT="ro"; break ;;
+                *)    warn "Please choose 1 or 2." ;;
+            esac
+        done
+        unset docs_ans docs_tries docs_choice_default
+    fi
+
+    # A value that came back from the TUI is normalized again here: the TUI
+    # writes the path as typed.
+    if [ -n "$DOCUMENTS_DIR_INPUT" ]; then
+        if ! DOCUMENTS_DIR="$(documents_dir_normalize "$DOCUMENTS_DIR_INPUT")"; then
+            err "Invalid documents folder '$DOCUMENTS_DIR_INPUT': $DOCUMENTS_DIR"
+            exit 2
+        fi
+    else
+        DOCUMENTS_DIR="$DOCUMENTS_DEFAULT"
+    fi
+    case "${DOCUMENTS_ACCESS_INPUT:-$docs_access_default}" in
+        ro) DOCUMENTS_READ_ONLY="true" ;;
+        *)  DOCUMENTS_READ_ONLY="false" ;;
+    esac
+    unset docs_access_default
+
+    if [ -z "$DOCUMENTS_DIR" ]; then
+        warn "No usable documents folder (your home path holds a character the compose .env cannot carry)."
+        warn "Documents will live in $CREMIND_INSTALL_DIR/docker/documents, which an uninstall deletes; pass --documents-dir to choose another."
+    else
+        # Created as the user running this script, so the folder (at least)
+        # is theirs — compose would otherwise create a missing one as root.
+        # An installer that itself runs in a container would only create it
+        # inside that container, where the Docker daemon never looks.
+        if [ "$IN_CONTAINER" -eq 1 ]; then
+            info "This installer runs inside a container, so it did not create $DOCUMENTS_DIR; Docker creates it on the Docker host if it is missing."
+        elif [ ! -d "$DOCUMENTS_DIR" ]; then
+            if ! mkdir -p "$DOCUMENTS_DIR" 2>/dev/null; then
+                err "Could not create the documents folder $DOCUMENTS_DIR."
+                err "Create it yourself, or choose another with --documents-dir PATH."
+                exit 2
+            fi
+            ok "Created $DOCUMENTS_DIR"
+        fi
+        if [ "$DOCUMENTS_READ_ONLY" = "true" ]; then
+            ok "Documents folder: $DOCUMENTS_DIR (read-only)"
+            info "Each profile's working directory lives in the cremind-data volume: a read-only folder cannot hold them."
+        else
+            ok "Documents folder: $DOCUMENTS_DIR (read-write)"
+            info "Each profile's working directory: $DOCUMENTS_DIR/cremind-workspaces/<profile>"
+        fi
+    fi
+    case "$(uname -s)" in
+        Darwin)
+            [ -n "$DOCKER_DOCUMENTS_MACOS_PRIVACY_NOTE" ] && info "$DOCKER_DOCUMENTS_MACOS_PRIVACY_NOTE"
+            ;;
+        Linux)
+            if [ "$DOCUMENTS_READ_ONLY" = "false" ] && [ -n "$DOCKER_DOCUMENTS_LINUX_OWNER_NOTE" ]; then
+                info "$DOCKER_DOCUMENTS_LINUX_OWNER_NOTE"
+            fi
+            ;;
+    esac
+    # Repeated after the answer for the runs that never saw the prompt (TUI,
+    # --unattended) — unless the folder already is a Windows drive.
+    if [ "$IS_WSL" -eq 1 ] && [ -n "$DOCKER_DOCUMENTS_WSL_NOTE" ]; then
+        case "$DOCUMENTS_DIR" in
+            /mnt/*) ;;
+            *) info "$DOCKER_DOCUMENTS_WSL_NOTE" ;;
+        esac
+    fi
+elif [ -n "$DOCUMENTS_DIR_INPUT" ] || [ -n "$DOCUMENTS_ACCESS_INPUT" ]; then
+    # Only the Docker bundle mounts a documents folder: native installs use
+    # your real ~/Documents directly, Kubernetes the chart's work volume.
+    info "The documents-folder setting applies to Docker installs only; ignoring it for $MODE."
 fi
 
 # ── kubernetes questions ──────────────────────────────────────────────────
@@ -3767,6 +4270,29 @@ EOF
     elif [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
         printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >>"$DOCKER_DIR/.env"
     fi
+    # The documents folder resolved in ── documents folder ── above, which
+    # compose binds at /root/Documents. Appended with printf, never sed'd into a
+    # placeholder: a folder name may hold | or &, which a sed replacement would
+    # eat. Unquoted is safe because documents_dir_normalize refused everything
+    # compose's .env parser treats specially. Left out when there is no usable
+    # folder, so compose falls back to the bundle's own ./documents.
+    # CREMIND_COMPOSE_HOST_DIR tells the app where this bundle lives on the
+    # host, for the instructions it shows; skipped if the path is not .env-safe.
+    if [ -n "$DOCUMENTS_DIR" ]; then
+        printf 'CREMIND_HOST_DOCUMENTS=%s\n' "$DOCUMENTS_DIR" >>"$DOCKER_DIR/.env"
+    fi
+    printf 'CREMIND_DOCUMENTS_READ_ONLY=%s\n' "$DOCUMENTS_READ_ONLY" >>"$DOCKER_DIR/.env"
+    # Every profile's working directory lives in
+    # /root/Documents/cremind-workspaces — which a read-only mount cannot hold.
+    # Then they go to the cremind-data volume instead (writable, not visible on
+    # the host); see the compose file.
+    if [ "$DOCUMENTS_READ_ONLY" = "true" ]; then
+        printf 'CREMIND_DOCKER_WORKSPACES_DIR=%s\n' "/root/.cremind/workspaces" >>"$DOCKER_DIR/.env"
+    fi
+    if compose_host_dir="$(documents_dir_normalize "$DOCKER_DIR")"; then
+        printf 'CREMIND_COMPOSE_HOST_DIR=%s\n' "$compose_host_dir" >>"$DOCKER_DIR/.env"
+    fi
+    unset compose_host_dir
     chmod 600 "$DOCKER_DIR/.env"
 
     # Dev channel: emit a docker-compose.override.yml that points the
@@ -3803,6 +4329,17 @@ EOF
         warn "Ignoring INSTALL_MODE=$INSTALL_MODE from the environment: this is a Docker install."
     fi
     unset INSTALL_MODE
+    # Same shadowing for the documents keys: an exported CREMIND_HOST_DOCUMENTS
+    # would mount one folder now and the .env's another on the next plain
+    # ``docker compose up -d``. The installer's own inputs are
+    # CREMIND_DOCUMENTS_DIR / CREMIND_DOCUMENTS_ACCESS, already folded in.
+    for _doc_key in CREMIND_HOST_DOCUMENTS CREMIND_DOCUMENTS_READ_ONLY CREMIND_COMPOSE_HOST_DIR CREMIND_DOCKER_WORKSPACES_DIR; do
+        if [ -n "$(printenv "$_doc_key" 2>/dev/null || true)" ]; then
+            warn "Ignoring $_doc_key from the environment: $DOCKER_DIR/.env holds the installer's value."
+        fi
+        unset "$_doc_key"
+    done
+    unset _doc_key
 
     # Per-channel pull / build strategy:
     #   production / test → pull the pre-built image from Docker Hub
@@ -3995,6 +4532,12 @@ EOF
   ${BOLD}VNC password${RESET} (saved to $DOCKER_DIR/.env):
     $(grep '^VNC_PASSWORD=' "$DOCKER_DIR/.env" | cut -d= -f2-)
 EOF
+        fi
+        if [ -n "$DOCUMENTS_DIR" ]; then
+            if [ "$DOCUMENTS_READ_ONLY" = "true" ]; then docs_how="read-only"; else docs_how="read-write"; fi
+            printf '  %sDocuments%s:  %s (%s, /root/Documents in the container)\n' \
+                "$BOLD" "$RESET" "$DOCUMENTS_DIR" "$docs_how"
+            unset docs_how
         fi
         cat <<EOF
 

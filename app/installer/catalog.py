@@ -77,6 +77,43 @@ class VncPasswordPrompt:
 
 
 @dataclass(frozen=True)
+class DockerDocuments:
+    """The Docker documents-folder questions (asked only when mode == docker).
+
+    The defaults are a fallback for a catalog that predates the
+    ``[docker_documents]`` section, so an older ``_catalog.json`` still gives
+    the screen readable text instead of blank prompts.
+    """
+
+    prompt: str = "Which folder on this computer should Cremind use as its Documents folder?"
+    hint: str = (
+        "It is mounted into the container at /root/Documents. Each profile "
+        "works in its own folder inside it, cremind-workspaces/<profile>: the "
+        "agent's default working folder and the folder Documentation search "
+        "indexes. It is created if it does not exist."
+    )
+    access_prompt: str = "Should Cremind be able to change files in that folder?"
+    rw_label: str = "Read-write"
+    ro_label: str = "Read-only"
+    rw_disclosure: str = "The agent's file tools write to your real folder."
+    ro_disclosure: str = (
+        "The agent cannot save files there; the profiles' own working folders "
+        "live in Cremind's data volume instead."
+    )
+    linux_owner_note: str = (
+        "On Linux, files the agent creates in the folder are owned by root."
+    )
+    macos_privacy_note: str = (
+        "macOS will ask you to allow Docker to access Documents. If you deny "
+        "it, the folder looks empty to Cremind."
+    )
+    wsl_note: str = (
+        "Inside WSL, ~/Documents is the Linux home. Use "
+        "/mnt/c/Users/<you>/Documents for the Windows one."
+    )
+
+
+@dataclass(frozen=True)
 class KubernetesPrompts:
     """The kubernetes-mode questions (asked only when mode == kubernetes).
 
@@ -101,6 +138,7 @@ class Catalog:
     modes: tuple[Mode, ...] = ()
     docker_desktop: DockerDesktop = DockerDesktop()
     vnc_password: VncPasswordPrompt = VncPasswordPrompt()
+    docker_documents: DockerDocuments = DockerDocuments()
     kubernetes: KubernetesPrompts = KubernetesPrompts()
 
     def deployment(self, deployment_id: str) -> Deployment | None:
@@ -195,6 +233,16 @@ def load(path: str | Path) -> Catalog:
         hint=vp_raw.get("hint", ""),
     )
 
+    # Key by key, so a catalog that has the section but not every key (or an
+    # older one without it) still falls back per field.
+    docs_raw = data.get("docker_documents", {}) or {}
+    docker_documents = DockerDocuments(
+        **{
+            name: str(docs_raw.get(name) or getattr(DockerDocuments, name))
+            for name in DockerDocuments.__dataclass_fields__
+        }
+    )
+
     k8s_raw = data.get("kubernetes", {}) or {}
     kubernetes = KubernetesPrompts(
         context_prompt=k8s_raw.get("context_prompt", KubernetesPrompts.context_prompt),
@@ -218,5 +266,6 @@ def load(path: str | Path) -> Catalog:
         modes=tuple(modes),
         docker_desktop=docker_desktop,
         vnc_password=vnc_password,
+        docker_documents=docker_documents,
         kubernetes=kubernetes,
     )

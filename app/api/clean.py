@@ -98,12 +98,12 @@ def get_clean_routes(
 
         # Resolve the document service lazily (it's built during boot, after the
         # route factory runs). registry falls back to the booted state's registry.
-        document_service = None
+        cremind_document_service = None
         state_registry = registry
         try:
             from app.runtime import get_state
             state = get_state()
-            document_service = getattr(state, "document_service", None)
+            cremind_document_service = getattr(state, "cremind_document_service", None)
             if state_registry is None:
                 state_registry = getattr(state, "registry", None)
         except Exception:  # noqa: BLE001
@@ -114,7 +114,7 @@ def get_clean_routes(
             config_storage=config_storage,
             registry=state_registry,
             drop_profile_embeddings=drop_profile_embeddings,
-            document_service=document_service,
+            cremind_document_service=cremind_document_service,
         )
 
         logger.info(

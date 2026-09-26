@@ -168,8 +168,16 @@ def profile_get(
 def profile_create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Profile name."),
+    working_dir: Optional[str] = typer.Option(
+        None,
+        "--working-dir",
+        help=(
+            "The new profile's working directory (absolute path; created if missing). "
+            "Default: <workspaces>/<name>."
+        ),
+    ),
 ) -> None:
-    """Create a new profile."""
+    """Create a new profile (admin only)."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -179,16 +187,21 @@ def profile_create(
     cfg: Config = ctx.obj["cfg"]
     cfg.require_token()
 
-    async def _run() -> None:
+    async def _run():
         async with Client(cfg) as client:
-            await create_profile(client, name)
+            return await create_profile(client, name, working_dir)
 
-    asyncio.run(_run())
+    resp = asyncio.run(_run()) or {}
     sys.stdout.write(f"{name}\n")
     # stdout stays pipe-clean (the name alone); the advice goes to stderr.
     # What this command makes is a shell: no LLM, no tools, no channels and no
     # token, so nothing can act as it and it answers nothing. Most callers
     # asking for "a new profile" want the wizard instead.
+    folder = resp.get("working_dir") if isinstance(resp, dict) else None
+    if isinstance(folder, dict) and folder.get("path"):
+        sys.stderr.write(f"Working directory: {folder['path']}\n")
+    elif isinstance(folder, dict) and folder.get("error"):
+        sys.stderr.write(f"Warning: its working directory could not be set up: {folder['error']}\n")
     sys.stderr.write(
         f"Created a bare profile: '{name}' has no LLM, tools, memory or channels, "
         "and no token yet.\n"
@@ -201,6 +214,14 @@ def profile_create(
 def profile_delete(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Profile name."),
+    delete_working_dir: bool = typer.Option(
+        False,
+        "--delete-working-dir",
+        help=(
+            "Also delete its working directory and every file in it. Default: keep it "
+            "(moved to <workspaces>/.deleted/). A folder chosen elsewhere is never touched."
+        ),
+    ),
 ) -> None:
     """Delete a profile (cascades conversations, tools, skills)."""
     import asyncio
@@ -208,15 +229,116 @@ def profile_delete(
     from app.cli.client._base import Client
     from app.cli.client.profiles import delete_profile
     from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
 
     cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
     cfg.require_token()
 
-    async def _run() -> None:
+    async def _run():
         async with Client(cfg) as client:
-            await delete_profile(client, name)
+            return await delete_profile(client, name, delete_working_dir=delete_working_dir)
 
-    asyncio.run(_run())
+    resp = asyncio.run(_run()) or {}
+    if mode.json:
+        print_json(resp)
+        return
+    line = _describe_retired_working_dir(resp.get("working_dir"))
+    if line:
+        stream = sys.stderr if line.startswith("Warning:") else sys.stdout
+        stream.write(f"{line}\n")
+
+
+def _describe_retired_working_dir(info: object) -> str:
+    """One line on what ``profile delete`` did with the working directory."""
+    if not isinstance(info, dict):
+        return ""
+    action, path = info.get("action"), info.get("path") or ""
+    if action == "archived":
+        return f"Working directory kept: moved to {info.get('archived_to')}"
+    if action == "deleted":
+        return f"Working directory deleted: {path}"
+    if action == "none":
+        return f"Working directory {path} was empty or missing; nothing to keep."
+    if action == "untouched":
+        return f"Working directory left in place: {path} (not a folder Cremind made for it)"
+    if action == "failed":
+        return f"Warning: the working directory {path} could not be moved or deleted: {info.get('error')}"
+    return ""
+
+
+# ── working-dir ────────────────────────────────────────────────────────────
+
+
+def _looks_like_profile_name(text: str) -> bool:
+    # Same rule the server applies. A path always has a separator, a drive
+    # colon or a ``~``, none of which a profile name may contain, so a lone
+    # argument is never ambiguous.
+    import re
+
+    return bool(re.fullmatch(r"[a-z0-9_-]{1,64}", text))
+
+
+@profile_app.command("working-dir")
+@graceful_errors
+def profile_working_dir(
+    ctx: typer.Context,
+    name: Optional[str] = typer.Argument(
+        None, help="Profile (default: your own). May be omitted before PATH.",
+    ),
+    path: Optional[str] = typer.Argument(
+        None, help="New folder, absolute (admin only). Omit to show the current one.",
+    ),
+    default: bool = typer.Option(
+        False, "--default", help="Reset to the default folder, <workspaces>/<name> (admin only).",
+    ),
+) -> None:
+    """Show a profile's working directory, or (admin) change it."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.me import get_me
+    from app.cli.client.profiles import get_working_dir, set_working_dir
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    if name is not None and path is None and not _looks_like_profile_name(name):
+        name, path = None, name
+    if path is not None and default:
+        typer.echo("give a PATH or --default, not both", err=True)
+        raise typer.Exit(code=1)
+
+    async def _run() -> dict:
+        async with Client(cfg) as client:
+            target = name or (await get_me(client)).profile
+            if not target:
+                raise RuntimeError("could not tell which profile this token belongs to; name it")
+            if default:
+                return await set_working_dir(client, target, None)
+            if path is not None:
+                return await set_working_dir(client, target, path)
+            return await get_working_dir(client, target)
+
+    try:
+        info = asyncio.run(_run())
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+
+    if mode.json:
+        print_json(info)
+        return
+    print_kv([
+        ("profile", str(info.get("profile") or "")),
+        ("path", str(info.get("path") or "")),
+        ("default", "yes" if info.get("is_default") else "no"),
+        ("default_path", str(info.get("default_path") or "")),
+        ("exists", "yes" if info.get("exists") else "no"),
+    ])
 
 
 @persona_app.command("get")

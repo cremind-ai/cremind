@@ -21,4 +21,4 @@ class Deps:
     config_storage: Any                           # DynamicConfigStorage (sync)
     registry: Any = None                          # ToolRegistry | None
     drop_profile_embeddings: Optional[Callable[[str], None]] = None
-    document_service: Any = None                  # DocumentSyncService | None
+    cremind_document_service: Any = None                  # CremindDocumentSyncService | None

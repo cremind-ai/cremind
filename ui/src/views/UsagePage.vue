@@ -10,7 +10,9 @@ import { useSettingsStore } from '../stores/settings';
 import { useUsageStore } from '../stores/usage';
 import UsageChart from '../components/usage/UsageChart.vue';
 import UsageStatTile from '../components/usage/UsageStatTile.vue';
-import { formatTokens, formatTokensCompact, formatUsd, formatPercent, formatTimestamp } from '../utils/usageFormat';
+import {
+  formatTokens, formatTokensCompact, formatUsd, formatPercent, formatTimestamp, usageSourceTypeLabel,
+} from '../utils/usageFormat';
 import { goBackToChat } from '../utils/backToChat';
 import type { UsageGroupSlice, UsageTimePoint } from '../services/usageApi';
 
@@ -172,6 +174,10 @@ const bySourceOption = computed(() => {
   const slices = [...(summary.value?.by_source ?? [])].slice(0, 12).reverse();
   const typeColor: Record<string, string> = {
     reasoning: c.primary, tool: c.warning, subagent: c.series[3], intrinsic: c.success, aggregate: c.textSecondary,
+    // Documentation search's own model calls: image descriptions and checks
+    // (`userdocs` on rows written before the rename).
+    documents: c.series[5],
+    userdocs: c.series[5],
   };
   return {
     tooltip: {
@@ -179,7 +185,8 @@ const bySourceOption = computed(() => {
       backgroundColor: c.surface, borderColor: c.border, textStyle: { color: c.text },
       formatter: (ps: any) => {
         const s = slices[ps[0].dataIndex];
-        return `${s.display_name} (${s.source_type})<br/>${formatTokens(s.total_tokens)} tok · ${formatUsd(s.estimated_cost_usd)}`;
+        const type = usageSourceTypeLabel(s.source_type);
+        return `${s.display_name} (${type})<br/>${formatTokens(s.total_tokens)} tok · ${formatUsd(s.estimated_cost_usd)}`;
       },
     },
     grid: { left: 8, right: 16, top: 8, bottom: 8, containLabel: true },
@@ -285,7 +292,7 @@ const hasData = computed(() => (summary.value?.request_count ?? 0) > 0 || (summa
           <ElTableColumn label="Source" min-width="160">
             <template #default="{ row }">
               <span class="src-name">{{ row.display_name }}</span>
-              <ElTag size="small" :type="row.source_type === 'reasoning' ? 'primary' : row.source_type === 'subagent' ? 'danger' : 'warning'" effect="light">{{ row.source_type }}</ElTag>
+              <ElTag size="small" :type="row.source_type === 'reasoning' ? 'primary' : row.source_type === 'subagent' ? 'danger' : 'warning'" effect="light">{{ usageSourceTypeLabel(row.source_type) }}</ElTag>
             </template>
           </ElTableColumn>
           <ElTableColumn label="Tokens" width="110" align="right">

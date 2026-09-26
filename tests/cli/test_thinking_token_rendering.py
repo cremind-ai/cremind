@@ -50,7 +50,7 @@ def test_extract_token_usage_uses_shared_formatter():
 def test_thinking_event_renders_tool_and_tokens():
     theme = default_theme()
     line = format_event(_event("thinking", {
-        "Step": 1, "Call_Id": "c1", "Tool": "documentation_search",
+        "Step": 1, "Call_Id": "c1", "Tool": "cremind_documentation_search",
         "Tool_Input": json.dumps({"query": "x"}), "Model_Label": "Fake m",
         "Token_Usage": {
             "input_tokens": 8, "cache_read_input_tokens": 5,
@@ -58,7 +58,7 @@ def test_thinking_event_renders_tool_and_tokens():
         },
     }), theme)
     assert line is not None and line.kind == "thinking"
-    assert "documentation_search" in line.body
+    assert "cremind_documentation_search" in line.body
     assert "Fake m" in line.body
     assert "tokens (in 8, cached 5 / out 2)" in line.body
 

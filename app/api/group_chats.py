@@ -88,6 +88,26 @@ def _may_see_seat(viewer: str, viewer_is_admin: bool, profile: str) -> bool:
     return bool(viewer_is_admin or (profile and profile == viewer))
 
 
+def _private_seat_cwd(payload: Dict[str, Any], viewer: str) -> bool:
+    """Whether a seat ``cwd`` frame names a folder the viewer may not open.
+
+    Watching a member's agent work is the admin's right; that member's working
+    directory is still the member's alone (the admin is not exempt), so a
+    ``cwd`` frame pointing inside another profile's folder is dropped for the
+    viewer rather than handed to a file tree that could only fail on it. The
+    room keeps showing the seat as private (see ``handle_get_group``)."""
+    if not isinstance(payload, dict) or payload.get("type") != "cwd":
+        return False
+    if (payload.get("profile") or "") == viewer:
+        return False
+    wd = (payload.get("data") or {}).get("working_directory")
+    if not isinstance(wd, str) or not wd:
+        return False
+    from app.config.working_dirs import is_foreign
+
+    return is_foreign(wd, viewer)
+
+
 def _normalized_settings(
     raw: Any,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
@@ -283,19 +303,23 @@ def get_group_chat_routes(conversation_storage: ConversationStorage) -> list[Rou
         await _publish(group["id"], "group_updated", group)
         return JSONResponse({"group": group}, status_code=201)
 
-    async def _seat_working_directory(row: Dict[str, Any]) -> str:
+    async def _seat_working_directory(row: Dict[str, Any]) -> Optional[str]:
         """Where one member's agent is currently working.
 
         Same precedence the agent itself reads on its next step — the in-memory
         override under the seat's ``context_id`` (this boot's
         ``change_working_directory``), then the persisted column, then the
-        profile default — so the room's file panel opens on the directory the
-        agent's own tools would use rather than on a stale one.
+        member profile's OWN folder — so the room's file panel opens on the
+        directory the agent's own tools would use rather than on a stale one.
+        An override that now lies in another profile's folder is skipped, as
+        the agent skips it. ``None`` when the seat names no profile.
         """
         from app.config.settings import get_user_working_directory
+        from app.config.working_dirs import is_foreign
         from app.utils.context_storage import get_context
         from app.utils.working_directory import WORKING_DIR_OVERRIDE_KEY
 
+        member = row.get("profile") or ""
         conversation_id = row.get("shadow_conversation_id")
         conv: Optional[Dict[str, Any]] = None
         if conversation_id:
@@ -306,15 +330,18 @@ def get_group_chat_routes(conversation_storage: ConversationStorage) -> list[Rou
                     f"[group] could not read the seat {conversation_id}", exc_info=True,
                 )
         if conv:
+            member = conv.get("profile") or member
             override = get_context(
                 conv.get("context_id") or conversation_id, WORKING_DIR_OVERRIDE_KEY,
             )
-            if isinstance(override, str) and override:
+            if isinstance(override, str) and override and not is_foreign(override, member):
                 return override
             persisted = conv.get("working_directory")
-            if isinstance(persisted, str) and persisted:
+            if isinstance(persisted, str) and persisted and not is_foreign(persisted, member):
                 return persisted
-        return get_user_working_directory()
+        if not member:
+            return None
+        return get_user_working_directory(member)
 
     async def handle_get_group(request: Request) -> JSONResponse:
         """One room, plus which of its members are mid-turn right now.
@@ -332,9 +359,22 @@ def get_group_chat_routes(conversation_storage: ConversationStorage) -> list[Rou
         if err is not None:
             return err
         viewer, viewer_is_admin = _profile_from_request(request), is_admin(request)
+        from app.config.working_dirs import is_foreign
+
         for row in group.get("member_rows") or []:
-            if _may_see_seat(viewer, viewer_is_admin, row.get("profile") or ""):
-                row["working_directory"] = await _seat_working_directory(row)
+            member = row.get("profile") or ""
+            if not _may_see_seat(viewer, viewer_is_admin, member):
+                continue
+            wd = await _seat_working_directory(row)
+            # The admin may watch every seat work, but a member's working
+            # directory is that member's alone (the admin is not exempt from
+            # that): another member's folder comes back as a flag, not a path,
+            # so the room shows "private" instead of a tree it cannot open.
+            if wd and member != viewer and is_foreign(wd, viewer):
+                row["working_directory"] = None
+                row["working_directory_private"] = True
+            else:
+                row["working_directory"] = wd
         return JSONResponse({"group": group, "thinking": _thinking_profiles(group)})
 
     async def handle_update_group(request: Request) -> JSONResponse:
@@ -728,7 +768,7 @@ def get_group_chat_routes(conversation_storage: ConversationStorage) -> list[Rou
                 continue
             for event in ring:
                 payload = seat_event_payload(profile, conversation_id, event)
-                if payload is not None:
+                if payload is not None and not _private_seat_cwd(payload, viewer):
                     frames.append({"type": "seat_event", "data": payload})
         return frames
 
@@ -782,6 +822,8 @@ def get_group_chat_routes(conversation_storage: ConversationStorage) -> list[Rou
             if event_type == "seat_event":
                 profile = (event.get("data") or {}).get("profile") or ""
                 if not _may_see_seat(viewer, viewer_is_admin, profile):
+                    return None
+                if _private_seat_cwd(event.get("data") or {}, viewer):
                     return None
                 return event
             return event

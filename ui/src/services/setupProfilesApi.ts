@@ -17,13 +17,13 @@ function resolveBaseUrl(agentUrl: string): string {
   return `${window.location.origin}${agentUrl}`;
 }
 
+// No working directory here: each profile has its own, and the server
+// suggests it per profile (``SetupProfilesResponse.suggested_working_dir``).
 export interface SetupProfileServerConfig {
   db_provider?: 'sqlite' | 'postgres';
   sqlite_db_path?: string;
   service_name?: string;
   agent_name?: string;
-  working_dir?: string;
-  user_working_dir?: string;
   system_dir?: string;
   postgres?: {
     host?: string;
@@ -47,11 +47,27 @@ export interface SetupProfilesResponse {
   profiles: SetupProfile[];
   /** Profile id from SETUP_WIZARD_ENV; null when unset, blank, or invalid. */
   selected: string | null;
+  /** The working directory the profile being set up will get: the admin's
+   *  on first setup (created by the server), else the ``profile`` asked
+   *  about. Null when the server will not say (after setup, to a caller
+   *  that may not see it) or predates per-profile folders. */
+  suggested_working_dir?: string | null;
+  /** True only on first setup — afterwards a profile's folder changes from
+   *  Settings → Profiles (admin), never from its own setup. */
+  working_dir_editable?: boolean;
 }
 
-export async function fetchSetupProfiles(agentUrl: string): Promise<SetupProfilesResponse> {
+export async function fetchSetupProfiles(
+  agentUrl: string,
+  /** After first setup: the profile being set up, and the admin token that
+   *  may see its folder. */
+  opts: { profile?: string; token?: string } = {},
+): Promise<SetupProfilesResponse> {
   const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/config/setup-profiles`);
+  const query = opts.profile ? `?profile=${encodeURIComponent(opts.profile)}` : '';
+  const res = await fetch(`${base}/api/config/setup-profiles${query}`, {
+    headers: opts.token ? { Authorization: `Bearer ${opts.token}` } : {},
+  });
   if (!res.ok) throw new Error(`Failed to fetch setup profiles: ${res.statusText}`);
   return res.json();
 }

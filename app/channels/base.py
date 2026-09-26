@@ -1809,6 +1809,21 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         pending_files: list[dict] = []
         seen_file_uris: set[str] = set()
         auto_files = self._auto_send_files_enabled()
+        # Documentation search citations. A platform shows plain text, so the
+        # answer's "[doc:…]" tokens go out as "[1]" markers plus a "Sources:"
+        # footer. One renderer per turn: an interim reply and the final
+        # answer are halves of one message and share one numbering (the web
+        # UI's). A room's footer leaves out paths and links — other people
+        # read it. Cheap for everything else: it returns at once when a text
+        # has no citation token, and it never raises, so a reply is never lost to it.
+        try:
+            from app.documents.citations import CitationRenderer
+
+            citations: Any = CitationRenderer(
+                self.profile, conversation_id, include_paths=not target.is_group,
+            )
+        except Exception:  # noqa: BLE001
+            citations = None
 
         def note_group_post(text: str, delivered: bool) -> None:
             """Record one thing the agent actually said out loud in a room.
@@ -1866,6 +1881,8 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 return
             step_index += 1
             body = _format_step_markdown(step_index, step)
+            if body and citations is not None:
+                body = await citations.render_step(body)
             if body:
                 logger.debug(
                     f"channels[{self.channel_type}]: flush_step #{step_index} "
@@ -1893,6 +1910,8 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 text = _strip_silent_lines(text)
             if not text:
                 return
+            if citations is not None:
+                text = await citations.render(text)
             logger.info(
                 f"channels[{self.channel_type}]: flush_interim sending "
                 f"len={len(text)} to={target.key} conv={conversation_id}"
@@ -1953,6 +1972,8 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                     f"no response is sent"
                 )
                 return
+            if citations is not None:
+                text = await citations.render(text)
             prefix = "*Response*\n\n" if detail and step_index > 0 else ""
             logger.info(
                 f"channels[{self.channel_type}]: flush_final sending "

@@ -256,3 +256,10 @@ def test_a_turn_that_blew_up_still_says_how_long_it_ran(tmp_path, monkeypatch):
         assert latency["first_step_ms"] is None
 
     asyncio.run(scenario())
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

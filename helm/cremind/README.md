@@ -604,6 +604,57 @@ embeddings.
 > To instead have `helm uninstall` delete this volume automatically (so a
 > reinstall always starts clean), see [Uninstalling and removing data](#uninstalling-and-removing-data).
 
+## Sizing for Documentation search
+
+Documentation search indexes each profile's own working directory (plus Google
+Drive, when linked). With `persistence.work` enabled — the default — every
+profile's folder is on the `work` volume, at
+`<persistence.work.mountPath>/cremind-workspaces/<profile>`
+(`/root/Documents/cremind-workspaces/…`; the chart sets `CREMIND_WORKSPACES_DIR`
+to the `cremind-workspaces` folder). A release
+upgraded from before per-profile folders keeps the admin on
+`/root/Documents` itself. With the volume disabled the folders move to
+`<cremind.systemDir>/workspaces` on the system volume, so size that one for
+them instead. Size the `work` volume for every profile's files together. The
+feature's own data lands on two volumes.
+
+**The system volume** (`persistence.system`) holds the per-profile index
+(`storage/documents/`) and the local embedding models, which are downloaded on
+first use (about 1 GB per model). The chart points `HF_HOME` and
+`SENTENCE_TRANSFORMERS_HOME` at `<cremind.systemDir>/.cache/`, so the models
+survive a rollout and move with a custom `systemDir`. The 5Gi default is enough
+to try the feature; give it **8Gi or more** for real use:
+
+```bash
+helm install cremind oci://registry-1.docker.io/cremind/cremind \
+  --version <X.Y.Z> --namespace cremind --create-namespace \
+  --set persistence.system.size=10Gi
+```
+
+On an existing release, raising the size resizes the claim in place only when
+its StorageClass has `allowVolumeExpansion: true`.
+
+**The bundled stores.** From inside the pod, the app can measure only the
+volumes mounted there, not a database or vector store running in another pod.
+So the chart passes it the sizes of the ones it runs itself:
+
+- `CREMIND_DB_CAPACITY` from `postgresql.primary.persistence.size` (8Gi).
+- `CREMIND_VECTORSTORE_CAPACITY` from `qdrant.persistence.size` (10Gi), or from
+  ChromaDB's `chromadb.chromadb.data.volumeSize`. ChromaDB defaults to only 1Gi,
+  which a large document collection fills quickly.
+
+The storage governor then warns and pauses indexing before a volume fills,
+instead of finding out when a write fails. Nothing is passed for an external
+service, for persistence turned off or an `existingClaim` (their size is
+unknown to the chart), or when both vector subcharts are enabled. In those
+cases, state the sizes yourself with
+`cremind docs admin set --vector-capacity-mb <MB> --db-capacity-mb <MB>`.
+
+The StatefulSet claim sizes apply at the first install only: changing
+`postgresql.primary.persistence.size` or `qdrant.persistence.size` on an
+existing release fails the upgrade, because a StatefulSet's
+`volumeClaimTemplates` cannot change.
+
 ## Key values
 
 | Key | Default | Notes |
@@ -619,12 +670,14 @@ embeddings.
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. A `localhost` value sets the Google callback port for every flow; any other value with an explicit port sets it for Calendar connect and the Drive picker only ([Linking Google accounts](#linking-google-accounts)). Naming `cremind.apiPort` (1112) here is refused for those callbacks — that port is the pod's own loopback, never proxied — and the pod logs a warning at boot. An `APP_URL` in `cremind.extraEnv` overrides it. |
 | `cremind.ssl` | `""` | HTTP by default; boolean `false` or string `none` explicitly disables in-pod TLS, while boolean `true` selects `after-setup`. `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both switch the sidecar to an L4 passthrough relay and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
-| `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
+| `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles; with Documentation search on, also its index and the local embedding models. **8Gi+ recommended for document search** — see [Sizing for Documentation search](#sizing-for-documentation-search). |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
-| `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |
+| `persistence.work.*` | `10Gi`, RWO | Every profile's working directory, at `<mountPath>/cremind-workspaces/<profile>` (the chart sets `CREMIND_WORKSPACES_DIR`); an upgraded release's admin keeps `mountPath` itself. Disabled → `<systemDir>/workspaces` on the system volume. Deleted by `helm uninstall` unless annotated `helm.sh/resource-policy: keep`. |
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
+| `postgresql.primary.persistence.size` | `8Gi` | Bundled PostgreSQL's data volume; also passed to the app as `CREMIND_DB_CAPACITY`. Choose it before the first install — a StatefulSet's claim template cannot change on upgrade. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
+| `qdrant.persistence.size` | `10Gi` | Bundled Qdrant's volume; also passed to the app as `CREMIND_VECTORSTORE_CAPACITY`. Same first-install caveat. |
 | `proxy.enabled` | `true` | nginx sidecar. Without `cremind.ssl` it is the single-entry L7 proxy (UI + API + noVNC on one port; noVNC routes only on the desktop flavor). With `cremind.ssl` it is an L4 TCP passthrough relay that keeps a port-forward alive across app restarts, and noVNC moves to Service port 6080. `false` removes it and points the Service at the app. |
 | `proxy.edgePort` | `8082` | Pod-private nginx listener referenced by the Ingress backend Service. It separates public Service traffic from the controller's forwarded scheme and must differ from `proxy.port`. |
 | `proxy.adminPort` | `8081` | Relay mode only: pod-internal port carrying the sidecar's own `/healthz` for its probes. Never on the Service. |
@@ -667,7 +720,8 @@ State survives a pod reschedule without scaling: PostgreSQL holds the dynamic
 config (JWT signing secret, LLM keys, tool configs, profiles) and three PVCs hold
 the rest — `system` (`/root/.cremind`: `bootstrap.toml`, OAuth tokens, per-profile
 files), `venv` (`/opt/cremind/venv`: installed deps), and `work`
-(`/root/Documents`: the files the agent creates). So a restarted/rescheduled
+(`/root/Documents`: every profile's working directory under `cremind-workspaces/`, the
+files the agents create). So a restarted/rescheduled
 single pod boots straight through with no re-setup and no lost files. Only these
 mounted paths persist — data written elsewhere (e.g. `/tmp`, or a manual
 `kubectl exec` into `/root`) is ephemeral; add `extraVolumes`/`extraVolumeMounts`
@@ -683,6 +737,14 @@ the generated Secret, and the chart's own three PVCs (`<release>-system`,
 `-venv`, `-work`). Whether each PVC's underlying **PV and disk** also disappear
 is governed by the StorageClass `reclaimPolicy`: `Delete` (the default on most
 cloud provisioners) destroys the disk; `Retain` leaves a `Released` PV behind.
+
+The `-work` claim holds every profile's working directory — the users' files.
+Unlike the installers' `--uninstall --purge`, which keeps those folders on a
+native or Docker install, `helm uninstall` takes them with the claim. Either
+keep the claim (`--set-json 'persistence.work.annotations={"helm.sh/resource-policy":"keep"}'`
+on install or upgrade; Helm then leaves it behind, to delete by hand later) or
+take a backup first — `cremind backup create` includes the working directories
+by default.
 
 The bundled **StatefulSet** subcharts are the exception — their data PVCs come
 from `volumeClaimTemplates`, which neither Helm nor Kubernetes garbage-collects

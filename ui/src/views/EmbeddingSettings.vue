@@ -2,9 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRouter } from 'vue-router';
-import {
-  ElButton, ElMessage, ElMessageBox, ElDialog,
-} from 'element-plus';
+import { ElButton, ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
@@ -12,22 +10,19 @@ import {
   getEmbeddingConfig,
   applyEmbeddingConfig,
   fetchServiceCapabilities,
-  streamFeaturesInstall,
   EmbeddingFeaturesNotInstalledError,
   type EmbeddingConfig,
   type EmbeddingFeaturesNotInstalledDetail,
-  type FeatureInstallEvent,
   type ServiceCapabilitiesResponse,
 } from '../services/configApi';
 import { fetchInstallCatalog, type InstallCatalog } from '../services/installCatalogApi';
-import { useServerRestart } from '../composables/useServerRestart';
 import EmbeddingConfigForm from '../components/shared/EmbeddingConfigForm.vue';
+import FeatureInstallDialog from '../components/shared/FeatureInstallDialog.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
-const serverRestart = useServerRestart();
 
 // Subscribe reactively to the SSE-driven store. App.vue opens the
 // stream globally; this page just reads.
@@ -136,112 +131,48 @@ watch(status, (curr) => {
 });
 
 // ── Feature-install dialog ────────────────────────────────────────────
-// Mirrors the pattern in AgentsToolsSettings.vue: when ``applyChanges``
-// gets a 409 FeatureNotInstalled, open this dialog, pipe pip output
-// from /api/features/install over SSE, and either prompt for a restart
-// (when ``requires_restart=True`` features were installed — the
-// embedding providers always are) or retry the apply automatically
+// When ``applyChanges`` gets a 409 FeatureNotInstalled, the shared dialog
+// pipes pip output from /api/features/install over SSE, then either prompts
+// for a restart (when ``requires_restart=True`` features were installed — the
+// embedding providers always are) or retries the apply automatically
 // (vectorstore-only installs are hot-reloadable).
-const featureInstallOpen = ref(false);
-const featureInstallDetail = ref<EmbeddingFeaturesNotInstalledDetail | null>(null);
-const featureInstallBusy = ref(false);
-const featureInstallLog = ref<string[]>([]);
-const featureInstallError = ref<string | null>(null);
-const featureInstallRestartRequired = ref(false);
-
-const featureInstallExtras = computed(() => {
-  const detail = featureInstallDetail.value;
-  if (!detail) return [] as string[];
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const entry of detail.missing) {
-    for (const grp of entry.extras) {
-      if (!seen.has(grp)) {
-        seen.add(grp);
-        out.push(grp);
-      }
-    }
-  }
-  return out;
-});
+const installDialog = ref<InstanceType<typeof FeatureInstallDialog> | null>(null);
 
 function openFeatureInstallDialog(detail: EmbeddingFeaturesNotInstalledDetail) {
-  featureInstallDetail.value = detail;
-  featureInstallLog.value = [];
-  featureInstallError.value = null;
-  featureInstallRestartRequired.value = false;
-  featureInstallBusy.value = false;
-  featureInstallOpen.value = true;
-}
-
-function closeFeatureInstallDialog() {
-  featureInstallOpen.value = false;
-  featureInstallDetail.value = null;
-  featureInstallLog.value = [];
-  featureInstallError.value = null;
-  featureInstallRestartRequired.value = false;
-}
-
-async function confirmFeatureInstall() {
-  const detail = featureInstallDetail.value;
-  if (!detail || featureInstallBusy.value) return;
-  featureInstallBusy.value = true;
-  featureInstallError.value = null;
-  featureInstallLog.value = [];
-
-  const handleEvent = (evt: FeatureInstallEvent) => {
-    const prefix = evt.event === 'error' ? '✖' : evt.event === 'done' ? '✓' : '•';
-    if (evt.message) {
-      featureInstallLog.value.push(`${prefix} ${evt.message}`);
-    }
-  };
-
-  try {
-    const result = await streamFeaturesInstall(
-      settingsStore.agentUrl,
-      settingsStore.authToken,
-      detail.missing.map((m) => m.feature_key),
-      handleEvent,
-    );
-    if (!result.ok || result.failed.length) {
-      featureInstallError.value =
-        result.error || `Install failed for: ${result.failed.join(', ')}`;
-      featureInstallBusy.value = false;
-      return;
-    }
-    if (result.restart_required) {
-      // Heavy-init features (sentence-transformers + torch) can't be
-      // hot-loaded in the live process. Persist the new config with
-      // ``defer_apply`` so the boot path's
-      // ``initialize_embedding_subsystem`` picks it up after restart —
-      // otherwise the page would still show "Disabled" because the
-      // enabled flag never made it to SQLite.
-      try {
-        await applyEmbeddingConfig(
-          settingsStore.agentUrl,
-          settingsStore.authToken,
-          form.value,
-          { deferApply: true },
-        );
-      } catch (e) {
-        featureInstallError.value =
-          e instanceof Error ? e.message : 'Failed to save embedding config';
-        featureInstallBusy.value = false;
-        return;
+  installDialog.value?.open({
+    detail,
+    title: 'Install vector embedding dependencies?',
+    purpose: 'Enabling Vector Embedding',
+    onInstalled: async (restartRequired) => {
+      if (restartRequired) {
+        // Heavy-init features (sentence-transformers + torch) can't be
+        // hot-loaded in the live process. Persist the new config with
+        // ``defer_apply`` so the boot path's
+        // ``initialize_embedding_subsystem`` picks it up after restart —
+        // otherwise the page would still show "Disabled" because the
+        // enabled flag never made it to SQLite.
+        try {
+          await applyEmbeddingConfig(
+            settingsStore.agentUrl,
+            settingsStore.authToken,
+            form.value,
+            { deferApply: true },
+          );
+        } catch (e) {
+          throw new Error(e instanceof Error ? e.message : 'Failed to save embedding config');
+        }
+        return {
+          restart: 'Install complete. Your settings have been saved. Restart the Cremind '
+            + 'server — the embedding model will load automatically on startup and this '
+            + 'page will report "Success" when it\'s ready.',
+        };
       }
-      featureInstallRestartRequired.value = true;
-      featureInstallBusy.value = false;
-      return;
-    }
-    // Hot-loadable install (vectorstore-only). Retry the apply now
-    // that the new module is importable.
-    featureInstallOpen.value = false;
-    featureInstallDetail.value = null;
-    await runApply();
-  } catch (e) {
-    featureInstallError.value = e instanceof Error ? e.message : 'Install stream failed';
-    featureInstallBusy.value = false;
-  }
+      // Hot-loadable install (vectorstore-only). Retry the apply now
+      // that the new module is importable — after the dialog closed, since
+      // the apply reopens it if yet another group is missing.
+      return { restart: null, after: runApply };
+    },
+  });
 }
 
 async function runApply() {
@@ -306,22 +237,7 @@ onMounted(() => {
     return;
   }
   loadConfig();
-  // Resolve install_mode early so the install dialog's Restart button
-  // knows whether to route through the Electron IPC bridge or
-  // POST /api/system/restart.
-  serverRestart.loadInstallMode();
 });
-
-async function restartFromInstallDialog() {
-  await serverRestart.restart();
-  // The page is about to be reloaded (Docker/Electron supervisor
-  // respawns) or the connection will drop (no supervisor) — either
-  // way, closing the dialog avoids leaving a stale "Install complete"
-  // banner up if the page survives.
-  if (serverRestart.phase.value === 'reconnected') {
-    closeFeatureInstallDialog();
-  }
-}
 </script>
 
 <template>
@@ -364,7 +280,7 @@ async function restartFromInstallDialog() {
             <div class="field-hint">
               {{ enabled
                   ? 'Configure the model and vector store below. Applying changes will reload + rebuild caches.'
-                  : 'Semantic ranking is off. Documentation search still works, but its relevance judge reviews the whole shared library plus up to 50 per-profile documents instead of a vector-ranked shortlist; long-term memory search returns the stored facts unranked; Google Places uses a fixed list of common place types.' }}
+                  : 'Semantic ranking is off. Cremind documentation search still works, but its relevance judge reviews the whole shared library plus up to 50 per-profile documents instead of a vector-ranked shortlist; long-term memory search returns the stored facts unranked; Google Places uses a fixed list of common place types. Settings → My Documents is hidden until it is back on; the document indexes profiles already built are kept and still searched by keyword.' }}
             </div>
           </template>
 
@@ -394,92 +310,8 @@ async function restartFromInstallDialog() {
 
     <!-- Feature install dialog (opened by ``applyChanges`` when the
          backend returns 409 FeatureNotInstalled). Streams pip output
-         from /api/features/install over SSE. Mirrors the pattern used
-         on the Agents & Tools page. -->
-    <ElDialog
-      v-model="featureInstallOpen"
-      :title="featureInstallDetail ? 'Install vector embedding dependencies?' : 'Install dependencies'"
-      width="560px"
-      :close-on-click-modal="!featureInstallBusy"
-      :close-on-press-escape="!featureInstallBusy"
-      :show-close="!featureInstallBusy"
-    >
-      <div v-if="featureInstallDetail" class="feature-install-body">
-        <p>
-          Enabling Vector Embedding requires the following optional
-          dependency group<span v-if="featureInstallExtras.length !== 1">s</span>:
-          <code>cremind[{{ featureInstallExtras.join(',') }}]</code>.
-        </p>
-        <ul class="feature-install-list">
-          <li v-for="entry in featureInstallDetail.missing" :key="entry.feature_key">
-            <code>{{ entry.feature_key }}</code>
-            <span v-if="entry.requires_restart_after_install" class="feature-install-restart-tag">
-              · restart required after install
-            </span>
-          </li>
-        </ul>
-
-        <div v-if="featureInstallLog.length" class="feature-install-log">
-          <div v-for="(line, i) in featureInstallLog" :key="i">{{ line }}</div>
-        </div>
-
-        <p v-if="featureInstallError" class="feature-install-error">
-          {{ featureInstallError }}
-        </p>
-
-        <p v-if="featureInstallRestartRequired" class="feature-install-restart">
-          Install complete. Your settings have been saved. Restart the
-          Cremind server — the embedding model will load automatically on
-          startup and this page will report "Success" when it's ready.
-        </p>
-        <p
-          v-if="featureInstallRestartRequired && serverRestart.error.value"
-          class="feature-install-error"
-        >
-          Restart failed: {{ serverRestart.error.value }}
-        </p>
-      </div>
-      <template #footer>
-        <ElButton
-          v-if="!featureInstallRestartRequired"
-          @click="closeFeatureInstallDialog"
-          :disabled="featureInstallBusy"
-        >
-          Cancel
-        </ElButton>
-        <ElButton
-          v-if="!featureInstallRestartRequired"
-          type="primary"
-          :loading="featureInstallBusy"
-          @click="confirmFeatureInstall"
-        >
-          {{ featureInstallError ? 'Retry install' : 'Install' }}
-        </ElButton>
-        <template v-if="featureInstallRestartRequired">
-          <ElButton
-            @click="closeFeatureInstallDialog"
-            :disabled="serverRestart.isBusy.value"
-          >
-            Close
-          </ElButton>
-          <!-- ``autofocus`` lands focus on Restart so a Tab-less user
-               can hit Enter to proceed; the Close button is still one
-               Tab away for anyone who wants to dismiss without
-               restarting. The Element Plus button forwards the
-               attribute to the underlying <button>. -->
-          <ElButton
-            type="primary"
-            autofocus
-            :loading="serverRestart.isBusy.value"
-            :disabled="serverRestart.isBusy.value"
-            @click="restartFromInstallDialog"
-          >
-            <Icon icon="mdi:restart" style="margin-right: 4px" />
-            Restart
-          </ElButton>
-        </template>
-      </template>
-    </ElDialog>
+         from /api/features/install over SSE. -->
+    <FeatureInstallDialog ref="installDialog" />
   </div>
 </template>
 
@@ -523,36 +355,4 @@ async function restartFromInstallDialog() {
    reach them. */
 .field-hint { margin-top: 4px; font-size: 0.775rem; color: var(--text-secondary); line-height: 1.4; }
 .actions { margin-top: 24px; }
-
-.feature-install-body p { margin: 0 0 12px 0; font-size: 0.875rem; line-height: 1.5; }
-.feature-install-body code { background: var(--surface-color); padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; }
-.feature-install-list { margin: 0 0 12px 18px; padding: 0; font-size: 0.825rem; color: var(--text-secondary); }
-.feature-install-list li { margin-bottom: 2px; }
-/* Bare text on the dialog body, so it needs a token: the fixed amber was
-   near-unreadable against the dark-mode background. */
-.feature-install-restart-tag { color: var(--el-color-warning); }
-/* Same frame as the Agents & Tools install log: on ``--surface-color`` with
-   no border the box was invisible against the light-mode dialog body, which
-   made a streaming install look like nothing was happening. */
-.feature-install-log {
-  max-height: 240px; overflow-y: auto; margin: 12px 0;
-  padding: 10px 12px; background: var(--bg-color);
-  border: 1px solid var(--border-color);
-  border-radius: 6px; color: var(--text-primary);
-  font-family: var(--font-mono, monospace);
-  font-size: 0.75rem; line-height: 1.4;
-}
-.feature-install-log > div { white-space: pre-wrap; }
-/* Semantic tokens, not fixed hex: these banners sit inside the install dialog
-   and hard-coded light tints rendered as near-white blocks in dark mode. */
-.feature-install-error {
-  margin: 8px 0 0 0; padding: 8px 12px;
-  background: var(--surface-hover); border: 1px solid var(--el-color-danger); border-radius: 6px;
-  color: var(--el-color-danger); font-size: 0.825rem;
-}
-.feature-install-restart {
-  margin: 8px 0 0 0; padding: 10px 12px;
-  background: var(--surface-hover); border: 1px solid var(--el-color-warning); border-radius: 6px;
-  color: var(--el-color-warning); font-size: 0.825rem; line-height: 1.5;
-}
 </style>

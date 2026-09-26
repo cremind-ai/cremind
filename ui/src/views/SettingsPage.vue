@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
+import { visibleSettingsCards } from '../utils/myDocumentsAccess';
+import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
 import { ElCard } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
+const embeddingStatus = useEmbeddingStatusStore();
 
 interface SettingsCard {
   title: string;
@@ -15,6 +18,8 @@ interface SettingsCard {
   route: string;
   /** When true, only the admin profile can see this card. */
   adminOnly?: boolean;
+  /** When true, the card shows only while Vector Embedding is on. */
+  requiresEmbedding?: boolean;
 }
 
 const allCards: SettingsCard[] = [
@@ -42,6 +47,17 @@ const allCards: SettingsCard[] = [
     icon: 'mdi:vector-square',
     route: 'embedding',
     adminOnly: true,
+  },
+  {
+    // Every profile: each one has its own folder and its own index. It rides
+    // the server-wide embedding model, so it is hidden while Vector Embedding
+    // is off (the admin also finds the server-wide Documentation search
+    // settings on it).
+    title: 'My Documents',
+    description: 'Let the agent search your own files — your working directory and Google Drive — and watch indexing progress',
+    icon: 'mdi:file-search-outline',
+    route: 'documents',
+    requiresEmbedding: true,
   },
   {
     title: 'Channels',
@@ -85,11 +101,18 @@ const allCards: SettingsCard[] = [
 
 // Vector Embedding is a server-wide configuration owned by the admin
 // profile (the backend enforces this with require_admin). Hide it from
-// non-admin profiles so they don't see a card that 403s on click.
+// non-admin profiles so they don't see a card that 403s on click. My
+// Documents follows Vector Embedding being on (the embedding store rides the
+// per-profile events stream, so every profile knows).
 const isAdmin = computed(() => props.profile === 'admin');
-const settingsCards = computed(() =>
-  allCards.filter(card => !card.adminOnly || isAdmin.value),
-);
+const settingsCards = computed(() => visibleSettingsCards(allCards, {
+  isAdmin: isAdmin.value,
+  embedding: { known: embeddingStatus.known, enabled: embeddingStatus.enabled },
+}));
+
+// On a fresh load the stream may not have answered yet; this asks once so the
+// My Documents card does not wait on it.
+onMounted(() => { void embeddingStatus.whenKnown(); });
 
 function navigateTo(route: string) {
   router.push(`/${props.profile}/settings/${route}`);

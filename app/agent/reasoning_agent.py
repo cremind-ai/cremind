@@ -25,11 +25,12 @@ reasoning-trace summary keep working unchanged.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import platform
 import re
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Dict, List, Mapping, Optional, Tuple
 
 # OpenAI SDK lives in the ``llm-openai`` extras group. Its types are
 # referenced only in PEP 563-stringified annotations here, so importing
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
 
 from a2a.types import DataPart, Part, TextPart
 
+from app.agent import document_review as dr
+from app.agent import search_tools as st
 from app.agent.usage import UsageRecord
 from app.utils.formatting import dict_to_text
 from app.config import (
@@ -51,6 +54,7 @@ from app.config import (
 )
 from app.config.runtime_env import runtime_environment_prompt_line
 from app.config.settings import get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.config.user_config import resolve_agent_config, resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.constants.status import Status
@@ -131,7 +135,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}{builtin_tools_guidance}{skills_guidance}{search_guidance}{coding_delegation_guidance}
+{reasoning_guidance}{builtin_tools_guidance}{documentation_search_guidance}{skills_guidance}{search_guidance}{coding_delegation_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -241,9 +245,14 @@ came of it — the rule is still active and will report again on its next
 occurrence, so NEVER re-register it, and never register a standing automation
 from a result turn. To list, pause, resume or stop automations use the CLI
 (`cremind skill-events`, `cremind file-watchers`, `cremind calendar schedule`):
-run `documentation_search` for the command's doc, then run it with the Shell
-Executor.
+look up the command's exact usage first — in Cremind's documentation when this
+conversation offers a Cremind documentation search, otherwise with `--help` —
+then run it with the Shell Executor.
 '''
+# (No function is named above on purpose: this block is a conversation-constant
+# append, while which search functions a run exposes follows the conversation's
+# search-tool selection. Naming one here would point the model at a function the
+# selection may have removed; the SEARCH SOURCES block names the real ones.)
 
 
 # Appended (only) to a Plan-mode PLANNING turn's system prompt. The user wants a
@@ -269,8 +278,10 @@ files — only the plan tools below write anything.
        loads its SKILL.md and performs nothing, and those instructions are the
        ONLY source of its real capabilities, prerequisites and commands, so a
        plan built on an unloaded skill is guesswork;
-   (c) search the documentation for the relevant feature and CLI docs;
-   (d) search your memory for what the user has already set up;
+   (c) search the documentation for the relevant feature and CLI docs, with
+       whichever documentation search this conversation offers;
+   (d) search your memory for what the user has already set up, when memory
+       search is available;
    (e) run read-only `cremind ... list/get/show/status/catalog` commands to see
        live state — which channels, tools, skills, models and profiles exist.
    Never ask the user something a loaded skill, a document, or a listing can
@@ -756,107 +767,56 @@ def _format_standing_instructions_block(text: str) -> str:
     )
 
 
-def _search_tool_classes():
-    """The built-in search tool CLASSES in guidance order: ``(local_tier, web)``.
-
-    Imported lazily and defensively straight from ``app.tools.builtin`` so this
-    module hard-codes no tool names: each tool's own class is the single source
-    of truth for its identity (the defining module == the registered group's
-    ``config_name``) and the function name the model sees (the class ``name`` ==
-    the leaf). A rename/move of a class therefore breaks the import loudly here
-    instead of silently drifting. Lazy + guarded because a tool module may fail
-    to import when an optional dependency is absent -- in which case the tool is
-    not registered either, so omitting it from the guidance is correct. By the
-    time an agent is constructed these modules are already imported (at
-    registration), so the lazy import is just a cached lookup.
-
-    Returns ``([local_classes], web_class_or_None)``.
-    """
-    local = []
-    web = None
+def _static_leaf_names(tool) -> List[str]:
+    """A group's registered leaf names, from its STATIC ``skills`` — never from
+    ``leaf_function_specs``, whose ``prepare_tools`` / per-leaf state is
+    re-read every step (see ``_build_builtin_tools_guidance``). Empty for a
+    tool that exposes no leaves or cannot say."""
     try:
-        from app.tools.builtin.documentation_search import DocumentationSearchTool
-        local.append(DocumentationSearchTool)
-    except Exception:  # noqa: BLE001 - missing optional dep => tool not registered
-        pass
-    try:
-        from app.tools.builtin.search_memory import SearchMemoryTool
-        local.append(SearchMemoryTool)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from app.tools.builtin.web_search import WebSearchTool
-        web = WebSearchTool
-    except Exception:  # noqa: BLE001
-        pass
-    return local, web
+        return [s.name for s in (getattr(tool, "skills", None) or [])]
+    except Exception:  # noqa: BLE001 — a group that cannot list its leaves names none
+        return []
 
 
-def _build_search_guidance(tools) -> str:
-    """Assemble the fallback-search guidance from the search tools actually
-    enabled for this run, naming ONLY the ones present so the prompt never
-    references a tool the user turned off. Local lookup (documentation/memory) is
-    tried first; web search is the last-resort internet fallback. Returns "" when
-    none are enabled. Wrapped ``'\\n...\\n'`` to match REASONING_GUIDANCE's spacing.
+def _exposed_leaf_functions(tool, disabled: Optional[Mapping[str, Any]] = None) -> List[str]:
+    """The function names the model sees for ``tool`` in this run: its static
+    leaves minus the ones the profile disabled, namespaced exactly as the
+    ``tools=`` block names them (``make_leaf_name``)."""
+    off = (disabled or {}).get(tool.tool_id, ()) or ()
+    return [make_leaf_name(tool.tool_id, leaf) for leaf in _static_leaf_names(tool) if leaf not in off]
 
-    Each search tool is matched to its LIVE registered group by its defining
-    module (``cls.__module__`` == the group's ``config_name``); the function name
-    the model sees is ``make_leaf_name(group.tool_id, cls.name)`` -- the group's
-    real registry id plus the class-defined leaf -- so it always matches the
-    ``tools=`` block and re-derives automatically on any rename.
 
-    Enablement is judged at the group level (presence in ``tools``). The rare
-    case of a single-leaf group whose sole leaf is disabled via the API-only
-    per-leaf path (the Settings UI hides leaf toggles for single-leaf groups) is
-    not handled -- the group still counts as enabled here.
-    """
-    local_classes, web_class = _search_tool_classes()
-    group_by_stem = {}
+def _search_exposed_functions(tools, disabled: Optional[Mapping[str, Any]] = None) -> Dict[str, List[str]]:
+    """``{search source id: [function names]}`` for the search groups this run
+    exposes — the groups that survived every gate AND the conversation's
+    search-tool selection (i.e. are in ``tools``), each with at least one
+    function the profile has not disabled. Leaf order is the group's
+    registration order, so equal inputs give equal output."""
+    out: Dict[str, List[str]] = {}
     for tool in tools:
-        stem = getattr(tool, "config_name", None)
-        if stem is not None:
-            group_by_stem[stem] = tool
+        tool_id = getattr(tool, "tool_id", None)
+        if not st.is_search_tool(tool_id):
+            continue
+        fns = _exposed_leaf_functions(tool, disabled)
+        if fns:
+            out[tool_id] = fns
+    return out
 
-    def exposed(cls) -> Optional[str]:
-        if cls is None:
-            return None
-        group = group_by_stem.get(cls.__module__.rsplit(".", 1)[-1])
-        return make_leaf_name(group.tool_id, cls.name) if group is not None else None
 
-    local = [f"`{fn}`" for fn in (exposed(c) for c in local_classes) if fn]
-    web = exposed(web_class)
+def _build_search_guidance(tools, disabled: Optional[Mapping[str, Any]] = None) -> str:
+    """The SEARCH SOURCES block: the search sources this run exposes, in their
+    fixed priority order (Documentation search → Cremind documentation search →
+    Memory search → Web search), each naming ONLY its exposed functions.
 
-    if not local and not web:
-        return ""
-    if local:
-        joined = " and ".join(local)
-        body = (
-            "When there is a request or information lookup from a user — if it is "
-            "casual chat you can respond immediately. If it is not casual chat, "
-            "you can check the list of supported tools to see if any tool can fulfill "
-            "the user's need. If not, do not give up too quickly — you must not affirm "
-            f"whether this request/information can be fulfilled or not — instead call {joined} "
-            f"tool{'s' if len(local) > 1 else ''} to ensure that the request/information "
-            "has been verified."
-        )
-        if web:
-            body += (
-                f" Only if that returns nothing useful may you then call `{web}` "
-                "to search the public internet."
-            )
-    else:
-        # documentation_search is locked-on, so a local tool is normally always
-        # present; this web-only branch is a defensive fallback.
-        body = (
-            "When there is a request or information lookup from a user — if it is "
-            "casual chat you can respond immediately. If it is not casual chat, "
-            "you can check the list of supported tools to see if any tool can fulfill "
-            "the user's need. If not, do not give up too quickly — you must not affirm "
-            f"whether this request/information can be fulfilled or not — instead call the "
-            f"`{web}` tool to search the public internet to ensure that the "
-            "request/information has been verified."
-        )
-    return "\n" + body + "\n"
+    With per-conversation selection a conversation may keep any subset of the
+    four, including web search alone or no search at all — both ordinary states:
+    the first names only web search (as the one source, not as a "fallback" to
+    nothing), the second renders "". The text is a pure function of the exposed
+    functions (``search_tools.build_priority_guidance``), so two runs with the
+    same effective selection send byte-identical text, and it is built once per
+    run from static leaves, so it never varies between a run's steps.
+    """
+    return st.build_priority_guidance(_search_exposed_functions(tools, disabled))
 
 
 _CODING_LEAVES = ("run", "wait", "stop", "status")
@@ -1099,13 +1059,19 @@ def _build_coding_delegation_guidance(tools) -> str:
     return "\n" + body + "\n"
 
 
-def _build_builtin_tools_guidance(tools) -> str:
+def _build_builtin_tools_guidance(tools, search_disabled: Optional[Mapping[str, Any]] = None) -> str:
     """Dynamic catalogue of ENABLED, non-hidden built-in groups that declare an
     authored ``description`` in their module ``TOOL_CONFIG`` — the tool's purpose
     plus the exact leaf function names as they appear in the ``tools=`` block.
 
+    A search group lists only the functions this run exposes: its leaves minus
+    ``search_disabled`` (the per-leaf switches the run froze at ``__init__``,
+    which ``_build_tools_and_dispatch`` applies to those groups too), so the
+    catalogue cannot name a search function the model was not sent. Other
+    groups keep listing every registered leaf, as before.
+
     Opt-in and GROUP-LEVEL by design, so the block stays byte-stable within a run
-    and only changes when the enabled built-in SET changes — exactly like
+    and only changes when the enabled built-in SET changes — like
     ``_build_search_guidance``:
       * a group with no authored description is skipped (``group.description``
         falls back to SERVER_NAME, so we read the STATIC ``TOOL_CONFIG`` to
@@ -1134,10 +1100,13 @@ def _build_builtin_tools_guidance(tools) -> str:
         if not description:                 # opt-in: only authored descriptions render
             continue
         label = getattr(tool, "name", None) or config_name
-        fns = [
-            f"`{make_leaf_name(tool.tool_id, s.name)}`"
-            for s in getattr(tool, "skills", [])
-        ]
+        if st.is_search_tool(getattr(tool, "tool_id", None)):
+            fns = [f"`{fn}`" for fn in _exposed_leaf_functions(tool, search_disabled)]
+        else:
+            fns = [
+                f"`{make_leaf_name(tool.tool_id, s.name)}`"
+                for s in getattr(tool, "skills", [])
+            ]
         entry = f"- {label} — {description}"
         if fns:
             entry += " Functions: " + ", ".join(fns) + "."
@@ -1151,6 +1120,136 @@ def _build_builtin_tools_guidance(tools) -> str:
         "then call one of its listed functions."
     )
     return "\n" + header + "\n" + "\n".join(lines) + "\n"
+
+
+def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, Any]] = None) -> str:
+    """How to use the user's own files: which functions, dates, citations.
+
+    Present ONLY when the ``documentation_search`` group survived this run's gate
+    (Documentation search allowed, turned on, and permitted for this
+    conversation's origin) AND the conversation's search-tool selection, so
+    every other prompt stays byte-identical. Built from the run's enabled tool
+    set only — leaf names from the group's static ``skills`` minus the ones the
+    profile disabled (``disabled``, read once per run), never from per-step
+    state — so it is byte-stable within a run, like the blocks around it.
+
+    It names only functions this run exposes: its own leaves as they survive
+    the per-leaf switches, and a sibling (Cremind's manual search, the clock)
+    only when that sibling's group — and its function — is exposed too. With
+    per-conversation selection the manual's search is routinely absent while
+    this group is present, so it is never assumed.
+
+    The citation rules are what make the answer verifiable: every token the
+    tools print is registered, and the saved answer's tokens are checked
+    against that registry, so an invented or edited token shows up as
+    unverified. The research sentence names ``research`` only when that leaf
+    is exposed; otherwise legal/financial questions are sent to ``read``.
+
+    The filter sentence exists because a model filling the ``filters`` object
+    tends to invent restrictions nobody asked for (``size_max: 0``,
+    ``has_gps: true``) that exclude every file, and then to conclude the files
+    are not there and fall back to web search. It names no sibling source, so
+    the text is the same whichever other search tools the run exposes.
+
+    The several-sources sentence exists because a model given two relevant
+    guides will read one, answer from it, and never open the other — the
+    answer's citations all verify, so nothing downstream notices. It asks for
+    each relevant file to be weighed (read by its passage token, not by a
+    section title guessed from a table of contents), for differences to be
+    attributed and for an unreviewed source to be admitted; it names the read
+    function only when the run exposes it, and sets no citation count. The
+    agent backs it with automatic reads (``_run_document_review``); the
+    sentence is what makes the model use them.
+    """
+    by_id = {getattr(t, "tool_id", None): t for t in tools}
+    group = by_id.get(st.DOCUMENTATION_SEARCH)
+    if group is None:
+        return ""
+    exposed = set(_exposed_leaf_functions(group, disabled))
+
+    def fn(leaf: str) -> str:
+        return f"`{make_leaf_name(group.tool_id, leaf)}`"
+
+    def has(leaf: str) -> bool:
+        return make_leaf_name(group.tool_id, leaf) in exposed
+
+    own = [fn(leaf) for leaf in ("find_files", "search", "read") if has(leaf)]
+    if not own:
+        return ""
+
+    def sibling(group_: Any, module: str, cls_name: str) -> Optional[str]:
+        """``group_``'s function for the leaf ``module.cls_name`` defines, when
+        this run exposes it. The leaf comes from the tool's own class, so a
+        rename re-derives here instead of drifting."""
+        if group_ is None:
+            return None
+        try:
+            import importlib
+
+            leaf = getattr(importlib.import_module(f"app.tools.builtin.{module}"), cls_name).name
+        except Exception:  # noqa: BLE001 — a missing sibling is simply not named
+            return None
+        name = make_leaf_name(group_.tool_id, leaf)
+        return name if name in _exposed_leaf_functions(group_, disabled) else None
+
+    doc_fn = sibling(
+        by_id.get(st.CREMIND_DOCUMENTATION_SEARCH),
+        "cremind_documentation_search", "CremindDocumentationSearchTool",
+    )
+    not_these = (
+        f"not `{doc_fn}` (Cremind's own manual) and not the file-system tools"
+        if doc_fn else "not the file-system tools"
+    )
+    clock = next((t for t in tools if getattr(t, "config_name", None) == "current_time"), None)
+    time_fn = sibling(clock, "current_time", "GetCurrentTimeTool")
+    when = f"with `{time_fn}` first" if time_fn else "against today's date first"
+    leaves = [leaf for leaf in _static_leaf_names(group) if has(leaf)]
+    read = fn("read") if "read" in leaves else "the read function"
+    if "research" in leaves:
+        research = (
+            f"Legal, financial or compliance questions, and requests to compile everything in a "
+            f"folder, MUST go through {fn('research')} — never conclude from snippets; if it "
+            "reports status 'running', call it again with continue_job before answering."
+        )
+    else:
+        research = (
+            "For legal, financial or compliance questions, read the relevant sections in full "
+            f"with {read} before answering — never conclude from snippets alone."
+        )
+    if "read" in leaves:
+        read_each = (
+            f" — for an explanation, an overview or a comparison, read the matching passage of every "
+            f"relevant file (pass its [doc:…#…] passage token as file to {read}) rather than a section "
+            "title guessed from a table of contents —"
+        )
+    else:
+        read_each = ","
+    sources = (
+        "When the results come from several files, assess each relevant one before answering"
+        f"{read_each} then combine what they add, whatever language each is in, attribute any "
+        "difference between them to the file it comes from, and say so when a relevant file could "
+        "not be read; never state that a file does not cover something unless you read that part of "
+        "it. When the user limits the question to one file or folder, put that in filters "
+        "— name_query or path_glob for a file they name, file_ids for one from earlier results, "
+        "folder for a folder — and stay within it. "
+    )
+    body = (
+        "USER DOCUMENTS — THE USER'S OWN FILES: " + ", ".join(own) + " search and read the files "
+        "the user indexed with Documentation search (their own documents, notes, reports, "
+        f"spreadsheets, photos and project folders). Use them — {not_these} — whenever the user "
+        "refers to their own files or what those files say. Resolve relative dates (\"2 days "
+        f"ago\", \"last year\") to calendar dates {when}, and widen a fuzzy date by ±1 day. "
+        "Set only the filters the user's request calls for (a folder, type, date or size they "
+        "named) and leave every other filter out — never add a size, location, source or date "
+        "limit of your own. If a filtered call finds nothing, call again without the filters "
+        "the user did not ask for before saying their files do not have it or searching "
+        "anywhere else; keep the restrictions the user did ask for. "
+        "Cite every claim taken from these results by copying the [doc:…] token printed next to "
+        "its passage exactly, right after the claim; never invent or alter a token. Quote only "
+        "text that appears in the results, in quotation marks, followed by its token. "
+        + sources + research
+    )
+    return "\n" + body + "\n"
 
 
 def _build_skills_guidance(tools) -> str:
@@ -1254,6 +1353,32 @@ _PLAN_READONLY_CLI_GROUPS: Dict[str, frozenset] = {
     # a token — the very thing plan mode promises not to do while planning.
     "profile wizard": frozenset({"status"}),
     "setup server-config": frozenset({"get"}),
+}
+
+# ``cremind profile working-dir`` is its own reader AND setter, decided by its
+# ARGUMENTS rather than a verb: ``working-dir [NAME]`` shows a profile's working
+# directory, while ``working-dir [NAME] PATH`` and ``working-dir [NAME]
+# --default`` move it (admin only) — re-pointing that profile's file panel,
+# default tool directory and Documentation search index. A lone argument is a
+# NAME only when it passes the CLI's own profile-name test (below, kept equal to
+# ``app/cli/commands/profile.py::_looks_like_profile_name`` by
+# ``tests/agent/test_plan_mode_gating.py``); anything else is a PATH. So only
+# the bare form and the one-NAME form read, and no option rides along at all —
+# ``--default`` is the setter, and refusing every option keeps a new one from
+# quietly inheriting the read.
+_PLAN_PROFILE_NAME_RE = re.compile(r"[a-z0-9_-]{1,64}\Z")
+
+
+def _profile_working_dir_reads(args: List[str]) -> bool:
+    if any(a.startswith("-") for a in args):
+        return False
+    return not args or (len(args) == 1 and _PLAN_PROFILE_NAME_RE.match(args[0]) is not None)
+
+
+# Leaves under a group whose reading or writing turns on their arguments, mapped
+# to the judge of the tokens that follow the leaf (``--`` already dropped).
+_PLAN_READONLY_CLI_ARG_LEAVES: Dict[str, Callable[[List[str]], bool]] = {
+    "profile working-dir": _profile_working_dir_reads,
 }
 
 # Leaves under a group whose own NAME is a read-only verb, which must not ride
@@ -1403,12 +1528,15 @@ def _is_readonly_cremind_command(command: str) -> bool:
     """True for a single, plain, read-only ``cremind ...`` invocation.
 
     Accepts ``cremind <verb>`` (a root command such as ``cremind me``),
-    ``cremind <group> <verb>`` (``cremind channels catalog --json``) and
-    ``cremind <known nested group> <verb>`` (``cremind llm providers models``),
-    optionally behind the root flags above. Everything else — a second chained
-    command, a shell metacharacter, an unknown leading flag, a blocked group, a
-    refused sub-command of an otherwise admitted group, an unknown nested group,
-    or a verb that is not on the read-only list — is rejected. Pure and
+    ``cremind <group> <verb>`` (``cremind channels catalog --json``),
+    ``cremind <known nested group> <verb>`` (``cremind llm providers models``)
+    and the reading form of a leaf whose arguments decide
+    (``cremind profile working-dir [NAME]``), optionally behind the root flags
+    above. Everything else — a second chained command, a shell metacharacter,
+    an unknown leading flag, a blocked group, a refused sub-command of an
+    otherwise admitted group, an unknown nested group, the writing form of an
+    argument-decided leaf, or a verb that is not on the read-only list — is
+    rejected. Pure and
     side-effect free so it can be unit-tested directly.
     """
     if not isinstance(command, str):
@@ -1504,6 +1632,10 @@ def _is_readonly_cremind_command(command: str) -> bool:
         return False
     if len(rest) >= 2 and rest[1] in _PLAN_READONLY_CLI_VERBS:
         return True
+    # A leaf that reads or writes by its arguments: its own judge decides.
+    judge = _PLAN_READONLY_CLI_ARG_LEAVES.get(" ".join(rest[:2]))
+    if judge is not None:
+        return judge(rest[2:])
     # Depth 3, but only for a group pair that really exists, and only for the
     # verbs that are readers in THAT pair — never for an arbitrary word followed
     # by a read-only-looking one.
@@ -1514,15 +1646,21 @@ def _is_readonly_cremind_command(command: str) -> bool:
 
 
 class _LeafOutcome:
-    """Collected output of one leaf tool run (so leaves can run concurrently)."""
+    """Collected output of one leaf tool run (so leaves can run concurrently).
 
-    __slots__ = ("call_id", "status_chunks", "tool_text", "parts")
+    ``evidence`` is the delivery record of a Documentation Search result
+    (``app.documents.delivery.DocumentEvidence``), present only when the
+    trusted built-in group produced it — see ``document_review.trusted_evidence``.
+    """
 
-    def __init__(self, call_id: str, status_chunks: list, tool_text: str, parts: list):
+    __slots__ = ("call_id", "status_chunks", "tool_text", "parts", "evidence")
+
+    def __init__(self, call_id: str, status_chunks: list, tool_text: str, parts: list, evidence: Any = None):
         self.call_id = call_id
         self.status_chunks = status_chunks
         self.tool_text = tool_text
         self.parts = parts
+        self.evidence = evidence
 
 
 def _coerce_args(raw: Any) -> Dict[str, Any]:
@@ -1548,10 +1686,27 @@ class ReasoningAgent:
     # (used in tests) and any future subclass from tripping on a missing attribute.
     _parallel_tool_calls: bool = True
 
-    # Fallback-search system-prompt block; ``__init__`` recomputes it from the
-    # run's enabled tools. Class-level default keeps ``__new__`` construction
-    # (used in tests) from tripping on a missing attribute.
+    # SEARCH SOURCES (priority-order) system-prompt block; ``__init__`` recomputes
+    # it from the search functions the run exposes. Class-level default keeps
+    # ``__new__`` construction (used in tests) from tripping on a missing attribute.
     _search_guidance: str = ""
+
+    # The conversation's search-tool selection this run adopted at its start
+    # (``search_tools.Snapshot``), and the hook told once, at the run's first
+    # main-model request, what that request sent (the cache baseline). Frozen
+    # for the run: saving a new selection mid-response never touches a running
+    # agent. ``None`` defaults = every source, no hook — what every caller that
+    # predates the selection (and every ``__new__``-built test agent) gets.
+    _search_snapshot: Optional["st.Snapshot"] = None
+    _on_search_baseline: Optional[Callable[[dict], Any]] = None
+    # Set once the baseline hook has fired for this run (see ``_loop``).
+    _search_baseline_recorded: bool = False
+    # ``{search source id: frozenset(disabled leaves)}`` read ONCE in
+    # ``__init__`` and used by ``_build_tools_and_dispatch`` for the search
+    # groups, so the functions the tools block exposes and the ones the search
+    # guidance names can never drift apart mid-run. Empty (never mutated) =
+    # read per step, the historical behaviour.
+    _search_disabled_leaves: Mapping[str, frozenset] = {}
 
     # Coding-delegation block (Claude Code and/or Codex); ``__init__`` recomputes
     # it from the run's enabled tools (empty unless a disabled-by-default coding
@@ -1563,6 +1718,11 @@ class ReasoningAgent:
     # Class-level default keeps ``__new__`` construction (tests) and direct
     # ``_build_instruction`` calls from tripping on a missing attribute.
     _builtin_tools_guidance: str = ""
+
+    # Documentation Search block; ``__init__`` recomputes it (empty unless the
+    # documentation_search tool survived this run's gate). Same class-level-default
+    # rationale as above.
+    _documentation_search_guidance: str = ""
 
     # Skills catalogue block (what a skill is + the enabled skill ids); ``__init__``
     # recomputes it from the run's enabled tools (empty unless a skill is on).
@@ -1606,6 +1766,12 @@ class ReasoningAgent:
     # rationale as above.
     _task_chain_depth: int = 0
 
+    # This turn's document evidence and automatic source review
+    # (``document_review.DocumentReview``), created fresh by ``run`` — on the
+    # run, never shared between turns, conversations or profiles. None on a
+    # skeleton agent that never ran.
+    _doc_review: Optional["dr.DocumentReview"] = None
+
     def __init__(
         self,
         llm: LLMProvider,
@@ -1621,11 +1787,20 @@ class ReasoningAgent:
         message_origin: Optional[dict] = None,
         task_chain_depth: int = 0,
         maintenance: bool = False,
+        search_tools: Optional["st.Snapshot"] = None,
+        on_search_baseline: Optional[Callable[[dict], Any]] = None,
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # The conversation's search-tool selection, frozen when the run started
+        # (``None`` = the default, every source), and the hook that records the
+        # cache baseline at this run's first main-model request — sync or async,
+        # never allowed to break the run (see ``_record_search_baseline``).
+        self._search_snapshot = search_tools or st.DEFAULT_SNAPSHOT
+        self._on_search_baseline = on_search_baseline
+        self._search_baseline_recorded = False
         # Where this conversation's user messages come from (Web UI vs a channel
         # + the sender's identity). Derived from the conversation row upstream,
         # so it is constant for the whole run: render it ONCE here rather than
@@ -1818,6 +1993,17 @@ class ReasoningAgent:
         from app.groups.index import has_group_membership
         if self._group_chat or not has_group_membership(profile):
             tools = [t for t in tools if t.tool_id != "send_group_message"]
+        # ``documentation_search`` searches the profile's own files. Offered only when
+        # the admin allowed Documentation search, the profile turned it on, and
+        # this conversation's origin is one the profile permits (web UI / CLI /
+        # its own automations by default; channels and rooms only when opted
+        # in — an answer there reaches other people). Conversation-constant
+        # and read from cheap state once, so the tools block stays byte-stable
+        # like the gates above. Skipped entirely when the tool is not enabled.
+        if any(t.tool_id == "documentation_search" for t in tools):
+            from app.documents.gate import documents_tool_available
+            if not documents_tool_available(profile, message_origin):
+                tools = [t for t in tools if t.tool_id != "documentation_search"]
         # A maintenance turn is not allowed to speak to anyone. Withheld rather
         # than refused at dispatch because the gate directly above states the
         # invariant plainly and a fold slips underneath it: a fold on a seat has
@@ -1831,13 +2017,37 @@ class ReasoningAgent:
         # price for "an unattended maintenance call can never message a human".
         if self._maintenance:
             tools = [t for t in tools if t.tool_id not in _MAINTENANCE_BLOCKED_TOOLS]
+        # The conversation's search-tool selection, applied LAST: it is a
+        # conversation-level filter on top of every gate above, so it can only
+        # remove a search group, never bring back one a gate withheld. A removed
+        # source takes its whole group (every function — reading, research…);
+        # unrelated tools pass untouched, and the registry's lock on Cremind's
+        # own documentation search is not consulted — the registry still always
+        # OFFERS that tool, this conversation simply does not use it. Frozen with
+        # the run's snapshot, so the tools block is byte-stable for the run and
+        # identical for any two runs with the same effective selection. A
+        # maintenance fold receives the conversation's snapshot too (see
+        # ``compaction.run_model_fold``) so its tools block still matches the
+        # turns whose cache entry it reads.
+        tools = st.filter_tools(tools, self._search_snapshot)
         self._tools = tools
         self._tools_by_id = {t.tool_id: t for t in self._tools}
-        # Fallback-search guidance, built from the live enabled tool groups
-        # (static for the run) so the system prompt stays byte-identical across
-        # steps. Names only the search tools actually enabled for this profile,
-        # using the exact function names those groups expose to the model.
-        self._search_guidance = _build_search_guidance(self._tools)
+        # Per-leaf switches for the search groups, read ONCE for the run: the
+        # guidance below names exactly these functions and
+        # ``_build_tools_and_dispatch`` exposes exactly these, so a leaf toggled
+        # mid-response changes neither until the next run — the same contract
+        # as the selection itself. (Other groups keep their per-step read.)
+        disabled_now = self._read_disabled_leaves()
+        self._search_disabled_leaves = {
+            tool_id: frozenset(disabled_now.get(tool_id, ()) or ())
+            for tool_id in st.SEARCH_TOOL_IDS
+        }
+        # SEARCH SOURCES guidance: the exposed search sources in priority order,
+        # each naming only its exposed functions. Static for the run, so the
+        # system prompt stays byte-identical across steps; a pure function of
+        # the exposed functions, so equal effective selections render equal
+        # text. Empty when the conversation keeps no search source at all.
+        self._search_guidance = _build_search_guidance(self._tools, self._search_disabled_leaves)
         # Coding-delegation guidance — present only when a (disabled-by-default)
         # coding delegate (claude_code and/or codex) is enabled for this profile;
         # empty otherwise. Names both agents when both are on (model picks).
@@ -1845,7 +2055,15 @@ class ReasoningAgent:
         # Built-in tools catalogue — one line per enabled, non-hidden built-in
         # that declares an authored description; empty otherwise. Static for the
         # run (group-level), so the system prompt stays byte-identical per step.
-        self._builtin_tools_guidance = _build_builtin_tools_guidance(self._tools)
+        self._builtin_tools_guidance = _build_builtin_tools_guidance(
+            self._tools, self._search_disabled_leaves,
+        )
+        # Documentation Search rules (functions, dates, citations) — only when the
+        # gate above AND the selection kept the tool; empty otherwise. Static for
+        # the run, and naming only functions this run exposes.
+        self._documentation_search_guidance = _build_documentation_search_guidance(
+            self._tools, {**disabled_now, **self._search_disabled_leaves},
+        )
         # Skills catalogue — what a skill IS (an instruction bundle that must be
         # loaded before it can be relied on) plus the enabled skill ids. Same
         # enabled-set-only contract as the block above, so it is static for the
@@ -2008,6 +2226,20 @@ class ReasoningAgent:
 
     # ── config lookups ────────────────────────────────────────────────
 
+    def _read_disabled_leaves(self) -> Dict[str, Any]:
+        """``{tool_id: {disabled leaf, …}}`` for this profile, or ``{}`` when the
+        registry cannot say (a test double, storage not up). Never raises: a
+        failed read must not fail the run, and "nothing disabled" is what the
+        per-step read in ``_build_tools_and_dispatch`` would conclude too."""
+        reader = getattr(self.registry, "disabled_leaves_by_tool", None)
+        if reader is None:
+            return {}
+        try:
+            return dict(reader(self.profile) or {})
+        except Exception:  # noqa: BLE001
+            logger.exception(f"[reasoning] could not read disabled leaves for profile={self.profile}")
+            return {}
+
     def _load_arguments(self, tool_id: str) -> dict:
         try:
             return self.registry.config.get_arguments(tool_id, self.profile)
@@ -2088,7 +2320,12 @@ class ReasoningAgent:
             get_context(self.context_id, "_working_directory_override")
             if self.context_id else None
         )
-        cwd = override or get_user_working_directory()
+        # The profile's own folder unless the conversation switched elsewhere —
+        # and never into another profile's (the tool adapter drops such an
+        # override the same way, so the prompt and the tools agree).
+        if override and is_foreign(override, self.profile):
+            override = None
+        cwd = override or get_user_working_directory(self.profile)
         instruction = SYSTEM_TEMPLATE.format(
             persona_description=read_persona_file(self.profile),  # raw; resolved below
             current_os=platform.system(),
@@ -2102,6 +2339,7 @@ class ReasoningAgent:
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
             builtin_tools_guidance=self._builtin_tools_guidance,
+            documentation_search_guidance=getattr(self, "_documentation_search_guidance", ""),
             # ``getattr`` (like the coding block below) tolerates the skeleton
             # agents tests build via ``__new__``, which never run ``__init__``.
             skills_guidance=getattr(self, "_skills_guidance", ""),
@@ -2181,7 +2419,8 @@ class ReasoningAgent:
                     "[Plan mode — PLANNING phase: do NOT execute the task yet. "
                     "Investigate first — LOAD every relevant skill (a skill call "
                     "only loads its instructions and performs nothing), search the "
-                    "docs, and list live state with read-only `cremind` commands — "
+                    "docs when a documentation search is available, and list live "
+                    "state with read-only `cremind` commands — "
                     "then ask what only the user can decide with "
                     "`ask_user_question` and stop. If this message answers your "
                     "questions, research what the answers imply, ask again only if "
@@ -2395,6 +2634,9 @@ class ReasoningAgent:
         dispatch: Dict[str, tuple] = {}
         # Per-profile disabled sub-tools ("leaves"), resolved in one read.
         disabled_by_tool = self.registry.disabled_leaves_by_tool(self.profile)
+        # The search groups use the set frozen at ``__init__`` instead, so the
+        # functions exposed here are exactly the ones the search guidance names.
+        frozen_search = getattr(self, "_search_disabled_leaves", None) or {}
 
         for tool in self._tools:
             if tool.tool_type is ToolType.SKILL:
@@ -2419,7 +2661,10 @@ class ReasoningAgent:
             except Exception:  # noqa: BLE001
                 logger.exception(f"leaf_function_specs failed for '{tool.tool_id}'")
                 continue
-            disabled = disabled_by_tool.get(tool.tool_id, ())
+            if tool.tool_id in frozen_search:
+                disabled = frozen_search[tool.tool_id]
+            else:
+                disabled = disabled_by_tool.get(tool.tool_id, ())
             for fs in leaf_specs:
                 if fs.leaf_name in disabled:
                     continue  # sub-tool disabled for this profile
@@ -2432,7 +2677,76 @@ class ReasoningAgent:
                     specs.append(fs.schema)
                 dispatch[fs.name] = ("leaf", tool, fs.leaf_name)
 
+        # Historical function names (the search tools' names before the rename)
+        # that older conversations still carry in their replayed history. A model
+        # copying one is routed to today's function — DISPATCH ONLY, no schema is
+        # ever sent under the old name — and only when today's function is in
+        # this step's dispatch. That map is built from ``self._tools`` after every
+        # gate and the conversation's selection, and after the per-leaf switches
+        # above, so an alias can never reach a source this run does not expose.
+        for alias, target in st.resolve_historical_aliases(dispatch).items():
+            dispatch[alias] = dispatch[target]
+
         return specs, dispatch
+
+    # ── search cache baseline ─────────────────────────────────────────
+
+    def _search_prompt_text(self) -> str:
+        """Every system-prompt block whose text follows the search selection:
+        the SEARCH SOURCES block and the Documentation-search rules. Part of
+        the baseline fingerprint, so a change to either is a change to what
+        the model was sent."""
+        return (getattr(self, "_search_guidance", "") or "") + (
+            getattr(self, "_documentation_search_guidance", "") or ""
+        )
+
+    async def _record_search_baseline(self, specs: List[dict], dispatch: Dict[str, tuple]) -> None:
+        """Tell ``on_search_baseline`` what this run's first main-model request
+        sends for search: the snapshot's version, the sources it actually
+        exposes (a group counts only with at least one function in ``specs``),
+        and a fingerprint of those functions' names + schemas and the search
+        guidance text.
+
+        That record is what later edits are judged against — whether a change
+        would alter what the model is sent (the cache warning) and whether a
+        saved selection has been adopted yet (the "next response" notice) — so
+        it describes the request as sent, not the selection as stored.
+
+        Not for maintenance runs (a fold is not a response of the
+        conversation, and its request must not clear a pending selection).
+        Best-effort: the hook may be sync or async, and whatever it raises is
+        logged and swallowed — bookkeeping never breaks a run.
+        """
+        hook = getattr(self, "_on_search_baseline", None)
+        if hook is None or getattr(self, "_maintenance", False):
+            return
+        try:
+            function_specs: List[Tuple[str, Any]] = []
+            effective: set = set()
+            for spec in specs or []:
+                name = ((spec or {}).get("function") or {}).get("name")
+                entry = dispatch.get(name) if name else None
+                if not entry or entry[0] != "leaf":
+                    continue
+                owner = getattr(entry[1], "tool_id", None)
+                if not st.is_search_tool(owner):
+                    continue
+                function_specs.append((name, spec))
+                effective.add(owner)
+            snapshot = getattr(self, "_search_snapshot", None) or st.DEFAULT_SNAPSHOT
+            baseline = st.make_baseline(
+                version=snapshot.version,
+                effective=[t for t in st.SEARCH_TOOL_IDS if t in effective],
+                fingerprint_hex=st.fingerprint(function_specs, self._search_prompt_text()),
+            )
+            result = hook(baseline)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"[reasoning] recording the search cache baseline failed for "
+                f"context={getattr(self, 'context_id', None)}; the run continues"
+            )
 
     # Event-CREATION leaves: their schema stays exposed on every run (byte-stable
     # tools prefix) but their EXECUTION is blocked anywhere inside an event-run
@@ -2630,6 +2944,11 @@ class ReasoningAgent:
         self._turn_messages = []
         self._final_answer_text = ""
         self.current_step_count = 0
+        # What this turn's document searches and reads delivered, and the
+        # automatic reads that calls for (see _run_document_review).
+        self._doc_review = dr.DocumentReview()
+        # The search cache baseline is recorded once per RUN (see ``_loop``).
+        self._search_baseline_recorded = False
         # A mid-turn reply already streamed to the user, waiting to be folded
         # into the next assistant message (see _acknowledge_interruption).
         self._pending_ack_text = ""
@@ -2770,6 +3089,28 @@ class ReasoningAgent:
             # prefix) — tool_choice "none" forbids new calls instead.
             instant_final = self._mode == "instant" and self.current_step_count >= 2
 
+            # Automatic document review: the last step's searches showed
+            # relevant passages from several files, and some were not read
+            # yet — read them now, before the model answers from half the
+            # sources. Here, after the new-input check and before the request,
+            # so the model sees what was read and nothing streams first. A
+            # user message that just arrived may have changed the scope: it
+            # goes first and the pending candidates are dropped. An
+            # automation's result landing meanwhile changes nothing about the
+            # question, so the review still runs.
+            review = getattr(self, "_doc_review", None)
+            if review is not None and review.has_pending():
+                if drained:
+                    review.suppress(dr.REASON_NEW_INPUT)
+                elif self._mode == "instant":
+                    # One round of tool calls is Instant mode's contract.
+                    review.suppress(dr.REASON_INSTANT)
+                elif getattr(self, "_maintenance", False):
+                    review.suppress(dr.REASON_NOT_REVIEWED)
+                else:
+                    async for item in self._run_document_review(dispatch):
+                        yield item
+
             messages: List["ChatCompletionMessageParam"] = [
                 {"role": "system", "content": instruction},
                 *self.history_messages,
@@ -2787,6 +3128,16 @@ class ReasoningAgent:
                 self._pending_ack_text = ""
             tool_calls: List[dict] = []
             finish_reason = None
+            # The run's first MAIN-model request goes out here. Its search
+            # baseline is recorded once the provider has actually answered it
+            # (the first streamed chunk below), never before: a request refused
+            # outright — a bad key, an outage, an overflow that survives the
+            # retry — reached no cache and adopted nothing, so it must not
+            # clear a pending selection or become what later edits are judged
+            # against. Once per run (an overflow/LLM retry re-enters this
+            # line); the mid-turn acknowledgement above is a side call and
+            # never records.
+            record_baseline = not getattr(self, "_search_baseline_recorded", False)
             try:
                 async for resp in self.llm.chat_completion_stream(
                     messages=messages,
@@ -2803,6 +3154,10 @@ class ReasoningAgent:
                     retry=self._reasoning_retry,
                     args=self._llm_args(),
                 ):
+                    if record_baseline:
+                        record_baseline = False
+                        self._search_baseline_recorded = True
+                        await self._record_search_baseline(specs, dispatch)
                     rtype = resp["type"]
                     if rtype == ChatCompletionTypeEnum.CONTENT:
                         data = resp.get("data")
@@ -2966,7 +3321,8 @@ class ReasoningAgent:
                         "else waits for the execution phase. Keep researching "
                         "instead: LOAD the skills relevant to this request (a "
                         "skill call only loads its instructions), search the "
-                        "documentation, and list live state with those read-only "
+                        "documentation when this conversation offers a "
+                        "documentation search, and list live state with those read-only "
                         "commands. Then ask the user what only they can decide "
                         "with `ask_user_question`, and call `write_plan` once "
                         "every step names a real tool, skill or command; "
@@ -2987,6 +3343,17 @@ class ReasoningAgent:
                     truncate=(entry[1].tool_id, entry[2]) not in self._UNCLAMPED_LEAVES,
                 )
                 yield self._result_artifact(step_no, call_id, outcome.parts)
+                if outcome.evidence is not None and self._doc_review is not None:
+                    self._doc_review.observe(outcome.evidence)
+
+            # A batch that hands the question to a research job leaves the
+            # reading to the job: no ordinary automatic review on top of it.
+            if self._doc_review is not None and any(
+                e and e[0] == "leaf" and getattr(e[1], "tool_id", None) == st.DOCUMENTATION_SEARCH
+                and e[2] == "research"
+                for (_c, _n, _a, e) in resolved
+            ):
+                self._doc_review.suppress(dr.REASON_RESEARCH)
 
             # Event run parked pending: the agent called request_user_input this
             # step (the tool recorded the question in run_state, keyed by the
@@ -3043,12 +3410,38 @@ class ReasoningAgent:
         if self.context_id:
             clear_context(self.context_id, "current_shell_directory")
         final_answer = data or self._final_answer_text
-        return {
+        chunk = {
             "type": ChatCompletionTypeEnum.DONE,
             "data": data,
             "llm_messages": self._build_llm_messages(final_answer),
             **self._token_fields(),
         }
+        review = self._document_review_summary(final_answer)
+        if review:
+            chunk["document_review"] = review
+        return chunk
+
+    def _document_review_summary(self, final_answer: str) -> Optional[Dict[str, Any]]:
+        """The turn's ``document_review`` record (see ``document_review``), or
+        None when it touched no documents. Candidates still pending here had
+        no model step left to be reviewed before (the turn parked, or hit
+        its step limit). Logged as counts with the run's identifiers —
+        never document names or text. Bookkeeping: never fails the turn."""
+        review = getattr(self, "_doc_review", None)
+        if review is None:
+            return None
+        try:
+            review.suppress(dr.REASON_NO_STEP)
+            summary = review.summary(final_answer)
+            if summary:
+                from app.utils.task_context import current_task_id_var
+
+                logger.info(dr.log_line(summary, profile=self.profile, conversation=self.context_id,
+                                        run=current_task_id_var.get()))
+            return summary
+        except Exception:  # noqa: BLE001
+            logger.exception("[document_review] could not summarise the turn")
+            return None
 
     def _build_llm_messages(self, final_answer: str) -> Optional[List[Dict[str, Any]]]:
         """Assemble the turn's canonical native message trace for replay/persistence.
@@ -3094,25 +3487,30 @@ class ReasoningAgent:
     # ── per-call dispatch ──────────────────────────────────────────────
 
     def _thinking_artifact(self, step: int, call_id: str, tool_name: str,
-                           args: Dict[str, Any], tool) -> Dict[str, Any]:
+                           args: Dict[str, Any], tool, *, origin: Optional[str] = None) -> Dict[str, Any]:
         """UI artifact announcing one tool call in a step (Thought removed).
 
         ``Token_Usage`` carries the reasoning call's four-way token split for this
         step so the Thinking Process can show per-step token detail; the reasoning
         usage is recorded on the step's DONE chunk before these artifacts are
         yielded, so it is already available here.
+
+        ``origin`` marks a call the agent made itself rather than the model
+        (``document_review.ORIGIN`` for an automatic document read): it is
+        carried as ``Origin`` so the activity trace can say so, and such a
+        call has no reasoning call of its own, so it carries no token usage.
         """
-        return {
-            "type": ChatCompletionTypeEnum.THINKING_ARTIFACT,
-            "data": {
-                "Step": step,
-                "Call_Id": call_id,
-                "Tool": tool_name,
-                "Tool_Input": json.dumps(args, ensure_ascii=False),
-                "Model_Label": self._model_label_for(tool) if tool is not None else self.llm.model_label,
-                "Token_Usage": self._reasoning_usage_for_step(step),
-            },
+        data = {
+            "Step": step,
+            "Call_Id": call_id,
+            "Tool": tool_name,
+            "Tool_Input": json.dumps(args, ensure_ascii=False),
+            "Model_Label": self._model_label_for(tool) if tool is not None else self.llm.model_label,
+            "Token_Usage": None if origin else self._reasoning_usage_for_step(step),
         }
+        if origin:
+            data["Origin"] = origin
+        return {"type": ChatCompletionTypeEnum.THINKING_ARTIFACT, "data": data}
 
     def _result_artifact(self, step: int, call_id: str, parts: List[Part]) -> Dict[str, Any]:
         return {
@@ -3195,7 +3593,8 @@ class ReasoningAgent:
             Part(root=TextPart(text=result_event.observation_text or ""))
         ]
         text = self._render_result_text(parts, result_event.observation_text or "")
-        return _LeafOutcome(call_id, status_chunks, text, parts)
+        evidence = dr.trusted_evidence(tool, result_event, tool_id=st.DOCUMENTATION_SEARCH)
+        return _LeafOutcome(call_id, status_chunks, text, parts, evidence)
 
     def _append_tool_result(
         self, call_id: str, observation_text: str, fn_name: str | None = None,
@@ -3224,6 +3623,99 @@ class ReasoningAgent:
             "tool_call_id": call_id,
             "content": text,
         })
+
+    # ── automatic document review ─────────────────────────────────────────
+
+    def _auto_read_cap(self) -> Optional[int]:
+        """The most one automatic read may render so that its result, with
+        the line introducing it, passes this run's tool-result clamp
+        untouched (the Documentation Search budget keeps 100 tokens of slack
+        under the clamp); None when nothing is clamped."""
+        if not getattr(self, "_tool_result_enabled", False):
+            return None
+        return int(self._tool_result_max_tokens) - 100 - dr.NOTE_RESERVE
+
+    async def _run_document_review(
+        self, dispatch: Dict[str, tuple],
+    ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
+        """Read the matching passage of each file a search returned but did
+        not show whole, before the next model response.
+
+        The reads go through the normal tool path, with the read function
+        taken from this step's dispatch table — so a read the profile
+        disabled, or a conversation without Documentation search, reads
+        nothing — as one tool-call group of the agent's own: unique call ids,
+        every call answered by its result, each call announced to the
+        activity trace with ``Origin`` set. No LLM request is made and no
+        step is counted. Which files, and the limits, are the review's (see
+        ``document_review``): each read renders into its share of the
+        allowance and within the profile's tool-result budget, one at a time
+        so what one leaves is the next one's, and the round's last result
+        carries a short summary of it. An automatic read never makes
+        candidates of its own.
+        """
+        review = self._doc_review
+        fn = make_leaf_name(st.DOCUMENTATION_SEARCH, "read")
+        entry = dispatch.get(fn)
+        if (
+            not entry or entry[0] != "leaf"
+            or getattr(entry[1], "tool_id", None) != st.DOCUMENTATION_SEARCH or entry[2] != "read"
+            or self._is_plan_blocked_leaf(entry, {}) or self._is_event_blocked_leaf(entry, {})
+        ):
+            review.suppress(dr.REASON_READ_UNAVAILABLE)
+            return
+        cap = self._auto_read_cap()
+        if cap is not None and cap - dr.SUMMARY_RESERVE < dr.MIN_READ_TOKENS:
+            review.suppress(dr.REASON_TOKEN_BUDGET)
+            return
+        chosen = review.plan()
+        if not chosen:
+            return
+        from app.tools.builtin.documentation_search import BUDGET_ARG
+
+        tool = entry[1]
+        step_no = max(1, self.current_step_count - 1)
+        calls = [(f"call_docreview_{uuid.uuid4().hex[:16]}", src) for src in chosen]
+        for call_id, src in calls:
+            yield self._thinking_artifact(step_no, call_id, fn, {"file": src.candidate}, tool, origin=dr.ORIGIN)
+        # A reply to an interruption, already streamed this step, belongs
+        # before these reads — which is where the user saw it.
+        ack, self._pending_ack_text = getattr(self, "_pending_ack_text", "") or "", ""
+        self._turn_messages.append({
+            "role": "assistant",
+            "content": ack or None,
+            "tool_calls": [
+                {"id": call_id, "type": "function",
+                 "function": {"name": fn, "arguments": json.dumps({"file": src.candidate})}}
+                for call_id, src in calls
+            ],
+        })
+        attempts: List[dr.Attempt] = []
+        texts: List[Tuple[str, str]] = []
+        for i, (call_id, src) in enumerate(calls):
+            budget = review.budget_for(len(calls) - i)
+            if cap is not None:
+                budget = min(budget, cap - (dr.SUMMARY_RESERVE if i == len(calls) - 1 else 0))
+            note = (f"[Automatic document review, read {i + 1} of {len(calls)} — made for you, not a call "
+                    f"you chose: the passage the search matched in {src.token}.]")
+            outcome = await self._collect_leaf(
+                tool=tool, leaf_name="read", args={"file": src.candidate, BUDGET_ARG: budget}, call_id=call_id,
+            )
+            for status_chunk in outcome.status_chunks:
+                yield status_chunk
+            attempts.append(review.record_attempt(src, outcome.evidence, note_tokens=dr.count_tokens(note)))
+            texts.append((call_id, f"{note}\n{outcome.tool_text}"))
+            yield self._result_artifact(step_no, call_id, outcome.parts)
+        summary = review.round_note(attempts, fn)
+        review.add_tokens(dr.count_tokens(summary))
+        for j, (call_id, text) in enumerate(texts):
+            if j == len(texts) - 1:
+                text = f"{text}\n\n{summary}"
+            self._append_tool_result(call_id, text, fn_name=fn)
+        logger.info(
+            f"[document_review] profile={self.profile} conversation={self.context_id} automatic reads: "
+            + ", ".join(f"{a.token} {a.outcome}" + (f" ({a.reason})" if a.reason else "") for a in attempts)
+        )
 
     def _drain_task_notices(self) -> List[Dict[str, Any]]:
         """Tell the agent, mid-turn, that an awaited task result has landed.

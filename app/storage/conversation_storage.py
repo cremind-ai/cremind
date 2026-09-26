@@ -2,7 +2,8 @@ import re
 import time
 import uuid
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import String, delete, func, select, text, update
+from sqlalchemy import cast as sa_cast
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -28,6 +29,26 @@ def is_valid_conversation_id(s: str) -> bool:
     digit (no leading separator). Length 1..128.
     """
     return isinstance(s, str) and bool(_CONVERSATION_ID_RE.match(s))
+
+
+def _search_policy():
+    """:mod:`app.agent.search_tools`, imported on first use.
+
+    Lazy because importing anything under ``app.agent`` runs the package
+    ``__init__`` (the A2A executor and everything it pulls in) — fine inside
+    the running server, too heavy and too circular for this module's import.
+    """
+    from app.agent import search_tools
+
+    return search_tools
+
+
+# The CAS outcomes of ``set_search_tools`` (and of
+# ``GroupChatStorage.set_group_search_tools``).
+SEARCH_TOOLS_OK = "ok"
+SEARCH_TOOLS_NOOP = "noop"
+SEARCH_TOOLS_CONFLICT = "conflict"
+SEARCH_TOOLS_MISSING = "missing"
 
 
 class ConversationStorage:
@@ -213,6 +234,7 @@ class ConversationStorage:
         self, profile: str, context_id: str | None = None,
         task_id: str | None = None, title: str = "Untitled Chat",
         channel_id: str | None = None, kind: str = "chat",
+        search_tools: list[str] | None = None,
     ) -> dict:
         """Create a conversation. If ``channel_id`` is omitted, the profile's
         ``main`` channel is used (auto-created if missing).
@@ -220,7 +242,17 @@ class ConversationStorage:
         ``kind`` is ``chat`` (normal thread, shown in the sidebar) or
         ``event_run`` (a hidden per-trigger conversation backing one event run,
         excluded from :meth:`list_conversations`).
+
+        ``search_tools`` is the new chat's search-source selection, stored in
+        its normalized form (``None`` — the default — and "all four" both store
+        ``NULL``); the version starts at 0. An invalid selection raises
+        :class:`app.agent.search_tools.SelectionError` (a ``ValueError``)
+        before anything is written — validate at the API edge.
         """
+        stored = (
+            _search_policy().normalize_selection(search_tools)
+            if search_tools is not None else None
+        )
         await self._ensure_initialized()
         now = time.time() * 1000
         async with self.async_session_maker.begin() as session:
@@ -233,6 +265,8 @@ class ConversationStorage:
                 task_id=task_id,
                 title=title,
                 kind=kind,
+                search_tools=stored,
+                search_tools_version=0,
                 created_at=now,
                 updated_at=now,
             )
@@ -1043,6 +1077,170 @@ class ConversationStorage:
                 )
             )
 
+    # ── Search-tool selection ──
+    #
+    # None of these touch ``updated_at``: choosing search sources is a setting,
+    # not activity, and must not move the conversation up the sidebar.
+
+    _SEARCH_ROW_COLUMNS = (
+        ConversationModel.id,
+        ConversationModel.profile,
+        ConversationModel.kind,
+        ConversationModel.channel_id,
+        ConversationModel.context_id,
+        ConversationModel.search_tools,
+        ConversationModel.search_tools_version,
+        ConversationModel.search_cache_baseline,
+    )
+
+    @staticmethod
+    def _search_row_to_dict(row) -> dict:
+        policy = _search_policy()
+        return {
+            "id": row.id,
+            "profile": row.profile,
+            "kind": row.kind or "chat",
+            "channel_id": row.channel_id,
+            "context_id": row.context_id,
+            "search_tools": policy.read_stored(row.search_tools),
+            "search_tools_version": int(row.search_tools_version or 0),
+            "search_cache_baseline": policy.read_baseline(row.search_cache_baseline),
+        }
+
+    async def _read_search_row(self, session: AsyncSession, conversation_id: str):
+        return (await session.execute(
+            select(*self._SEARCH_ROW_COLUMNS)
+            .where(ConversationModel.id == conversation_id)
+        )).first()
+
+    async def get_search_tools_row(self, conversation_id: str) -> dict | None:
+        """The conversation's search-tool state, or ``None`` when it is gone.
+
+        ``{id, profile, kind, channel_id, context_id, search_tools,
+        search_tools_version, search_cache_baseline}`` — ``search_tools`` read
+        tolerantly (unknown ids dropped; ``None`` = every source) and the
+        baseline as :func:`app.agent.search_tools.read_baseline` returns it.
+        The baseline lives only here, never in the generic conversation dict,
+        so sidebar payloads stay small.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            row = await self._read_search_row(session, conversation_id)
+            return self._search_row_to_dict(row) if row is not None else None
+
+    async def set_search_tools(
+        self, conversation_id: str, *, expected_version: int, selection: list[str] | None,
+    ) -> tuple[str, dict | None]:
+        """Compare-and-set the conversation's selection.
+
+        Returns ``(status, row)`` with ``row`` shaped like
+        :meth:`get_search_tools_row`:
+
+        - ``"ok"`` — saved; the version went up by one.
+        - ``"noop"`` — the normalized selection equals what is stored; nothing
+          was written and the version is unchanged.
+        - ``"conflict"`` — ``expected_version`` is not the stored version (or
+          another writer won the race); ``row`` is the current state. Checked
+          before the no-op test, so a stale client always learns it was stale.
+        - ``"missing"`` — no such conversation; ``row`` is ``None``.
+
+        Atomic: the write is ``UPDATE … WHERE id = ? AND search_tools_version
+        = ?`` and a zero rowcount is a conflict, so two concurrent saves can
+        never both succeed. The checks read in their own short transaction and
+        the write transaction STARTS with that UPDATE — on SQLite (WAL) a
+        transaction that read first cannot be upgraded to a writer once
+        another save committed, and would fail with "database is locked"
+        instead of reporting the conflict. ``updated_at`` is not touched. An
+        invalid ``selection`` raises
+        :class:`app.agent.search_tools.SelectionError` before anything is read.
+        """
+        policy = _search_policy()
+        wanted = policy.normalize_selection(selection)
+        expected = int(expected_version)
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            row = await self._read_search_row(session, conversation_id)
+        if row is None:
+            return SEARCH_TOOLS_MISSING, None
+        current = self._search_row_to_dict(row)
+        if expected != current["search_tools_version"]:
+            return SEARCH_TOOLS_CONFLICT, current
+        if wanted == current["search_tools"]:
+            return SEARCH_TOOLS_NOOP, current
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                update(ConversationModel)
+                .where(
+                    ConversationModel.id == conversation_id,
+                    ConversationModel.search_tools_version == expected,
+                )
+                .values(search_tools=wanted, search_tools_version=expected + 1)
+                .execution_options(synchronize_session=False)
+            )
+            won = (result.rowcount or 0) == 1
+            row = await self._read_search_row(session, conversation_id)
+        if row is None:
+            return SEARCH_TOOLS_MISSING, None
+        return (SEARCH_TOOLS_OK if won else SEARCH_TOOLS_CONFLICT), self._search_row_to_dict(row)
+
+    async def record_search_cache_baseline(
+        self, conversation_id: str, baseline: dict | None,
+    ) -> bool:
+        """Store what a main-model request actually sent for search (see
+        :func:`app.agent.search_tools.make_baseline`); ``None`` clears it.
+
+        Written at the request itself, by the run — never by an edit — so it
+        always describes a prompt the provider really saw. Does not touch
+        ``updated_at``. Returns ``False`` when the conversation is gone.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                update(ConversationModel)
+                .where(ConversationModel.id == conversation_id)
+                .values(search_cache_baseline=dict(baseline) if baseline is not None else None)
+            )
+            return (result.rowcount or 0) > 0
+
+    async def has_main_model_activity(self, conversation_id: str) -> bool:
+        """Whether a main-model response has ever run in this conversation.
+
+        The conservative input to the cache warning for conversations that
+        predate baselines. Only evidence of a real model call counts: an agent
+        message that carries token usage, or a ``reasoning`` usage row (which
+        survives ``clear_conversation_messages`` — and a cleared chat still
+        shares its tools/system prefix with the provider's cache). An agent row
+        WITHOUT usage is not evidence: an event run's trigger bubble, or the
+        reply a run gives when it is refused before reaching the model
+        ("embedding is still initializing", a setup error). Two indexed
+        ``LIMIT 1`` lookups.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            found = (await session.execute(
+                select(MessageModel.id)
+                .where(
+                    MessageModel.conversation_id == conversation_id,
+                    MessageModel.role == "agent",
+                    MessageModel.token_usage.isnot(None),
+                    # A plain JSON column stores Python None as the JSON text
+                    # 'null', which IS NOT NULL does not exclude.
+                    func.coalesce(sa_cast(MessageModel.token_usage, String), "null") != "null",
+                )
+                .limit(1)
+            )).first()
+            if found is not None:
+                return True
+            found = (await session.execute(
+                select(UsageRecordModel.id)
+                .where(
+                    UsageRecordModel.conversation_id == conversation_id,
+                    UsageRecordModel.source_kind == "reasoning",
+                )
+                .limit(1)
+            )).first()
+            return found is not None
+
     # ── Helpers ──
 
     @staticmethod
@@ -1061,6 +1259,8 @@ class ConversationStorage:
 
     @staticmethod
     def _conv_to_dict(conv: ConversationModel) -> dict:
+        # ``search_cache_baseline`` is deliberately absent (see
+        # :meth:`get_search_tools_row`): this dict feeds every sidebar listing.
         return {
             "id": conv.id,
             "profile": conv.profile,
@@ -1070,6 +1270,8 @@ class ConversationStorage:
             "title": conv.title,
             "kind": getattr(conv, "kind", "chat"),
             "working_directory": getattr(conv, "working_directory", None),
+            "search_tools": _search_policy().read_stored(getattr(conv, "search_tools", None)),
+            "search_tools_version": int(getattr(conv, "search_tools_version", 0) or 0),
             "created_at": conv.created_at,
             "updated_at": conv.updated_at,
         }

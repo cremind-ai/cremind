@@ -101,7 +101,10 @@ def test_token_serial_migration_sqlite(tmp_path: Path, monkeypatch) -> None:
     # ...and it must still actually reject a duplicate name.
     with eng.begin() as c:
         with pytest.raises(IntegrityError):
-            c.execute(text("INSERT INTO profiles VALUES ('pid3','admin',3,3,0)"))
+            c.execute(text(
+                "INSERT INTO profiles (id, name, created_at, updated_at, token_serial) "
+                "VALUES ('pid3','admin',3,3,0)"
+            ))
 
     # THE regression guard: `profiles` is a cascade parent, so any migration
     # that rebuilds the table (op.batch_alter_table on SQLite) wipes the

@@ -93,6 +93,46 @@ def test_tools_default_parameters():
     assert out[0]["parameters"] == {"type": "object", "properties": {}}
 
 
+def test_tools_without_strict_are_sent_non_strict():
+    """Responses reads a missing ``strict`` as strict and makes every property
+    required, so optional arguments come back invented (``size_max: 0``)."""
+    out = oc._convert_tools([
+        {"type": "function", "function": {"name": "unset", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "none", "strict": None}},
+        {"type": "function", "function": {"name": "odd", "strict": "yes"}},
+    ])
+    assert [t["strict"] for t in out] == [False, False, False]
+
+
+def test_tools_explicit_strict_is_preserved():
+    out = oc._convert_tools([
+        {"type": "function", "function": {"name": "on", "strict": True}},
+        {"type": "function", "function": {"name": "off", "strict": False}},
+    ])
+    assert [t["strict"] for t in out] == [True, False]
+
+
+def test_tools_parameter_schemas_are_passed_through_unchanged():
+    """Non-strict means the schema is NOT rewritten into strict form: optional
+    properties stay out of ``required``, and the caller's dict is not touched."""
+    import copy
+
+    from app.tools.builtin import documentation_search as ds
+
+    tools = [{"type": "function", "function": {
+        "name": f"documentation_search__{leaf.name}", "description": leaf.description,
+        "parameters": leaf.parameters,
+    }} for leaf in ds.get_tools({})]
+    before = copy.deepcopy(tools)
+    out = oc._convert_tools(tools)
+    assert tools == before
+    for entry, tool in zip(out, before):
+        assert entry["parameters"] == tool["function"]["parameters"]
+        assert entry["strict"] is False
+    search = next(t for t in out if t["name"] == "documentation_search__search")
+    assert search["parameters"]["required"] == ["query"]
+
+
 def test_tool_choice_variants():
     assert oc._convert_tool_choice("auto") == "auto"
     assert oc._convert_tool_choice("none") == "none"

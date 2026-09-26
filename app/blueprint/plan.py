@@ -110,7 +110,9 @@ def stage_upload(archive_bytes_path: Path, *, owner: str) -> ImportSession:
 
     report = assert_importable(manifest)  # raises on fatal
 
-    steps, warnings = build_import_plan(payload, manifest, report.supported_components)
+    steps, warnings = build_import_plan(
+        payload, manifest, report.supported_components, target_profile=owner,
+    )
 
     now = time.time()
     session = ImportSession(
@@ -127,7 +129,12 @@ def stage_upload(archive_bytes_path: Path, *, owner: str) -> ImportSession:
         # one), then imports into it.
         target_profile=owner,
         steps=[{"key": s["key"], "status": "pending", "requirements": s.get("requirements", []), "result": {}} for s in steps],
-        warnings=[{"kind": "compat", "message": w} for w in report.warnings],
+        warnings=(
+            [{"kind": "compat", "message": w} for w in report.warnings]
+            # What the plan builders found (a setting or a tool this install
+            # does not have) — shown before the step, not only after it.
+            + [{"kind": "plan", "message": w} for w in warnings]
+        ),
     )
     session.save()
     logger.info(f"[blueprint] staged import session {session_id} steps={[s['key'] for s in steps]}")
@@ -137,7 +144,20 @@ def stage_upload(archive_bytes_path: Path, *, owner: str) -> ImportSession:
 # ── plan ─────────────────────────────────────────────────────────────────────
 
 
-def load_component(payload_dir: Path, key: str) -> dict | None:
+def load_payload_manifest(payload_dir: Path) -> BlueprintManifest | None:
+    """The staged archive's FULL manifest (source roots included — the session
+    keeps only :meth:`BlueprintManifest.summary`, which has none), or ``None``
+    when it cannot be read."""
+    path = Path(payload_dir) / MANIFEST_MEMBER
+    try:
+        return BlueprintManifest.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def load_component_doc(payload_dir: Path, key: str) -> tuple[int, dict] | None:
+    """``(version, data)`` of ``components/<key>.json`` exactly as written, or
+    ``None`` when absent/unreadable. A document without a version is v1."""
     path = Path(payload_dir) / f"{COMPONENTS_PREFIX}{key}.json"
     if not path.is_file():
         return None
@@ -145,16 +165,42 @@ def load_component(payload_dir: Path, key: str) -> dict | None:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
+        return None
+    try:
+        version = int(doc.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    return version, doc["data"]
+
+
+def load_component(payload_dir: Path, key: str) -> dict | None:
+    """A component's ``data`` in the CURRENT shape — an older document is
+    lifted by :func:`app.blueprint.compat.upgrade_component` (e.g. a v1 tools
+    document's ids mapped), so plan builders and appliers never see an old
+    shape."""
+    from app.blueprint.compat import upgrade_component
+
+    loaded = load_component_doc(payload_dir, key)
+    if loaded is None:
+        return None
+    version, data = loaded
+    return upgrade_component(key, version, data)
 
 
 def build_import_plan(
-    payload_dir: Path, manifest: BlueprintManifest, supported: list[str]
+    payload_dir: Path,
+    manifest: BlueprintManifest,
+    supported: list[str],
+    *,
+    target_profile: str | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Return ``(steps, warnings)`` for the wizard.
 
     Only components present in the manifest AND supported by this build get a
-    step; ``profile`` is always the first step.
+    step; ``profile`` is always the first step. ``target_profile`` is the
+    profile the blueprint is imported into — its working directory is where a
+    file watcher rooted in the source profile's own folder is suggested to go.
     """
     warnings: list[str] = []
     present = set(manifest.components.keys()) & set(supported)
@@ -166,7 +212,10 @@ def build_import_plan(
             continue
         data = load_component(payload_dir, key) or {}
         builder = _PLAN_BUILDERS.get(key)
-        step = builder(data, manifest, warnings) if builder else {"requirements": []}
+        if key == "events":
+            step = _plan_events(data, manifest, warnings, target_profile=target_profile)
+        else:
+            step = builder(data, manifest, warnings) if builder else {"requirements": []}
         step.setdefault("key", key)
         step.setdefault("title", _STEP_TITLES.get(key, key))
         step.setdefault("kind", "apply")
@@ -266,8 +315,17 @@ def _plan_tools(data: dict, manifest: BlueprintManifest, warnings: list[str]) ->
         # Friendly name: a2a/mcp definition, else the tools-table row (built-ins
         # exist on the importing machine), else the raw id.
         defn = tool.get("definition") or {}
-        row = ts.get_tool(tool_id) or {}
+        found = ts.get_tool(tool_id) if tool_id else None
+        row = found or {}
         name = defn.get("name") or row.get("name") or tool_id
+        # A tool this install does not have (a built-in from a newer build or
+        # a feature that is not installed here) is skipped by the applier —
+        # say so up front rather than let it look applied.
+        available = found is not None
+        if not available:
+            warnings.append(
+                f"Tool {tool_id!r} is not available on this install; its settings will be skipped."
+            )
 
         # Flatten the non-secret config into {key: value} for display (secret
         # values are never in the doc; their names live in secret_variables).
@@ -282,6 +340,7 @@ def _plan_tools(data: dict, manifest: BlueprintManifest, warnings: list[str]) ->
                 "tool_id": tool_id,
                 "name": name,
                 "kind": tool.get("kind"),
+                "available": available,
                 "settings": settings,
                 "secret_variables": secrets,
                 "disabled_leaves": len(tool.get("disabled_leaves") or []),
@@ -318,16 +377,106 @@ def _plan_skills(data: dict, manifest: BlueprintManifest, warnings: list[str]) -
     return {"requirements": reqs}
 
 
-def _plan_events(data: dict, manifest: BlueprintManifest, warnings: list[str]) -> dict:
-    from app.backup.paths import build_path_map, relocate_path
+def remap_into_target_working_dir(
+    manifest: BlueprintManifest | None,
+    root: str | None,
+    target_profile: str | None,
+    *,
+    create: bool = False,
+) -> str | None:
+    """A path inside the SOURCE profile's own working directory, moved to the
+    same place inside ``target_profile``'s — or ``None`` when it is not inside
+    it (or nothing names a target).
+
+    Each profile has its own working directory, so the plain prefix relocation
+    (``<source SYS>`` → ``<target SYS>``) would carry
+    ``<workspaces>/<source profile>/notes`` to the TARGET's copy of the source
+    profile's folder: another profile's, which the importing profile may not
+    watch. The source folder is the one the manifest recorded
+    (``source_paths.user_working_dir`` — for an older blueprint the server-wide
+    folder, which was every profile's) and the source profile's default
+    ``<workspaces root>/<source profile>``; the deepest match wins."""
+    if manifest is None or not root or not target_profile:
+        return None
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    sp = manifest.source_paths
+    flavor = PureWindowsPath if sp.sep == "\\" else PurePosixPath
+    try:
+        path = flavor(root)
+    except Exception:  # noqa: BLE001
+        return None
+    if not path.is_absolute():
+        return None
+
+    prefixes: list[tuple[str, ...]] = []
+    if sp.user_working_dir:
+        prefixes.append(flavor(sp.user_working_dir).parts)
+    ws_root = getattr(sp, "workspaces_root", "") or (
+        str(flavor(sp.system_dir) / "workspaces") if sp.system_dir else ""
+    )
+    if ws_root and manifest.source_profile:
+        prefixes.append((flavor(ws_root) / manifest.source_profile).parts)
+
+    def fold(parts: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(p.casefold() for p in parts) if sp.case_insensitive else parts
+
+    parts = path.parts
+    # Longer first; a bare drive/root is never a working directory prefix.
+    for prefix in sorted((p for p in prefixes if len(p) > 1), key=len, reverse=True):
+        if len(parts) >= len(prefix) and fold(parts[: len(prefix)]) == fold(prefix):
+            from app.config.working_dirs import profile_working_dir
+
+            base = profile_working_dir(target_profile, create=create)
+            rest = parts[len(prefix):]
+            return os.path.normpath(os.path.join(base, *rest)) if rest else base
+    return None
+
+
+def relocate_watcher_root(
+    manifest: BlueprintManifest | None,
+    pm: Any,
+    root: str,
+    target_profile: str | None,
+    *,
+    create: bool = False,
+) -> tuple[str, bool]:
+    """``(root on this install, changed)`` for a blueprint file watcher: into
+    the target profile's own working directory when it sat in the source
+    profile's (see :func:`remap_into_target_working_dir`), else the usual
+    system-dir / home prefix relocation."""
+    remapped = remap_into_target_working_dir(manifest, root, target_profile, create=create)
+    if remapped is not None:
+        return remapped, True
+    if pm is not None:
+        from app.backup.paths import relocate_path
+
+        relocated, changed, _abs = relocate_path(pm, root)
+        if changed and relocated:
+            return relocated, True
+    return root, False
+
+
+def _plan_events(
+    data: dict,
+    manifest: BlueprintManifest,
+    warnings: list[str],
+    *,
+    target_profile: str | None = None,
+) -> dict:
+    from app.backup.paths import build_path_map
+    from app.config.working_dirs import is_foreign
 
     pm = build_path_map(manifest, _system_dir(), os.path.expanduser("~"))
 
     watcher_reqs: list[dict] = []
     for w in data.get("file_watcher") or []:
         src = w.get("root_path") or ""
-        suggested, changed, _abs = relocate_path(pm, src)
-        exists = bool(suggested) and os.path.isdir(suggested)
+        suggested, changed = relocate_watcher_root(manifest, pm, src, target_profile)
+        # A suggestion inside ANOTHER profile's working directory would be
+        # refused on apply; say so now (and do not probe what is there).
+        foreign = bool(suggested) and bool(target_profile) and is_foreign(suggested, target_profile)
+        exists = bool(suggested) and not foreign and os.path.isdir(suggested)
         watcher_reqs.append(
             {
                 "type": "watcher_path",
@@ -336,6 +485,7 @@ def _plan_events(data: dict, manifest: BlueprintManifest, warnings: list[str]) -
                 "suggested_root_path": suggested,
                 "relocated": changed,
                 "exists": exists,
+                "foreign": foreign,
             }
         )
 
@@ -383,4 +533,4 @@ _PLAN_BUILDERS = {
 }
 
 
-__all__ = ["build_import_plan", "load_component", "stage_upload"]
+__all__ = ["build_import_plan", "load_component", "load_component_doc", "stage_upload"]

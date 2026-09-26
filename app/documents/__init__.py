@@ -1,34 +1,20 @@
-"""Documentation subsystem for the Documentation Search built-in tool.
+"""Documentation search — the agent searching and reasoning over the user's own files.
 
-Two on-disk roots are watched:
+A per-profile RAG index over a chosen folder (and, optionally, the Google Drive
+files Cremind has been granted), kept in sync incrementally, searched with
+vector + full-text retrieval, and answered with verifiable citations.
 
-- ``<CREMIND_SYSTEM_DIR>/documents``                     -- shared docs
-- ``<CREMIND_SYSTEM_DIR>/<profile>/documents``           -- per-profile docs
+Independent of ``cremind_documentation_search`` / :mod:`app.cremind_documents`, which only
+indexes Cremind's own manual. The two share no collection, table, tool or
+prompt text.
 
-Markdown files in either tree must declare a YAML-frontmatter ``description``
-field. Only the description is embedded into the Qdrant collection used by
-the ``documentation_search`` built-in tool; the body is read from disk on
-demand at query time.
+Layout:
+
+- :mod:`app.documents.settings` — the admin gate, per-profile options, root
+  validation, and confirm-before-destroy change plans.
+- ``app.documents.index`` — the per-profile SQLite index file (manifest, chunks,
+  FTS5), the vector collections, and the sync engine that fills them.
+
+The main-database half (settings, caption cache, vision quota) is in
+:mod:`app.storage.documents_storage`.
 """
-
-from __future__ import annotations
-
-from typing import Optional
-
-from app.documents.sync import DocumentSyncService
-
-_service: Optional[DocumentSyncService] = None
-
-
-def set_service(service: Optional[DocumentSyncService]) -> None:
-    """Register (or clear) the global :class:`DocumentSyncService` singleton."""
-    global _service
-    _service = service
-
-
-def get_service() -> Optional[DocumentSyncService]:
-    """Return the singleton :class:`DocumentSyncService`, or None if not initialized."""
-    return _service
-
-
-__all__ = ["DocumentSyncService", "set_service", "get_service"]

@@ -126,6 +126,10 @@ def invalidate_storage_singletons() -> None:
     _gcs._instance = None
     import app.storage.channel_group_storage as _cgs
     _cgs._instance = None
+    import app.storage.documents_storage as _uds
+    _uds._instance = None
+    import app.storage.documents_citations_storage as _udc
+    _udc._instance = None
     try:
         from app.utils.client_storage import _reset_auth_client_storage_singleton
         _reset_auth_client_storage_singleton()

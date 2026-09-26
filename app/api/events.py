@@ -512,11 +512,13 @@ def get_event_routes() -> list[Route]:
                 # an extra round-trip. Hydrate from the persisted column
                 # first so reopening a conversation after a restart
                 # restores the user's last-chosen directory; if the
-                # persisted path no longer exists, the helper clears it
-                # and we fall back to the user default.
+                # persisted path no longer exists (or is now another
+                # profile's), the helper clears it and we fall back to the
+                # conversation profile's own folder.
                 from app.utils.working_directory import hydrate_working_directory
                 effective_cwd = await hydrate_working_directory(
                     conversation_id, get_conversation_storage(),
+                    profile=conv.get("profile") or profile,
                 )
                 yield _frame({
                     "type": "ready",

@@ -92,7 +92,8 @@ export const useSettingsStore = defineStore('settings', () => {
   // Active authentication token (for the current profile session)
   const authToken = ref('');
 
-  // Working directory from backend (for resolving absolute file paths to API URLs)
+  // The signed-in profile's own working directory (GET /api/me
+  // ``user_working_dir``) — each profile has its own. Forward slashes.
   const workingDir = ref('');
 
   // Chat mode (per-profile, default: reasoning). Replaces the old reasoning
@@ -174,15 +175,31 @@ export const useSettingsStore = defineStore('settings', () => {
     authToken.value = token;
     profileId.value = profileName;
     chatMode.value = getChatMode(profileName);
+    // Never show the previous profile's folder while this one's loads.
+    workingDir.value = '';
 
     fetchMe(agentUrl.value, token)
       .then((me) => {
-        if (me.working_dir) {
-          workingDir.value = me.working_dir;
-        }
+        workingDir.value = me.user_working_dir || '';
       })
       .catch(() => {});
     return true;
+  }
+
+  /**
+   * Re-read the signed-in profile's working directory — after the admin moved
+   * its own (Settings → Profiles). An answer that arrives after the token
+   * changed belongs to the previous profile and is dropped.
+   */
+  async function refreshWorkingDir(): Promise<void> {
+    const token = authToken.value;
+    if (!token) return;
+    try {
+      const me = await fetchMe(agentUrl.value, token);
+      if (authToken.value === token) workingDir.value = me.user_working_dir || '';
+    } catch {
+      /* keep what is shown; the next activation re-reads it */
+    }
   }
 
   // ── Legacy methods ──
@@ -226,9 +243,7 @@ export const useSettingsStore = defineStore('settings', () => {
             setProfileId(me.profile);
             setTokenForProfile(me.profile, token);
           }
-          if (me.working_dir) {
-            workingDir.value = me.working_dir;
-          }
+          workingDir.value = me.user_working_dir || '';
         })
         .catch(() => {
           // Token may be invalid or server unreachable — ignore silently
@@ -263,6 +278,7 @@ export const useSettingsStore = defineStore('settings', () => {
     removeTokenForProfile,
     getLoggedInProfiles,
     activateProfile,
+    refreshWorkingDir,
     // Chat mode (plan / reasoning / instant)
     chatMode,
     getChatMode,

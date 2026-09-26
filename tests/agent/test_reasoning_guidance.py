@@ -47,7 +47,7 @@ def _fake_cfg() -> SimpleNamespace:
 def _build(monkeypatch, provider_name, model_name):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
     llm = SimpleNamespace(provider_name=provider_name, model_name=model_name)
@@ -169,62 +169,99 @@ def test_runtime_environment_absent_safe(monkeypatch, clean_runtime_env):
     assert "VNC" not in prompt
 
 
-# ── fallback-search guidance ──────────────────────────────────────────────
+# ── search-sources guidance ───────────────────────────────────────────────
 #
-# The agent injects a "when the tools can't fulfil it, search first" block that
-# names ONLY the search tools enabled for the run. The function names are derived
-# from each tool's own class (imported from app.tools.builtin) plus the live
-# group's registry tool_id -- never hard-coded in reasoning_agent.
+# The agent injects a SEARCH SOURCES block that lists the search sources this
+# run exposes in their fixed priority order (Documentation search → Cremind
+# documentation search → Memory search → Web search), naming ONLY the functions
+# the run actually sends. Which sources are present follows the gates AND the
+# conversation's search-tool selection (see tests/agent/test_search_tools_agent.py
+# for the selection itself); these cases pin the text.
 
 # Function names the model actually sees. Note the memory tool registers as
 # ``memory_search`` (slug of "Memory Search"), so its function is
 # ``memory_search__search_memory`` -- NOT a bare ``search_memory``.
-_DOC_FN = "documentation_search__search_documentation"
+_USER_FN = "documentation_search__search"
+_DOC_FN = "cremind_documentation_search__search_documentation"
+_SECTION_FN = "cremind_documentation_search__read_documentation_section"
 _MEM_FN = "memory_search__search_memory"
 _WEB_FN = "web_search__search_web"
 
 
-def _grp(config_name, tool_id):
-    """Stand-in for a live built-in search tool group. The helper matches it to a
-    tool class by ``config_name`` (== the class's defining module) and builds the
-    exposed name from ``tool_id`` + the real class ``name``."""
-    return SimpleNamespace(config_name=config_name, tool_id=tool_id)
+def _grp(tool_id, *leaves, config_name=None):
+    """Stand-in for a live built-in search group: its registry ``tool_id`` and
+    its STATIC registered leaves (``skills``), which is what the guidance reads."""
+    return SimpleNamespace(
+        config_name=config_name or tool_id, tool_id=tool_id,
+        skills=[SimpleNamespace(name=leaf) for leaf in leaves],
+    )
 
 
-# (module stem == config_name, registry tool_id) for the three search tools.
-_DOC = ("documentation_search", "documentation_search")
-_MEM = ("search_memory", "memory_search")
-_WEB = ("web_search", "web_search")
+def _user():
+    return _grp("documentation_search", "find_files", "search", "read", "research")
 
 
-def test_all_three_search_tools_named_with_web_fallback():
-    g = ra._build_search_guidance([_grp(*_DOC), _grp(*_MEM), _grp(*_WEB)])
-    # The guidance's characteristic instruction: don't claim a request can/can't
-    # be fulfilled — verify via the search tools first.
-    assert "must not affirm whether" in g
-    assert _DOC_FN in g
-    assert _MEM_FN in g
-    assert _WEB_FN in g
-    assert "search the public internet" in g
+def _doc():
+    return _grp("cremind_documentation_search", "search_documentation", "read_documentation_section")
+
+
+def _mem():
+    return _grp("memory_search", "search_memory", config_name="search_memory")
+
+
+def _web():
+    return _grp("web_search", "search_web")
+
+
+def test_every_source_named_in_priority_order_with_web_as_the_fallback():
+    g = ra._build_search_guidance([_web(), _mem(), _doc(), _user()])  # registry order is irrelevant
+    assert "SEARCH SOURCES — IN PRIORITY ORDER" in g
+    # The characteristic instruction: never claim something can't be found /
+    # done before the relevant sources were tried.
+    assert "Do not claim something cannot be found" in g
+    for fn in (_USER_FN, _DOC_FN, _SECTION_FN, _MEM_FN, _WEB_FN):
+        assert f"`{fn}`" in g
+    order = [g.index(f"`{fn}`") for fn in (_USER_FN, _DOC_FN, _MEM_FN, _WEB_FN)]
+    assert order == sorted(order)
+    assert "public internet — the fallback" in g
 
 
 def test_web_search_disabled_omits_internet_fallback():
-    g = ra._build_search_guidance([_grp(*_DOC), _grp(*_MEM)])
-    assert _DOC_FN in g
-    assert _MEM_FN in g
+    g = ra._build_search_guidance([_doc(), _mem()])
+    assert _DOC_FN in g and _MEM_FN in g
     assert _WEB_FN not in g
     assert "public internet" not in g
 
 
 def test_search_memory_disabled_not_named():
-    g = ra._build_search_guidance([_grp(*_DOC), _grp(*_WEB)])
-    assert _DOC_FN in g
-    assert _WEB_FN in g
+    g = ra._build_search_guidance([_doc(), _web()])
+    assert _DOC_FN in g and _WEB_FN in g
     assert _MEM_FN not in g
 
 
+def test_web_only_is_not_called_a_fallback_to_nothing():
+    """With per-conversation selection a web-only conversation is ordinary."""
+    g = ra._build_search_guidance([_web()])
+    assert f"`{_WEB_FN}`" in g
+    assert "sources above" not in g and "fallback" not in g
+    for fn in (_USER_FN, _DOC_FN, _MEM_FN):
+        assert fn not in g
+
+
 def test_no_search_tools_omits_block():
-    assert ra._build_search_guidance([_grp("calc", "calc")]) == ""
+    assert ra._build_search_guidance([_grp("calc", "run")]) == ""
+    assert ra._build_search_guidance([]) == ""
+
+
+def test_a_disabled_function_is_not_named():
+    g = ra._build_search_guidance(
+        [_doc(), _web()], {"cremind_documentation_search": {"read_documentation_section"}},
+    )
+    assert _DOC_FN in g
+    assert _SECTION_FN not in g
+    # Every function of a group off → the group is not a source at all.
+    g = ra._build_search_guidance([_doc(), _web()], {"web_search": {"search_web"}})
+    assert _WEB_FN not in g and "Web search" not in g
 
 
 def test_agent_wires_search_guidance_into_prompt(monkeypatch):
@@ -233,51 +270,42 @@ def test_agent_wires_search_guidance_into_prompt(monkeypatch):
     # REASONING STEP block is absent and only the search block is present.
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
     llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")
-    registry = _FakeRegistry([_grp(*_DOC), _grp(*_MEM), _grp(*_WEB)])
+    registry = _FakeRegistry([_doc(), _mem(), _web()])
     agent = ra.ReasoningAgent(llm=llm, registry=registry, profile="default", context_id="ctx")
 
     prompt = agent._build_instruction()
     assert _DOC_FN in prompt and _MEM_FN in prompt and _WEB_FN in prompt
+    assert "SEARCH SOURCES — IN PRIORITY ORDER" in prompt
     assert "REASONING STEP" not in prompt
 
 
-def test_search_tool_classes_resolve():
-    # Guards the lazy imports: a rename/move of any search tool class would make
-    # these resolve to the wrong set (or drop one), failing loudly here.
-    from app.tools.builtin.documentation_search import DocumentationSearchTool
-    from app.tools.builtin.search_memory import SearchMemoryTool
-    from app.tools.builtin.web_search import WebSearchTool
-
-    local, web = ra._search_tool_classes()
-    assert local == [DocumentationSearchTool, SearchMemoryTool]
-    assert web is WebSearchTool
-
-
 def test_exposed_names_match_real_tool_definitions():
-    # Faithful drift guard: build group stand-ins with tool_id = slugify(SERVER_NAME)
-    # exactly as registration does, and confirm the guidance emits the documented
-    # function names. Catches a rename of SERVER_NAME (changes the tool_id) or of a
-    # class ``name`` (changes the leaf, surfaced via _search_tool_classes()).
+    # Faithful drift guard: the policy's source ids must be the ids registration
+    # derives (slugify(SERVER_NAME)), and the leaves the real modules register
+    # must produce the documented function names. Catches a rename of a
+    # SERVER_NAME (changes the tool_id) or of a leaf class ``name``.
+    from app.agent import search_tools as st
     from app.tools.ids import slugify
     from app.tools.builtin import (
-        documentation_search as d,
+        cremind_documentation_search as d,
+        documentation_search as u,
         search_memory as m,
         web_search as w,
     )
 
+    modules = (u, d, m, w)
+    assert tuple(slugify(mod.SERVER_NAME) for mod in modules) == st.SEARCH_TOOL_IDS
     groups = [
-        _grp("documentation_search", slugify(d.SERVER_NAME)),
-        _grp("search_memory", slugify(m.SERVER_NAME)),
-        _grp("web_search", slugify(w.SERVER_NAME)),
+        _grp(slugify(mod.SERVER_NAME), *[t.name for t in mod.get_tools({})])
+        for mod in modules
     ]
     g = ra._build_search_guidance(groups)
-    assert _DOC_FN in g
-    assert _MEM_FN in g
-    assert _WEB_FN in g
+    for fn in (_USER_FN, _DOC_FN, _SECTION_FN, _MEM_FN, _WEB_FN):
+        assert f"`{fn}`" in g
 
 
 # ── skill-authoring clause ↔ change_working_directory's live enum ─────────────

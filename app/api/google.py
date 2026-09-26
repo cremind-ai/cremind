@@ -114,7 +114,11 @@ def get_google_routes() -> List[Route]:
             stop_watch=bool(body.get("stop_watch", True)),
             force_revoke=bool(body.get("force_revoke", False)),
         )
-        _publish(profile, [spec.dir_name])
+        _publish(
+            profile,
+            [spec.dir_name],
+            drive_gone=spec.dir_name == "gdrive" and _drive_gone(profile, [result]),
+        )
         if result.get("still_linked"):
             result = {**result, "error": "wipe_failed"}
         return JSONResponse(result, status_code=_status_for(result))
@@ -129,7 +133,13 @@ def get_google_routes() -> List[Route]:
 
         body = await _json_body(request)
         out = await engine.unlink_all(profile, revoke=bool(body.get("revoke", True)))
-        _publish(profile, [row["skill"] for row in out.get("results", [])])
+        rows = out.get("results", [])
+        drive_rows = [row for row in rows if row.get("skill") == "gdrive"]
+        _publish(
+            profile,
+            [row["skill"] for row in rows],
+            drive_gone=bool(drive_rows) and _drive_gone(profile, drive_rows),
+        )
         if out.get("failed"):
             out = {**out, "error": "wipe_failed"}
             return JSONResponse(out, status_code=500)
@@ -142,11 +152,46 @@ def get_google_routes() -> List[Route]:
     ]
 
 
-def _publish(profile: str, touched: List[str]) -> None:
+def _drive_gone(profile: str, rows: List[Dict[str, Any]]) -> bool:
+    """Whether a gdrive unlink really removed the Drive link.
+
+    Both the engine's report and the filesystem must say so: a wipe that failed
+    leaves a usable credential on disk, and a link re-made from chat in the
+    meantime is a live link again — neither may cost the user their Drive index.
+    """
+    if any(row.get("still_linked") for row in rows):
+        return False
+    try:
+        from app.drive import skill_token
+
+        return skill_token.token_path(profile) is None
+    except Exception as exc:  # noqa: BLE001 - unknown means "keep the index"
+        logger.debug(f"[google] drive token check failed for {profile}: {exc}")
+        return False
+
+
+def _purge_drive_index(profile: str) -> None:
+    """Delete the profile's Drive index for Documentation search. Queued on the
+    engine and never waited for; a no-op on a server without one."""
+    try:
+        from app.documents import state as uds_state
+
+        if uds_state.request_purge(profile, "drive"):
+            logger.info(f"[google] {profile}: gdrive unlinked, Drive index purge requested")
+    except Exception as exc:  # noqa: BLE001 - never fail a completed unlink on this
+        logger.warning(f"[google] could not request the Drive index purge for {profile}: {exc}")
+
+
+def _publish(profile: str, touched: List[str], drive_gone: bool = False) -> None:
     """Wake the settings page, and the calendar page when gcalendar moved.
 
     The settings stream is wakeup-only, so clients refetch — which is what makes a
     CLI unlink show up in an already-open browser tab.
+
+    ``drive_gone`` means a gdrive unlink really removed the Drive link: the Drive
+    index goes with it, at once. (A link that vanishes any other way — unlinked
+    from chat, the skill removed — is noticed by the engine, which waits before
+    purging.)
     """
     try:
         from app.events.settings_state_bus import publish_settings_state_changed
@@ -154,6 +199,8 @@ def _publish(profile: str, touched: List[str]) -> None:
         publish_settings_state_changed(profile)
     except Exception as exc:  # noqa: BLE001 - never fail a completed unlink on this
         logger.debug(f"[google] settings publish failed for {profile}: {exc}")
+    if drive_gone:
+        _purge_drive_index(profile)
     if "gcalendar" not in touched:
         return
     try:

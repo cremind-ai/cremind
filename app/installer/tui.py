@@ -1140,6 +1140,231 @@ def screen_vnc_password(state: TuiResult, ctx: "Context") -> ScreenResult:
         return replace(state, vnc_password=entered), "advance"
 
 
+# ── documents folder (docker mode) ───────────────────────────────────────
+#
+# The host folder bind-mounted at /root/Documents: every profile's working
+# directory (its agent's default working folder, the root its Documentation
+# search indexes) lives in its cremind-workspaces/ subfolder. Without the mount it
+# lives on the container's writable layer and is lost when the container is
+# recreated. Kubernetes has its own answer (the chart's `persistence.work`
+# volume), so this is asked in docker mode only.
+#
+# The path ends up unquoted in the compose .env as CREMIND_HOST_DOCUMENTS.
+# Compose's .env parser interpolates ``$``, treats ``#`` as a comment, handles
+# ``"`` as a quote and trims surrounding whitespace, so those are refused here
+# and — with the same rule — by install.sh / install.ps1 for a flag value.
+# Apostrophes and inner spaces survive unquoted and are allowed.
+
+_DOCUMENTS_DIR_FORBIDDEN = (
+    ("$", "a dollar sign ($)"),
+    ("#", "a hash sign (#)"),
+    ('"', 'a double quote (")'),
+    ("\n", "a line break"),
+    ("\r", "a carriage return"),
+)
+
+
+def normalize_documents_dir(value: str, *, home: str | None = None) -> str:
+    """Expand a leading ``~`` and make the path absolute.
+
+    Only ``~`` on its own or followed by a separator is expanded, as the
+    install scripts do; ``~bob/x`` is refused by :func:`validate_documents_dir`.
+    An absolute path is returned untouched, so a forward-slash Windows path
+    from a previous .env stays in that form. ``home`` exists for tests.
+    """
+    import os
+
+    path = value
+    if path == "~" or path.startswith(("~/", "~\\")):
+        root = home if home is not None else str(Path.home())
+        path = root + path[1:]
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    return path
+
+
+def validate_documents_dir(value: str, *, home: str | None = None) -> str | None:
+    """Return an error for a folder the compose .env cannot carry, or ``None``.
+
+    The characters are checked on the resolved path too, since expanding
+    ``~`` or a relative path can bring in a home or working directory that
+    contains one of them. The message names the character either way.
+    """
+    if not value or not value.strip():
+        return "Enter the folder to use as Cremind's Documents folder."
+    if value != value.strip():
+        return (
+            "The folder path starts or ends with a space (or another blank "
+            "character). Docker Compose's .env file would drop it, so remove "
+            "it or choose another folder."
+        )
+    if value.startswith("~") and not (value == "~" or value.startswith(("~/", "~\\"))):
+        # ``~bob/x`` (another user's home): the install scripts refuse it
+        # rather than guess, and so does the TUI, so both agree.
+        return (
+            "Use your own home (~/...) or a full path; another user's home "
+            "(~name) is not supported here."
+        )
+    resolved = normalize_documents_dir(value, home=home)
+    for text in (value, resolved):
+        for char, name in _DOCUMENTS_DIR_FORBIDDEN:
+            if char in text:
+                shown = "" if text is value else f" ({resolved})"
+                return (
+                    f"The folder path{shown} contains {name}, which Docker "
+                    "Compose's .env file would misread. Choose a folder whose "
+                    "path does not contain it."
+                )
+    return None
+
+
+def _host_platform() -> str:
+    """``wsl``, ``linux``, ``darwin``, ``windows`` — which notes apply here.
+
+    WSL is told apart from Linux the way install.sh does it: its kernel
+    string in /proc/version mentions Microsoft.
+    """
+    import sys
+
+    if sys.platform.startswith("linux"):
+        try:
+            version = Path("/proc/version").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            version = ""
+        return "wsl" if "microsoft" in version.lower() else "linux"
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform.startswith(("win", "cygwin", "msys")):
+        return "windows"
+    return sys.platform
+
+
+def _read_env_value(path: str, key: str) -> str:
+    """The last ``key=value`` in a previous install's .env, or "".
+
+    install.ps1 writes that file with ``Set-Content -Encoding utf8``, which on
+    Windows PowerShell 5.1 starts it with a BOM — hence ``utf-8-sig``.
+    """
+    if not path:
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
+    found = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith(f"{key}="):
+            continue
+        value = line[len(key) + 1:].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        found = value
+    return found
+
+
+def _documents_defaults(ctx: "Context") -> tuple[str, str]:
+    """The folder and access to preselect: the shell's pick, else the last install.
+
+    The shell resolves the folder default itself (flag > env > previous .env
+    > platform default, which on Windows follows OneDrive's redirection of
+    Documents) and passes it as ``--documents-default``. Reading the previous
+    .env here is the fallback for when it did not; the access has no such
+    flag, so the previous .env is where its default comes from.
+    """
+    folder = ctx.documents_default or _read_env_value(
+        ctx.docker_env, "CREMIND_HOST_DOCUMENTS"
+    )
+    if not folder:
+        folder = str(Path.home() / "Documents")
+    read_only = _read_env_value(ctx.docker_env, "CREMIND_DOCUMENTS_READ_ONLY")
+    return folder, ("ro" if read_only.lower() == "true" else "rw")
+
+
+def screen_documents(state: TuiResult, ctx: "Context") -> ScreenResult:
+    """Pick the host Documents folder, then read-write or read-only.
+
+    Two steps in one screen, walked like the VNC password and its
+    confirmation: Back on the access step returns to the folder step, and
+    only Back on the first step that was actually shown leaves the screen.
+    Each step is skipped when its value arrived by flag (or the shell's
+    ``CREMIND_DOCUMENTS_*`` env fallback, which it forwards the same way).
+    """
+    if state.mode != "docker":
+        return state, "skip"
+    ask_dir = not state.documents_dir
+    ask_access = not state.documents_access
+    if not ask_dir and not ask_access:
+        return state, "skip"
+
+    dd = ctx.catalog.docker_documents
+    platform = _host_platform()
+    default_dir, default_access = _documents_defaults(ctx)
+
+    dir_text = dd.prompt
+    if dd.hint:
+        dir_text += f"\n\n{dd.hint}"
+    if platform == "wsl" and dd.wsl_note:
+        dir_text += f"\n\n{dd.wsl_note}"
+    if platform == "darwin" and dd.macos_privacy_note:
+        dir_text += f"\n\n{dd.macos_privacy_note}"
+
+    # Each disclosure is led by its row's label, so the two read as a key to
+    # the choices below rather than as two loose sentences.
+    access_text = dd.access_prompt
+    disclosures = "\n".join(
+        f"{label}: {text}"
+        for label, text in ((dd.rw_label, dd.rw_disclosure), (dd.ro_label, dd.ro_disclosure))
+        if text
+    )
+    if disclosures:
+        access_text += f"\n\n{disclosures}"
+    if platform in ("linux", "wsl") and dd.linux_owner_note:
+        access_text += f"\n\n{dd.linux_owner_note}"
+
+    folder = state.documents_dir
+    typed = default_dir
+    step = "dir" if ask_dir else "access"
+    while True:
+        if step == "dir":
+            value, action = _text(
+                title="Cremind · Documents folder",
+                text=dir_text,
+                default=typed,
+                validator=validate_documents_dir,
+                allow_back=ctx.can_go_back,
+            )
+            if action != "advance":
+                return state, action
+            typed = value or ""
+            folder = normalize_documents_dir(typed)
+            if not ask_access:
+                return replace(state, documents_dir=folder), "advance"
+            step = "access"
+            continue
+
+        access, action = _radio(
+            title="Cremind · Documents access",
+            text=access_text,
+            values=[("rw", dd.rw_label), ("ro", dd.ro_label)],
+            default=default_access,
+            allow_back=ask_dir or ctx.can_go_back,
+        )
+        if action == "cancel":
+            return state, "cancel"
+        if action == "back":
+            if ask_dir:
+                step = "dir"  # re-show the folder with what was typed
+                continue
+            return state, "back"
+        return (
+            replace(state, documents_dir=folder, documents_access=access or "rw"),
+            "advance",
+        )
+
+
 def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
     version_label = state.version_spec or "(latest on channel)"
     if state.channel == "dev":
@@ -1190,6 +1415,12 @@ def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
                 "VNC password",
                 "********" if state.vnc_password else "(keep existing)",
             ))
+    if state.mode == "docker":
+        access = "read-only" if state.documents_access == "ro" else "read-write"
+        rows.append((
+            "Documents",
+            f"{state.documents_dir or '(installer default)'} ({access})",
+        ))
     if state.mode == "kubernetes":
         rows.append(
             ("App URL", state.k8s_app_url or "(auto: http(s)://localhost:1515)")
@@ -1253,6 +1484,9 @@ class Context:
     ssl_inherited: bool = False
     native_env: str = ""
     docker_env: str = ""
+    # The folder the shell would use if nobody answered: prefills the
+    # documents screen. Context only — never written back.
+    documents_default: str = ""
     # Set by the driver before each screen call: True when there is a previous
     # *prompted* screen to return to. Screens forward it as ``allow_back``.
     can_go_back: bool = False
@@ -1291,6 +1525,7 @@ _SCREENS: list[Callable[[TuiResult, Context], ScreenResult]] = [
     screen_custom_fields,
     screen_desktop,
     screen_vnc_password,
+    screen_documents,
     screen_ssl,
     screen_k8s_advanced,
     screen_k8s_fields,
@@ -1312,6 +1547,7 @@ def run(
     ssl_inherited: bool = False,
     native_env: str = "",
     docker_env: str = "",
+    documents_default: str = "",
 ) -> TuiResult | None:
     """Drive the screen list; return the final TuiResult or ``None`` on cancel.
 
@@ -1334,6 +1570,7 @@ def run(
         ssl_inherited=ssl_inherited,
         native_env=native_env,
         docker_env=docker_env,
+        documents_default=documents_default,
     )
     state = initial
     cursor = 0

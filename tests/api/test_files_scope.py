@@ -23,6 +23,7 @@ tree never followed the seat's agent.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ import pytest
 pytest.importorskip("a2a")
 
 from app.api import files as files_api  # noqa: E402
+from app.config import working_dirs  # noqa: E402
 from app.utils.context_storage import (  # noqa: E402
     clear_context,
     get_context,
@@ -116,7 +118,11 @@ def _setup(tmp_path, monkeypatch) -> _FakeStorage:
     system_dir.mkdir()
     user_dir.mkdir()
     monkeypatch.setattr(files_api.BaseConfig, "CREMIND_SYSTEM_DIR", str(system_dir))
-    monkeypatch.setattr(files_api, "get_user_working_directory", lambda: str(user_dir))
+    monkeypatch.setattr(files_api, "get_user_working_directory", lambda profile: str(user_dir))
+    # No profile rows: no path is anyone's working directory here (the
+    # working-directory rule has its own suite, test_files_working_dirs.py).
+    monkeypatch.setattr(importlib.import_module("app.config.settings"), "_dynamic_config_storage", None)
+    working_dirs.invalidate()
 
     storage = _FakeStorage({SEAT_ROW: {
         "id": SEAT_ROW, "context_id": SEAT_CONTEXT, "profile": "member",

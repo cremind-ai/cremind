@@ -370,3 +370,10 @@ def test_an_ordinary_conversation_posts_nothing_to_any_room(tmp_path, monkeypatc
         assert calls == []
 
     asyncio.run(scenario())
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

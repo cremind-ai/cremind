@@ -203,6 +203,14 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
 # or in Cremind's own terminal all land in the same place and persist. These
 # name the SHARED server login; per-profile logins live under
 # <CREMIND_SYSTEM_DIR>/<profile>/coding-cli/ and need no variable.
+#
+# ``HF_HOME`` / ``SENTENCE_TRANSFORMERS_HOME`` do the same for the local
+# embedding models (multilingual-e5, EmbeddingGemma) that sentence-transformers
+# downloads on first use. Their default, ~/.cache/huggingface, is in the
+# writable layer too, so every recreate re-downloaded hundreds of MB before
+# document search could embed anything. Under <system dir>/.cache they persist
+# with the rest of the system volume, and backups skip them (a download, not
+# user data).
 ENV PATH="/opt/cremind/venv/bin:${PATH}" \
     CREMIND_SYSTEM_DIR=/root/.cremind \
     CREMIND_UI_PORT=1515 \
@@ -210,7 +218,9 @@ ENV PATH="/opt/cremind/venv/bin:${PATH}" \
     PORT=1112 \
     CLAUDE_CONFIG_DIR=/root/.cremind/coding-cli/claude \
     CODEX_HOME=/root/.cremind/coding-cli/codex \
-    PLAYWRIGHT_BROWSERS_PATH=/root/.cremind/playwright-browsers
+    PLAYWRIGHT_BROWSERS_PATH=/root/.cremind/playwright-browsers \
+    HF_HOME=/root/.cremind/.cache/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/root/.cremind/.cache/sentence-transformers
 
 WORKDIR /root/.cremind
 

@@ -7,7 +7,12 @@
 
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
-import { setConversationCwd, DirectoryAccessError } from '../services/filesApi';
+import {
+  setConversationCwd,
+  DirectoryAccessError,
+  FOREIGN_WORKSPACE_MESSAGE,
+  isForeignWorkspaceError,
+} from '../services/filesApi';
 
 export interface NavigateResult {
   ok: boolean;
@@ -18,9 +23,10 @@ export function useCwdNavigation() {
   const settings = useSettingsStore();
   const panel = useTerminalPanelStore();
 
-  // Is ``target`` within the pinned user working root? Used as the no-
-  // conversation navigation floor. Fails open when the root is unknown
-  // (pre-seed) — the backend still enforces the real allowlist.
+  // Is ``target`` within the pinned working root (the signed-in profile's own
+  // working directory)? Used as the no-conversation navigation floor. Fails
+  // open when the root is unknown (pre-seed) — the backend still enforces the
+  // real allowlist.
   function isWithinRoot(target: string): boolean {
     const root = panel.userWorkingRoot;
     if (!root || target === root) return true;
@@ -31,9 +37,11 @@ export function useCwdNavigation() {
 
   // Whether the panel may navigate to ``target``. With an active conversation
   // the backend widens its read allowlist via the per-conversation cwd
-  // override, so anywhere reachable on disk is fair game. Without one there's
-  // no override to set, so navigation must stay inside the user working dir
-  // (an allowed base) or the backend would 403 and strand the tree.
+  // override, so anywhere reachable on disk is fair game — except another
+  // profile's working directory, which the backend refuses (POST /cwd 403s
+  // and navigate() rolls back). Without one there's no override to set, so
+  // navigation must stay inside the profile's working dir (an allowed base)
+  // or the backend would 403 and strand the tree.
   function canNavigateTo(target: string): boolean {
     if (panel.scopeConversationId) return true;
     return isWithinRoot(target);
@@ -75,8 +83,9 @@ export function useCwdNavigation() {
     } catch (e: unknown) {
       // Roll back the optimistic update.
       panel.setConversationCwd(conversationId, previous);
-      const message =
-        e instanceof DirectoryAccessError
+      const message = isForeignWorkspaceError(e)
+        ? FOREIGN_WORKSPACE_MESSAGE
+        : e instanceof DirectoryAccessError
           ? e.message
           : (e as Error)?.message || 'Failed to change directory';
       return { ok: false, error: message };

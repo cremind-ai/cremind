@@ -202,7 +202,7 @@ def test_adapter_request_auto_recovers_end_to_end(tmp_path, monkeypatch):
     _set_home(monkeypatch, home)
     # First-run cwd is a controlled temp Documents (not the target), so the
     # out-of-sandbox target is denied before recovery kicks in.
-    monkeypatch.setattr(adapter_mod, "get_user_working_directory", lambda: str(documents))
+    monkeypatch.setattr(adapter_mod, "get_user_working_directory", lambda *a, **k: str(documents))
 
     class FakeConvStorage:
         def __init__(self):
@@ -255,3 +255,10 @@ def test_switch_conversation_cwd_sets_and_persists(tmp_path):
         assert storage.calls == [(cid, {"working_directory": str(d)})]
     finally:
         clear_context(cid, WORKING_DIR_OVERRIDE_KEY)
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

@@ -30,6 +30,20 @@ ssl = false
 api_key = ""
 persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/storage/chroma when blank
 
+[documentation_search]
+# Documentation search — the admin gate. Server-wide because the embedding
+# model and vector store are; each profile then opts in on its own My
+# Documents page. Written via PUT /api/documentation-search/admin (app/documents/settings.py),
+# never via the embedding PUT, which would force a chat-blocking rebuild.
+allowed = false
+storage_budget_mb = 10240        # all profiles' indexes together (vectors + text)
+per_profile_budget_mb = 0        # 0 = no per-profile cap, only the global budget
+vision_daily_cap_default = 1000  # photos/scans captioned per profile per day
+max_file_mb = 100                # larger files are indexed by metadata only
+workers = 2                      # extraction subprocesses shared by all profiles
+vector_capacity_mb = 0           # external/K8s vector store size; 0 = measure
+db_capacity_mb = 0               # external/K8s database size; 0 = measure
+
 [llm]
 # Provider and model groups are configured via the setup wizard (stored in SQLite).
 # No defaults — setup must be completed first.

@@ -1,16 +1,25 @@
 import socket
-from typing import Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import qdrant_client
 from qdrant_client.http.models import (
+    Batch,
     PointStruct,
     Filter,
     FieldCondition,
+    HnswConfigDiff,
     MatchValue,
     MatchAny,
     FilterSelector,
+    PayloadSchemaType,
     PointIdsList,
+    QuantizationSearchParams,
+    Range,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
     SearchParams,
+    WalConfigDiff,
 )
 from qdrant_client.models import Distance, VectorParams
 from requests.exceptions import ConnectionError, ConnectTimeout
@@ -20,6 +29,9 @@ from app.config.settings import BaseConfig
 from app.constants.status import Status
 from app.lib.exception import VectorStoreException
 from .base import VectorStoreBase, EmbeddingProvider, StoredPoint
+
+if TYPE_CHECKING:
+    from app.documents.vectors import VectorFilter
 
 
 class QdrantException(VectorStoreException):
@@ -44,9 +56,22 @@ def _build_qdrant_client():
     )
 
 
+# Points per request for the pre-embedded primitives: 256 × 768 floats is a
+# few MB of JSON, well under the server's default 32 MB request limit.
+_UD_BATCH = 256
+
+
+def _already_exists(e: Exception) -> bool:
+    # Server: 409 "Collection `x` already exists!"; local mode: ValueError
+    # "Collection x already exists". Both mean another writer won the race.
+    return "already exists" in str(e).lower()
+
+
 class QdrantClient(VectorStoreBase):
-    def __init__(self, size: int):
-        self._client = _build_qdrant_client()
+    def __init__(self, size: int, client: Any = None):
+        # ``client`` injects a ready ``qdrant_client.QdrantClient`` (tests use
+        # ``location=":memory:"``); production builds one from config.
+        self._client = client if client is not None else _build_qdrant_client()
         self.size = size
         self._text_key = qdrant_text_key
 
@@ -363,3 +388,199 @@ class QdrantClient(VectorStoreBase):
             payload["score"] = r.score
             out.append(payload)
         return out
+
+    # ── Pre-embedded primitives (Documentation search) ──────────────────────
+    #
+    # Contract in VectorStoreBase. These call the client directly rather than
+    # through the tenacity ``_safe_*`` wrappers: those retry for up to ~6 s on
+    # ANY error and then raise ``RetryError``, whose message no longer says
+    # "No space left on device" — the one error the storage governor must see.
+    # The documents engine has its own backoff.
+
+    @staticmethod
+    def _err(e: Exception) -> QdrantException:
+        return QdrantException(Status.VECTOR_STORE_ERROR, str(e))
+
+    def ensure_collection(
+        self,
+        name: str,
+        dim: int,
+        *,
+        payload_indexes: Optional[Dict[str, str]] = None,
+    ) -> str:
+        try:
+            # Raises when Qdrant is unreachable — which must never read as
+            # "missing" and lead to a create over live data.
+            names = self.list_collections()
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        if name in names:
+            result = "present"
+        else:
+            try:
+                self._client.create_collection(
+                    collection_name=name,
+                    # Vectors on disk; the int8 copy below stays in RAM for
+                    # the HNSW walk and search rescores from disk. Saves RAM,
+                    # not disk — the governor budgets for both.
+                    vectors_config=VectorParams(size=int(dim), distance=Distance.COSINE, on_disk=True),
+                    hnsw_config=HnswConfigDiff(m=16, ef_construct=100),
+                    quantization_config=ScalarQuantization(
+                        scalar=ScalarQuantizationConfig(
+                            type=ScalarType.INT8, quantile=0.99, always_ram=True,
+                        ),
+                    ),
+                    # The default 32 MB WAL per collection adds up across
+                    # profiles and model generations; our batches are small.
+                    wal_config=WalConfigDiff(wal_capacity_mb=8),
+                    on_disk_payload=True,
+                )
+                result = "created"
+            except Exception as e:  # noqa: BLE001
+                if not _already_exists(e):
+                    raise self._err(e) from e
+                result = "present"
+        if payload_indexes:
+            # Checked on "present" too: a crash between create and the index
+            # calls leaves a collection without them, and this repairs it.
+            self._ensure_payload_indexes(name, payload_indexes)
+        return result
+
+    def _ensure_payload_indexes(self, name: str, wanted: Dict[str, str]) -> None:
+        schemas = {field: PayloadSchemaType(kind) for field, kind in wanted.items()}
+        try:
+            info = self._client.get_collection(name)
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        have = set((getattr(info, "payload_schema", None) or {}).keys())
+        for field, schema in schemas.items():
+            if field in have:
+                continue
+            try:
+                self._client.create_payload_index(
+                    collection_name=name, field_name=field, field_schema=schema,
+                )
+            except Exception as e:  # noqa: BLE001
+                if not _already_exists(e):
+                    raise self._err(e) from e
+
+    def upsert_vectors(
+        self,
+        name: str,
+        ids: List[int],
+        vectors: List[List[float]],
+        payloads: List[Dict[str, Any]],
+    ) -> None:
+        if not (len(ids) == len(vectors) == len(payloads)):
+            raise ValueError(
+                f"upsert_vectors: {len(ids)} ids, {len(vectors)} vectors, "
+                f"{len(payloads)} payloads"
+            )
+        for i in range(0, len(ids), _UD_BATCH):
+            batch = Batch(
+                ids=[int(x) for x in ids[i:i + _UD_BATCH]],
+                vectors=[
+                    v if isinstance(v, list) else [float(x) for x in v]
+                    for v in vectors[i:i + _UD_BATCH]
+                ],
+                payloads=[dict(p or {}) for p in payloads[i:i + _UD_BATCH]],
+            )
+            try:
+                # wait=True: the write path marks rows embedded right after
+                # this returns, so the points must be applied by then.
+                self._client.upsert(collection_name=name, points=batch, wait=True)
+            except Exception as e:  # noqa: BLE001
+                raise self._err(e) from e
+
+    def retrieve_vectors(self, name: str, ids: List[int]) -> Dict[int, List[float]]:
+        out: Dict[int, List[float]] = {}
+        for i in range(0, len(ids), _UD_BATCH):
+            try:
+                # Returns the original float vectors, not the int8 copy.
+                records = self._client.retrieve(
+                    collection_name=name,
+                    ids=[int(x) for x in ids[i:i + _UD_BATCH]],
+                    with_payload=False,
+                    with_vectors=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                raise self._err(e) from e
+            for r in records:
+                if isinstance(r.vector, list):
+                    out[int(r.id)] = [float(x) for x in r.vector]
+        return out
+
+    def delete_ids(self, name: str, ids: List[int]) -> None:
+        for i in range(0, len(ids), 1000):
+            try:
+                self._client.delete(
+                    collection_name=name,
+                    points_selector=PointIdsList(points=[int(x) for x in ids[i:i + 1000]]),
+                    wait=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                raise self._err(e) from e
+
+    def scroll_ids(
+        self, name: str, offset: Any = None, limit: int = 1000,
+    ) -> Tuple[List[int], Any]:
+        try:
+            records, next_offset = self._client.scroll(
+                collection_name=name,
+                offset=offset,
+                limit=max(1, int(limit)),
+                with_payload=False,
+                with_vectors=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        return [int(r.id) for r in records], next_offset
+
+    def count(self, name: str) -> int:
+        try:
+            return int(self._client.count(collection_name=name, exact=True).count)
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+
+    @staticmethod
+    def _ud_filter(filt: Optional["VectorFilter"]) -> Optional[Filter]:
+        if filt is None:
+            return None
+        must = []
+        for key, op, value in filt.conditions():
+            if op == "in":
+                must.append(FieldCondition(key=key, match=MatchAny(any=value)))
+            elif op == "range":
+                lo, hi = value
+                must.append(FieldCondition(key=key, range=Range(gte=lo, lte=hi)))
+            else:  # pragma: no cover — VectorFilter emits only the two above
+                raise ValueError(f"unsupported filter op {op!r}")
+        return Filter(must=must) if must else None
+
+    def query_vectors(
+        self,
+        name: str,
+        vector: List[float],
+        k: int,
+        filt: Optional["VectorFilter"] = None,
+    ) -> List[Tuple[int, float]]:
+        if k <= 0 or (filt is not None and filt.matches_nothing):
+            return []
+        try:
+            response = self._client.query_points(
+                collection_name=name,
+                query=list(vector),
+                query_filter=self._ud_filter(filt),
+                # The HNSW walk runs on the int8 copy; rescoring 2× the
+                # candidates against the full vectors recovers the precision.
+                search_params=SearchParams(
+                    hnsw_ef=max(128, int(k)),
+                    quantization=QuantizationSearchParams(rescore=True, oversampling=2.0),
+                ),
+                limit=int(k),
+                with_payload=False,
+                with_vectors=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise self._err(e) from e
+        return [(int(p.id), float(p.score)) for p in response.points]

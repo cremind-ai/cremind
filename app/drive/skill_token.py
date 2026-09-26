@@ -28,6 +28,9 @@ _FILES_ENDPOINT = "https://www.googleapis.com/drive/v3/files"
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 LEGACY_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+# Read access to every file, from a bring-your-own client's GOOGLE_SCOPES:
+# whole-Drive for reading (and so for document indexing), per-file for writes.
+DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
 SKILL_DIR_NAME = "gdrive"
 _TOKEN_REL = Path("scripts") / ".google_token.json"
@@ -46,7 +49,22 @@ _access_cache: Dict[str, Dict[str, Any]] = {}
 
 
 class DriveTokenError(RuntimeError):
-    pass
+    """A token could not be produced. ``kind`` says what the caller may do:
+
+    - ``unlinked``           no token file (possibly a read landing mid-swap)
+    - ``auth_revoked``       Google refused the refresh token (``invalid_grant``),
+                             or there is none: only a re-link fixes it
+    - ``auth_misconfigured`` the token endpoint refused the OAuth client itself
+                             (``invalid_client``, ``unauthorized_client``, other 4xx)
+    - ``unreachable``        network, 5xx, or an unusable answer: try again later
+
+    Callers used to tell these apart by message text; the messages are kept
+    as they were, since people read them.
+    """
+
+    def __init__(self, message: str, *, kind: str = "unreachable") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 def skill_dir(profile: str) -> Optional[Path]:
@@ -191,7 +209,8 @@ def access_model(profile: str, scopes: List[str]) -> Dict[str, str]:
     Returned from here rather than phrased separately by the CLI, the settings
     page, and the API, so the three cannot describe the same account differently.
     """
-    if LEGACY_DRIVE_SCOPE not in set(scopes):
+    granted = set(scopes)
+    if LEGACY_DRIVE_SCOPE not in granted and DRIVE_READONLY_SCOPE not in granted:
         return {
             "access_model": "per-file (granted files + files Cremind created)",
             "access_note": "",
@@ -200,6 +219,14 @@ def access_model(profile: str, scopes: List[str]) -> Dict[str, str]:
         why = "your own Google credentials"
     else:
         why = "the shared Cremind client still requests it"
+    if LEGACY_DRIVE_SCOPE not in granted:
+        return {
+            "access_model": f"whole-Drive, read-only ({why})",
+            "access_note": (
+                "Every file in this Drive can be read; granting a file still lets Cremind "
+                "change it."
+            ),
+        }
     return {
         "access_model": f"whole-Drive ({why})",
         "access_note": (
@@ -228,7 +255,8 @@ def status(profile: str) -> Dict[str, Any]:
         "expected_scopes": want or list(DRIVE_SCOPES_FALLBACK),
         "expected_resolved": want is not None,
         "scopes_stale": scopes_are_stale(scopes, want),
-        "whole_drive": LEGACY_DRIVE_SCOPE in set(scopes),
+        # Whole-Drive for reading: what document indexing cares about.
+        "whole_drive": bool({LEGACY_DRIVE_SCOPE, DRIVE_READONLY_SCOPE} & set(scopes)),
         **access_model(profile, scopes),
     }
 
@@ -241,7 +269,10 @@ def _refresh(profile: str, data: Dict[str, Any]) -> str:
         "client_secret": data.get("client_secret", ""),
     }
     if not payload["refresh_token"]:
-        raise DriveTokenError("the linked Google account has no refresh token; re-link the gdrive skill")
+        raise DriveTokenError(
+            "the linked Google account has no refresh token; re-link the gdrive skill",
+            kind="auth_revoked",
+        )
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.post(TOKEN_ENDPOINT, data=payload)
@@ -252,14 +283,27 @@ def _refresh(profile: str, data: Dict[str, Any]) -> str:
         if "invalid_grant" in body:
             raise DriveTokenError(
                 "Google rejected the stored refresh token. Re-link the gdrive skill, "
-                "then grant files again."
+                "then grant files again.",
+                kind="auth_revoked",
             ) from exc
-        raise DriveTokenError(f"could not refresh the Google access token: {exc}") from exc
+        status = exc.response.status_code if exc.response is not None else 0
+        # A 4xx other than a timeout or throttle is Google refusing the OAuth
+        # client (deleted, rotated, wrong secret): waiting will not fix it, so
+        # it must not look like an outage.
+        misconfigured = 400 <= status < 500 and status not in (408, 429)
+        raise DriveTokenError(
+            f"could not refresh the Google access token: {exc}",
+            kind="auth_misconfigured" if misconfigured else "unreachable",
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise DriveTokenError(f"could not refresh the Google access token: {exc}") from exc
-    access = tok.get("access_token")
+        raise DriveTokenError(
+            f"could not refresh the Google access token: {exc}", kind="unreachable"
+        ) from exc
+    access = tok.get("access_token") if isinstance(tok, dict) else None
     if not access:
-        raise DriveTokenError("Google's refresh response contained no access token")
+        raise DriveTokenError(
+            "Google's refresh response contained no access token", kind="unreachable"
+        )
     _access_cache[profile] = {
         "token": access,
         "expiry": time.time() + int(tok.get("expires_in", 3600)),
@@ -278,18 +322,29 @@ def forget_access_token(profile: str) -> None:
     _access_cache.pop(profile, None)
 
 
-def access_token(profile: str) -> str:
-    """A usable access token for ``profile``, refreshed in memory as needed."""
-    cached = _access_cache.get(profile)
-    if cached and time.time() < float(cached.get("expiry", 0)) - 60:
-        return str(cached["token"])
+def access_token(profile: str, *, force_refresh: bool = False) -> str:
+    """A usable access token for ``profile``, refreshed in memory as needed.
+
+    ``force_refresh`` skips both the cache and the file's stored token and asks
+    Google for a new one. It exists for the 401 case: a grant revoked at Google
+    leaves both copies looking unexpired, so without it a retry would resend the
+    same dead token for up to an hour — and only a real refresh can say whether
+    the grant is gone (``invalid_grant``) or the token merely went stale.
+    """
+    if force_refresh:
+        _access_cache.pop(profile, None)
+    else:
+        cached = _access_cache.get(profile)
+        if cached and time.time() < float(cached.get("expiry", 0)) - 60:
+            return str(cached["token"])
     data = read_token(profile)
     if not data:
-        raise DriveTokenError("the gdrive skill is not linked to a Google account")
-    stored_expiry = float(data.get("expiry") or 0)
-    stored = data.get("access_token")
-    if stored and time.time() < stored_expiry - 60:
-        return str(stored)
+        raise DriveTokenError("the gdrive skill is not linked to a Google account", kind="unlinked")
+    if not force_refresh:
+        stored_expiry = float(data.get("expiry") or 0)
+        stored = data.get("access_token")
+        if stored and time.time() < stored_expiry - 60:
+            return str(stored)
     return _refresh(profile, data)
 
 
@@ -328,7 +383,7 @@ def list_files(
             resp.raise_for_status()
             payload = resp.json()
     except Exception as exc:  # noqa: BLE001
-        raise DriveTokenError(f"Drive list failed: {exc}") from exc
+        raise DriveTokenError(f"Drive list failed: {exc}", kind="unreachable") from exc
 
     provenance = {entry.get("id"): entry for entry in read_grants(profile)}
     files = []

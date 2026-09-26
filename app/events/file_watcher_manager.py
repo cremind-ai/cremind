@@ -4,7 +4,8 @@ A single watchdog ``Observer`` is mounted per (profile, root_path, recursive)
 key. Multiple subscriptions on the same root share one Observer; each
 incoming watchdog event is filtered per-subscription (target_kind,
 event_types, extensions) before being fanned out to the per-conversation
-queue.
+queue. An event for a path inside ANOTHER profile's working directory never
+reaches the watching profile (:func:`_foreign_to`) — the admin is not exempt.
 
 Watchdog callbacks run on a watchdog thread; we bridge into the asyncio
 loop via :func:`asyncio.AbstractEventLoop.call_soon_threadsafe` so the queue
@@ -78,6 +79,30 @@ def _normalize_path(p: str) -> str:
 def _matches_ignore(path: str) -> bool:
     name = os.path.basename(path)
     return any(fnmatch.fnmatch(name, pat) for pat in _IGNORE_PATTERNS)
+
+
+def _foreign_to(path: str, profile: str) -> bool:
+    """Whether ``path`` lies in another profile's working directory (or an
+    unowned workspaces entry), so ``profile``'s watchers must not see it.
+
+    Registration already refuses a root inside another profile's folder, but
+    a watcher on a PARENT still sees a child that is someone else's — the
+    admin whose folder holds the workspaces root, or a folder the admin moved
+    since. :func:`app.config.working_dirs.is_foreign` caches the ownership
+    snapshot for a few seconds, so this costs a ``realpath`` per event. A
+    failed check drops the event (fail closed) rather than leak it."""
+    if not path:
+        return False
+    try:
+        from app.config.working_dirs import is_foreign
+
+        return is_foreign(path, profile)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            f"FileWatcherManager: ownership check failed for {path!r}; event dropped",
+            exc_info=True,
+        )
+        return True
 
 
 def _watchdog_event_type(event: FileSystemEvent) -> Optional[str]:
@@ -180,6 +205,19 @@ class _SharedHandler(FileSystemEventHandler):
                 self._debounce = {
                     k: v for k, v in self._debounce.items() if v >= cutoff
                 }
+
+        # Another profile's working directory under this root is not this
+        # profile's to watch (after the debounce, so a burst is checked once).
+        # A move across that boundary reads as the half this profile may see:
+        # out of its view is a delete, into it a create.
+        src_foreign = _foreign_to(src_path, self._profile)
+        dest_foreign = bool(dest_path) and _foreign_to(dest_path, self._profile)
+        if src_foreign and (dest_foreign or not dest_path):
+            return
+        if src_foreign:
+            event_type, src_path, dest_path = "created", dest_path, ""
+        elif dest_foreign:
+            event_type, dest_path = "deleted", ""
 
         is_directory = bool(getattr(event, "is_directory", False))
         target_kind = "folder" if is_directory else "file"

@@ -595,7 +595,7 @@ def test_profile_create_stays_pipe_clean_and_points_at_the_wizard(
         async def __aexit__(self, *_exc):
             return False
 
-    async def _create(_client, _name):
+    async def _create(_client, _name, _working_dir=None):
         return None
 
     monkeypatch.setattr(base, "Client", lambda _cfg, **_kw: _FakeClient())

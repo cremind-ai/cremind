@@ -136,6 +136,26 @@
     console this flag wins, else the previous install's password is kept, else
     one is generated and printed at the end.
 
+.PARAMETER DocumentsDir
+    (Docker mode) The folder on this machine the container sees as
+    /root/Documents. Each profile's working directory (where its agent works
+    and what its document search indexes) is
+    <folder>\cremind-workspaces\<profile>; an install that predates
+    per-profile folders keeps the admin on the
+    folder itself. Created if missing. A leading ~ is expanded, a relative
+    path is made absolute, and the path is written with forward slashes; $, #, double
+    quotes and leading/trailing whitespace are refused (compose's .env would
+    mangle them). Default: $env:CREMIND_DOCUMENTS_DIR, else the previous
+    install's folder, else your Documents folder as Windows reports it (which
+    follows OneDrive redirection). Interactive installs ask.
+
+.PARAMETER DocumentsAccess
+    (Docker mode) 'rw' or 'ro'. Mount that folder read-write (default; the
+    agent's file tools change your real files) or read-only (the agent cannot
+    save there; the profiles' working directories then live in the
+    cremind-data volume instead). Default: $env:CREMIND_DOCUMENTS_ACCESS,
+    else the previous install's choice, else rw.
+
 .PARAMETER BootService
     Register a Scheduled Task that starts Cremind at logon and restarts it if
     it stops. Default: on for native installs, which is also what makes the
@@ -199,7 +219,16 @@
 
 .PARAMETER Purge
     (with -Uninstall) Wipe both System Dir and Install Dir. For docker
-    installs, also runs ``docker compose down -v`` to drop volumes.
+    installs, also runs ``docker compose down -v`` to drop volumes. Keeps the
+    profiles' working directories (the workspaces folder: <System Dir>\
+    workspaces or $env:CREMIND_WORKSPACES_DIR, and a Docker install's
+    <documents>\cremind-workspaces) and says where; folders an admin chose
+    elsewhere are never touched.
+
+.PARAMETER PurgeWorkspaces
+    (with -Uninstall; implies -Purge) Delete the workspaces folder too. Asks
+    to confirm in an interactive console; without one (or with -Unattended)
+    the switch is the confirmation.
 
 .NOTES
     Service selection (database backend, vector store backend, …) is no
@@ -247,6 +276,13 @@ param(
     # / no console — keep the previous install's password, else generate one.
     # 6-8 characters from [A-Za-z0-9@%_+=:,.-]; see $VncPasswordRe below.
     [string] $VncPassword = '',
+    # Docker mode only: the host folder mounted at /root/Documents, and how.
+    # Empty = $env:CREMIND_DOCUMENTS_DIR / _ACCESS, else ask, else the previous
+    # install's value, else the default. Both are TUI output keys too (read
+    # back by the whitelist in Invoke-InstallerTuiBootstrap), which is why
+    # the ValidateSet on the access matters.
+    [string] $DocumentsDir = '',
+    [ValidateSet('','rw','ro')] [string] $DocumentsAccess = '',
     # Register a logon Scheduled Task that starts and supervises the server?
     # Neither set = on for native installs, unless a previous install opted
     # out. Setting both is an error. See the ── boot service ── section.
@@ -267,6 +303,8 @@ param(
     [switch] $Uninstall,
     [switch] $Keep,
     [switch] $Purge,
+    # With -Purge: delete the profiles' working directories too (kept by default).
+    [switch] $PurgeWorkspaces,
     # Skip the prompt_toolkit TUI bootstrap and fall back to the legacy
     # numbered prompts. CI/debugging only — interactive users benefit
     # from the TUI's keyboard navigation and version picker.
@@ -381,13 +419,23 @@ function Write-Utf8NoBomFile {
 # Detection: $InstallDir\docker\docker-compose.yml -> Docker; else
 #            $SystemDir\venv -> Native; else partial-install -> Native.
 #
-# The User Working Directory (server_config.user_working_dir, picked in
-# the Setup Wizard) is NEVER touched directly. When it resolves inside
-# the System Dir (typical default), it goes with -Purge along with the
-# rest of the System Dir.
+# The profiles' working directories. Each profile's default folder lives in
+# the workspaces folder - $env:CREMIND_WORKSPACES_DIR, else
+# <System Dir>\workspaces (native), and <documents folder>\cremind-workspaces
+# for a Docker install - which -Purge KEEPS (everything else goes) unless
+# -PurgeWorkspaces. The Docker name is not plain "workspaces": the user's own
+# <documents folder>\workspaces is theirs, and -PurgeWorkspaces must never
+# delete it. A folder an admin chose for a profile elsewhere
+# (profiles.working_dir; before per-profile folders,
+# server_config.user_working_dir) is NEVER touched; when it resolves inside
+# the System Dir, -Purge takes it along with the rest of the System Dir.
 if ($Uninstall) {
     if ($Keep -and $Purge) {
         Write-Host "Pass at most one of -Keep / -Purge." -ForegroundColor Red
+        exit 2
+    }
+    if ($Keep -and $PurgeWorkspaces) {
+        Write-Host "-PurgeWorkspaces deletes the profiles' working directories; it cannot be combined with -Keep." -ForegroundColor Red
         exit 2
     }
     # ErrorActionPreference is 'Stop' from the install path; the uninstall
@@ -456,11 +504,103 @@ if ($Uninstall) {
         exit 1
     }
 
-    # Resolve mode (flag or interactive).
+    # Resolve mode (flag or interactive). -PurgeWorkspaces is a purge that
+    # deletes the working directories too.
     $UninstallMode = ''
-    if ($Purge) { $UninstallMode = 'purge' }
+    if ($Purge -or $PurgeWorkspaces) { $UninstallMode = 'purge' }
     elseif ($Keep) { $UninstallMode = 'keep' }
+    $DeleteWorkspaces = [bool]$PurgeWorkspaces
 
+    # An absolute, separator-trimmed spelling of a stored or configured path
+    # (~ expanded); '' for ''.
+    function Get-UninstallFullPath([string]$Path) {
+        if (-not $Path) { return '' }
+        $p = $Path.Trim()
+        if ($p -eq '~') { $p = $env:USERPROFILE }
+        elseif ($p.StartsWith('~/') -or $p.StartsWith('~\')) { $p = Join-Path $env:USERPROFILE $p.Substring(2) }
+        try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+        $trimmed = $p.TrimEnd('\', '/')
+        if ($trimmed -match '^[A-Za-z]:$') { return $trimmed + '\' }
+        return $trimmed
+    }
+    # $Child equals $Parent or lies inside it (case-insensitive, no resolving).
+    function Test-UninstallPathInside([string]$Child, [string]$Parent) {
+        $c = Get-UninstallFullPath $Child
+        $p = Get-UninstallFullPath $Parent
+        if (-not $c -or -not $p) { return $false }
+        if ($c -ieq $p) { return $true }
+        $prefix = $p.TrimEnd('\') + '\'
+        return $c.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    }
+    # Remove $Dir except $Keep, a path inside it that stays where it is with
+    # its parent folders; every sibling on the way down to $Keep goes. A $Keep
+    # that is empty, missing or outside $Dir removes $Dir whole; $Keep = $Dir
+    # keeps it all. A junction or symlink is removed as a link (never
+    # followed), and one on the way down to $Keep is kept whole.
+    function Remove-TreeExcept([string]$Dir, [string]$Keep) {
+        if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return }
+        $dirFull = Get-UninstallFullPath $Dir
+        $keepFull = Get-UninstallFullPath $Keep
+        if (-not $keepFull -or -not (Test-Path -LiteralPath $keepFull) -or -not (Test-UninstallPathInside $keepFull $dirFull)) {
+            Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction Continue
+            return
+        }
+        if ($keepFull -ieq $dirFull) { return }
+        $cur = $dirFull
+        foreach ($next in ($keepFull.Substring($dirFull.Length) -split '[\\/]')) {
+            if (-not $next) { continue }
+            if ($cur -ne $dirFull) {
+                $curItem = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+                if ($curItem -and ($curItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { break }
+            }
+            foreach ($entry in @(Get-ChildItem -LiteralPath $cur -Force -ErrorAction SilentlyContinue)) {
+                if ($entry.Name -ieq $next) { continue }
+                if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    try { $entry.Delete() } catch { }
+                } else {
+                    Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction Continue
+                }
+            }
+            $cur = Join-Path $cur $next
+        }
+    }
+
+    # Where the working directories are. The native root is a candidate for
+    # every kind (this machine may have run a native install before).
+    $wsNativeRaw = if ($env:CREMIND_WORKSPACES_DIR) { $env:CREMIND_WORKSPACES_DIR } else { Join-Path $UninstallSystemDir 'workspaces' }
+    $UninstallWsNative = Get-UninstallFullPath $wsNativeRaw
+    $UninstallWsDocker = ''
+    $UninstallWsInVolume = $false
+    if ($Kind -eq 'docker') {
+        $wsEnvFile = Join-Path $UninstallInstallDir 'docker\.env'
+        $wsDocs = ''
+        if (Test-Path -LiteralPath $wsEnvFile) {
+            foreach ($line in (Get-Content -LiteralPath $wsEnvFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                $line = $line.TrimStart([char]0xFEFF)
+                if (-not $wsDocs -and $line -like 'CREMIND_HOST_DOCUMENTS=*') {
+                    $wsDocs = $line.Substring('CREMIND_HOST_DOCUMENTS='.Length).Trim()
+                } elseif ($line -like 'CREMIND_DOCKER_WORKSPACES_DIR=?*') {
+                    # A read-only documents mount puts them in the cremind-data volume.
+                    $UninstallWsInVolume = $true
+                }
+            }
+        }
+        if (-not $wsDocs) { $wsDocs = Join-Path $UninstallInstallDir 'docker\documents' }
+        $UninstallWsDocker = Get-UninstallFullPath (Join-Path $wsDocs 'cremind-workspaces')
+    }
+    function Test-UninstallWsPresent {
+        return ((Test-Path -LiteralPath $UninstallWsNative -PathType Container) -or
+                ($UninstallWsDocker -and (Test-Path -LiteralPath $UninstallWsDocker -PathType Container)) -or
+                $UninstallWsInVolume)
+    }
+    function Write-UninstallWsList {
+        foreach ($ws in @($UninstallWsNative, $UninstallWsDocker)) {
+            if ($ws -and (Test-Path -LiteralPath $ws -PathType Container)) { Write-Host "  $ws" }
+        }
+        if ($UninstallWsInVolume) { Write-Host '  (the ones in the cremind-data volume)' }
+    }
+
+    $UninstallAskedWs = $false
     if (-not $UninstallMode) {
         Write-Host ''
         Write-Host "Uninstall Cremind ($Kind):"
@@ -480,6 +620,7 @@ if ($Uninstall) {
                       elseif ($K8sPresent) { ' (incl. the cluster volumes)' }
                       else { '' }
         Write-Host "  [p] Purge all    - delete everything Cremind installed$purgeExtra"
+        Write-Host "                     except the profiles' working directories (asked next)"
         Write-Host '  [c] Cancel'
         Write-Host ''
         $ans = Read-Host -Prompt 'Choose'
@@ -488,22 +629,49 @@ if ($Uninstall) {
             '^[pP]' { $UninstallMode = 'purge' }
             default { Write-Host 'Cancelled.'; exit 0 }
         }
+        if ($UninstallMode -eq 'purge' -and (Test-UninstallWsPresent)) {
+            Write-Host ''
+            Write-Host "The profiles' working directories are kept unless you delete them too:"
+            Write-UninstallWsList
+            $ans = Read-Host -Prompt 'Delete them as well? This cannot be undone. [y/N]'
+            $DeleteWorkspaces = ($ans -match '^(y|yes)$')
+            $UninstallAskedWs = $true
+        }
     }
 
-    # Probe the User Working Directory (best-effort; only when sqlite3.exe
-    # is on PATH). Used only for the post-purge "preserved at..." message.
-    $UserDir = $null
+    # -PurgeWorkspaces asks once more in an interactive console; with no
+    # console (the desktop app, CI) or -Unattended the switch is the
+    # confirmation.
+    $wsCanAsk = (-not $Unattended) -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    if ($UninstallMode -eq 'purge' -and $DeleteWorkspaces -and -not $UninstallAskedWs -and $wsCanAsk -and (Test-UninstallWsPresent)) {
+        Write-Host ''
+        Write-Host "-PurgeWorkspaces deletes every profile's working directory:"
+        Write-UninstallWsList
+        $ans = Read-Host -Prompt 'Type "delete" to confirm; anything else keeps them'
+        if ($ans -ne 'delete') {
+            $DeleteWorkspaces = $false
+            Write-Host 'Keeping the working directories.'
+        }
+    }
+
+    # Folders an admin chose for a profile outside the workspaces folder:
+    # never touched, and named after a purge so nobody wonders where they
+    # went. Best-effort - a native SQLite install, sqlite3.exe on PATH. An
+    # install from before per-profile folders kept its one folder in
+    # server_config.
+    $UninstallChosenDirs = @()
     if ($UninstallMode -eq 'purge') {
         $sqlite = Get-Command sqlite3.exe -ErrorAction SilentlyContinue
-        if ($sqlite) {
-            $dbPath = Join-Path $UninstallSystemDir 'storage\cremind.db'
-            if (Test-Path -LiteralPath $dbPath) {
-                try {
-                    $UserDir = & $sqlite.Source $dbPath "select value from server_config where key='user_working_dir'" 2>$null
-                    $UserDir = ($UserDir | Select-Object -First 1)
-                } catch {
-                    $UserDir = $null
+        $dbPath = Join-Path $UninstallSystemDir 'storage\cremind.db'
+        if ($sqlite -and (Test-Path -LiteralPath $dbPath)) {
+            try {
+                $rows = & $sqlite.Source -separator '|' $dbPath "select name, working_dir from profiles where working_dir is not null and working_dir <> ''" 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    $rows = & $sqlite.Source $dbPath "select 'admin|' || value from server_config where key='user_working_dir'" 2>$null
                 }
+                $UninstallChosenDirs = @($rows | Where-Object { $_ -and $_.Contains('|') })
+            } catch {
+                $UninstallChosenDirs = @()
             }
         }
     }
@@ -646,6 +814,7 @@ if ($Uninstall) {
 
     # Docker container/volume cleanup. Only runs when the daemon is reachable
     # AND the user didn't pick force-remove at the pre-check above.
+    $UninstallWsCopied = ''
     if ($Kind -eq 'docker' -and $dockerInstalled -and -not $forceRemove) {
         $docker = Get-Command docker.exe -ErrorAction SilentlyContinue
         if ($docker -and (Test-Path -LiteralPath (Join-Path $UninstallInstallDir 'docker'))) {
@@ -653,6 +822,18 @@ if ($Uninstall) {
             Push-Location -LiteralPath $DockerDir
             try {
                 if ($UninstallMode -eq 'purge') {
+                    # With a read-only documents folder the working directories
+                    # live in the cremind-data volume, which `down -v` deletes:
+                    # copy them out first so a purge keeps them there too.
+                    if ($UninstallWsInVolume -and -not $DeleteWorkspaces) {
+                        $wsCopy = Join-Path $env:USERPROFILE ('cremind-workspaces-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+                        & $docker.Source compose -p cremind cp 'cremind:/root/.cremind/workspaces' $wsCopy 2>$null | Out-Null
+                        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $wsCopy -PathType Container)) {
+                            $UninstallWsCopied = $wsCopy
+                        } else {
+                            Write-Host 'Could not copy the working directories out of the cremind-data volume; they are removed with it.' -ForegroundColor Yellow
+                        }
+                    }
                     Write-Host 'Stopping containers and removing volumes...'
                     & $docker.Source compose -p cremind down -v --remove-orphans
                 } else {
@@ -797,16 +978,59 @@ if ($Uninstall) {
             Write-Host "Refusing to purge a root-like Install Dir: '$UninstallInstallDir'" -ForegroundColor Red
             exit 1
         }
+        # The workspaces folders survive a purge unless -PurgeWorkspaces:
+        # inside the System / Install Dir everything else there goes around
+        # them; outside, they are simply not touched (or deleted with it).
+        $keepSys = ''
+        $keepInst = ''
+        if (-not $DeleteWorkspaces) {
+            if (Test-UninstallPathInside $UninstallWsNative $UninstallSystemDir) { $keepSys = $UninstallWsNative }
+            if ($UninstallWsDocker -and (Test-UninstallPathInside $UninstallWsDocker $UninstallInstallDir)) { $keepInst = $UninstallWsDocker }
+        }
         if (Test-Path -LiteralPath $UninstallSystemDir) {
-            Remove-Item -LiteralPath $UninstallSystemDir -Recurse -Force -ErrorAction Continue
-            Write-Host "Removed $UninstallSystemDir."
+            Remove-TreeExcept $UninstallSystemDir $keepSys
+            if ($keepSys -and (Test-Path -LiteralPath $keepSys)) {
+                Write-Host "Removed $UninstallSystemDir, except the profiles' working directories."
+            } else {
+                Write-Host "Removed $UninstallSystemDir."
+            }
         }
         if (Test-Path -LiteralPath $UninstallInstallDir) {
-            Remove-Item -LiteralPath $UninstallInstallDir -Recurse -Force -ErrorAction Continue
+            Remove-TreeExcept $UninstallInstallDir $keepInst
             Write-Host "Removed $UninstallInstallDir."
         }
-        if ($UserDir -and ($UserDir -notlike "$UninstallSystemDir*")) {
-            Write-Host "User Working Directory preserved at: $UserDir"
+        foreach ($ws in @($UninstallWsNative, $UninstallWsDocker)) {
+            if (-not $ws -or -not (Test-Path -LiteralPath $ws -PathType Container)) { continue }
+            if ($DeleteWorkspaces) {
+                # Only ever a folder of its own: never a drive root or one that
+                # holds the home folder (a stray CREMIND_WORKSPACES_DIR=~).
+                if (($ws -match '^[A-Za-z]:\\$') -or (Test-UninstallPathInside $env:USERPROFILE $ws)) {
+                    Write-Host "Not deleting ${ws}: it contains your home folder. Delete the working directories in it by hand." -ForegroundColor Yellow
+                    continue
+                }
+                Remove-Item -LiteralPath $ws -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $ws) {
+                    Write-Host "Could not delete everything in $ws; remove what is left by hand." -ForegroundColor Yellow
+                } else {
+                    Write-Host "Removed the profiles' working directories at $ws."
+                }
+            } else {
+                Write-Host "Kept the profiles' working directories at: $ws"
+                Write-Host '  (delete them with -Uninstall -PurgeWorkspaces, or by hand)'
+            }
+        }
+        if ($UninstallWsCopied) {
+            Write-Host "Kept the profiles' working directories (copied out of the cremind-data volume) at: $UninstallWsCopied"
+        }
+        # Folders an admin chose elsewhere, one "name|path" per row.
+        foreach ($row in $UninstallChosenDirs) {
+            $parts = $row.Split([char]'|', 2)
+            $chosen = Get-UninstallFullPath $parts[1]
+            if (-not $chosen) { continue }
+            if (Test-UninstallPathInside $chosen $UninstallSystemDir) { continue }
+            if (Test-UninstallPathInside $chosen $UninstallWsNative) { continue }
+            if ($UninstallWsDocker -and (Test-UninstallPathInside $chosen $UninstallWsDocker)) { continue }
+            Write-Host "Working directory of profile '$($parts[0])' preserved at: $chosen"
         }
     } else {
         # Keep mode: remove venv + bin + install scratch; preserve runtime state.
@@ -829,10 +1053,17 @@ if ($Uninstall) {
         if ($K8sPresent -and (Test-Path -LiteralPath $UninstallK8sEnv)) {
             $K8sKeepText = Get-Content -LiteralPath $UninstallK8sEnv -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         }
-        # Wipe the Install Dir wholesale - it's all install scratch.
+        # Wipe the Install Dir wholesale - it's all install scratch, but for
+        # the working directories a Docker install without a recorded
+        # documents folder keeps in its .\documents fallback.
+        $keepInst = ''
+        if ($UninstallWsDocker -and (Test-UninstallPathInside $UninstallWsDocker $UninstallInstallDir)) { $keepInst = $UninstallWsDocker }
         if (Test-Path -LiteralPath $UninstallInstallDir) {
-            Remove-Item -LiteralPath $UninstallInstallDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-TreeExcept $UninstallInstallDir $keepInst
             Write-Host "Removed install scratch at $UninstallInstallDir."
+        }
+        if ($keepInst -and (Test-Path -LiteralPath $keepInst)) {
+            Write-Host "Kept the profiles' working directories at: $keepInst"
         }
         if ($K8sKeepText) {
             $keepDir = Split-Path -Parent $UninstallK8sEnv
@@ -1045,6 +1276,88 @@ if ($VncPassword -and $VncPassword -notmatch $VncPasswordRe) {
 # The VNC password a previous install left in docker\.env, read before the TUI
 # runs so an empty answer can mean "keep that one" instead of rotating it.
 $PrevVncPassword = ''
+
+# The one rule for a Docker documents folder, mirrored in install.sh
+# (documents_dir_normalize) and app/installer/tui.py.
+#
+# Resolve-DocumentsDir RAW → an object whose Path is RAW as an absolute path
+# with forward slashes, or whose Problem says why RAW cannot be used.
+#
+# The path is appended UNQUOTED to docker\.env as CREMIND_HOST_DOCUMENTS, and
+# compose's .env parser expands $, reads # as a comment, treats " as quoting
+# and trims surrounding whitespace. Escaping would have to match that parser
+# exactly, so those are refused instead — naming the character, because a
+# "valid path" error for a real folder is baffling otherwise. Apostrophes and
+# inner spaces are fine unquoted. The checks run on the RESULT too, since
+# $HOME or the current location can carry the same characters. Forward
+# slashes because the same value is read by the Linux compose CLI inside the
+# container, where a backslash is just a character.
+function Resolve-DocumentsDir {
+    param([AllowEmptyString()][string] $Raw)
+    $charProblem = {
+        param([string] $Text)
+        if ($Text.Contains('$')) { return 'it contains $, which docker compose would expand as a variable' }
+        if ($Text.Contains('#')) { return 'it contains #, which docker compose would read as the start of a comment' }
+        if ($Text.Contains('"')) { return 'it contains a double quote ("), which docker compose would read as quoting' }
+        if ($Text.Contains("`n") -or $Text.Contains("`r")) { return 'it contains a line break' }
+        return ''
+    }
+    $fail = { param([string] $Why) [pscustomobject]@{ Path = ''; Problem = $Why } }
+    if (-not $Raw) { return (& $fail 'it is empty') }
+    if ($Raw -match '^\s' -or $Raw -match '\s$') {
+        return (& $fail 'it starts or ends with whitespace, which docker compose would drop')
+    }
+    if ($Raw.StartsWith('~') -and $Raw -ne '~' -and $Raw -notmatch '^~[\\/]') {
+        return (& $fail '~user paths are not supported; write the full path')
+    }
+    $problem = & $charProblem $Raw
+    if ($problem) { return (& $fail $problem) }
+    $path = $Raw
+    if ($path -eq '~') {
+        $path = $HOME
+    } elseif ($path -match '^~[\\/]') {
+        $path = Join-Path $HOME $path.Substring(2)
+    }
+    try {
+        $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path)
+    } catch {
+        return (& $fail "it is not a usable path ($($_.Exception.Message))")
+    }
+    $path = $path -replace '\\', '/'
+    $problem = & $charProblem $path
+    if ($problem) { return (& $fail $problem) }
+    while ($path.Length -gt 1 -and $path.EndsWith('/') -and $path -notmatch '^[A-Za-z]:/$') {
+        $path = $path.Substring(0, $path.Length - 1)
+    }
+    return [pscustomobject]@{ Path = $path; Problem = '' }
+}
+
+# -DocumentsDir / -DocumentsAccess, else the environment. Checked now, in every
+# mode, like -VncPassword above: an unattended install must fail on a folder
+# it cannot mount rather than write a .env compose misreads. The normalized
+# value is what the TUI is handed, so it sees an absolute path.
+$DocumentsDirSource = '-DocumentsDir'
+if (-not $DocumentsDir -and $env:CREMIND_DOCUMENTS_DIR) {
+    $DocumentsDir = $env:CREMIND_DOCUMENTS_DIR
+    $DocumentsDirSource = 'CREMIND_DOCUMENTS_DIR'
+}
+if ($DocumentsDir) {
+    $docsCheck = Resolve-DocumentsDir $DocumentsDir
+    if ($docsCheck.Problem) {
+        Write-Err2 "Invalid $DocumentsDirSource '$DocumentsDir': $($docsCheck.Problem)"
+        exit 2
+    }
+    $DocumentsDir = $docsCheck.Path
+}
+if (-not $DocumentsAccess -and $env:CREMIND_DOCUMENTS_ACCESS) {
+    if ($env:CREMIND_DOCUMENTS_ACCESS -notin @('rw', 'ro')) {
+        Write-Err2 "Invalid CREMIND_DOCUMENTS_ACCESS: $($env:CREMIND_DOCUMENTS_ACCESS) (must be rw or ro)"
+        exit 2
+    }
+    $DocumentsAccess = $env:CREMIND_DOCUMENTS_ACCESS
+}
+# ValidateSet and -in both ignore case; the TUI's argparse does not.
+$DocumentsAccess = $DocumentsAccess.ToLowerInvariant()
 
 if ($BootService -and $NoBootService) {
     Write-Err2 "-BootService and -NoBootService are mutually exclusive"
@@ -1614,6 +1927,49 @@ if (Test-Path -LiteralPath $prevVncEnv) {
     }
 }
 
+# The documents folder and access a previous Docker install recorded in the
+# same file, read here for the same reason: the TUI and the fallback prompt
+# offer them as the default, and an unattended re-run keeps them. A recorded
+# folder that no longer passes Resolve-DocumentsDir (hand-edited) is dropped
+# with a warning rather than failing a re-install over it.
+$PrevDocumentsDir = ''
+$PrevDocumentsAccess = ''
+if (Test-Path -LiteralPath $prevVncEnv) {
+    foreach ($line in (Get-Content -LiteralPath $prevVncEnv -Encoding UTF8)) {
+        if (-not $PrevDocumentsDir -and $line -like 'CREMIND_HOST_DOCUMENTS=*') {
+            $prevDocsRaw = $line.Substring('CREMIND_HOST_DOCUMENTS='.Length)
+            if ($prevDocsRaw) {
+                $prevDocs = Resolve-DocumentsDir $prevDocsRaw
+                if ($prevDocs.Problem) {
+                    Write-Warn2 "Ignoring the previous documents folder '$prevDocsRaw': $($prevDocs.Problem)"
+                } else {
+                    $PrevDocumentsDir = $prevDocs.Path
+                }
+            }
+        } elseif (-not $PrevDocumentsAccess -and $line -like 'CREMIND_DOCUMENTS_READ_ONLY=*') {
+            switch ($line.Substring('CREMIND_DOCUMENTS_READ_ONLY='.Length).Trim()) {
+                'true'  { $PrevDocumentsAccess = 'ro' }
+                'false' { $PrevDocumentsAccess = 'rw' }
+            }
+        }
+    }
+}
+
+# What the documents folder is when nobody says otherwise: the previous
+# install's, else the Documents folder Windows reports — which follows OneDrive
+# redirection, unlike $HOME\Documents. Empty only when that path holds a
+# character the .env cannot carry; the docker branch then leaves
+# CREMIND_HOST_DOCUMENTS unset and compose falls back to a folder inside the
+# bundle. Handed to the TUI as --documents-default, which only prefills: it
+# never counts as an answer.
+$DocumentsDefault = $PrevDocumentsDir
+if (-not $DocumentsDefault) {
+    $myDocuments = [Environment]::GetFolderPath('MyDocuments')
+    if (-not $myDocuments) { $myDocuments = Join-Path $HOME 'Documents' }
+    $docsDefaultCheck = Resolve-DocumentsDir $myDocuments
+    if (-not $docsDefaultCheck.Problem) { $DocumentsDefault = $docsDefaultCheck.Path }
+}
+
 # ── TUI bootstrap ─────────────────────────────────────────────────────────
 #
 # Mirror of the install.sh bootstrap: launch the prompt_toolkit TUI for a
@@ -1690,6 +2046,11 @@ function Invoke-InstallerTuiBootstrap {
     # Either previous install counts - the mode is not settled yet, and the
     # text prompt re-points $PrevVncPassword once it is.
     $tuiArgs.Add($(if ($PrevVncPassword -or (Get-PrevK8s 'VNC_PASSWORD')) { '1' } else { '0' }))
+    # Docker documents folder: the two values round-trip like the flags below;
+    # --documents-default is context only (the prefill, never written back).
+    if ($DocumentsDir)     { $tuiArgs.Add('--documents-dir');     $tuiArgs.Add($DocumentsDir) }
+    if ($DocumentsAccess)  { $tuiArgs.Add('--documents-access');  $tuiArgs.Add($DocumentsAccess) }
+    if ($DocumentsDefault) { $tuiArgs.Add('--documents-default'); $tuiArgs.Add($DocumentsDefault) }
     # Kubernetes: capabilities and the probed context list are context-only
     # (the TUI never writes them back); the value flags round-trip, so a flag
     # the operator passed is echoed back instead of being cleared.
@@ -1746,8 +2107,12 @@ function Invoke-InstallerTuiBootstrap {
             if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
                 $k = $Matches[1]
                 $v = $Matches[2]
-                # Strip surrounding single quotes the bash quoter may have added.
-                if ($v -match "^'(.*)'$") { $v = ($Matches[1] -replace "'\\\\''", "'") }
+                # Strip the surrounding single quotes the bash quoter adds, then
+                # undo its only escape: a quote inside the value is written as
+                # '\'' (close, escaped quote, reopen), so John's comes back from
+                # 'John'\''s'. A literal Replace, not -replace: this used to be
+                # a regex that matched '\\'' instead and returned John'\''s.
+                if ($v -match "^'(.*)'$") { $v = $Matches[1].Replace("'\''", "'") }
                 switch ($k) {
                     'CHANNEL'              { if (-not $Channel)        { Set-Variable -Scope Script Channel $v } }
                     'VERSION_SPEC'         { if (-not $Version)        { Set-Variable -Scope Script Version $v } }
@@ -1757,6 +2122,8 @@ function Invoke-InstallerTuiBootstrap {
                     'SSL_CHOICE'           { if (-not $Ssl -and $v -in @('none', 'auto', 'after-setup')) { Set-Variable -Scope Script Ssl $v } }
                     'DESKTOP_UI'           { if (-not $DesktopUi)      { Set-Variable -Scope Script DesktopUi $v } }
                     'VNC_PASSWORD_INPUT'   { if (-not $VncPassword)    { Set-Variable -Scope Script VncPassword $v } }
+                    'DOCUMENTS_DIR_INPUT'  { if (-not $DocumentsDir)   { Set-Variable -Scope Script DocumentsDir $v } }
+                    'DOCUMENTS_ACCESS_INPUT' { if (-not $DocumentsAccess -and $v -in @('rw', 'ro')) { Set-Variable -Scope Script DocumentsAccess $v } }
                     'CUSTOM_listen_host'   { if (-not $ListenHost)     { Set-Variable -Scope Script ListenHost $v } }
                     'CUSTOM_public_url'    { if (-not $PublicUrl)      { Set-Variable -Scope Script PublicUrl $v } }
                     'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
@@ -2119,6 +2486,121 @@ if (($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and $DesktopUi -ne '0' -and
     if (-not $VncPassword -and -not $PrevVncPassword) {
         Write-Warn2 "No VNC password entered; generating one and printing it at the end."
     }
+}
+
+# ── documents folder (docker mode only) ───────────────────────────────────
+#
+# The host folder the container sees as /root/Documents — what Documentation search indexes and where the agent works by default. Without the bind it
+# lives on the container's own layer and vanishes whenever compose recreates
+# the container. Kubernetes never gets here: the chart's persistence.work
+# volume is mounted at the same path.
+#
+# Precedence: -DocumentsDir → $env:CREMIND_DOCUMENTS_DIR (both folded into
+# $DocumentsDir and validated up front) → the TUI's or the prompt's answer →
+# the previous install's folder → the Windows Documents folder. Access runs
+# the same chain from -DocumentsAccess / $env:CREMIND_DOCUMENTS_ACCESS, default
+# rw. Each question is asked only when its value is still open and someone
+# can answer: not -Unattended, an interactive session, a console on stdin.
+$DocumentsHostDir  = ''
+$DocumentsReadOnly = 'false'
+if ($Mode -eq 'docker') {
+    $docsCanAsk = (-not $Unattended) -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    if (-not $DocumentsDir -and $docsCanAsk) {
+        Write-Host ""
+        Write-Host $script:DockerDocuments.Prompt -ForegroundColor White
+        if ($script:DockerDocuments.Hint) {
+            Write-Host ("  $($script:DockerDocuments.Hint)") -ForegroundColor DarkGray
+        }
+        # Bounded for the same reason as the VNC loop: a host whose Read-Host
+        # returns empty without blocking would re-read forever. Giving up
+        # keeps the default.
+        $docsTries = 0
+        while (-not $DocumentsDir -and $docsTries -lt 5) {
+            $docsTries++
+            $docsAns = Read-Host "  [$DocumentsDefault]"
+            if (-not $docsAns) { $docsAns = $DocumentsDefault }
+            if (-not $docsAns) {
+                Write-Warn2 "Type the full path of a folder."
+                continue
+            }
+            $docsCheck = Resolve-DocumentsDir $docsAns
+            if ($docsCheck.Problem) {
+                Write-Warn2 "That folder can't be used: $($docsCheck.Problem)"
+                continue
+            }
+            $DocumentsDir = $docsCheck.Path
+        }
+    }
+
+    $docsAccessDefault = if ($PrevDocumentsAccess) { $PrevDocumentsAccess } else { 'rw' }
+    if (-not $DocumentsAccess -and $docsCanAsk) {
+        Write-Host ""
+        Write-Host $script:DockerDocuments.AccessPrompt -ForegroundColor White
+        Write-Host "  1) $($script:DockerDocuments.RwLabel)"
+        Write-Host "     $($script:DockerDocuments.RwDisclosure)" -ForegroundColor DarkGray
+        Write-Host "  2) $($script:DockerDocuments.RoLabel)"
+        Write-Host "     $($script:DockerDocuments.RoDisclosure)" -ForegroundColor DarkGray
+        $docsChoiceDefault = if ($docsAccessDefault -eq 'ro') { '2' } else { '1' }
+        $docsTries = 0
+        while (-not $DocumentsAccess -and $docsTries -lt 5) {
+            $docsTries++
+            $docsAns = Read-Host "Choose [1-2] [$docsChoiceDefault]"
+            if (-not $docsAns) { $docsAns = $docsChoiceDefault }
+            switch ($docsAns) {
+                { $_ -in @('1', 'rw') } { $DocumentsAccess = 'rw' }
+                { $_ -in @('2', 'ro') } { $DocumentsAccess = 'ro' }
+                default { Write-Warn2 "Please choose 1 or 2." }
+            }
+        }
+    }
+
+    # A value that came back from the TUI is normalized again here: the TUI
+    # writes the path as typed, backslashes and all.
+    if ($DocumentsDir) {
+        $docsCheck = Resolve-DocumentsDir $DocumentsDir
+        if ($docsCheck.Problem) {
+            Write-Err2 "Invalid documents folder '$DocumentsDir': $($docsCheck.Problem)"
+            exit 2
+        }
+        $DocumentsHostDir = $docsCheck.Path
+    } else {
+        $DocumentsHostDir = $DocumentsDefault
+    }
+    $docsAccess = if ($DocumentsAccess) { $DocumentsAccess } else { $docsAccessDefault }
+    $DocumentsReadOnly = if ($docsAccess -eq 'ro') { 'true' } else { 'false' }
+
+    if (-not $DocumentsHostDir) {
+        Write-Warn2 "No usable documents folder (your Documents path holds a character the compose .env cannot carry)."
+        Write-Warn2 "Documents will live in $(Join-Path (Join-Path $CremindInstallDir 'docker') 'documents'), which an uninstall deletes; pass -DocumentsDir to choose another."
+    } else {
+        # Created as the user running this script, so the folder is theirs
+        # rather than something Docker Desktop makes on first mount.
+        # [IO.Directory]::CreateDirectory, not New-Item: Windows PowerShell
+        # 5.1's New-Item has no -LiteralPath, and -Path would read [ ] in a
+        # folder name as a wildcard. It creates every missing parent and is a
+        # no-op for a folder that exists.
+        if (-not (Test-Path -LiteralPath $DocumentsHostDir -PathType Container)) {
+            try {
+                [System.IO.Directory]::CreateDirectory($DocumentsHostDir) | Out-Null
+            } catch {
+                Write-Err2 "Could not create the documents folder ${DocumentsHostDir}: $($_.Exception.Message)"
+                Write-Err2 "Create it yourself, or choose another with -DocumentsDir <path>."
+                exit 2
+            }
+            Write-Ok "Created $DocumentsHostDir"
+        }
+        $docsHow = if ($DocumentsReadOnly -eq 'true') { 'read-only' } else { 'read-write' }
+        Write-Ok "Documents folder: $DocumentsHostDir ($docsHow)"
+        if ($DocumentsReadOnly -eq 'true') {
+            Write-Info "Each profile's working directory lives in the cremind-data volume: a read-only folder cannot hold them."
+        } else {
+            Write-Info "Each profile's working directory: $DocumentsHostDir/cremind-workspaces/<profile>"
+        }
+    }
+} elseif ($DocumentsDir -or $DocumentsAccess) {
+    # Only the Docker bundle mounts a documents folder: native installs use
+    # your real Documents folder directly, Kubernetes the chart's work volume.
+    Write-Info "The documents-folder setting applies to Docker installs only; ignoring it for $Mode."
 }
 
 # ── kubernetes questions ──────────────────────────────────────────────────
@@ -3815,6 +4297,32 @@ if ($Mode -eq 'docker') {
     } elseif ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
         Add-Content -Path $EnvDocker -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
     }
+    # The documents folder resolved in ── documents folder ── above, which
+    # compose binds at /root/Documents. Appended like the TLS lines, never
+    # -replace'd into a template placeholder: -replace treats its replacement
+    # as a substitution pattern, and a free-text path should reach the file
+    # byte for byte. Unquoted is safe because Resolve-DocumentsDir refused
+    # everything compose's .env parser treats specially, and forward slashes
+    # because the Linux compose CLI inside the container reads it too.
+    # Left out when there is no usable folder, so compose falls back to the
+    # bundle's own ./documents. CREMIND_COMPOSE_HOST_DIR tells the app where
+    # this bundle lives on the host, for the instructions it shows; skipped if
+    # the path is not .env-safe.
+    if ($DocumentsHostDir) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_HOST_DOCUMENTS=$DocumentsHostDir" -Encoding utf8
+    }
+    Add-Content -Path $EnvDocker -Value "CREMIND_DOCUMENTS_READ_ONLY=$DocumentsReadOnly" -Encoding utf8
+    # Every profile's working directory lives in
+    # /root/Documents/cremind-workspaces - which a read-only mount cannot hold.
+    # Then they go to the cremind-data volume instead (writable, not visible on
+    # the host); see the compose file.
+    if ($DocumentsReadOnly -eq 'true') {
+        Add-Content -Path $EnvDocker -Value "CREMIND_DOCKER_WORKSPACES_DIR=/root/.cremind/workspaces" -Encoding utf8
+    }
+    $composeHostDir = Resolve-DocumentsDir $DockerDir
+    if (-not $composeHostDir.Problem) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_COMPOSE_HOST_DIR=$($composeHostDir.Path)" -Encoding utf8
+    }
 
     # Dev channel: emit a docker-compose.override.yml that points the
     # build context at the local checkout, switches the pip install
@@ -3858,6 +4366,16 @@ if ($Mode -eq 'docker') {
         Write-Warn2 "Ignoring INSTALL_MODE=$($env:INSTALL_MODE) from the environment: this is a Docker install."
     }
     Remove-Item Env:INSTALL_MODE -ErrorAction SilentlyContinue
+    # Same shadowing for the documents keys: a CREMIND_HOST_DOCUMENTS in this
+    # session would mount one folder now and the .env's another on the next
+    # plain ``docker compose up -d``. The installer's own inputs are
+    # CREMIND_DOCUMENTS_DIR / CREMIND_DOCUMENTS_ACCESS, already folded in.
+    foreach ($docKey in @('CREMIND_HOST_DOCUMENTS', 'CREMIND_DOCUMENTS_READ_ONLY', 'CREMIND_COMPOSE_HOST_DIR', 'CREMIND_DOCKER_WORKSPACES_DIR')) {
+        if (Test-Path -LiteralPath "Env:$docKey") {
+            Write-Warn2 "Ignoring $docKey from the environment: $EnvDocker holds the installer's value."
+            Remove-Item -LiteralPath "Env:$docKey" -ErrorAction SilentlyContinue
+        }
+    }
 
     # Per-channel pull / build strategy:
     #   production / test → pull the pre-built image from Docker Hub
@@ -4065,6 +4583,10 @@ Open this URL in your browser to continue setup:
   VNC password (saved to $EnvDocker):
     $StoredVnc
 "@
+        }
+        if ($DocumentsHostDir) {
+            $docsHow = if ($DocumentsReadOnly -eq 'true') { 'read-only' } else { 'read-write' }
+            Write-Host "  Documents   : $DocumentsHostDir ($docsHow, /root/Documents in the container)"
         }
         Write-Host @"
 

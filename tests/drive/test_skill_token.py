@@ -38,7 +38,8 @@ def skill(tmp_path, monkeypatch):
         "app.skills.sync.profile_skills_dir", lambda profile: tmp_path / profile / "skills"
     )
     st._access_cache.clear()
-    return scripts
+    yield scripts
+    st._access_cache.clear()  # a refreshed token must not leak into another module's tests
 
 
 def test_status_reports_the_linked_account(skill, monkeypatch):
@@ -193,8 +194,95 @@ def test_missing_refresh_token_is_an_actionable_error(skill):
     data = json.loads(path.read_text(encoding="utf-8"))
     data.update({"expiry": 0, "refresh_token": ""})
     path.write_text(json.dumps(data), encoding="utf-8")
-    with pytest.raises(st.DriveTokenError, match="re-link"):
+    with pytest.raises(st.DriveTokenError, match="re-link") as exc:
         st.access_token("alice")
+    assert exc.value.kind == "auth_revoked"
+
+
+def _token_endpoint(monkeypatch, *, status=200, body=None, error=None, calls=None):
+    """Fake the token endpoint behind ``_refresh``."""
+    import httpx
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def post(self, url, data=None):
+            if calls is not None:
+                calls.append(data)
+            if error is not None:
+                raise error
+            request = httpx.Request("POST", url)
+            return httpx.Response(status, json=body if body is not None else {}, request=request)
+
+    monkeypatch.setattr(st.httpx, "Client", FakeClient)
+
+
+def test_force_refresh_skips_the_cache_and_the_stored_token(skill, monkeypatch):
+    """A 401 means the unexpired-looking token is dead; the retry must really
+    refresh, or it resends the same token for up to an hour."""
+    st._access_cache["alice"] = {"token": "at-cached", "expiry": time.time() + 3600}
+    assert st.access_token("alice") == "at-cached"
+    calls: list = []
+    _token_endpoint(monkeypatch, body={"access_token": "at-new", "expires_in": 3600}, calls=calls)
+    before = (skill / ".google_token.json").read_bytes()
+    assert st.access_token("alice", force_refresh=True) == "at-new"
+    assert calls and calls[0]["refresh_token"] == "rt-1"
+    assert st.access_token("alice") == "at-new"  # the refreshed token is cached
+    assert (skill / ".google_token.json").read_bytes() == before, "still never writes the file"
+
+
+def test_a_failed_forced_refresh_drops_the_cached_token(skill, monkeypatch):
+    st._access_cache["alice"] = {"token": "at-dead", "expiry": time.time() + 3600}
+    _token_endpoint(monkeypatch, status=400, body={"error": "invalid_grant"})
+    with pytest.raises(st.DriveTokenError) as exc:
+        st.access_token("alice", force_refresh=True)
+    assert exc.value.kind == "auth_revoked"
+    assert str(exc.value).startswith("Google rejected the stored refresh token.")
+    assert "alice" not in st._access_cache
+
+
+@pytest.mark.parametrize("status,body,kind", [
+    (401, {"error": "invalid_client"}, "auth_misconfigured"),
+    (400, {"error": "unauthorized_client"}, "auth_misconfigured"),
+    (403, {"error": "access_denied"}, "auth_misconfigured"),
+    (429, {"error": "rate_limited"}, "unreachable"),
+    (503, {"error": "backend"}, "unreachable"),
+])
+def test_token_endpoint_failures_carry_a_kind(skill, monkeypatch, status, body, kind):
+    _token_endpoint(monkeypatch, status=status, body=body)
+    with pytest.raises(st.DriveTokenError) as exc:
+        st.access_token("alice", force_refresh=True)
+    assert exc.value.kind == kind
+    assert str(exc.value).startswith("could not refresh the Google access token: ")
+
+
+def test_a_network_failure_or_empty_answer_is_unreachable(skill, monkeypatch):
+    import httpx
+
+    _token_endpoint(monkeypatch, error=httpx.ConnectError("offline"))
+    with pytest.raises(st.DriveTokenError) as exc:
+        st.access_token("alice", force_refresh=True)
+    assert exc.value.kind == "unreachable"
+    _token_endpoint(monkeypatch, body={"expires_in": 3600})
+    with pytest.raises(st.DriveTokenError, match="contained no access token") as exc:
+        st.access_token("alice", force_refresh=True)
+    assert exc.value.kind == "unreachable"
+
+
+def test_not_linked_is_unlinked_even_when_forced(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.skills.sync.profile_skills_dir", lambda profile: tmp_path / profile / "skills"
+    )
+    for force in (False, True):
+        with pytest.raises(st.DriveTokenError, match="not linked") as exc:
+            st.access_token("nobody", force_refresh=force)
+        assert exc.value.kind == "unlinked"
+
+
+def test_a_token_error_without_a_kind_is_unreachable():
+    assert st.DriveTokenError("anything").kind == "unreachable"
 
 
 def test_list_files_includes_shared_drives(skill, monkeypatch):
@@ -376,3 +464,22 @@ def test_grant_provenance_survives_unreadable_cache(skill):
 )
 def test_parse_file_reference(value, expected):
     assert st.parse_file_reference(value) == expected
+
+
+def test_a_read_only_whole_drive_account_is_whole_drive_for_reading(skill, monkeypatch):
+    """A bring-your-own client granting drive.readonly can read every file:
+    document indexing must treat it as whole-Drive (and ask for folders),
+    while writes stay per-file — the description says both."""
+    path = skill / ".google_token.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["scopes"] = ["openid", "email", DRIVE_FILE, st.DRIVE_READONLY_SCOPE]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", DRIVE_FILE, st.DRIVE_READONLY_SCOPE],
+    )
+    monkeypatch.setattr(st, "uses_own_client", lambda profile: True)
+    out = st.status("alice")
+    assert out["whole_drive"] is True
+    assert out["access_model"] == "whole-Drive, read-only (your own Google credentials)"
+    assert "change it" in out["access_note"]

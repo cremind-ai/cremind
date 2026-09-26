@@ -47,6 +47,19 @@ export function formatRatePerM(n: number | null | undefined): string {
   return `$${s}/M`;
 }
 
+/**
+ * Badge text for a usage record's `source_type`, where the raw key reads
+ * awkwardly. Documentation search's own model calls (image descriptions,
+ * answer checks) are recorded as `documents`; rows written before the rename
+ * said `userdocs`, and read the same.
+ */
+export function usageSourceTypeLabel(type: string | null | undefined): string {
+  if (!type) return '';
+  if (type === 'event_gate') return 'event filter';
+  if (type === 'documents' || type === 'userdocs') return 'documentation search';
+  return type;
+}
+
 /** Epoch-ms → locale date+time, blank on falsy. */
 export function formatTimestamp(ms: number | null | undefined): string {
   if (!ms) return '';

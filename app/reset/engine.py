@@ -330,14 +330,21 @@ async def _clean_skills(profile: str, deps: Deps) -> dict[str, Any]:
     return detail
 
 
-async def _clean_documents(profile: str, deps: Deps) -> dict[str, bool]:
-    ds = deps.document_service
+async def _clean_cremind_documents(profile: str, deps: Deps) -> dict[str, bool]:
+    """The Cremind manual pages this profile wrote, and their points.
+
+    The directory is ``storage/cremind_documents/profiles/<uuid>``, resolved by
+    the service from the profile row (off the event loop: it is a DB read). A
+    profile whose uuid cannot be resolved has no directory to remove — never a
+    name-keyed guess, which could land in another tree entirely."""
+    ds = deps.cremind_document_service
     detail = {"removed": False}
     if ds is None:
         return detail
     try:
-        pdir = ds.profile_dir(profile)
-        detail["removed"] = await asyncio.to_thread(_rmtree, str(pdir))
+        pdir = await asyncio.to_thread(ds.profile_dir, profile)
+        if pdir is not None:
+            detail["removed"] = await asyncio.to_thread(_rmtree, str(pdir))
     except Exception:  # noqa: BLE001
         logger.exception("clean: documents dir removal failed")
     try:
@@ -345,6 +352,23 @@ async def _clean_documents(profile: str, deps: Deps) -> dict[str, bool]:
     except Exception:  # noqa: BLE001
         logger.exception("clean: document embedding prune failed")
     return detail
+
+
+async def _clean_documentation_search(profile: str, deps: Deps) -> dict[str, Any]:
+    """Delete the profile's document index, vectors, captions, research jobs
+    and settings. The indexed folder and every file in it are left untouched.
+
+    A running research job is stopped (and waited for) first, so it is not
+    still writing a checkpoint or an artifact while its rows and files go."""
+    from app.documents.service import clean_profile
+
+    try:
+        from app.documents.research.jobs import cancel_profile_jobs
+
+        await cancel_profile_jobs(profile, "the profile's document data was cleaned")
+    except Exception:  # noqa: BLE001 — the purge below stops them regardless
+        logger.exception(f"clean: could not stop research jobs for profile={profile}")
+    return await asyncio.to_thread(clean_profile, profile)
 
 
 async def _clean_browser_login(profile: str, deps: Deps) -> dict[str, bool]:
@@ -402,7 +426,8 @@ _ORDER: tuple[tuple[str, Any], ...] = (
     ("app_settings", _clean_app_settings),
     ("oauth_tokens", _clean_oauth_tokens),
     ("skills", _clean_skills),
-    ("documents", _clean_documents),
+    ("cremind_documents", _clean_cremind_documents),
+    ("documentation_search", _clean_documentation_search),
     ("browser_login", _clean_browser_login),
     ("uploads", _clean_uploads),
     ("plans", _clean_plans),

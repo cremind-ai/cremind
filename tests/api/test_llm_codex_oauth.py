@@ -331,7 +331,7 @@ def test_complete_success_persists_tokens(monkeypatch):
 
 def test_complete_reconciles_stale_model_group(monkeypatch):
     """Signing in with ChatGPT must clear a model group left pointing at an
-    API-key-only OpenAI model (the origin of the documentation_search bug)."""
+    API-key-only OpenAI model (the origin of the cremind_documentation_search bug)."""
     async def _fake_exchange(code, verifier):
         return {"access_token": "AT", "refresh_token": "RT", "expires_in": 3600,
                 "id_token": _make_jwt({"account_id": "acc-1"})}

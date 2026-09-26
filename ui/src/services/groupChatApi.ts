@@ -66,8 +66,19 @@ export interface GroupMember {
    * own, or every one for the admin) — the list response and the
    * ``group_updated`` stream frame both carry the row without it, so treat an
    * absent value as "unchanged", never as "reset to the default".
+   *
+   * `null` when the folder is private to the caller (see
+   * `working_directory_private`).
    */
-  working_directory?: string;
+  working_directory?: string | null;
+  /**
+   * Set (true) by the GET of a group on a seat the caller may watch but whose
+   * working directory belongs to that member alone — each profile's folder is
+   * its own, and the admin is not exempt. The path is then withheld (`null`
+   * above), so the room shows the seat as private instead of a file tree it
+   * could not open. Absent otherwise.
+   */
+  working_directory_private?: boolean;
 }
 
 export interface GroupMessage {

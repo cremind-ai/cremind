@@ -148,11 +148,11 @@ def test_default_catalog_mirrors_the_toml_skeleton() -> None:
     )
     fallback = install_catalog._DEFAULT_CATALOG
 
-    # Two tables the fallback has always left out: they carry only prompt text
+    # Tables the fallback leaves out: they carry only prompt text
     # for the Docker sub-questions, and the dataclasses that read them supply
     # their own defaults. Everything else must be mirrored, so a new top-level
     # table cannot be added to the TOML without deciding about the fallback.
-    known_omissions = {"docker_desktop", "vnc_password"}
+    known_omissions = {"docker_desktop", "vnc_password", "docker_documents"}
     assert set(toml_cat) - set(fallback) == known_omissions
     assert set(fallback) <= set(toml_cat)
     assert set(fallback["modes"]) == set(toml_cat["modes"])

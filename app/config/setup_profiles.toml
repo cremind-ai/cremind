@@ -12,6 +12,11 @@
 #   server_config      — seeds StepServerConfig (DB provider, paths, etc.)
 #   embedding_config   — seeds StepEmbeddingConfig (provider, vector store)
 #
+# No working directory here: each profile has its own
+# (``<workspaces root>/<profile>`` by default, see app/config/working_dirs.py),
+# so the wizard asks the server for the one to suggest
+# (``GET /api/config/setup-profiles`` → ``suggested_working_dir``).
+#
 # This file is the single source of truth for environment defaults and is
 # also consumable by external tooling (e.g. a future install.sh) via
 #   python -m app.config.setup_profiles --json
@@ -28,7 +33,6 @@ db_provider = "sqlite"
 sqlite_db_path = "cremind.db"
 service_name = "cremind-agent"
 agent_name = "Cremind Agent"
-user_working_dir = "~/Documents"
 
 [local.embedding_config]
 enabled = false
@@ -65,7 +69,6 @@ db_provider = "postgres"
 sqlite_db_path = "cremind.db"
 service_name = "cremind-agent"
 agent_name = "Cremind Agent"
-user_working_dir = "~/Documents"
 
 [docker.server_config.postgres]
 host = "postgres"
@@ -110,7 +113,6 @@ db_provider = "postgres"
 sqlite_db_path = "cremind.db"
 service_name = "cremind-agent"
 agent_name = "Cremind Agent"
-user_working_dir = "~/Documents"
 
 [server.server_config.postgres]
 host = ""
@@ -164,7 +166,6 @@ description = "In-cluster PostgreSQL and (optional) vector DB over service DNS. 
 db_provider = "postgres"
 service_name = "cremind-agent"
 agent_name = "Cremind Agent"
-user_working_dir = "~/Documents"
 
 [kubernetes.server_config.postgres]
 deployment_mode = "external"

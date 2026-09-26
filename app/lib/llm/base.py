@@ -255,7 +255,7 @@ def done_chunk_token_usage(response: Dict[str, Any]) -> Dict[str, int]:
     Every provider's ``chat_completion`` emits its usage on the terminal
     ``ChatCompletionTypeEnum.DONE`` chunk as four top-level int fields. This is the
     single place that names them, so direct ``chat_completion`` consumers (the
-    skill-event gate, the ``documentation_search`` judge, ``image_understanding``)
+    skill-event gate, the ``cremind_documentation_search`` judge, ``image_understanding``)
     read usage identically instead of each re-listing the keys. Missing/``None``
     values coerce to 0.
     """

@@ -180,6 +180,34 @@ class DynamicConfigStorage(SyncStorageBase):
             ).fetchall()
             return [{"key": r[0], "is_secret": False} for r in rows]
 
+    # ── Profile working directories (``profiles.working_dir``) ──
+    #
+    # NULL means the default folder (``<workspaces root>/<name>``, see
+    # :mod:`app.config.working_dirs`); a value is the folder the admin chose.
+
+    def get_profile_working_dir(self, profile: str) -> str | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT working_dir FROM profiles WHERE name = :profile"),
+                {"profile": profile},
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_profile_working_dir(self, profile: str, value: str | None) -> bool:
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text("UPDATE profiles SET working_dir = :value, updated_at = :now WHERE name = :profile"),
+                {"value": value or None, "now": time.time() * 1000, "profile": profile},
+            )
+            return result.rowcount > 0
+
+    def profile_working_dirs(self) -> dict[str, str | None]:
+        """``{name: working_dir or None}`` for every profile row (the
+        ``__server__`` pseudo profile included — callers filter it)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(text("SELECT name, working_dir FROM profiles")).fetchall()
+        return {str(r[0]): (r[1] or None) for r in rows}
+
     # ── Setup status ──
 
     def is_setup_complete(self) -> bool:

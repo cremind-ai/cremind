@@ -46,7 +46,7 @@ def _fake_agent_cfg() -> SimpleNamespace:
 def _skeleton(monkeypatch, *, event_run: bool):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_agent_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: "")
     llm = SimpleNamespace(provider_name="fake", model_name="fake-model")

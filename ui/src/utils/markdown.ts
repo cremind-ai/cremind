@@ -1,4 +1,4 @@
-import { Marked } from 'marked';
+import { Marked, type MarkedExtension } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
 
@@ -7,8 +7,14 @@ import hljs from 'highlight.js';
  * syntax highlighting, `breaks: true`, and image/link hrefs rewritten through
  * `resolveApiUrl` (so `/api/...` and absolute filesystem paths resolve to the
  * backend origin). Shared by the message bubble and the plan approval dialog.
+ *
+ * `extensions` are applied after the defaults, so they can add syntax (the
+ * citation chips in utils/citations.ts) without every caller opting in.
  */
-export function createChatMarked(resolveApiUrl: (href: string) => string): Marked {
+export function createChatMarked(
+  resolveApiUrl: (href: string) => string,
+  extensions: MarkedExtension[] = [],
+): Marked {
   const marked = new Marked(
     markedHighlight({
       langPrefix: 'hljs language-',
@@ -39,5 +45,6 @@ export function createChatMarked(resolveApiUrl: (href: string) => string): Marke
       },
     },
   });
+  if (extensions.length) marked.use(...extensions);
   return marked;
 }

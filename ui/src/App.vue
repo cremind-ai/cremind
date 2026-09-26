@@ -3,8 +3,11 @@ import { computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useChatStore } from './stores/chat';
 import { useGroupChatStore } from './stores/groupChat';
+import { useSearchToolsStore } from './stores/searchTools';
 import { useSettingsStore } from './stores/settings';
+import { followSignedInProfile } from './stores/terminalPanel';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
+import { useDocumentsStore } from './stores/documents';
 import { checkSetupStatus } from './services/configApi';
 import { PROFILE_ROUTES, CHAT_ROUTES } from './router/profileRoutes';
 import NavRail from './components/NavRail.vue';
@@ -79,8 +82,10 @@ const route = useRoute();
 const router = useRouter();
 const chatStore = useChatStore();
 const groupChatStore = useGroupChatStore();
+const searchToolsStore = useSearchToolsStore();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
+const documentsStore = useDocumentsStore();
 let stopHttpsCoordinator: (() => void) | null = null;
 let stopElectronMigrationGuard: (() => void) | null = null;
 let stopElectronMigrationRelease: (() => void) | null = null;
@@ -198,6 +203,12 @@ async function handleProfileNavigation(
     // Group rooms and their per-group SSE are scoped to the previous profile's
     // token — drop them alongside the chat state, whatever route we land on.
     groupChatStore.resetForProfileSwitch();
+    // Search-tool selections, room ones included, and the new-chat draft are
+    // the previous profile's — cleared whatever route we land on (the chat
+    // store's own reset only runs on chat routes).
+    searchToolsStore.resetForProfileSwitch();
+    // The file panel's folder is not dropped here: followSignedInProfile
+    // (below) does it on identity, which also covers the profile picker.
     // Reset chat state when switching to a different profile.
     if (onChatRoute) {
       await chatStore.resetForProfileSwitch();
@@ -215,6 +226,12 @@ async function handleProfileNavigation(
   }
 }
 
+// The file panel's working directory (and every conversation's cwd) belongs to
+// the signed-in profile alone, so it is dropped whenever that profile changes —
+// keyed on identity, not the route below: "Switch profile" passes through '/',
+// which has no profile param, so the route watch sees no previous profile.
+followSignedInProfile();
+
 watch(
   () => [route.name, route.params.profile],
   ([routeName, profile], [, oldProfile]) => {
@@ -224,8 +241,18 @@ watch(
   },
 );
 
+// Documentation search progress follows the same chat-route rule: the store
+// rides profile-events only where chat already holds it, and streams or polls
+// elsewhere — so it needs to know where we are.
+watch(
+  () => route.name,
+  (name) => documentsStore.setRoute(typeof name === 'string' ? name : ''),
+  { immediate: true },
+);
+
 onUnmounted(() => {
   embeddingStatusStore.disconnect();
+  documentsStore.disconnect();
   stopHttpsCoordinator?.();
   stopElectronMigrationGuard?.();
   stopElectronMigrationRelease?.();
@@ -262,6 +289,10 @@ onMounted(async () => {
   // streams, and the underlying connection is shared across browser
   // tabs by `createSharedStream`.
   embeddingStatusStore.connect(settingsStore.agentUrl);
+  // Once, like the embedding store: it opens nothing until a profile token
+  // exists, and follows token and route changes on its own. Its NavRail chip
+  // never uses the embedding overlay above.
+  documentsStore.connect(settingsStore.agentUrl);
 
   // Handle OAuth callback redirect
   const params = new URLSearchParams(window.location.search);
@@ -301,7 +332,8 @@ const handleLogout = () => {
   if (chatStore.isConnected) {
     chatStore.disconnect();
   }
-  // Clear active session
+  // Clear active session (this also drops the file panel's folder — see
+  // followSignedInProfile — so the next sign-in re-seeds from its own).
   settingsStore.authToken = '';
   settingsStore.profileId = '';
   router.push('/');

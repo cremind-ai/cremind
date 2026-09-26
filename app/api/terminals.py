@@ -46,6 +46,7 @@ from app.api.processes import (
 )
 from app.config.settings import get_user_working_directory
 from app.config.system_vars import build_system_env
+from app.config.working_dirs import is_foreign
 from app.tools.builtin.exec_shell_pty import (
     PtyProcess,
     spawn_argv_pty,
@@ -407,8 +408,20 @@ def get_terminal_routes() -> list:
         except Exception:  # noqa: BLE001
             body = {}
         cwd = body.get("cwd") if isinstance(body, dict) else None
+        # Another profile's working directory is treated exactly like a cwd
+        # that does not exist: the terminal opens in the caller's own folder
+        # instead (a conversation's cwd may be stale since the admin moved a
+        # folder, and opening SOMEWHERE beats failing). Checked before
+        # ``isdir`` so the reply says nothing about what is there. The shell
+        # itself runs as the server's OS user — this only picks where it starts.
+        if isinstance(cwd, str) and cwd and is_foreign(cwd, profile):
+            logger.warning(
+                f"terminal create: cwd {cwd!r} is inside another profile's "
+                f"working directory; opening {profile!r}'s own instead"
+            )
+            cwd = None
         if not (isinstance(cwd, str) and cwd and os.path.isdir(cwd)):
-            cwd = get_user_working_directory()
+            cwd = get_user_working_directory(profile)
         try:
             cols = int(body.get("cols") or 80)
             rows = int(body.get("rows") or 24)

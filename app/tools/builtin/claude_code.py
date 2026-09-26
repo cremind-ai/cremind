@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 
-from app.config.settings import BaseConfig, get_user_working_directory
+from app.config.settings import BaseConfig
 from app.tools.builtin.base import (
     BuiltInTool,
     BuiltInToolResult,
@@ -50,6 +50,7 @@ from app.tools.builtin.claude_code_runner import (
 )
 from app.types import ToolConfig
 from app.utils.logger import logger
+from app.utils.working_directory import resolve_tool_cwd
 
 SERVER_NAME = "Claude Code"
 
@@ -323,7 +324,8 @@ class ClaudeCodeRunTool(BuiltInTool):
                 "description": (
                     "OPTIONAL absolute path override. Default: the conversation's "
                     "current working directory. When resuming a session, use the same "
-                    "directory it was started in."
+                    "directory it was started in. Never a folder inside another "
+                    "profile's working directory."
                 ),
             },
             "model": {
@@ -349,12 +351,13 @@ class ClaudeCodeRunTool(BuiltInTool):
                 "message": "'prompt' is required.",
             })
 
-        raw_cwd = (
-            arguments.get("working_directory")
-            or arguments.get("_working_directory")
-            or get_user_working_directory()
-        )
-        cwd = os.path.abspath(os.path.expanduser(str(raw_cwd)))
+        # The calling profile's own folder by default; never another's.
+        cwd, cwd_error = resolve_tool_cwd(arguments)
+        if cwd is None:
+            return BuiltInToolResult(structured_content={
+                "error": "WorkingDirectoryError",
+                "message": cwd_error,
+            })
         try:
             os.makedirs(cwd, exist_ok=True)
         except OSError as exc:

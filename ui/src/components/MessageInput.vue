@@ -8,7 +8,9 @@ import { fetchSystemVars, fetchAgentNames } from '../services/configApi';
 import { uploadTempFiles } from '../services/filesApi';
 import { beginMigrationUpload, migrationReadiness } from '../services/migrationReadiness';
 import { CHAT_MODES, chatModeMeta, type ChatMode } from '../constants/chatModes';
+import { composerSearchToolsTarget, useSearchToolsStore } from '../stores/searchTools';
 import MentionMenu, { type MentionItem } from './MentionMenu.vue';
+import SearchToolsControl from './SearchToolsControl.vue';
 
 export interface Attachment {
   name: string;
@@ -38,6 +40,15 @@ const emit = defineEmits<{
 
 const settingsStore = useSettingsStore();
 const chatStore = useChatStore();
+const searchToolsStore = useSearchToolsStore();
+
+// The conversation whose search tools this composer edits: the event-run
+// drawer passes its run's conversation, the main chat follows the active one
+// (or the unsaved new-chat slot, whose draft rides the create).
+const searchToolsTarget = computed(() =>
+  composerSearchToolsTarget(props.conversationId, chatStore.activeConversationId));
+// Set while a send waits for a search-tools save to land.
+const awaitingSearchTools = ref(false);
 
 const inputText = ref('');
 const popoverVisible = ref(false);
@@ -179,7 +190,11 @@ const removeAttachment = (index: number) => {
   attachments.value.splice(index, 1);
 };
 
-const MIN_HEIGHT_PX = 112;  // tall enough for the reasoning/upload/send button column
+// The buttons live in the toolbar row under the text now, so the textarea no
+// longer has to be tall enough for a button column. 80px + the 6px gap + the
+// 28px toolbar keeps the composer at its old ~112px footprint — GroupComposer
+// uses the same numbers, so switching views does not move the send button.
+const MIN_HEIGHT_PX = 80;
 const MAX_HEIGHT_PX = 192;  // ≈ 8 rows
 
 // Mention/system-var autocomplete state
@@ -462,18 +477,39 @@ const handleClickInTextarea = () => {
 };
 
 // ── send / keyboard ──
-const submit = () => {
+const submit = async () => {
   // Don't send while an attachment is still provisioning/uploading — its path
   // isn't in `attachments` yet, so the message would go without it.
-  if (uploading.value) return;
-  if (inputText.value.trim() && !props.disabled) {
-    emit('send', { text: inputText.value, attachments: [...attachments.value] });
-    inputText.value = '';
-    attachments.value = [];
-    try { sessionStorage.removeItem(draftKey.value); } catch { /* ignore */ }
-    closeMenu();
-    nextTick(adjustHeight);
+  if (uploading.value || awaitingSearchTools.value) return;
+  if (!inputText.value.trim() || props.disabled) return;
+
+  // A search-tools change made just before sending must be saved before the
+  // message that should use it: the message never carries the selection, the
+  // server reads the saved one when the response starts. So wait for the save;
+  // if it fails (or someone else changed the selection meanwhile), keep the
+  // draft exactly as it is and let the control say why.
+  const target = searchToolsTarget.value;
+  if (searchToolsStore.hasPendingSave(target)) {
+    const keyAtSend = draftKey.value;
+    awaitingSearchTools.value = true;
+    let saved = false;
+    try {
+      saved = await searchToolsStore.settle(target);
+    } finally {
+      awaitingSearchTools.value = false;
+    }
+    // Moved to another conversation while waiting: the text on screen is now
+    // that one's draft, not what Enter was pressed on (which stays stored).
+    if (!saved || draftKey.value !== keyAtSend) return;
+    if (!inputText.value.trim() || props.disabled) return;
   }
+
+  emit('send', { text: inputText.value, attachments: [...attachments.value] });
+  inputText.value = '';
+  attachments.value = [];
+  try { sessionStorage.removeItem(draftKey.value); } catch { /* ignore */ }
+  closeMenu();
+  nextTick(adjustHeight);
 };
 
 const handleClick = () => {
@@ -483,7 +519,7 @@ const handleClick = () => {
     emit('stop');
     return;
   }
-  submit();
+  void submit();
 };
 
 const handleKeydown = (event: KeyboardEvent) => {
@@ -516,7 +552,7 @@ const handleKeydown = (event: KeyboardEvent) => {
     // message into the running turn. (The button itself stays a Stop control
     // while processing, so `handleClick` is not the send path here.)
     if (props.isProcessing) {
-      submit();
+      void submit();
     } else {
       handleClick();
     }
@@ -588,7 +624,7 @@ const selectMode = (mode: ChatMode) => {
           :value="inputText"
           placeholder="Type your message... (Enter to send, Shift+Enter for new line)"
           :disabled="disabled"
-          rows="3"
+          rows="2"
           spellcheck="true"
           @input="handleInput"
           @keydown="handleKeydown"
@@ -607,67 +643,86 @@ const selectMode = (mode: ChatMode) => {
         @select="insertSelection"
         @update:active-index="activeIndex = $event"
       />
-      <ElPopover
-        v-if="showModeSelector"
-        :visible="popoverVisible"
-        placement="top"
-        :width="280"
-        popper-class="mode-popover"
-        @update:visible="popoverVisible = $event"
-      >
-        <template #reference>
-          <button
-            class="mode-toggle-button"
-            :class="activeModeMeta.buttonClass"
-            :title="activeModeMeta.label"
-            @click="popoverVisible = !popoverVisible"
-            type="button"
+      <!-- One wrapping row under the text for every composer control. A narrow
+           window wraps it instead of squeezing the buttons over the text. -->
+      <div class="composer-toolbar">
+        <div class="toolbar-tools">
+          <ElPopover
+            v-if="showModeSelector"
+            :visible="popoverVisible"
+            placement="top"
+            :width="280"
+            popper-class="mode-popover"
+            @update:visible="popoverVisible = $event"
           >
-            <Icon :icon="activeModeMeta.icon" />
-          </button>
-        </template>
-        <div class="mode-menu" role="menu">
+            <template #reference>
+              <button
+                class="mode-toggle-button"
+                :class="activeModeMeta.buttonClass"
+                :title="activeModeMeta.label"
+                :aria-label="`Mode: ${activeModeMeta.label}`"
+                aria-haspopup="menu"
+                :aria-expanded="popoverVisible ? 'true' : 'false'"
+                @click="popoverVisible = !popoverVisible"
+                type="button"
+              >
+                <Icon :icon="activeModeMeta.icon" />
+              </button>
+            </template>
+            <div class="mode-menu" role="menu">
+              <button
+                v-for="m in CHAT_MODES"
+                :key="m.id"
+                type="button"
+                role="menuitemradio"
+                :aria-checked="m.id === mode"
+                class="mode-item"
+                :class="{ active: m.id === mode }"
+                @click="selectMode(m.id)"
+              >
+                <Icon :icon="m.icon" class="mode-item-icon" />
+                <span class="mode-item-text">
+                  <span class="mode-item-label">{{ m.label }}</span>
+                  <span class="mode-item-desc">{{ m.description }}</span>
+                </span>
+                <Icon v-if="m.id === mode" icon="mdi:check" class="mode-item-check" />
+              </button>
+            </div>
+          </ElPopover>
           <button
-            v-for="m in CHAT_MODES"
-            :key="m.id"
+            @click="triggerUpload"
+            :disabled="disabled || isProcessing || uploading"
+            class="upload-button"
+            :class="{ disabled: disabled || isProcessing || uploading }"
             type="button"
-            role="menuitemradio"
-            :aria-checked="m.id === mode"
-            class="mode-item"
-            :class="{ active: m.id === mode }"
-            @click="selectMode(m.id)"
+            :title="uploading ? 'Uploading…' : 'Attach files'"
+            :aria-label="uploading ? 'Uploading…' : 'Attach files'"
           >
-            <Icon :icon="m.icon" class="mode-item-icon" />
-            <span class="mode-item-text">
-              <span class="mode-item-label">{{ m.label }}</span>
-              <span class="mode-item-desc">{{ m.description }}</span>
-            </span>
-            <Icon v-if="m.id === mode" icon="mdi:check" class="mode-item-check" />
+            <Icon :icon="uploading ? 'mdi:loading' : 'mdi:paperclip'" :class="{ spin: uploading }" />
           </button>
+          <SearchToolsControl
+            :target="searchToolsTarget"
+            :running="isProcessing"
+            :disabled="disabled"
+          />
         </div>
-      </ElPopover>
-      <button
-        @click="triggerUpload"
-        :disabled="disabled || isProcessing || uploading"
-        class="upload-button"
-        :class="{ disabled: disabled || isProcessing || uploading }"
-        type="button"
-        :title="uploading ? 'Uploading…' : 'Attach files'"
-      >
-        <Icon :icon="uploading ? 'mdi:loading' : 'mdi:paperclip'" :class="{ spin: uploading }" />
-      </button>
-      <button
-        @click="handleClick"
-        :disabled="!isProcessing && (disabled || uploading || !inputText.trim())"
-        class="send-button"
-        :class="{
-          'disabled': !isProcessing && (disabled || uploading || !inputText.trim()),
-          'stop': isProcessing,
-        }"
-        :title="isProcessing ? 'Stop' : 'Send'"
-      >
-        <Icon :icon="isProcessing ? 'mdi:stop' : 'mdi:send'" />
-      </button>
+        <button
+          @click="handleClick"
+          :disabled="!isProcessing && (disabled || uploading || awaitingSearchTools || !inputText.trim())"
+          class="send-button"
+          :class="{
+            'disabled': !isProcessing && (disabled || uploading || awaitingSearchTools || !inputText.trim()),
+            'stop': isProcessing,
+          }"
+          :title="isProcessing ? 'Stop' : awaitingSearchTools ? 'Saving search tools…' : 'Send'"
+          :aria-label="isProcessing ? 'Stop' : awaitingSearchTools ? 'Saving search tools…' : 'Send'"
+        >
+          <Icon
+            :icon="isProcessing ? 'mdi:stop' : awaitingSearchTools ? 'mdi:loading' : 'mdi:send'"
+            :class="{ spin: awaitingSearchTools && !isProcessing }"
+          />
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -707,9 +762,9 @@ const selectMode = (mode: ChatMode) => {
   font-family: inherit;
   font-size: 0.95em;
   line-height: 1.6;
-  /* Right room for the reasoning/upload/send button stack. Layer + textarea
-     share this rule so the caret never drifts. */
-  padding: 10px 44px 10px 14px;
+  /* The buttons sit in the toolbar row below, not over the text, so no right
+     gutter. Layer + textarea share this rule so the caret never drifts. */
+  padding: 10px 14px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   white-space: pre-wrap;
@@ -735,7 +790,7 @@ const selectMode = (mode: ChatMode) => {
   position: relative;
   display: block;
   width: 100%;
-  min-height: 112px;
+  min-height: 80px;
   max-height: 192px;
   background: transparent;
   color: transparent;
@@ -795,10 +850,35 @@ const selectMode = (mode: ChatMode) => {
   text-decoration-color: rgba(239, 68, 68, 0.6);
 }
 
+/* The composer's controls: mode, attach and search tools on the left, send /
+   stop on the right. Wraps on a narrow window rather than overlapping. */
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  min-height: 28px;
+}
+
+.toolbar-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mode-toggle-button:focus-visible,
+.upload-button:focus-visible,
+.send-button:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 1px;
+}
+
 .mode-toggle-button {
-  position: absolute;
-  bottom: 74px;
-  right: 10px;
+  flex-shrink: 0;
   width: 28px;
   height: 28px;
   background: transparent;
@@ -812,7 +892,6 @@ const selectMode = (mode: ChatMode) => {
   font-size: 16px;
   transition: all 0.2s ease;
   padding: 0;
-  z-index: 3;
 }
 
 .mode-toggle-button:hover {
@@ -840,9 +919,8 @@ const selectMode = (mode: ChatMode) => {
 }
 
 .send-button {
-  position: absolute;
-  bottom: 10px;
-  right: 10px;
+  flex-shrink: 0;
+  margin-left: auto;
   width: 28px;
   height: 28px;
   background: var(--primary-color);
@@ -856,7 +934,6 @@ const selectMode = (mode: ChatMode) => {
   font-size: 16px;
   transition: all 0.2s ease;
   padding: 0;
-  z-index: 3;
 }
 
 .send-button:hover:not(:disabled) {
@@ -884,16 +961,13 @@ const selectMode = (mode: ChatMode) => {
   background: #dc2626;
 }
 
-/* Upload button — sits in the right-side stack between the reasoning toggle
-   (above) and the send button (below). */
+/* Upload button — in the toolbar, after the mode toggle. */
 .hidden-file-input {
   display: none;
 }
 
 .upload-button {
-  position: absolute;
-  bottom: 42px;
-  right: 10px;
+  flex-shrink: 0;
   width: 28px;
   height: 28px;
   background: transparent;
@@ -907,7 +981,6 @@ const selectMode = (mode: ChatMode) => {
   font-size: 16px;
   transition: all 0.2s ease;
   padding: 0;
-  z-index: 3;
 }
 
 .upload-button:hover:not(:disabled) {

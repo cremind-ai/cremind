@@ -29,6 +29,9 @@ name:
     data: {"status": ..., "phase": ..., "error": ..., "ready": bool,
            "busy": bool, "enabled": bool}
 
+    event: documentation_search
+    data: {<Documentation search snapshot, see app.documents.state>}
+
     event: ready
     data: {}
 
@@ -64,6 +67,7 @@ from app.events.profile_stream_fanout import get_profile_stream_fanout
 from app.events.settings_state_bus import get_settings_state_stream_bus
 from app.events.stream_bus import get_event_stream_bus
 from app.events.transport_state_bus import get_transport_state_bus
+from app.events.documents_bus import get_documents_stream_bus
 from app.config.tls_transition import public_transition
 from app.storage.conversation_storage import ConversationStorage
 from app.tools.builtin.exec_shell import list_processes
@@ -81,6 +85,17 @@ def _require_auth(request: Request) -> Optional[JSONResponse]:
 
 def _event_frame(event_name: str, data: Any) -> bytes:
     return f"event: {event_name}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+
+def _documents_snapshot(profile: str) -> Dict[str, Any]:
+    """The Documentation search snapshot, or a minimal one if it cannot be
+    built — a broken index must never take the chat stream down with it."""
+    try:
+        from app.documents.state import build_snapshot
+
+        return build_snapshot(profile)
+    except Exception:  # noqa: BLE001
+        return {"v": 1, "enabled": False, "state": "unknown"}
 
 
 def get_profile_events_routes(
@@ -145,6 +160,8 @@ def get_profile_events_routes(
         emb_queue = emb_bus.subscribe()
         transport_bus = get_transport_state_bus()
         transport_queue = transport_bus.subscribe()
+        ud_bus = get_documents_stream_bus()
+        ud_queue = ud_bus.subscribe(profile)
 
         replay = get_event_notifications().since(profile, since_ms)
         conv_snapshots = await get_event_stream_bus().snapshot_for_profile(profile)
@@ -157,6 +174,7 @@ def get_profile_events_routes(
             proc_task: asyncio.Task | None = None
             emb_task: asyncio.Task | None = None
             transport_task: asyncio.Task | None = None
+            ud_task: asyncio.Task | None = None
             try:
                 for entry in replay:
                     yield _event_frame("notification", entry)
@@ -178,6 +196,9 @@ def get_profile_events_routes(
                 yield _event_frame(
                     "embedding-state", _augment_with_enabled(embedding_state.to_dict()),
                 )
+                yield _event_frame(
+                    "documentation_search", await asyncio.to_thread(_documents_snapshot, profile),
+                )
                 transition = public_transition()
                 if transition:
                     yield _event_frame("transport-change", transition)
@@ -190,12 +211,14 @@ def get_profile_events_routes(
                 proc_task = asyncio.ensure_future(proc_queue.get())
                 emb_task = asyncio.ensure_future(emb_queue.get())
                 transport_task = asyncio.ensure_future(transport_queue.get())
+                ud_task = asyncio.ensure_future(ud_queue.get())
 
                 while True:
                     done, _pending = await asyncio.wait(
                         [
                             notif_task, convs_task, fanout_task,
                             settings_task, proc_task, emb_task, transport_task,
+                            ud_task,
                         ],
                         return_when=asyncio.FIRST_COMPLETED,
                         timeout=15.0,
@@ -243,13 +266,17 @@ def get_profile_events_routes(
                         elif task is transport_task:
                             yield _event_frame("transport-change", task.result())
                             transport_task = asyncio.ensure_future(transport_queue.get())
+                        elif task is ud_task:
+                            # Already a full snapshot — forward as-is.
+                            yield _event_frame("documentation_search", task.result())
+                            ud_task = asyncio.ensure_future(ud_queue.get())
 
                     if await request.is_disconnected():
                         return
             finally:
                 for task in (
                     notif_task, convs_task, fanout_task,
-                    settings_task, proc_task, emb_task, transport_task,
+                    settings_task, proc_task, emb_task, transport_task, ud_task,
                 ):
                     if task is not None and not task.done():
                         task.cancel()
@@ -260,6 +287,7 @@ def get_profile_events_routes(
                 proc_bus.unsubscribe(profile, proc_queue)
                 emb_bus.unsubscribe(emb_queue)
                 transport_bus.unsubscribe(transport_queue)
+                ud_bus.unsubscribe(profile, ud_queue)
 
         headers = {
             "Cache-Control": "no-cache",

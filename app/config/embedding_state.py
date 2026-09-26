@@ -17,13 +17,18 @@ Status transitions:
     INITIALIZING -- a load is in flight (boot or post-wizard).
     READY        -- model + vector store are live; agent can run.
     FAILED       -- last load attempt threw; ``error`` carries why.
+
+Listeners (:func:`add_listener`) hear every settled transition — READY,
+FAILED and DISABLED — whichever path caused it: boot, the apply pipeline,
+``defer_apply``, a failed load, or embedding being switched off. Documentation search uses this to notice a model or store change (and re-embed into a new
+collection) without hooking each of those paths separately.
 """
 
 from __future__ import annotations
 
 import threading
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from app.lib.embedding import LocalEmbeddings
@@ -57,6 +62,63 @@ def _publish_safe(snapshot: dict) -> None:
         publish_embedding_state_changed(snapshot)
     except Exception:  # noqa: BLE001
         pass
+
+
+# fn(status, embedding, vector_store). ``embedding`` / ``vector_store`` are the
+# instances the transition installed (both None for FAILED and DISABLED).
+EmbeddingListener = Callable[[EmbeddingStatus, Any, Any], None]
+
+# Module-level rather than on the instance: tests swap ``embedding_state`` for
+# a fake, and a registration must not vanish with the object it was made on.
+_listeners: list[EmbeddingListener] = []
+_listeners_lock = threading.Lock()
+
+
+def add_listener(fn: EmbeddingListener) -> None:
+    """Call ``fn(status, embedding, vector_store)`` after each settled transition.
+
+    Runs on the thread that made the transition, after the state lock is
+    released, so ``fn`` may read ``embedding_state`` freely. It must return
+    quickly (hand real work to a thread): the apply pipeline is waiting on it.
+    Two transitions racing on different threads can be heard out of order,
+    so a listener that acts later should re-read ``embedding_state``.
+    Adding the same function twice registers it once.
+    """
+    with _listeners_lock:
+        if fn not in _listeners:
+            _listeners.append(fn)
+
+
+def remove_listener(fn: EmbeddingListener) -> None:
+    """Unregister ``fn``; a function that was never added is ignored."""
+    with _listeners_lock:
+        try:
+            _listeners.remove(fn)
+        except ValueError:
+            pass
+
+
+def _notify_listeners(status: EmbeddingStatus, embedding: Any, vector_store: Any) -> None:
+    """Deliver one transition to every listener; never raises.
+
+    A listener bug must not turn a successful model load into an exception
+    in the apply pipeline (which would mark the load failed).
+    """
+    with _listeners_lock:
+        listeners = list(_listeners)
+    for fn in listeners:
+        try:
+            fn(status, embedding, vector_store)
+        except Exception as e:  # noqa: BLE001
+            try:
+                from app.utils.logger import logger
+
+                logger.exception(
+                    f"[embedding_state] listener {getattr(fn, '__qualname__', fn)!r} "
+                    f"failed on {status.value}: {e}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class _EmbeddingState:
@@ -131,6 +193,7 @@ class _EmbeddingState:
             self._vector_store = None
             snapshot = self._to_dict_locked()
         _publish_safe(snapshot)
+        _notify_listeners(EmbeddingStatus.DISABLED, None, None)
 
     def mark_initializing(self) -> bool:
         """Atomically claim the right to initialize.
@@ -189,6 +252,7 @@ class _EmbeddingState:
             self._vector_store = vector_store
             snapshot = self._to_dict_locked()
         _publish_safe(snapshot)
+        _notify_listeners(EmbeddingStatus.READY, embedding, vector_store)
 
     def mark_failed(self, error: str) -> None:
         with self._lock:
@@ -199,6 +263,7 @@ class _EmbeddingState:
             self._vector_store = None
             snapshot = self._to_dict_locked()
         _publish_safe(snapshot)
+        _notify_listeners(EmbeddingStatus.FAILED, None, None)
 
 
 embedding_state = _EmbeddingState()

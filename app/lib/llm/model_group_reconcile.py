@@ -4,7 +4,7 @@ Switching a provider's active auth method can change which models it can serve
 (most notably OpenAI's "Sign in with ChatGPT" Codex backend, which serves a
 different, restricted model set from the API-key path). A ``model_group.*``
 assignment left pointing at a model the new method can't serve would silently
-4xx at request time — the failure that made ``documentation_search``'s relevance
+4xx at request time — the failure that made ``cremind_documentation_search``'s relevance
 judge (``low`` group) return "no relevant result found".
 
 This helper clears such stale assignments so they transparently fall back to the

@@ -176,6 +176,8 @@ class CremindAgent:
         message_origin: dict | None = None,
         task_chain_depth: int = 0,
         maintenance: bool = False,
+        search_tools: Any = None,
+        on_search_baseline: Any = None,
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         logger.debug(f"Running CremindAgent with query: {query} and profile: {profile}")
 
@@ -243,6 +245,14 @@ class CremindAgent:
             # other identity signal is absent on such a run, so it has to be said
             # explicitly or the run passes for an ordinary chat turn.
             maintenance=maintenance,
+            # The conversation's search-tool selection (a frozen
+            # ``search_tools.Snapshot``, read by the caller when the run
+            # started; ``None`` = every source) and the hook that records what
+            # the run's first main-model request sent for search. Callers that
+            # know nothing of either (a fold passes the snapshot but no hook)
+            # get today's behaviour.
+            search_tools=search_tools,
+            on_search_baseline=on_search_baseline,
         )
 
         async for result in reasoning_agent.run(query, task_history):

@@ -80,6 +80,9 @@ def get_dynamic(table: str, key: str, default=None, profile: str | None = None):
     return default
 
 
+# The server-wide default of builds before per-profile working directories
+# (app/config/working_dirs.py). Kept only for the legacy reads that still meet
+# it: an old setup payload, an old backup's manifest, the installers' purge note.
 DEFAULT_USER_WORKING_DIR = os.path.join(os.path.expanduser("~"), "Documents")
 
 
@@ -336,34 +339,27 @@ def _upsert_env_line(env_path: str, key: str, value: str) -> None:
         pass
 
 
-def get_user_working_directory() -> str:
-    """Resolve the User Working Directory — the default active path injected
-    into built-in tools as ``_working_directory`` and shown to the LLM as the
-    ``Current User Working Directory``.
+def get_user_working_directory(profile: str) -> str:
+    """Resolve ``profile``'s User Working Directory — the default active path
+    injected into built-in tools as ``_working_directory`` and shown to the LLM
+    as the ``Current User Working Directory``.
 
-    This is the user's interaction folder — the root of the Tree Dir file
-    panel and the default working directory for every built-in tool call.
-    Distinct from ``BaseConfig.CREMIND_SYSTEM_DIR``, which is reserved for
-    Cremind's internal storage (bootstrap.toml, credentials.toml, SQLite
-    DB, tokens, per-profile state).
+    This is the profile's interaction folder — the root of its Tree Dir file
+    panel, the default working directory for every built-in tool call and
+    terminal, and the folder its Documentation search indexes. Distinct from
+    ``BaseConfig.CREMIND_SYSTEM_DIR``, which is reserved for Cremind's
+    internal storage (bootstrap.toml, credentials.toml, SQLite DB, tokens,
+    per-profile state).
 
-    Resolution order:
-      1. ``server_config.user_working_dir`` (set via setup wizard)
-      2. ``~/Documents`` fallback (auto-created if missing)
-
-    The returned directory is created if it does not exist.
+    Each profile has its own (the admin's choice in ``profiles.working_dir``,
+    else ``<workspaces root>/<profile>``) — see :mod:`app.config.working_dirs`.
+    The returned directory is created if it does not exist. ``profile`` is
+    required: there is no server-wide folder any more, and guessing ``admin``
+    would hand one profile another's files.
     """
-    raw = get_dynamic("server_config", "user_working_dir", default=None)
-    path = raw if raw else DEFAULT_USER_WORKING_DIR
-    if path.startswith("~"):
-        path = os.path.expanduser(path)
-    path = os.path.normpath(path)
-    try:
-        os.makedirs(path, exist_ok=True)
-    except OSError:
-        # Falls through; tools that actually need the dir will surface the error.
-        pass
-    return path
+    from app.config.working_dirs import profile_working_dir
+
+    return profile_working_dir(profile)
 
 
 class BaseConfig:
