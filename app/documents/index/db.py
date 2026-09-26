@@ -105,9 +105,16 @@ def is_corrupt_error(exc: BaseException) -> bool:
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 
-def index_dir(profile_uid: str) -> str:
-    """``<SYSTEM_DIR>/storage/documents/<profile_uid>`` — the whole directory is
-    this profile's derived data (the index, and nothing a backup keeps)."""
+_INDEX_FILE = "index.db"
+
+
+def index_dirs(profile_uid: str) -> tuple[str, str]:
+    """``(current, pre-rename)`` directories of this profile's index:
+    ``<SYSTEM_DIR>/storage/documents/<uid>`` and ``storage/userdocs/<uid>``.
+
+    For code that must deal with both at once — deleting an index deletes
+    whichever copies exist. Everything that opens or looks for the index uses
+    :func:`index_dir`, which picks one."""
     uid = str(profile_uid)
     # The uid names a directory that GC deletes wholesale; anything that could
     # climb out of storage/documents is a programming error, not a path.
@@ -115,11 +122,42 @@ def index_dir(profile_uid: str) -> str:
         raise ValueError(f"invalid profile uid for an index directory: {profile_uid!r}")
     from app.config.settings import BaseConfig
 
-    return os.path.join(BaseConfig.CREMIND_SYSTEM_DIR, "storage", "documents", uid)
+    base = BaseConfig.CREMIND_SYSTEM_DIR
+    return (
+        os.path.join(base, "storage", "documents", uid),
+        os.path.join(base, "storage", "userdocs", uid),
+    )
+
+
+def index_dir(profile_uid: str) -> str:
+    """The directory of this profile's index — the whole directory is its
+    derived data (the index, and nothing a backup keeps).
+
+    ``<SYSTEM_DIR>/storage/documents/<profile_uid>``, except while an index
+    from before the rename still waits at ``storage/userdocs/<uid>`` and
+    nothing is at the new place yet: then the old directory, used in place.
+    :mod:`app.documents.relocate` moves it at boot, before anything opens it —
+    but a boot whose move was skipped (another process held the lock, the
+    profile rows could not be read) or failed (a locked file, a full disk)
+    still starts the engine, and creating a fresh, empty index at the new
+    place would strand the old one: the next boot would find two different
+    indexes, keep both as a conflict, and everything would be re-extracted.
+    Used in place, the old index keeps working and the next boot's relocation
+    moves it whole, exactly as if the first had succeeded.
+
+    Every reader and writer goes through here (the engine's runtime, the
+    query engine, the citation registry), so they all agree on the one file.
+    """
+    current, legacy = index_dirs(profile_uid)
+    if not os.path.exists(os.path.join(current, _INDEX_FILE)) and os.path.exists(
+        os.path.join(legacy, _INDEX_FILE)
+    ):
+        return legacy
+    return current
 
 
 def index_path(profile_uid: str) -> str:
-    return os.path.join(index_dir(profile_uid), "index.db")
+    return os.path.join(index_dir(profile_uid), _INDEX_FILE)
 
 
 _SIDECARS = ("", "-wal", "-shm")
@@ -1641,6 +1679,36 @@ class IndexDB:
     def delete_collection_row(self, gen: int) -> None:
         with self._tx() as conn:
             conn.execute("DELETE FROM collections WHERE gen = ?", (int(gen),))
+
+    def rename_collection(
+        self, gen: int, *, old: str, new: str, meta: dict[str, Any] | None = None,
+    ) -> bool:
+        """Point generation ``gen`` at the physical collection ``new``.
+
+        Compare-and-set on the old name: False (and nothing written) when the
+        row no longer names ``old`` — a model change retired it meanwhile.
+        ``meta`` keys are written in the SAME transaction (``None`` deletes a
+        key), which is what lets the vector migration switch the row and
+        record the source's pending cleanup as one step: a crash can never
+        leave a switched row with its old collection forgotten, nor a cleanup
+        recorded for a collection that is still the live one."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE collections SET name = ? WHERE gen = ? AND name = ?",
+                (new, int(gen), old),
+            )
+            if cur.rowcount <= 0:
+                return False
+            for key, value in (meta or {}).items():
+                if value is None:
+                    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+                else:
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (key, str(value)),
+                    )
+            return True
 
     def next_gen(self) -> int:
         """Reserve and return a new, never-used generation number.

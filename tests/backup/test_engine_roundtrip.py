@@ -318,3 +318,95 @@ def test_a_rollback_keeps_the_results_this_install_still_owes(restore_env, tmp_p
             "SELECT origin_delivered_at FROM event_runs WHERE id='r-owed'"
         )).scalar()
     assert owed is None
+
+
+# ── Cremind manual pages and document indexes ───────────────────────────────
+
+
+def _two_profiles() -> None:
+    now = time.time()
+    with get_database_provider().sync_engine().begin() as c:
+        for pid, name in (("p1", "admin"), ("p2", "bob")):
+            c.execute(
+                text("INSERT INTO profiles (id, name, created_at, updated_at) VALUES (:i, :n, :t, :t)"),
+                {"i": pid, "n": name, "t": now},
+            )
+
+
+def _put(path: Path, text_: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text_, encoding="utf-8")
+
+
+def test_manual_pages_travel_by_uuid_and_indexes_stay_behind(restore_env, tmp_path):
+    """A profile's own manual pages live outside its name-keyed tree, at
+    ``storage/cremind_documents/profiles/<uuid>``: the archive must carry them
+    (for both profiles, each to its own uuid) — and never the derived index
+    store, the pre-rename index root, or the re-seeded shared mirror."""
+    import tarfile
+
+    from app.backup import engine as be
+    from app.backup.manifest import FILES_PREFIX
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    manual = src / "storage" / "cremind_documents"
+    _put(manual / "profiles" / "p1" / "mine.md", "admin's page")
+    _put(manual / "profiles" / "p2" / "bob.md", "bob's page")
+    _put(manual / "shared" / "document.md", "bundled")
+    _put(src / "storage" / "documents" / "p1" / "index.db", "index")
+    _put(src / "storage" / "userdocs" / "p2" / "index.db", "old index")
+
+    archive = be.create_backup(be.BackupOptions()).path
+    with tarfile.open(str(archive), "r:gz") as tf:
+        names = set(tf.getnames())
+    assert f"{FILES_PREFIX}storage/cremind_documents/profiles/p1/mine.md" in names
+    assert f"{FILES_PREFIX}storage/cremind_documents/profiles/p2/bob.md" in names
+    assert not any(
+        n.startswith(f"{FILES_PREFIX}{p}")
+        for n in names
+        for p in ("storage/documents", "storage/userdocs", "storage/cremind_documents/shared")
+    ), names
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(archive, target_system_dir=str(dst))
+    assert report.ok
+
+    restored = dst / "storage" / "cremind_documents" / "profiles"
+    assert (restored / "p1" / "mine.md").read_text(encoding="utf-8") == "admin's page"
+    assert (restored / "p2" / "bob.md").read_text(encoding="utf-8") == "bob's page"
+    assert not (restored / "p1" / "bob.md").exists()
+    assert not (dst / "storage" / "documents").exists()
+
+
+def test_an_archive_from_before_the_move_restores_pages_to_the_new_place(restore_env, tmp_path):
+    """An archive made before the manual moved carries a profile's pages at
+    ``<profile>/documents``. The restore copies them there, then relocates
+    them to the uuid directory of the restored profile row."""
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _two_profiles()
+    # The pre-move layout, as an older install's archive holds it.
+    _put(src / "admin" / "documents" / "note.md", "admin's old-layout page")
+    _put(src / "bob" / "documents" / "guides" / "g.md", "bob's old-layout page")
+    _put(src / "admin" / "PERSONA.md", "persona")
+
+    archive = be.create_backup(be.BackupOptions()).path
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(archive, target_system_dir=str(dst))
+    assert report.ok, report.error
+
+    pages = dst / "storage" / "cremind_documents" / "profiles"
+    assert (pages / "p1" / "note.md").read_text(encoding="utf-8") == "admin's old-layout page"
+    assert (pages / "p2" / "guides" / "g.md").read_text(encoding="utf-8") == "bob's old-layout page"
+    assert not (dst / "admin" / "documents").exists()
+    assert not (dst / "bob" / "documents").exists()
+    assert (dst / "admin" / "PERSONA.md").exists(), "the rest of the tree is restored as before"

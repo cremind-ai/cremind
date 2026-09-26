@@ -51,10 +51,10 @@ def test_payload_keeps_the_full_description_only_the_vector_text_is_capped(tmp_p
     """The stored payload is the source of truth; the cap is applied where the
     text is consumed (the embedder here, the judge prompt in the tool)."""
     long_desc = " ".join(f"keyword{i}" for i in range(600))
-    docs = tmp_path / "documents"
+    svc = CremindDocumentSyncService(working_dir=tmp_path, profile_uid_resolver=lambda p: f"uid-{p}")
+    docs = svc.shared_dir()
     docs.mkdir(parents=True)
     (docs / "big.md").write_text(f'---\ndescription: "{long_desc}"\n---\n\nbody\n', encoding="utf-8")
-    svc = CremindDocumentSyncService(working_dir=tmp_path)
 
     (payload,) = svc._scan_scope("shared").values()
 
@@ -65,10 +65,10 @@ def test_payload_keeps_the_full_description_only_the_vector_text_is_capped(tmp_p
 def test_oversized_description_warns_once_per_document(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_module, "_OVERSIZED_DESCRIPTIONS_WARNED", set())
     long_desc = "z " * DESCRIPTION_MAX_CHARS
-    docs = tmp_path / "documents"
+    svc = CremindDocumentSyncService(working_dir=tmp_path, profile_uid_resolver=lambda p: f"uid-{p}")
+    docs = svc.shared_dir()
     docs.mkdir(parents=True)
     (docs / "big.md").write_text(f'---\ndescription: "{long_desc.strip()}"\n---\n\nbody\n', encoding="utf-8")
-    svc = CremindDocumentSyncService(working_dir=tmp_path)
 
     messages: list[str] = []
     sink_id = logger.add(lambda m: messages.append(str(m)), level="WARNING")

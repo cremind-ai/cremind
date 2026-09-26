@@ -56,7 +56,30 @@ def get_service() -> "DocumentsService | None":
 
 
 def documents_root() -> str:
+    """Every profile's index directory lives here (``<uid>/``), plus the
+    extractors' ``tmp/``. Pre-rename installs are moved in from
+    ``storage/userdocs`` by app/documents/relocate.py before this engine
+    starts; an index whose move was skipped or failed is used where it is
+    until the next boot moves it (``app.documents.index.index_dir``), and
+    deleting an index removes both places (:func:`_remove_index_dirs`)."""
     return os.path.join(uds.system_dir(), "storage", "documents")
+
+
+def _remove_index_dirs(uid: str) -> None:
+    """Delete this uid's index wherever it is: the current directory and the
+    pre-rename one — a copy the engine was using in place because its move had
+    not happened yet, or one a relocation conflict kept — and close the
+    relocation's step for it, so the next boot neither moves the deleted index
+    back nor keeps reporting a conflict about it."""
+    from app.documents import relocate
+    from app.documents.index import index_dirs
+
+    current, _legacy = index_dirs(uid)
+    shutil.rmtree(current, ignore_errors=True)
+    try:
+        relocate.forget_index(uds.system_dir(), uid)
+    except Exception:  # noqa: BLE001 — the next boot closes the step (its source is gone)
+        logger.exception(f"[documents] could not close the relocation step of index {uid}")
 
 
 class DocumentsService:
@@ -417,7 +440,7 @@ class DocumentsService:
     # ── embedder ───────────────────────────────────────────────────────────
 
     def _embedder(self) -> None:
-        from app.documents import vector_sync
+        from app.documents import vector_migrate, vector_sync
 
         while not self._stop.is_set():
             with self._lock:
@@ -426,6 +449,17 @@ class DocumentsService:
             for rt in runtimes:
                 if self._stop.is_set():
                     return
+                # The pre-rename ``ud_`` collection is copied to its ``doc_``
+                # name on this same thread, one bounded batch per pass, so a
+                # copy and an embedding batch for one profile never overlap;
+                # while a copy runs the profile's new vectors wait (``hold``).
+                try:
+                    migration = vector_migrate.step(rt)
+                    did += migration.work
+                    if migration.hold:
+                        continue
+                except Exception:  # noqa: BLE001
+                    logger.exception(f"[documents] {rt.profile}: vector collection rename step failed")
                 try:
                     did += vector_sync.step(rt)
                 except Exception:  # noqa: BLE001
@@ -542,7 +576,7 @@ class DocumentsService:
         the only way to give the disk space back at once."""
         from app.storage.documents_storage import get_documents_storage
         from app.documents import vector_sync
-        from app.documents.index import index_dir, index_path
+        from app.documents.index import index_path
 
         rt = self.runtime(profile, create=True)
         if rt is None:
@@ -568,7 +602,9 @@ class DocumentsService:
         with self._lock:
             self._runtimes.pop(profile, None)
         vector_sync.drop_collections(rt.uid)
-        shutil.rmtree(index_dir(rt.uid), ignore_errors=True)
+        # Both places: a pre-rename copy left behind would be moved back by
+        # the next boot's relocation — the deleted index, resurrected.
+        _remove_index_dirs(rt.uid)
         storage.delete_captions(profile)
         storage.delete_vision_usage(profile)
         _purge_citations(profile)
@@ -606,7 +642,12 @@ class DocumentsService:
         self.wake_embedder()
 
     def _gc_orphan_indexes(self) -> None:
-        """Index folders and collections whose profile no longer exists."""
+        """Index folders and collections whose profile no longer exists.
+
+        Judged by the uid TAG alone, never the epoch or the prefix: a live
+        profile's pre-rename ``ud_`` collection and the ``doc_`` copy being
+        made of it (app/documents/vector_migrate.py) share the tag, so both
+        survive until the migration itself retires the old one."""
         from app.storage.documents_storage import get_documents_storage
         from app.documents import vector_sync
         from app.documents.vectors import parse_collection_name, profile_tag
@@ -620,7 +661,14 @@ class DocumentsService:
             for name in os.listdir(root):
                 if name == "tmp" or name in live:
                     continue
-                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                path = os.path.join(root, name)
+                if not _index_dir_like(path):
+                    # Not an index: before the move to uuid-keyed manual
+                    # directories, a profile NAMED "storage" kept its Cremind
+                    # manual pages right here, and one the relocation could
+                    # not move (a conflict) must not be collected as garbage.
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
                 logger.info(f"[documents] removed the index of a deleted profile ({name})")
         handles = vector_sync.live_handles()
         if handles is None:
@@ -1009,6 +1057,19 @@ def _ms(ts: Any) -> float | None:
     return float(ts) * 1000 if ts else None
 
 
+def _index_dir_like(path: str) -> bool:
+    """A directory holding nothing but an index file and its companions
+    (``index.db``, ``-wal``/``-shm``, the ``.bak`` a rebuild leaves), or
+    nothing at all — the only shape the orphan GC may delete wholesale."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return False
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return all(n.startswith("index.db") for n in names)
+
+
 def _file_view(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "fid": r.get("cite_id"), "id": int(r["id"]), "rel_path": r.get("rel_path"), "name": r.get("name"),
@@ -1051,7 +1112,6 @@ def forget_profile(profile: str, uid: str | None) -> None:
     gives the space back. Its research jobs' rows went with the profile row;
     their running tasks and artifacts go here."""
     from app.documents import vector_sync
-    from app.documents.index import index_dir
 
     _purge_research(profile)
     svc = get_service()
@@ -1067,7 +1127,10 @@ def forget_profile(profile: str, uid: str | None) -> None:
         vector_sync.drop_collections(uid)
     except Exception:  # noqa: BLE001
         pass
-    shutil.rmtree(index_dir(uid), ignore_errors=True)
+    # A copy the relocation could not move (a conflict it kept, or one the
+    # engine used in place) still sits at the pre-rename root; nothing else
+    # would ever collect it, and the next boot would move it back.
+    _remove_index_dirs(uid)
 
 
 def _purge_citations(profile: str) -> None:

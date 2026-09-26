@@ -13,7 +13,9 @@ import type { TokenUsage } from '../stores/chat';
 import { useChatStore } from '../stores/chat';
 import { useUsageStore } from '../stores/usage';
 import { useSettingsStore } from '../stores/settings';
-import { formatTokens, formatUsd, formatPercent, formatRatePerM } from '../utils/usageFormat';
+import {
+  formatTokens, formatUsd, formatPercent, formatRatePerM, usageSourceTypeLabel,
+} from '../utils/usageFormat';
 
 /**
  * The three fields this chip reads, and nothing else.
@@ -132,8 +134,7 @@ const bySource = computed(() => request.value?.by_source ?? []);
 const hasBreakdown = computed(() => bySource.value.length > 0);
 
 // Friendlier badge text for source types whose raw key reads awkwardly.
-const sourceTypeLabel = (t: string) =>
-  (t === 'event_gate' ? 'event filter' : t === 'documents' ? 'documentation search' : t);
+const sourceTypeLabel = usageSourceTypeLabel;
 
 const modelLabel = computed(() => request.value?.model ?? '');
 

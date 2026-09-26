@@ -70,6 +70,22 @@ export interface GroupDeletedFrame {
 }
 
 /**
+ * The room's shared search-tool selection was saved (by any posting member or
+ * the admin). Carries only the new version: the store re-reads the state
+ * unless it already holds that version.
+ */
+export interface GroupSearchToolsFrame {
+  type: 'search_tools';
+  data: {
+    version: number;
+    /** A member agent's new response just started on this version. */
+    adopted?: boolean;
+    // See `GroupSeatEventFrame` — declared for the `ready`-by-elimination branch.
+    agents?: undefined;
+  };
+}
+
+/**
  * What of a member's running turn the room is allowed to show — mirrors
  * `SEAT_EVENT_TYPES` in app/groups/hooks.py.
  *
@@ -132,7 +148,8 @@ export type GroupStreamFrame =
   | GroupAgentStatusFrame
   | GroupSeatEventFrame
   | GroupUpdatedFrame
-  | GroupDeletedFrame;
+  | GroupDeletedFrame
+  | GroupSearchToolsFrame;
 
 /**
  * Connection state of the tab that actually holds the socket. Follower tabs

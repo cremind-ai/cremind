@@ -31,3 +31,11 @@ Per-profile, three equivalent ways:
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`
 for the full configuration CLI.
+
+## Per conversation
+
+To keep the agent off the web in one conversation or group room only, untick
+Web search under the chat composer's **Search tools** button (or `cremind conv
+search-tools`); it is the last source in the priority order Documentation
+search → Cremind documentation search → Memory search → Web search, and the
+change applies from the next response.

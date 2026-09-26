@@ -331,13 +331,20 @@ async def _clean_skills(profile: str, deps: Deps) -> dict[str, Any]:
 
 
 async def _clean_cremind_documents(profile: str, deps: Deps) -> dict[str, bool]:
+    """The Cremind manual pages this profile wrote, and their points.
+
+    The directory is ``storage/cremind_documents/profiles/<uuid>``, resolved by
+    the service from the profile row (off the event loop: it is a DB read). A
+    profile whose uuid cannot be resolved has no directory to remove — never a
+    name-keyed guess, which could land in another tree entirely."""
     ds = deps.cremind_document_service
     detail = {"removed": False}
     if ds is None:
         return detail
     try:
-        pdir = ds.profile_dir(profile)
-        detail["removed"] = await asyncio.to_thread(_rmtree, str(pdir))
+        pdir = await asyncio.to_thread(ds.profile_dir, profile)
+        if pdir is not None:
+            detail["removed"] = await asyncio.to_thread(_rmtree, str(pdir))
     except Exception:  # noqa: BLE001
         logger.exception("clean: documents dir removal failed")
     try:

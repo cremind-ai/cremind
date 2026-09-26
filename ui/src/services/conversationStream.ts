@@ -54,6 +54,10 @@ export interface ConversationStreamEvent {
     // never opens one. The multiplexer forwards conversation-event frames of
     // any type, so this needed no change in profileEventsStream.ts.
     | 'citations'
+    // The conversation's search-tool selection was saved: `{version}`. Transient
+    // (never replayed); the chat store re-reads the state when the version is
+    // one it does not hold.
+    | 'search_tools'
     | 'complete'
     | 'error'
     | 'cwd';

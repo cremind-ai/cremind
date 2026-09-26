@@ -142,6 +142,14 @@ def get_profile_routes(
                     {"error": "Profile name must contain only lowercase letters, numbers, hyphens, and underscores"},
                     status_code=400,
                 )
+            # ``shared`` and ``cli`` are scope names of Cremind's own manual;
+            # a profile carrying one would share that scope (see
+            # app/cremind_documents/paths.py RESERVED_PROFILE_NAMES).
+            from app.cremind_documents.paths import reserved_profile_name_error
+
+            reserved = reserved_profile_name_error(name)
+            if reserved:
+                return JSONResponse({"error": reserved}, status_code=400)
             if await conversation_storage.profile_exists(name):
                 return JSONResponse(
                     {"error": f"Profile '{name}' already exists"}, status_code=409,
@@ -168,6 +176,20 @@ def get_profile_routes(
                 logger.info(
                     f"Backfilled {inserted} profile_tools row(s) for new profile '{name}'"
                 )
+
+            # Watch the new profile's own Cremind manual pages (its uuid folder
+            # under storage/cremind_documents/profiles) now, not only after the
+            # next restart. Off the loop: the watcher resolves the uuid and
+            # creates the folder.
+            try:
+                from app.cremind_documents import get_service as get_manual_service
+                from app.cremind_documents.watcher import start_scope_watcher
+
+                manual_service = get_manual_service()
+                if manual_service is not None:
+                    await asyncio.to_thread(start_scope_watcher, manual_service, name)
+            except Exception:  # noqa: BLE001 — the next boot starts it anyway
+                logger.exception(f"Manual watcher failed for new profile '{name}'")
 
             return JSONResponse(
                 {
@@ -279,6 +301,37 @@ def get_profile_routes(
             except Exception:  # noqa: BLE001 — never block the delete
                 logger.exception(
                     f"Could not remove the document index of deleted profile '{profile_name}'"
+                )
+
+            # The Cremind manual pages this profile wrote live outside its
+            # tree, at ``storage/cremind_documents/profiles/<uuid>`` (the uuid
+            # read above — the row is gone now), and their points carry the
+            # profile NAME as scope. Stop the watcher on that directory before
+            # removing it, prune the points, and forget the cached uuid so a
+            # profile re-created under this name gets its own, empty directory.
+            # Never the shared scope's watcher: a profile named ``shared``
+            # (possible before the name was reserved) shares that scope, and
+            # stopping it would leave the bundled manual unwatched for every
+            # profile. ``remove_profile_documents`` likewise never prunes it.
+            # The retired ``cli`` scope needs no such guard: it has no watcher
+            # of its own (one registered under ``cli`` can only be that
+            # profile's, and must stop before its folder goes), and its points
+            # are exactly what the boot prune removes anyway.
+            try:
+                from app.cremind_documents import get_service as get_manual_service
+                from app.cremind_documents import remove_profile_documents
+                from app.cremind_documents.paths import SHARED_SCOPE
+                from app.cremind_documents.watcher import stop_scope_watcher
+
+                if profile_name != SHARED_SCOPE:
+                    await asyncio.to_thread(stop_scope_watcher, profile_name)
+                await asyncio.to_thread(
+                    remove_profile_documents, profile_name, documents_uid,
+                    service=get_manual_service(),
+                )
+            except Exception:  # noqa: BLE001 — never block the delete
+                logger.exception(
+                    f"Could not remove the Cremind manual pages of deleted profile '{profile_name}'"
                 )
 
             # Group memberships cascade away with the profile row, but the

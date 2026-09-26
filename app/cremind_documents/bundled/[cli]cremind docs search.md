@@ -7,13 +7,12 @@ description: "Search the user's OWN indexed files (local folder and Google Drive
 These four subcommands query **Documentation search** the way the agent's
 Documentation Search tool does (`documentation_search__search`, `__find_files`,
 `__read`), over the current profile's index only. Turning indexing on, the
-folder and sync progress are in `cremind docs` (see `[cli]cremind
-documents`).
+folder and sync progress are in `cremind docs` (see `[cli]cremind docs`).
 
 Each prints the same text the agent reads: a header with the search mode and
 index status, the results inside a marked data block, and a `[doc:…]` citation
 token on every file and passage. Unlike the agent's copy it is not cut to a
-token budget. `cremind --json documents …` prints the structured result
+token budget. `cremind --json docs …` prints the structured result
 instead (`mode`, `items` with tokens, paging).
 
 If the profile has no index yet, or the feature is off or disabled by the
@@ -22,7 +21,7 @@ admin, the command says why and exits 1.
 ## Global flags
 
 All subcommands accept the root-level `--json` flag, right after `cremind`
-(`cremind --json documents search "budget"`).
+(`cremind --json docs search "budget"`).
 
 ## Subcommands
 
@@ -128,7 +127,8 @@ cremind docs cite '[doc:k7m2xq9a#3f9c2e1b]'
 ```
 
 A token from another profile, or one that was never printed by the tools, is
-reported as not found (exit 1).
+reported as not found (exit 1). Answers written before the rename carry
+`[ud:…]` tokens; `cite` and `read` accept them and print the `[doc:…]` form.
 
 ## Troubleshooting
 

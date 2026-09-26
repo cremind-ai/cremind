@@ -1,7 +1,10 @@
 """Cremind Documentation Search built-in tool.
 
-Vector-searches Markdown documentation kept under ``<CREMIND_SYSTEM_DIR>/documents``
-(shared) and ``<CREMIND_SYSTEM_DIR>/<profile>/documents`` (per-profile),
+Vector-searches Cremind's own Markdown manual, kept under
+``<CREMIND_SYSTEM_DIR>/storage/cremind_documents/shared`` (the bundle) and
+``<CREMIND_SYSTEM_DIR>/storage/cremind_documents/profiles/<profile uuid>``
+(pages a profile wrote), — not the user's own files, which
+``documentation_search`` searches —
 then runs an internal LLM-as-judge to pick the single most accurate
 candidate before loading that one document's body and returning it to the
 Reasoning Agent.
@@ -237,7 +240,7 @@ TOOL_CONFIG: ToolConfig = {
         "returns the single most relevant document, chosen by an internal LLM "
         "judge — whole when it is short, otherwise its head, a table of contents "
         "and the sections matching the query, so any other section can be read "
-        "on demand. Try it first for any factual or how-to lookup before "
+        "on demand. Use it for Cremind how-to, settings and CLI lookups before "
         "searching the public web. For a `cremind` CLI manual page, run the "
         "command it documents with the Shell Executor to get live answers "
         "instead of quoting the page."

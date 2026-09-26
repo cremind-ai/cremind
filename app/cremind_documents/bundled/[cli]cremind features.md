@@ -59,12 +59,17 @@ and `restart_pending` (bool).
 
 ```bash
 $ cremind features list
-FEATURE          INSTALLED  UPDATE    RESTART_AFTER  EXTRAS
-claude_code      false      -         false          claude-code
-codex            true       required  false          codex
-embedding.me5    false      -         true           embeddings-me5
+FEATURE               INSTALLED  UPDATE    RESTART_AFTER  EXTRAS
+claude_code           false      -         false          claude-code
+codex                 true       required  false          codex
+documentation_search  false      -         false          documents, documentation-search
+embedding.me5         false      -         true           embeddings-me5
 (codex: openai-codex 0.1.0b3 installed, needs openai-codex>=0.154.0,<0.155 - run `cremind features install codex`, then `cremind server restart`)
 ```
+
+`documentation_search` is Documentation search (indexing the user's own files,
+`cremind docs`); before the search-tool rename it was the `userdocs` feature
+and pip extra.
 
 ### `cremind features install`
 

@@ -105,10 +105,21 @@ def _write(directory: Path, name: str) -> None:
     (directory / name).write_text(_DOC, encoding="utf-8")
 
 
+def _shared(tmp_path: Path) -> Path:
+    return tmp_path / "storage" / "cremind_documents" / "shared"
+
+
+def _pdir(tmp_path: Path, profile: str) -> Path:
+    return tmp_path / "storage" / "cremind_documents" / "profiles" / f"uid-{profile}"
+
+
 def _install_service(monkeypatch, tmp_path: Path) -> CremindDocumentSyncService:
     """A real service over ``tmp_path``, served by ``app.cremind_documents.get_service``
-    (which ``_rebuild_caches`` imports inside the function, at call time)."""
-    service = CremindDocumentSyncService(working_dir=tmp_path)
+    (which ``_rebuild_caches`` imports inside the function, at call time).
+    Profiles resolve to ``uid-<name>`` directories."""
+    service = CremindDocumentSyncService(
+        working_dir=tmp_path, profile_uid_resolver=lambda p: f"uid-{p}",
+    )
     monkeypatch.setattr(documents_pkg, "get_service", lambda: service)
     return service
 
@@ -116,7 +127,7 @@ def _install_service(monkeypatch, tmp_path: Path) -> CremindDocumentSyncService:
 def test_rebuild_indexes_documents_while_the_state_is_rebuilding(
     monkeypatch, tmp_path, rebuilding_state, gg_places_calls,
 ):
-    _write(tmp_path / "documents", "widgets.md")
+    _write(_shared(tmp_path), "widgets.md")
     service = _install_service(monkeypatch, tmp_path)
     store, emb = _FakeStore(), _FakeEmbedder()
     # The precondition that used to bite: the service sees no store at all.
@@ -146,9 +157,9 @@ def test_rebuild_indexes_documents_while_the_state_is_rebuilding(
 def test_rebuild_reindexes_each_listed_profile_and_no_other(
     monkeypatch, tmp_path, rebuilding_state, gg_places_calls,
 ):
-    _write(tmp_path / "documents", "widgets.md")
-    _write(tmp_path / "alice" / "documents", "alice-notes.md")
-    _write(tmp_path / "bob" / "documents", "bob-notes.md")
+    _write(_shared(tmp_path), "widgets.md")
+    _write(_pdir(tmp_path, "alice"), "alice-notes.md")
+    _write(_pdir(tmp_path, "bob"), "bob-notes.md")
     service = _install_service(monkeypatch, tmp_path)
     store, emb = _FakeStore(), _FakeEmbedder()
 
@@ -164,7 +175,7 @@ def test_rebuild_reindexes_each_listed_profile_and_no_other(
 def test_override_is_cleared_when_the_reconcile_raises(
     monkeypatch, tmp_path, rebuilding_state, gg_places_calls,
 ):
-    _write(tmp_path / "documents", "widgets.md")
+    _write(_shared(tmp_path), "widgets.md")
     service = _install_service(monkeypatch, tmp_path)
     store, emb = _FakeStore(), _FakeEmbedder()
     seen_inside: list[tuple[object, object]] = []
@@ -186,3 +197,23 @@ def test_override_is_cleared_when_the_reconcile_raises(
     assert service._embedder() is None
     assert rebuilding_state.phase is None
     assert store.added == []
+
+
+def test_the_rebuild_closes_the_manual_collection_retirement(
+    monkeypatch, tmp_path, rebuilding_state, gg_places_calls,
+):
+    """The rebuild drops the pre-rename manual collection with the owned set;
+    the relocation journal (in the service's system dir, never the real one)
+    records that, so the boot stops waiting to retire it."""
+    from app.documents import relocate
+
+    _write(_shared(tmp_path), "widgets.md")
+    _install_service(monkeypatch, tmp_path)
+
+    embedding_lifecycle._rebuild_caches(
+        agent=None, embedding=_FakeEmbedder(), vector_store=_FakeStore(), profiles=[],
+    )
+
+    journal = relocate.Journal.load(tmp_path)
+    assert (journal.step("manual_collection") or {}).get("state") == "done"
+    assert relocate.pending_errors(tmp_path) == []

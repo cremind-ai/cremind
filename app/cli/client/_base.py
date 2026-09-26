@@ -14,6 +14,16 @@ import httpx
 
 from app.cli.config import Config
 
+#: The client-protocol marker every request carries. The server refuses
+#: tool-configuration, setup and cleanup writes without it (426
+#: ``ClientUpgradeRequired``), because a CLI older than the search-tool rename
+#: would send ``documentation_search`` meaning Cremind's manual, which is now the
+#: user's own documents. Mirrors ``app.middleware.client_protocol`` — spelled out
+#: here, not imported, to keep the slim CLI install free of server modules; a
+#: test pins the two equal.
+CLIENT_PROTOCOL_HEADER = "X-Cremind-Client-Protocol"
+CLIENT_PROTOCOL_VERSION = 2
+
 
 class APIError(Exception):
     """Raised when the server responds with a non-2xx status."""
@@ -43,11 +53,15 @@ class Client:
     which one caller needs: `POST /api/config/setup` pip-installs whatever
     optional features the payload implies *inside the request*, so a profile
     whose tools need packages can take minutes to create.
+
+    Both clients send :data:`CLIENT_PROTOCOL_HEADER` on every request — plain
+    calls, SSE streams, downloads and uploads alike — so no command can forget
+    it.
     """
 
     def __init__(self, cfg: Config, *, timeout: Optional[float] = 60.0) -> None:
         self._cfg = cfg
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = {CLIENT_PROTOCOL_HEADER: str(CLIENT_PROTOCOL_VERSION)}
         if cfg.token:
             headers["Authorization"] = f"Bearer {cfg.token}"
         self._http = httpx.AsyncClient(

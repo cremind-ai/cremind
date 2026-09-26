@@ -561,7 +561,7 @@ def test_the_query_api_runs_the_leaves_for_the_caller_only(corpus):
 # ── the agent: gate and guidance ───────────────────────────────────────────
 
 
-def _agent(monkeypatch, *, origin=None, allowed=True):
+def _agent(monkeypatch, *, origin=None, allowed=True, search_tools=None):
     import app.agent.reasoning_agent as ra
 
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: SimpleNamespace(
@@ -577,14 +577,17 @@ def _agent(monkeypatch, *, origin=None, allowed=True):
         return allowed and gate.origin_class(message_origin) == gate.ORIGIN_WEB_CLI
 
     monkeypatch.setattr(gate, "documents_tool_available", fake_gate)
+    import app.tools.builtin.cremind_documentation_search as manual
+
     group = SimpleNamespace(tool_id="documentation_search", config_name="documentation_search", name="Documentation Search",
                             skills=[SimpleNamespace(name=t.name) for t in tool.get_tools({})])
     docs = SimpleNamespace(tool_id="cremind_documentation_search", config_name="cremind_documentation_search",
-                           name="Cremind Documentation Search", skills=[])
+                           name="Cremind Documentation Search",
+                           skills=[SimpleNamespace(name=t.name) for t in manual.get_tools({})])
     registry = SimpleNamespace(tools_for_profile=lambda profile: [group, docs])
     llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")
     agent = ra.ReasoningAgent(llm=llm, registry=registry, profile="alice", context_id="ctx",
-                              message_origin=origin)
+                              message_origin=origin, search_tools=search_tools)
     return agent, calls
 
 
@@ -599,9 +602,32 @@ def test_the_agent_offers_the_tool_and_its_rules_in_the_web_ui(monkeypatch):
     assert "[doc:…]" in prompt and "±1 day" in prompt
     # The research leaf is registered: legal/financial questions are sent to it.
     assert "`documentation_search__research`" in prompt and "continue_job" in prompt
-    # The user's files come first in the verify-before-answering guidance.
-    assert prompt.index("`documentation_search__search`") < prompt.index("`cremind_documentation_search__search_documentation`")
+    # The rules name Cremind's manual as the sibling NOT to use for the user's files.
+    assert "not `cremind_documentation_search__search_documentation` (Cremind's own manual)" in prompt
+    # The user's files come first in the priority-ordered SEARCH SOURCES block.
+    sources = prompt[prompt.index("SEARCH SOURCES — IN PRIORITY ORDER"):]
+    assert sources.index("`documentation_search__search`") < sources.index(
+        "`cremind_documentation_search__search_documentation`")
     assert agent._build_instruction() == prompt  # byte-stable within the run
+
+
+def test_the_rules_name_the_manual_only_when_this_conversation_exposes_it(monkeypatch):
+    """A conversation that turned Cremind's manual off must not be told to avoid
+    (or use) a function it was never sent."""
+    from app.agent.search_tools import Snapshot
+
+    agent, _ = _agent(monkeypatch, search_tools=Snapshot.of(["documentation_search"], 3))
+    assert "cremind_documentation_search" not in agent._tools_by_id
+    prompt = agent._build_instruction()
+    assert "USER DOCUMENTS — THE USER'S OWN FILES" in prompt
+    assert "Use them — not the file-system tools —" in prompt
+    assert "cremind_documentation_search__" not in prompt
+    # …and the other way round: the user's files turned off leave no rules at all.
+    agent, _ = _agent(monkeypatch, search_tools=Snapshot.of(["cremind_documentation_search"], 4))
+    assert "documentation_search" not in agent._tools_by_id
+    prompt = agent._build_instruction()
+    assert "USER DOCUMENTS" not in prompt
+    assert re.search(r"(?<![a-z_])documentation_search__", prompt) is None
 
 
 def test_the_agent_hides_the_tool_in_channels_and_rooms(monkeypatch):
@@ -622,6 +648,9 @@ def test_the_research_sentence_appears_only_with_a_research_leaf():
     group.skills = leaves + [SimpleNamespace(name="research")]
     with_research = ra._build_documentation_search_guidance([group])
     assert "`documentation_search__research`" in with_research and "continue_job" in with_research
+    # A research leaf the profile switched off is not named either.
+    off = ra._build_documentation_search_guidance([group], {"documentation_search": {"research"}})
+    assert "documentation_search__research" not in off and "continue_job" not in off
     assert ra._build_documentation_search_guidance([]) == ""
 
 

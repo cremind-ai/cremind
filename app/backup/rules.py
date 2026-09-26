@@ -1,22 +1,29 @@
 """Inclusion/exclusion rules for the file trees under ``CREMIND_SYSTEM_DIR``.
 
 Include-list driven (safer than exclude-driven for a directory that also holds
-venvs, caches, and the DB): only the shared ``browser-profile/`` and each
-``<profile>/`` tree named in the DB are walked. The ``tokens/`` tree (JWT
-session tokens) is intentionally excluded — see :func:`include_roots`. Within
-those roots, transient and rebuildable content is pruned:
+venvs, caches, and the DB): only the shared ``browser-profile/``, each
+``<profile>/`` tree named in the DB, and each profile's own Cremind manual
+pages (``storage/cremind_documents/profiles/<uuid>``, keyed by the profile's
+uuid — see :func:`include_roots`) are walked. The ``tokens/`` tree (JWT
+session tokens) is intentionally excluded. Within those roots, transient and
+rebuildable content is pruned:
 
 - the relational DB (``storage/``) is captured as a portable logical dump, not
   copied file-for-file; ``storage/chroma`` embeddings rebuild on boot
-- shared ``documents/`` is re-seeded from the bundle on every boot
+- the shared manual (``storage/cremind_documents/shared``) is re-seeded from
+  the bundle on every boot, so it is never archived
 - ``uploads_tmp/`` is wiped on boot; skill ``scripts/.env`` is regenerated from
   ``tool_configs`` rows; exec_shell stdout dirs are process scratch
 - browser-profile Chromium caches are recreatable (login state — cookies,
   Local Storage — is kept)
-- ``storage/documents`` (Documentation search index files, rebuilt from the
-  user's own folder) and ``.cache`` (downloaded embedding models) are pruned
-  by name as well: a profile may be *called* ``storage``, and its tree then
-  starts where these live
+- ``storage/documents`` and ``storage/userdocs`` (Documentation search index
+  files, rebuilt from the user's own folder) and ``.cache`` (downloaded
+  embedding models) are pruned by name as well: a profile may be *called*
+  ``storage``, and its tree then starts where these live
+
+An archive made before the manual moved carries a profile's pages at
+``<profile>/documents``; the restore copies them back there and the relocation
+that follows (app/documents/relocate.py) moves them to the uuid directory.
 
 Pure functions only — no ``app.*`` imports — so this is trivially unit-testable
 and safe to import from the offline CLI.
@@ -55,10 +62,31 @@ _TOP_LEVEL_EXCLUDES: tuple[tuple[str, ...], ...] = (
     # them (app/documents/relocate.py).
     ("storage", "documents"),
     ("storage", "userdocs"),
+    # The bundled manual's mirror, re-seeded on every boot.
+    ("storage", "cremind_documents", "shared"),
+    # The relocation's journal and lock: bookkeeping of THIS installation's
+    # move, meaningless (and misleading) on another.
+    ("storage", "document-relocation.json"),
+    ("storage", "document-relocation.lock"),
     # HF_HOME / SENTENCE_TRANSFORMERS_HOME in the container image: embedding
     # models, downloaded again on first use.
     (".cache",),
 )
+
+# Each profile's own manual pages: ``storage/cremind_documents/profiles/<uuid>``
+# is walked as a root of its own (a uuid, not a name, so it needs the profile
+# ids — see :func:`include_roots`). Mirrors app.cremind_documents.paths.
+AUTHORED_DOCS_PARTS: tuple[str, ...] = ("storage", "cremind_documents", "profiles")
+
+
+def authored_docs_root(uid: str) -> str:
+    """The archive-relative root of one profile's manual pages."""
+    return "/".join((*AUTHORED_DOCS_PARTS, uid))
+
+
+def _valid_uid(uid: str) -> bool:
+    s = str(uid or "")
+    return bool(s) and s not in (".", "..") and not any(c in s for c in ("/", "\\", "\0"))
 
 
 def long_path(p: str) -> str:
@@ -78,8 +106,13 @@ def long_path(p: str) -> str:
     return "\\\\?\\" + ap
 
 
-def include_roots(profiles: list[str], *, include_browser_profiles: bool = True) -> list[str]:
-    """Top-level relative roots to walk, in a stable order.
+def include_roots(
+    profiles: list[str],
+    *,
+    include_browser_profiles: bool = True,
+    profile_uids: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """Relative roots to walk, in a stable order.
 
     ``tokens/`` (per-profile JWT session tokens) is deliberately **not** walked:
     the JWT signing secret and its issued tokens are local to an installation —
@@ -88,11 +121,17 @@ def include_roots(profiles: list[str], *, include_browser_profiles: bool = True)
     (see ``app/backup/engine.py``). Per-profile OAuth tokens (e.g. a skill's
     ``scripts/.google_token.json``) live under the ``<profile>/`` root and are
     still backed up as user data.
+
+    ``profile_uids`` adds each profile's manual pages
+    (``storage/cremind_documents/profiles/<uuid>``) — user-written content
+    that lives outside the profile's name-keyed tree. Only the uuids of live
+    profiles are passed, so a deleted profile's leftovers are never archived.
     """
     roots: list[str] = []
     if include_browser_profiles:
         roots.append("browser-profile")
     roots.extend(sorted(profiles))
+    roots.extend(authored_docs_root(uid) for uid in sorted(set(profile_uids)) if _valid_uid(uid))
     return roots
 
 
@@ -112,6 +151,14 @@ def is_excluded(rel_posix: str, *, is_dir: bool) -> bool:
 
     if any(tuple(parts[: len(prefix)]) == prefix for prefix in _TOP_LEVEL_EXCLUDES):
         return True
+
+    # The manual pages' own roots are walked explicitly; below them only the
+    # global prunes (``__pycache__``, ``*.tmp``…) apply — never the per-profile
+    # layout rules, which would misread ``storage`` as a profile name.
+    if tuple(parts[: len(AUTHORED_DOCS_PARTS)]) == AUTHORED_DOCS_PARTS:
+        if any(comp in _GLOBAL_EXCLUDE_DIRS for comp in parts):
+            return True
+        return not is_dir and name.lower().endswith(_GLOBAL_EXCLUDE_FILE_SUFFIXES)
 
     # Global directory prunes at any depth.
     if any(comp in _GLOBAL_EXCLUDE_DIRS for comp in parts):
@@ -150,15 +197,25 @@ def iter_backup_files(
     profiles: list[str],
     *,
     include_browser_profiles: bool = True,
+    profile_uids: list[str] | tuple[str, ...] = (),
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(absolute_source_path, relative_posix_arcname)`` for each file.
 
     ``relative_posix_arcname`` is relative to ``system_dir`` (the engine prepends
     the ``files/`` member prefix). Directories are pruned in-place so excluded
     subtrees are never descended. Symlinks are skipped (the caller records them).
+
+    Each file is yielded once even when two roots overlap (a profile named
+    ``storage`` walks ``<SYS>/storage``, which contains the manual roots). A
+    manual directory whose uuid is not in ``profile_uids`` — a deleted
+    profile's leftovers — is never walked, from any root.
     """
     base = Path(system_dir)
-    for root in include_roots(profiles, include_browser_profiles=include_browser_profiles):
+    live_uids = {u for u in profile_uids if _valid_uid(u)}
+    seen: set[str] = set()
+    for root in include_roots(
+        profiles, include_browser_profiles=include_browser_profiles, profile_uids=list(live_uids),
+    ):
         start = base / root
         if not start.exists():
             continue
@@ -177,6 +234,8 @@ def iter_backup_files(
                     continue  # don't descend symlinked dirs
                 if is_excluded(child_rel, is_dir=True):
                     continue
+                if rel_dir_posix == "/".join(AUTHORED_DOCS_PARTS) and d not in live_uids:
+                    continue  # a deleted profile's manual pages
                 kept.append(d)
             dirnames[:] = kept
 
@@ -187,10 +246,15 @@ def iter_backup_files(
                     continue
                 if is_excluded(child_rel, is_dir=False):
                     continue
+                if child_rel in seen:
+                    continue
+                seen.add(child_rel)
                 yield full, child_rel
 
 
 __all__ = [
+    "AUTHORED_DOCS_PARTS",
+    "authored_docs_root",
     "include_roots",
     "is_excluded",
     "iter_backup_files",

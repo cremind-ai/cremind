@@ -204,3 +204,26 @@ def test_a_token_minted_before_adoption_still_verifies_afterwards(
     claims = jwt.decode(before, secret, algorithms=["HS256"])
     after = jwt.decode(json.loads(response.body)["token"], secret, algorithms=["HS256"])
     assert claims["tsr"] == after["tsr"] == 7
+
+
+# ── reserved names ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", ["shared", "cli"])
+def test_a_new_profile_may_not_take_a_name_the_manual_reserves(setup_env, name: str) -> None:
+    """``shared`` and ``cli`` are scope names of Cremind's own manual: a
+    profile named ``shared`` would merge its pages into the bundled manual,
+    and deleting it would prune that manual for everyone."""
+    response, _storage, conversations = _run({"profile": name}, exists=False)
+    assert response.status_code == 400, response.body
+    assert "reserved" in json.loads(response.body)["error"]
+    assert conversations.created == []
+
+
+def test_a_profile_created_before_the_reservation_can_still_be_adopted(setup_env) -> None:
+    """Refusing it would leave that profile impossible to configure."""
+    response, _storage, conversations = _run(
+        {"profile": "shared", "adopt_existing": True}, exists=True,
+    )
+    assert response.status_code == 200, response.body
+    assert conversations.created == []

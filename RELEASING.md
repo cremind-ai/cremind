@@ -408,6 +408,34 @@ When the PR touches [`app/storage/models.py`](app/storage/models.py):
 4. Backfill **inside** the migration, not in application code.
 5. Test the upgrade from a real older install, not just a fresh DB.
 
+### An identifier changes meaning
+
+A rename that frees a name for something else — a tool id, a REST path, a
+config key, a clean-up component — is worse than a removal: an outdated client
+keeps working and quietly acts on the wrong thing. The search-tool rename (the
+tool id `documentation_search` moved from Cremind's manual to the user's own
+documents) is the worked example; its note is
+[`docs/upgrade-search-tool-rename.md`](docs/upgrade-search-tool-rename.md).
+
+1. Migrate stored data, backups and blueprint archives in the same release
+   (see **Schema change**), so nothing keeps the old meaning server-side.
+2. Bump the client-protocol version in all three places — the server
+   (`CLIENT_PROTOCOL_VERSION` in `app/middleware/client_protocol.py`), the CLI
+   (`app/cli/client/_base.py`) and the web UI
+   (`ui/src/services/clientProtocol.ts`; `tests/api/test_client_protocol.py`
+   pins the three equal) — and extend `requires_current_client` to the routes
+   that carry the identifier.
+   Outdated clients then get `426 ClientUpgradeRequired` instead of writing
+   under the old meaning.
+3. Answer retired URL prefixes with `410 EndpointRenamed` via
+   `RENAMED_PREFIXES` in `app/api/retired.py`.
+4. Write an upgrade note under `docs/` with before/after tables and example
+   commands, and link it from the release notes. Say plainly that server, web
+   UI and CLI upgrade together, and in which order.
+5. Validate the dev release with an **old** CLI and a web UI tab left open
+   from before the upgrade: both must be refused with the upgrade message on
+   the gated writes, and must still be able to read.
+
 ### A release fails partway through
 
 Because `publish` is the last job, a partial failure leaves the draft

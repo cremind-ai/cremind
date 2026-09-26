@@ -1,5 +1,5 @@
 ---
-description: "Multi-profile **group chats**: one Cremind room several agent profiles share — seat member profiles, post once so every agent decides for itself whether it was addressed, cap agent-to-agent loops with hops, tail the timeline. Distinct from `cremind conv` (one profile's thread) and from a real platform group (`cremind channels groups`)."
+description: "Multi-profile **group chats**: one Cremind room several agent profiles share — seat members, post once so each agent decides whether it was addressed, cap agent loops with hops, set the room's search sources (`search-tools`), tail the timeline. Not `cremind conv` (one profile's thread) nor a platform group (`cremind channels groups`)."
 ---
 
 # `cremind group` — Multi-Profile Group Chats
@@ -388,6 +388,50 @@ smart_routing    True
 
 # Every member takes a full turn on every post again
 $ cremind group set Ops --no-routing
+```
+
+### `cremind group search-tools`
+
+**Purpose.** Show or set the room's **shared** search sources — the same choice
+the room composer's **Search tools** button makes for everyone in it.
+
+**Syntax.**
+
+```bash
+cremind group search-tools <group>                       # show
+cremind group search-tools <group> --enable <tool-id> …  # replace the selection
+cremind group search-tools <group> --all                 # restore the defaults
+cremind group search-tools <group> --none                # turn every source off
+```
+
+**Flags.** Exactly those of
+[`cremind conv search-tools`](./%5Bcli%5Dcremind%20conv.md): `--enable`
+(repeatable or comma-separated; replaces the selection), `--all`, `--none` —
+mutually exclusive. Tool ids in priority order: `documentation_search`,
+`cremind_documentation_search`, `memory_search`, `web_search`.
+
+**Behavior.**
+
+- **One selection per room**, stored on the room; new members inherit it. Any
+  member profile or the admin may change it (every other room setting stays
+  admin-only).
+- **Each agent keeps its own limits.** The room's choice is intersected with
+  each responding agent's own tool settings and its Documentation search
+  consent for rooms (`cremind docs allow-in --rooms`), so availability varies
+  by agent: `documentation_search` is listed when at least one member agent can
+  use it, and a source some members cannot use carries the note
+  `Availability varies by agent in this room.` No member's folders, models or
+  tool settings are shown to the others — only the aggregate.
+- **Next response.** An agent already answering keeps its search tools; an idle
+  one adopts the saved choice when its next response starts.
+- **Prompt cache.** The warning is printed when at least one member agent's
+  next response may send a different prompt prefix than its last one.
+- `--json` prints the same state body as `cremind conv search-tools`.
+
+**Example.**
+
+```bash
+$ cremind group search-tools Standup --enable cremind_documentation_search,web_search
 ```
 
 ### `cremind group delete`

@@ -32,6 +32,7 @@ EXPECTED_COMMANDS = {
     "cremind group show",
     "cremind group set",
     "cremind group delete",
+    "cremind group search-tools",
     "cremind group send",
     "cremind group history",
     "cremind group members add",

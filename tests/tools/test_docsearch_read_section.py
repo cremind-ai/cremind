@@ -162,9 +162,20 @@ def _deterministic(monkeypatch):
     _patch_registry(monkeypatch, raises=RuntimeError("registry not initialized"))
 
 
+def _shared(tmp_path: Path) -> Path:
+    return tmp_path / "storage" / "cremind_documents" / "shared"
+
+
+def _pdir(tmp_path: Path, profile: str) -> Path:
+    """A profile's manual pages: keyed by its uuid (here ``uid-<name>``)."""
+    return tmp_path / "storage" / "cremind_documents" / "profiles" / f"uid-{profile}"
+
+
 @pytest.fixture
 def svc(tmp_path, monkeypatch) -> CremindDocumentSyncService:
-    service = CremindDocumentSyncService(working_dir=tmp_path)
+    service = CremindDocumentSyncService(
+        working_dir=tmp_path, profile_uid_resolver=lambda p: f"uid-{p}",
+    )
     monkeypatch.setattr(ds, "get_service", lambda: service)
     return service
 
@@ -172,7 +183,7 @@ def svc(tmp_path, monkeypatch) -> CremindDocumentSyncService:
 @pytest.fixture
 def library(tmp_path, svc) -> Path:
     """A shared corpus: the widgets CLI reference, a long guide, and a skill."""
-    shared = tmp_path / "documents"
+    shared = _shared(tmp_path)
     _write(shared, "[cli]cremind widgets", _WIDGETS, "Manage widgets")
     _write(shared, "[cli]cremind gadgets", "# cremind gadgets\n\n## Commands\n\nNone.\n", "Gadgets")
     _write(shared, "gizmo guide", _GIZMO, "Gizmo guide")
@@ -259,7 +270,7 @@ def test_a_heading_inside_a_code_fence_is_not_a_section(library):
 
 def test_duplicate_headings_serve_the_first_with_a_note(tmp_path, svc):
     body = "# notes\n\n## Notes\n\nfirst copy\n\n## Other\n\nx\n\n## Notes\n\nsecond copy\n"
-    _write(tmp_path / "documents", "notes doc", body)
+    _write(_shared(tmp_path), "notes doc", body)
 
     text = _text(_read("notes doc", "notes"))
 
@@ -337,7 +348,7 @@ def test_the_directive_is_reserved_out_of_the_section_budget(tmp_path, svc, monk
         lines.append(f"dump line {i:04d} " + "-" * 60)
         i += 1
     body = "\n".join(lines) + "\n"
-    _write(tmp_path / "documents", "[cli]cremind big", body)
+    _write(_shared(tmp_path), "[cli]cremind big", body)
     total = _tok(_section(body, "Dump"))
     assert budget_with < total <= budget_without  # precondition of the test
 
@@ -395,7 +406,7 @@ def test_no_section_on_a_long_doc_without_sections_returns_its_beginning(tmp_pat
     _set_clamp(monkeypatch, 1300)
     body = "# flat\n\n" + _filler("FLAT", 100) + "\n"
     assert _tok(body) > 1200
-    _write(tmp_path / "documents", "flat doc", body)
+    _write(_shared(tmp_path), "flat doc", body)
 
     text = _text(_read("flat doc"))
 
@@ -569,7 +580,7 @@ def test_a_long_single_line_doc_still_shows_its_beginning(tmp_path, svc, monkeyp
     content at all."""
     _set_clamp(monkeypatch, 1300)
     body = "word " * 2000 + "\n"  # one line, ~2500 tokens, no headings
-    _write(tmp_path / "documents", "blob doc", body)
+    _write(_shared(tmp_path), "blob doc", body)
 
     text = _text(_read("blob doc"))
 
@@ -582,7 +593,7 @@ def test_an_oversized_section_whose_paragraph_is_one_line_still_shows_its_beginn
     line came back as just its heading."""
     _set_clamp(monkeypatch, 1300)
     body = "# big\n\n## Blob\n\n" + "word " * 2000 + "\n"
-    _write(tmp_path / "documents", "blob section doc", body)
+    _write(_shared(tmp_path), "blob section doc", body)
 
     text = _text(_read("blob section doc", "blob"))
 
@@ -613,7 +624,7 @@ def test_var_tokens_resolve_for_the_calling_profile(tmp_path, svc, monkeypatch):
         return text.replace("$CREMIND_PROFILE", profile)
 
     monkeypatch.setattr(ds, "resolve_system_var_tokens", _resolve)
-    _write(tmp_path / "documents", "profile guide", _PROFILE_GUIDE)
+    _write(_shared(tmp_path), "profile guide", _PROFILE_GUIDE)
 
     text = _text(_read("profile guide", "where your files live", profile="bob"))
 
@@ -629,7 +640,7 @@ def test_var_tokens_resolve_before_headings_are_matched(tmp_path, svc, monkeypat
     monkeypatch.setattr(
         ds, "resolve_system_var_tokens", lambda text, profile: text.replace("$CREMIND_PROFILE", profile),
     )
-    _write(tmp_path / "documents", "profile guide", _PROFILE_GUIDE)
+    _write(_shared(tmp_path), "profile guide", _PROFILE_GUIDE)
 
     text = _text(_read("profile guide", "notes for bob", profile="bob"))
     assert text.startswith('[Section "Notes for bob" of "profile guide" (shared)')
@@ -673,12 +684,12 @@ def test_an_uninitialized_service_is_reported(monkeypatch):
 
 @pytest.fixture
 def two_profiles(tmp_path, svc) -> Path:
-    _write(tmp_path / "documents", "shared guide", "# shared\n\n## Hello\n\nfor everyone\n")
+    _write(_shared(tmp_path), "shared guide", "# shared\n\n## Hello\n\nfor everyone\n")
     admin_path = _write(
-        tmp_path / "admin" / "documents", "admin notes",
+        _pdir(tmp_path, "admin"), "admin notes",
         "# admin notes\n\n## Secrets\n\nadmin eyes only\n",
     )
-    _write(tmp_path / "bob" / "documents", "bob notes", "# bob notes\n\n## Mine\n\nbob stuff\n")
+    _write(_pdir(tmp_path, "bob"), "bob notes", "# bob notes\n\n## Mine\n\nbob stuff\n")
     return admin_path
 
 
@@ -702,6 +713,8 @@ def test_a_path_never_reaches_another_profiles_document(two_profiles):
         admin_path.as_posix(),
         "../admin/documents/admin notes",
         "..\\admin\\documents\\admin notes.md",
+        "../uid-admin/admin notes",
+        "..\\uid-admin\\admin notes.md",
     ):
         err = _error(_read(document, "secrets", profile="bob"))
         assert err["error"] == "DocumentNotFound", document
@@ -770,7 +783,7 @@ def test_the_group_exposes_both_leaves_under_the_module_constants():
 def test_dispatch_through_the_adapter_injects_the_profile(tmp_path, svc):
     # The doc exists ONLY in bob's scope, so it resolves only if the adapter
     # injected _profile="bob" (the leaf falls back to "admin" without it).
-    _write(tmp_path / "bob" / "documents", "bob notes", "# bob notes\n\n## Mine\n\nbob stuff\n")
+    _write(_pdir(tmp_path, "bob"), "bob notes", "# bob notes\n\n## Mine\n\nbob stuff\n")
     group = _group()
 
     ok = _execute_leaf(
@@ -799,7 +812,7 @@ def test_an_oversized_section_caps_its_subsection_list_to_the_budget(tmp_path, s
     parts = ["# faq", "", "Questions and answers.", "", "## Questions", "", "Pick one."]
     for i in range(220):
         parts += ["", f"### Question number {i:03d} about widgets", "", _filler(f"q{i}", 3)]
-    _write(tmp_path / "documents", "faq", "\n".join(parts))
+    _write(_shared(tmp_path), "faq", "\n".join(parts))
 
     text = _text(_read("faq", "Questions"))
 
@@ -815,7 +828,7 @@ def test_a_head_the_envelope_cut_is_readable_as_the_introduction(tmp_path, svc, 
     _set_clamp(monkeypatch, 4000)
     head = _filler("HEAD", 60)
     body = f"# guide\n\n{head}\n\n## Setup\n\n{_filler('setup', 10)}\n"
-    _write(tmp_path / "documents", "long intro guide", body)
+    _write(_shared(tmp_path), "long intro guide", body)
 
     text = _text(_read("long intro guide", "Introduction"))
 
@@ -827,7 +840,7 @@ def test_a_head_the_envelope_cut_is_readable_as_the_introduction(tmp_path, svc, 
 def test_a_real_heading_named_introduction_wins_over_the_head(tmp_path, svc, monkeypatch):
     _set_clamp(monkeypatch, 4000)
     body = "# guide\n\nPREAMBLE\n\n## Introduction\n\nREAL-SECTION\n"
-    _write(tmp_path / "documents", "intro guide", body)
+    _write(_shared(tmp_path), "intro guide", body)
 
     text = _text(_read("intro guide", "Introduction"))
 
@@ -838,8 +851,8 @@ def test_an_ambiguous_document_name_lists_qualified_references(tmp_path, svc, mo
     """Regression: the shared copy used to win silently, so an envelope built
     for the profile's copy sent the reader to a different document."""
     _set_clamp(monkeypatch, 4000)
-    _write(tmp_path / "documents", "guide", "# guide\n\n## Alpha\n\nshared\n")
-    _write(tmp_path / "admin" / "documents", "guide", "# guide\n\n## Rollback\n\nADMIN-COPY\n")
+    _write(_shared(tmp_path), "guide", "# guide\n\n## Alpha\n\nshared\n")
+    _write(_pdir(tmp_path, "admin"), "guide", "# guide\n\n## Rollback\n\nADMIN-COPY\n")
 
     err = _error(_read("guide", "Rollback"))
     assert err["error"] == "AmbiguousDocument"
@@ -852,7 +865,7 @@ def test_an_ambiguous_document_name_lists_qualified_references(tmp_path, svc, mo
 def test_a_hyphenated_heading_is_found_with_spaces(tmp_path, svc, monkeypatch):
     _set_clamp(monkeypatch, 4000)
     body = "# cremind tools\n\n## Subcommands\n\n### `cremind tools set-args`\n\nSET-ARGS-BODY\n"
-    _write(tmp_path / "documents", "[cli]cremind tools", body)
+    _write(_shared(tmp_path), "[cli]cremind tools", body)
 
     text = _text(_read("[cli]cremind tools", "set args"))
 

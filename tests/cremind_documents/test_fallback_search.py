@@ -33,13 +33,16 @@ BUNDLED = Path(__file__).resolve().parents[2] / "app" / "cremind_documents" / "b
 def _svc_with_system_docs(tmp_path):
     """A degraded-mode service (no vector store / embedding) seeded with the
     real bundled system docs under its shared ``documents/`` dir."""
-    docs = tmp_path / "documents"
+    svc = CremindDocumentSyncService(
+        working_dir=tmp_path, vector_store=None, embedding=None,
+        profile_uid_resolver=lambda p: f"uid-{p}",
+    )
+    docs = svc.shared_dir()
     docs.mkdir(parents=True)
     count = 0
     for p in BUNDLED.glob("*.md"):
         shutil.copy2(p, docs / p.name)
         count += 1
-    svc = CremindDocumentSyncService(working_dir=tmp_path, vector_store=None, embedding=None)
     return svc, count
 
 
@@ -63,7 +66,7 @@ def test_fallback_caps_the_profile_corpus_but_never_the_shared_one(tmp_path):
     svc, sys_count = _svc_with_system_docs(tmp_path)
 
     # Give the profile scope more docs than the cap so truncation must kick in.
-    pdir = tmp_path / "admin" / "documents"
+    pdir = svc.profile_dir("admin")
     pdir.mkdir(parents=True)
     overflow = FALLBACK_MAX_PROFILE_CANDIDATES + 5
     for i in range(overflow):
@@ -91,7 +94,7 @@ def test_a_growing_bundle_never_squeezes_shared_docs_out(tmp_path):
     """The old fixed cap would start hiding system docs once the bundle
     outgrew it. Shared scope is now unbounded, so headroom is not a concern."""
     svc, sys_count = _svc_with_system_docs(tmp_path)
-    docs = tmp_path / "documents"
+    docs = svc.shared_dir()
     for i in range(FALLBACK_MAX_PROFILE_CANDIDATES + 20):
         (docs / f"extra{i:03d}.md").write_text(
             f'---\ndescription: "extra shared doc {i}"\n---\n\nbody {i}\n',

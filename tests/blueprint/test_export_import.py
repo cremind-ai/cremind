@@ -471,3 +471,169 @@ def _tool_storage():
     from app.storage.tool_storage import get_tool_storage
 
     return get_tool_storage()
+
+
+# ── tools component v2: the document-search id swap ──────────────────────────
+
+
+def _seed_profiles_and_tools(tool_ids: tuple[str, ...]) -> None:
+    now = time.time() * 1000
+    eng = get_database_provider().sync_engine()
+    with eng.begin() as c:
+        for pid, name in (("p-src", "src"), ("p-dst", "dst")):
+            c.execute(
+                text("INSERT INTO profiles (id,name,created_at,updated_at) VALUES (:i,:n,:t,:t)"),
+                {"i": pid, "n": name, "t": now},
+            )
+        for tid in tool_ids:
+            c.execute(
+                text("INSERT INTO tools (tool_id,name,tool_type,source,description,created_at,updated_at) "
+                     "VALUES (:tid,:tid,'builtin',:tid,'d',:t,:t)"),
+                {"tid": tid, "t": now},
+            )
+
+
+def _write_blueprint(path: Path, tools_doc: dict) -> Path:
+    """A hand-built archive, as an older build would have written it."""
+    import io
+    import sys
+
+    from app.blueprint.manifest import BlueprintManifest, ComponentEntry, SourcePaths
+
+    manifest = BlueprintManifest(
+        app_version="0.0.18",
+        platform=sys.platform,
+        source_profile="src",
+        source_paths=SourcePaths("", "", "", "/", False),
+        name="old",
+        components={
+            "tools": ComponentEntry(
+                tools_doc["version"], "components/tools.json",
+                {"count": len(tools_doc["data"]["tools"])},
+            ),
+        },
+    )
+    with tarfile.open(str(path), mode="w:gz") as tf:
+        for name, payload in (
+            ("manifest.json", manifest.to_dict()),
+            ("components/tools.json", tools_doc),
+        ):
+            data = json.dumps(payload).encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return path
+
+
+def _entry(tool_id: str, *, variables=None, leaves=(), secrets=(), kind="builtin") -> dict:
+    return {
+        "tool_id": tool_id,
+        "kind": kind,
+        "enabled": None,
+        "config": {"arg": {}, "meta": {}},
+        "variables": dict(variables or {}),
+        "secret_variables": list(secrets),
+        "disabled_leaves": list(leaves),
+    }
+
+
+def test_export_writes_tools_v2_with_todays_ids(env):
+    _seed_profiles_and_tools(("cremind_documentation_search", "documentation_search"))
+    ts = _tool_storage()
+    ts.set_config(profile="src", tool_id="cremind_documentation_search", scope="variable",
+                  key="DEFAULT_TOP_K", value="7")
+    ts.set_config(profile="src", tool_id="documentation_search", scope="leaf",
+                  key="research", value="false")
+
+    from app.blueprint.engine import ExportOptions, create_blueprint
+
+    result = create_blueprint(ExportOptions(profile="src", name="v2", components={"tools"}))
+    doc = _component_doc(result.path, "tools")
+    assert doc["version"] == 2
+    assert result.manifest.components["tools"].version == 2
+    assert result.manifest.min_app_version == "0.0.19"
+    assert {t["tool_id"] for t in doc["data"]["tools"]} == {
+        "cremind_documentation_search", "documentation_search",
+    }
+
+    # A v2 document imports as is: no id is mapped twice.
+    from app.blueprint.apply import Deps, apply_tools
+    from app.blueprint.plan import stage_upload
+    from app.storage.dynamic_config_storage import DynamicConfigStorage
+
+    session = stage_upload(result.path, owner="admin")
+    session.target_profile = "dst"
+    res = apply_tools(session, {}, Deps(registry=None, conversation_storage=None,
+                                        config_storage=DynamicConfigStorage()))
+    assert res["warnings"] == []
+    assert ts.get_config(profile="dst", tool_id="cremind_documentation_search",
+                         scope="variable", key="DEFAULT_TOP_K") == "7"
+    assert ts.get_config(profile="dst", tool_id="documentation_search",
+                         scope="leaf", key="research") == "false"
+
+
+def test_importing_a_v1_tools_component_maps_the_swapped_ids_once(env, tmp_path):
+    _seed_profiles_and_tools(("cremind_documentation_search", "documentation_search", "browser"))
+    archive = _write_blueprint(tmp_path / "old.cremind-blueprint", {
+        "component": "tools",
+        "version": 1,
+        "data": {"tools": [
+            # v1: the Cremind manual search.
+            _entry("documentation_search", variables={"DEFAULT_TOP_K": "7"},
+                   leaves=["read_documentation_section"]),
+            # v1: the personal-document search.
+            _entry("user_documents", variables={"RESEARCH_MODEL_GROUP": "high"},
+                   leaves=["research"], secrets=["DRIVE_TOKEN"]),
+            # A built-in this install does not have: skipped, and it must not
+            # abort the entries after it.
+            _entry("from_a_newer_build", variables={"X": "1"}),
+            _entry("browser", variables={"BROWSER_HOST": "example.com"}),
+        ]},
+    })
+
+    from app.blueprint.apply import Deps, apply_tools
+    from app.blueprint.plan import stage_upload
+    from app.storage.dynamic_config_storage import DynamicConfigStorage
+
+    session = stage_upload(archive, owner="admin")
+    session.target_profile = "dst"
+    session.save()
+
+    plan = next(s for s in session.plan if s["key"] == "tools")
+    preview = {t["tool_id"]: t for t in plan["preview"]["tools"]}
+    assert set(preview) == {
+        "cremind_documentation_search", "documentation_search", "from_a_newer_build", "browser",
+    }
+    assert preview["from_a_newer_build"]["available"] is False
+    assert preview["documentation_search"]["available"] is True
+    assert any(w["kind"] == "plan" and "from_a_newer_build" in w["message"] for w in session.warnings)
+    # The secret requirement names the id the tool has HERE.
+    assert {"type": "tool_secrets", "tool_id": "documentation_search",
+            "variables": ["DRIVE_TOKEN"]} in plan["requirements"]
+
+    # A client that keyed the secret by the id the old manifest printed still works.
+    res = apply_tools(
+        session, {"secrets": {"user_documents": {"DRIVE_TOKEN": "tok"}}},
+        Deps(registry=None, conversation_storage=None, config_storage=DynamicConfigStorage()),
+    )
+    ts = _tool_storage()
+
+    def cfg(tool_id, scope, key):
+        return ts.get_config(profile="dst", tool_id=tool_id, scope=scope, key=key)
+
+    # Manual-search settings landed on cremind_documentation_search ...
+    assert cfg("cremind_documentation_search", "variable", "DEFAULT_TOP_K") == "7"
+    assert cfg("cremind_documentation_search", "leaf", "read_documentation_section") == "false"
+    assert cfg("cremind_documentation_search", "variable", "RESEARCH_MODEL_GROUP") is None
+    # ... and the personal search's on documentation_search — not chained onward.
+    assert cfg("documentation_search", "variable", "RESEARCH_MODEL_GROUP") == "high"
+    assert cfg("documentation_search", "leaf", "research") == "false"
+    assert cfg("documentation_search", "variable", "DRIVE_TOKEN") == "tok"
+    assert cfg("documentation_search", "variable", "DEFAULT_TOP_K") is None
+    # The unknown built-in was skipped with a warning; the next entry applied.
+    assert any("from_a_newer_build" in w for w in res["warnings"])
+    assert cfg("browser", "variable", "BROWSER_HOST") == "example.com"
+    assert "configured browser" in res["applied"]
+    # Nothing was written for src (profiles stay apart).
+    assert ts.get_config(profile="src", tool_id="documentation_search",
+                         scope="variable", key="RESEARCH_MODEL_GROUP") is None

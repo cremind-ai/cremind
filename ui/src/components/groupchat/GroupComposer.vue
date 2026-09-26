@@ -5,9 +5,15 @@
 // members and KEEPS the `@` on insert: `@handle` is how an agent recognises it
 // was addressed, so dropping the sigil (as the chat composer does) would make
 // every mention read as an ordinary name.
+//
+// The Search tools control edits the ROOM's selection (room-wide: every member
+// agent's next turn uses it). It is only here when the viewer may post — the
+// same people the server lets save it.
 import { computed, nextTick, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import MentionMenu, { type MentionItem } from '../MentionMenu.vue';
+import SearchToolsControl from '../SearchToolsControl.vue';
+import { useSearchToolsStore, type SearchToolsTarget } from '../../stores/searchTools';
 
 const props = withDefaults(defineProps<{
   members: { profile: string; name: string }[];
@@ -15,6 +21,8 @@ const props = withDefaults(defineProps<{
   /** Shown instead of the composer when the viewer may not post. */
   disabledHint?: string;
   sending?: boolean;
+  /** A member agent is mid-turn: a search-tools save applies from its next one. */
+  running?: boolean;
   /** Browser handoffs persist one draft per viewer and room. */
   profile: string;
   groupId: string;
@@ -22,9 +30,16 @@ const props = withDefaults(defineProps<{
   disabled: false,
   disabledHint: '',
   sending: false,
+  running: false,
 });
 
 const emit = defineEmits<{ send: [text: string] }>();
+
+const searchToolsStore = useSearchToolsStore();
+const searchToolsTarget = computed<SearchToolsTarget | null>(() =>
+  (props.groupId ? { kind: 'group', id: props.groupId } : null));
+// Set while a post waits for a search-tools save to land.
+const awaitingSearchTools = ref(false);
 
 const inputText = ref('');
 const taRef = ref<HTMLTextAreaElement | null>(null);
@@ -43,9 +58,10 @@ watch(inputText, (value) => {
   } catch { /* storage may be unavailable */ }
 });
 
-// Matches the two-party chat's composer, so switching between the two does not
-// move the send button up and down the screen.
-const MIN_HEIGHT_PX = 112;
+// Matches the two-party chat's composer (80px of text + the toolbar row), so
+// switching between the two does not move the send button up and down the
+// screen.
+const MIN_HEIGHT_PX = 80;
 const MAX_HEIGHT_PX = 180;
 
 // ── mention menu state ──
@@ -166,9 +182,25 @@ const handleInput = () => {
   if (triggerStart.value >= 0) updateMenuPosition();
 };
 
-const submit = () => {
+const submit = async () => {
   const text = inputText.value.trim();
-  if (!text || props.disabled || props.sending) return;
+  if (!text || props.disabled || props.sending || awaitingSearchTools.value) return;
+  // Wait for a just-made search-tools change to be saved, so the turns this
+  // post starts use it (the post never carries the selection). A failed or
+  // conflicting save keeps the draft; the control explains.
+  const target = searchToolsTarget.value;
+  if (searchToolsStore.hasPendingSave(target)) {
+    const keyAtSend = draftKey.value;
+    awaitingSearchTools.value = true;
+    let saved = false;
+    try {
+      saved = await searchToolsStore.settle(target);
+    } finally {
+      awaitingSearchTools.value = false;
+    }
+    if (!saved || draftKey.value !== keyAtSend) return;
+    if (!inputText.value.trim() || props.disabled || props.sending) return;
+  }
   emit('send', inputText.value);
   inputText.value = '';
   closeMenu();
@@ -201,7 +233,7 @@ const handleKeydown = (event: KeyboardEvent) => {
 
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    submit();
+    void submit();
   }
 };
 
@@ -230,15 +262,6 @@ const handleBlur = () => {
         @keydown="handleKeydown"
         @blur="handleBlur"
       />
-      <button
-        type="button"
-        class="send-button"
-        :disabled="sending || !inputText.trim()"
-        :title="sending ? 'Sending…' : 'Send'"
-        @click="submit"
-      >
-        <Icon :icon="sending ? 'mdi:loading' : 'mdi:send'" :class="{ spin: sending }" />
-      </button>
       <MentionMenu
         :visible="menuVisible"
         :items="items"
@@ -249,6 +272,25 @@ const handleBlur = () => {
         @select="insertSelection"
         @update:active-index="activeIndex = $event"
       />
+      <!-- Same row as the two-party composer's: controls left, send right. -->
+      <div class="composer-toolbar">
+        <div class="toolbar-tools">
+          <SearchToolsControl :target="searchToolsTarget" :running="running" />
+        </div>
+        <button
+          type="button"
+          class="send-button"
+          :disabled="sending || awaitingSearchTools || !inputText.trim()"
+          :title="sending ? 'Sending…' : awaitingSearchTools ? 'Saving search tools…' : 'Send'"
+          :aria-label="sending ? 'Sending…' : awaitingSearchTools ? 'Saving search tools…' : 'Send'"
+          @click="submit"
+        >
+          <Icon
+            :icon="sending || awaitingSearchTools ? 'mdi:loading' : 'mdi:send'"
+            :class="{ spin: sending || awaitingSearchTools }"
+          />
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -278,9 +320,9 @@ const handleBlur = () => {
   box-sizing: border-box;
   display: block;
   width: 100%;
-  min-height: 112px;
+  min-height: 80px;
   max-height: 180px;
-  padding: 10px 44px 10px 14px;
+  padding: 10px 14px;
   font-family: inherit;
   font-size: 0.95em;
   line-height: 1.6;
@@ -302,10 +344,34 @@ const handleBlur = () => {
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
 }
 
+/* Mirrors MessageInput's toolbar row, so the send button sits in the same spot
+   in a room and in a two-party chat. */
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  min-height: 28px;
+}
+
+.toolbar-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.send-button:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 1px;
+}
+
 .send-button {
-  position: absolute;
-  bottom: 10px;
-  right: 10px;
+  flex-shrink: 0;
+  margin-left: auto;
   width: 28px;
   height: 28px;
   display: flex;

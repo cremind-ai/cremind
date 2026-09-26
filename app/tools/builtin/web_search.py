@@ -59,9 +59,9 @@ TOOL_CONFIG: ToolConfig = {
     "display_name": SERVER_NAME,
     "description": (
         "Searches the public web and returns ranked results with snippets. "
-        "Use it as the last-resort internet fallback when local tools "
-        "(documentation and memory) cannot answer, or when the user "
-        "explicitly wants fresh external information."
+        "Use it when the other search sources available in this "
+        "conversation cannot answer, or when the user explicitly wants "
+        "fresh external information."
     ),
     "visible": True,
     "required_config": {

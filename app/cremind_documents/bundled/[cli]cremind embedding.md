@@ -1,16 +1,21 @@
 ---
-description: "Inspect and control the vector-embedding subsystem with `cremind embedding` (admin): read live `status`, `get` or `set` the persisted embedding config (provider + vector store), kick off an `initialize`/rebuild, and `--follow` the load progress over SSE. Setting a provider whose optional extras aren't installed returns a FeatureNotInstalled error listing the missing keys — install them with `cremind features install` first."
+description: "Inspect and control the vector-embedding subsystem with `cremind embedding` (admin) — the semantic search behind Cremind documentation search, Documentation search (the user's own files) and memory recall: read live `status`, `get` or `set` the persisted embedding config (provider + vector store), kick off an `initialize`/rebuild, and `--follow` the load progress over SSE. Setting a provider whose optional extras aren't installed returns a FeatureNotInstalled error listing the missing keys — install them with `cremind features install` first."
 ---
 
 # `cremind embedding` — Vector Embedding Subsystem
 
 `cremind embedding` inspects and controls Cremind's vector-embedding subsystem
-— the semantic-search backend behind `cremind_documentation_search` and memory recall.
-It mirrors the admin-only **Embedding** settings page. Turning it off degrades
-those two features rather than disabling them: `cremind_documentation_search` hands
-its relevance judge the whole shared library plus up to 50 of the profile's own
-documents instead of a vector-ranked shortlist, and long-term memory search
-returns the stored facts unranked.
+— the semantic-search backend behind Cremind documentation search
+(`cremind_documentation_search`, Cremind's own manuals), Documentation search
+(`documentation_search`, the user's own files — `cremind docs`) and memory
+recall. It mirrors the admin-only **Embedding** settings page. Turning it off
+degrades those features rather than disabling them:
+`cremind_documentation_search` hands its relevance judge the whole shared
+library plus up to 50 of the profile's own documents instead of a
+vector-ranked shortlist; Documentation search keeps its index and answers by
+keyword only (`mode: lexical_only`) but stops syncing
+(`suspended(embedding_off)`), and an admin cannot allow it until embedding is
+back on; long-term memory search returns the stored facts unranked.
 
 The `get` and `set` operations are admin-only. `status` and `initialize` back
 the Setup Wizard's pre-token polling, so they don't require a token; `get`/`set`

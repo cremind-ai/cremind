@@ -11,8 +11,9 @@ after a disk failure without losing anything.
 
 Unlike `cremind db backup` (which snapshots only the relational database), a
 full backup also includes everything Cremind keeps on disk: per-profile skills
-(and their Google/OAuth token files), personas, per-profile documents, channel
-session files, and browser login state.
+(and their Google/OAuth token files), personas, the Cremind documentation
+pages each profile wrote (`storage/cremind_documents/profiles/<profile uuid>/`),
+channel session files, and browser login state.
 
 The JWT sign-in secret and the per-profile session tokens are **not** backed
 up — they are local to each installation. Carrying them across a restore would
@@ -30,13 +31,20 @@ A `.cremind-backup` archive is a gzipped tar with three parts:
   profile list.
 - **A portable database dump** — a backend-neutral logical dump, so a backup
   taken on SQLite restores into PostgreSQL and vice-versa.
-- **The file trees** under `CREMIND_SYSTEM_DIR` (skills, personas, per-profile
-  documents, channel sessions, browser profiles).
+- **The file trees** under `CREMIND_SYSTEM_DIR` (skills, personas, the
+  Cremind documentation pages profiles wrote, channel sessions, browser
+  profiles). An archive made before the manual moved carries a profile's pages
+  at `<profile>/documents/`; after a restore they are moved to the new place
+  at boot.
 
 Rebuildable/transient and installation-local content is intentionally excluded:
 the raw database files (dumped logically instead), the embeddings vector store
-(rebuilt on boot), the shared documents corpus (re-seeded from the bundle),
-temporary chat uploads, derived skill `.env` files (regenerated from the
+(rebuilt on boot), the bundled Cremind manual
+(`storage/cremind_documents/shared/`, re-seeded from the bundle),
+the Documentation search index files (`storage/documents/`, and
+`storage/userdocs/` from before the rename — the restored profile re-indexes
+its own folder; its Documentation search settings are in the database and
+restored), temporary chat uploads, derived skill `.env` files (regenerated from the
 database), and the JWT sign-in secret and session tokens (kept per-install;
 re-issued on restore).
 

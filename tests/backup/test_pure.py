@@ -106,6 +106,23 @@ def test_transform_row_records_relocations_and_unmapped():
     assert len(rep2.unmapped) == 1
 
 
+def test_transform_row_relocates_the_documentation_search_folder_under_either_table_name():
+    """Rows are relocated while loading into the ARCHIVE's schema: an archive
+    from before the rename carries ``userdoc_sources``, a newer one
+    ``document_sources`` — both hold the profile's indexed folder."""
+    pm = build_path_map(_win_manifest(), "/root/.cremind", "/home/bob")
+    for table in ("document_sources", "userdoc_sources"):
+        rep = RelocationReport()
+        row = {"profile": "admin", "kind": "local", "root_path": r"C:\Users\alice\Documents\notes"}
+        transform_row(pm, table, row, rep)
+        assert row["root_path"] == "/home/bob/Documents/notes", table
+        assert len(rep.relocated) == 1
+    rep = RelocationReport()
+    drive = {"profile": "admin", "kind": "drive", "root_path": None}
+    transform_row(pm, "document_sources", drive, rep)
+    assert drive["root_path"] is None and not rep.relocated and not rep.unmapped
+
+
 def test_transform_row_server_config_only_working_dir_key():
     pm = build_path_map(_win_manifest(), "/root/.cremind", "/root")
     rep = RelocationReport()
@@ -187,6 +204,76 @@ def test_iter_backup_files_never_walks_the_index_or_the_model_cache(tmp_path: Pa
     assert {rel for _, rel in iter_backup_files(str(tmp_path), ["admin"])} == {
         "admin/PERSONA.md", "admin/.cache/keep.txt",
     }
+
+
+_ADMIN_UID = "a1a1a1a1-0000-4000-8000-000000000001"
+_BOB_UID = "b2b2b2b2-0000-4000-8000-000000000002"
+
+
+def test_each_profiles_manual_pages_are_backed_up_by_uuid_and_derived_data_is_not(tmp_path: Path):
+    """A profile's own Cremind manual pages live outside its name-keyed tree
+    (``storage/cremind_documents/profiles/<uuid>``) and are user content: they
+    are archived. The shared mirror, both index roots and the relocation's
+    bookkeeping are derived or local: never archived. A deleted profile's
+    leftover pages are not either."""
+    for rel in (
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/mine.md",
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/sub/deep.md",
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/__pycache__/x.pyc",
+        f"storage/cremind_documents/profiles/{_BOB_UID}/bob.md",
+        "storage/cremind_documents/profiles/deleted-profile-uid/old.md",
+        "storage/cremind_documents/shared/document.md",
+        f"storage/documents/{_ADMIN_UID}/index.db",
+        f"storage/userdocs/{_ADMIN_UID}/index.db-wal",
+        "storage/document-relocation.json",
+        "admin/PERSONA.md",
+        "bob/PERSONA.md",
+    ):
+        _touch(tmp_path, rel)
+
+    backed_up = {
+        rel for _, rel in iter_backup_files(
+            str(tmp_path), ["admin", "bob"], profile_uids=[_ADMIN_UID, _BOB_UID],
+        )
+    }
+    assert backed_up == {
+        "admin/PERSONA.md",
+        "bob/PERSONA.md",
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/mine.md",
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/sub/deep.md",
+        f"storage/cremind_documents/profiles/{_BOB_UID}/bob.md",
+    }
+
+
+def test_a_profile_named_storage_does_not_duplicate_or_leak_manual_pages(tmp_path: Path):
+    """Its walk starts at ``<SYS>/storage`` and so passes the manual roots:
+    each page is archived once, and a deleted profile's pages still are not."""
+    for rel in (
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/mine.md",
+        "storage/cremind_documents/profiles/deleted-profile-uid/old.md",
+        "storage/cremind_documents/shared/document.md",
+        "storage/document-relocation.lock",
+        "storage/skills/notes/SKILL.md",
+    ):
+        _touch(tmp_path, rel)
+
+    rels = [
+        rel for _, rel in iter_backup_files(
+            str(tmp_path), ["storage"], profile_uids=[_ADMIN_UID, "5707-uid-of-storage"],
+        )
+    ]
+    assert sorted(rels) == sorted([
+        "storage/skills/notes/SKILL.md",
+        f"storage/cremind_documents/profiles/{_ADMIN_UID}/mine.md",
+    ])
+
+
+def test_the_manual_root_rules():
+    assert is_excluded("storage/cremind_documents/shared", is_dir=True)
+    assert is_excluded("storage/cremind_documents/shared/document.md", is_dir=False)
+    assert not is_excluded(f"storage/cremind_documents/profiles/{_ADMIN_UID}/uploads_tmp/x.md", is_dir=False)
+    assert is_excluded(f"storage/cremind_documents/profiles/{_ADMIN_UID}/a.tmp", is_dir=False)
+    assert is_excluded("storage/userdocs", is_dir=True)
 
 
 # ── encryption envelope ─────────────────────────────────────────────────────

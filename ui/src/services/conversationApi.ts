@@ -1,4 +1,5 @@
 import type { ChatMode } from '../constants/chatModes';
+import type { SearchToolId } from './searchToolsApi';
 
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
@@ -241,14 +242,27 @@ export async function updateConversationId(
   return { ...data.conversation, message_count: 0 };
 }
 
+export interface CreateConversationOptions {
+  /**
+   * The new-chat slot's search-tools draft, saved with the row so the very
+   * first response already runs on it. `null` means the defaults; omit the
+   * option entirely to send nothing (a server that predates the field ignores
+   * it either way).
+   */
+  searchTools?: SearchToolId[] | null;
+}
+
 export async function createConversation(
   agentUrl: string, authToken: string, title?: string,
+  options: CreateConversationOptions = {},
 ): Promise<ConversationSummary> {
   const base = resolveBaseUrl(agentUrl);
+  const body: Record<string, unknown> = { title: title ?? 'Untitled Chat' };
+  if ('searchTools' in options) body.search_tools = options.searchTools ?? null;
   const res = await fetch(`${base}/api/conversations`, {
     method: 'POST',
     headers: authHeaders(authToken),
-    body: JSON.stringify({ title: title ?? 'Untitled Chat' }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Failed to create conversation: ${res.statusText}`);
   const data = await res.json();

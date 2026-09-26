@@ -678,7 +678,28 @@ def get_documents_routes() -> List[Route]:
         denied = require_auth(request)
         if denied is not None:
             return denied
-        snap = await asyncio.to_thread(uds_state.build_snapshot, _profile(request))
+        profile = _profile(request)
+        snap = await asyncio.to_thread(uds_state.build_snapshot, profile)
+        # Files the upgrade could not move to their new locations (a
+        # destination that already held something different, a failed copy):
+        # both sides were kept and a person has to decide. The admin sees every
+        # one; a profile sees only its own, never another profile's paths.
+        # "Its own" is decided by uuid, not name: an index step only ever
+        # knew the uuid, and a name can outlive its profile — a later profile
+        # re-created under it must not see its predecessor's problems.
+        try:
+            from app.documents.relocate import pending_errors, problem_uid
+
+            problems = await asyncio.to_thread(pending_errors)
+            if not is_admin(request):
+                own_uid = await asyncio.to_thread(_storage().profile_uid, profile) if problems else None
+                problems = [
+                    p for p in problems
+                    if own_uid and (problem_uid(p) or "").lower() == str(own_uid).lower()
+                ]
+            snap["relocation_errors"] = problems
+        except Exception:  # noqa: BLE001 — status must not fail over diagnostics
+            logger.debug("[documents] could not read relocation problems", exc_info=True)
         return JSONResponse(snap)
 
     async def handle_stream(request: Request) -> Any:

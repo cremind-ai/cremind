@@ -378,6 +378,12 @@ start <name>` (with an admin token), which walks the same steps the web wizard
 does; or run `cremind setup reconfigure` first to allow first-run setup to run
 again.
 
+**`426 ClientUpgradeRequired` on `setup complete`** — This `cremind` predates
+the search-tool rename, and a payload's `tool_configs` are keyed by tool id
+(`documentation_search` is now the user's own documents; Cremind's manual is
+`cremind_documentation_search`). Run `pip install -U cremind` and retry;
+nothing was created.
+
 **`reset-orphaned` rejected** — The recovery path only fires when the
 database is genuinely orphaned (`setup_complete=true` but no profiles).
 Run `cremind setup status` first to confirm.

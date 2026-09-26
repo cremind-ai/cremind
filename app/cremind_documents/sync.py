@@ -6,15 +6,23 @@ vector store back-end the user picked (Qdrant or Chroma).
 Responsibilities
 ----------------
 - ``seed_shared_from_app(...)``  -- on boot, mirror bundled
-  ``<repo>/documents/*.md`` into ``<CREMIND_SYSTEM_DIR>/documents/`` exactly:
-  missing files are copied in, divergent files are overwritten, and files
-  not present in the bundle are deleted. The bundle is authoritative for
-  system documents, so any in-session edits or extras only live until the
-  next restart.
+  ``app/cremind_documents/bundled/*.md`` into
+  ``<CREMIND_SYSTEM_DIR>/storage/cremind_documents/shared/`` exactly: missing
+  files are copied in, divergent files are overwritten, and files not present
+  in the bundle are deleted. The bundle is authoritative for system documents,
+  so any in-session edits or extras only live until the next restart. That
+  directory is dedicated to the mirror — no profile's tree can overlap it.
 - ``full_reconcile(scope, profile=None)`` -- scan a scope's on-disk directory,
   upsert new/changed docs, delete points whose source files have disappeared.
 - ``apply_event(scope, path, event_type)`` -- handle a single watcher event
   (created / modified / deleted / moved-from / moved-to).
+
+Scopes are ``"shared"`` or a profile NAME — the name is what every vector
+payload carries and what searches filter on. Only the on-disk directory is
+keyed by the profile's uuid (``storage/cremind_documents/profiles/<uuid>``, see
+:mod:`app.cremind_documents.paths`), resolved through the ``profiles`` table.
+A profile whose uuid cannot be resolved has no directory: its scope is skipped
+(and logged) rather than written to a name-keyed guess.
 
 Thread safety: watchdog dispatches callbacks on its own thread, so all
 methods that mutate the collection take the same ``threading.Lock``.
@@ -27,9 +35,10 @@ import shutil
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional
 
 from app.config.embedding_state import embedding_state
+from app.cremind_documents import paths as doc_paths
 from app.cremind_documents.parser import parse_document
 from app.lib.embedding import LocalEmbeddings
 from app.utils.logger import logger
@@ -43,15 +52,21 @@ if TYPE_CHECKING:
     from app.vectorstores.base import VectorStore
 
 COLLECTION_NAME = "cremind_documentation_search"
-SHARED_SCOPE = "shared"
+# The manual's collection before the rename. Dropped once the new one is
+# populated (app/documents/relocate.py ``retire_legacy_manual_collection``).
+LEGACY_COLLECTION_NAME = "documentation_search"
+# Reserved as profile names too (app/cremind_documents/paths.py).
+SHARED_SCOPE = doc_paths.SHARED_SCOPE
 
 # Retired scope. CLI-reference docs (the bundled ``[cli]cremind *.md`` files)
 # once lived in their own ``"cli"`` scope, searched by a dedicated ``cli``
 # built-in tool. That tool was removed and the docs folded back into the shared
-# corpus; ``seed_shared_from_app`` drops any stale ``<working_dir>/cli`` tree and
-# ``prune_scope("cli")`` removes leftover points so upgraded installs carry no
-# orphaned CLI-scope state.
-_LEGACY_CLI_SCOPE = "cli"
+# corpus; ``prune_scope("cli")`` removes leftover points so upgraded installs
+# carry no orphaned CLI-scope state. Its on-disk tree (``<SYS>/cli/documents``)
+# is retired by app/documents/relocate.py — which, unlike the blanket
+# ``rmtree(<SYS>/cli)`` that used to run here, knows whether a PROFILE is named
+# ``cli`` and owns that tree.
+_LEGACY_CLI_SCOPE = doc_paths.LEGACY_CLI_SCOPE
 
 # In degraded mode (no embedding model / vector store) the LLM relevance judge
 # is the ONLY discriminator, so it must see the whole shared system-doc set --
@@ -103,6 +118,13 @@ class CremindDocumentSyncService:
     ``vector_store`` / ``embedding`` remain as an override seam for tests and
     for :meth:`pinned`, which the embedding lifecycle needs because it rebuilds
     into a store that has not been published READY yet.
+
+    ``working_dir`` is the system directory; the manual's two trees live under
+    it at ``storage/cremind_documents``. ``profile_uid_resolver`` maps a
+    profile name to its uuid (default: the ``profiles`` table). Resolved uuids
+    are cached per instance — a profile's uuid never changes while it exists —
+    and :meth:`forget_profile` drops the entry when the profile is deleted, so
+    a profile re-created under the same name resolves to its own new directory.
     """
 
     def __init__(
@@ -111,10 +133,17 @@ class CremindDocumentSyncService:
         working_dir: Path,
         vector_store: Optional["VectorStore"] = None,
         embedding: Optional[LocalEmbeddings] = None,
+        profile_uid_resolver: Optional[Callable[[str], Optional[str]]] = None,
     ):
         self._working_dir = Path(working_dir)
         self._vector_store_override = vector_store
         self._embedding_override = embedding
+        self._resolve_uid = profile_uid_resolver or doc_paths.resolve_profile_uid
+        self._uid_cache: dict[str, str] = {}
+        self._uid_lock = threading.Lock()
+        # Profiles already reported as unresolvable, so a missing row is logged
+        # once rather than on every search.
+        self._unresolved_logged: set[str] = set()
         self._lock = threading.Lock()
         self._last_search_mode: Optional[str] = None
 
@@ -179,13 +208,53 @@ class CremindDocumentSyncService:
 
     # ── Public paths ────────────────────────────────────────────────────────
 
+    @property
+    def working_dir(self) -> Path:
+        """The system directory this service's trees live under."""
+        return self._working_dir
+
     def shared_dir(self) -> Path:
-        return self._working_dir / "documents"
+        return doc_paths.shared_dir(self._working_dir)
 
-    def profile_dir(self, profile: str) -> Path:
-        return self._working_dir / profile / "documents"
+    def profile_uid(self, profile: str) -> Optional[str]:
+        """``profile``'s uuid (cached once resolved), or None when unknown."""
+        with self._uid_lock:
+            cached = self._uid_cache.get(profile)
+        if cached:
+            return cached
+        try:
+            uid = self._resolve_uid(profile)
+        except Exception as e:  # noqa: BLE001 — a resolver failure is "unknown"
+            logger.debug(f"[cremind_documents] uuid lookup failed for profile {profile!r}: {e}")
+            uid = None
+        if not uid or not doc_paths.valid_uid(uid):
+            with self._uid_lock:
+                first = profile not in self._unresolved_logged
+                self._unresolved_logged.add(profile)
+            if first:
+                logger.info(
+                    f"[cremind_documents] profile {profile!r} has no known uuid; its "
+                    "authored manual pages are skipped until it does"
+                )
+            return None
+        with self._uid_lock:
+            self._uid_cache[profile] = str(uid)
+            self._unresolved_logged.discard(profile)
+        return str(uid)
 
-    def scope_dir(self, scope: str) -> Path:
+    def forget_profile(self, profile: str) -> None:
+        """Drop the cached uuid of a deleted profile (see the class docstring)."""
+        with self._uid_lock:
+            self._uid_cache.pop(profile, None)
+            self._unresolved_logged.discard(profile)
+
+    def profile_dir(self, profile: str) -> Optional[Path]:
+        """``storage/cremind_documents/profiles/<uuid>``, or None when the
+        profile's uuid cannot be resolved (the scope is then skipped)."""
+        uid = self.profile_uid(profile)
+        return doc_paths.profile_dir_for_uid(uid, self._working_dir) if uid else None
+
+    def scope_dir(self, scope: str) -> Optional[Path]:
         return self.shared_dir() if scope == SHARED_SCOPE else self.profile_dir(scope)
 
     # ── System-level seeding ───────────────────────────────────────────────
@@ -200,13 +269,12 @@ class CremindDocumentSyncService:
         - Any file in ``shared_dir()`` not present in the bundle is deleted.
 
         Mid-session edits or extras therefore live only until the next restart.
-        Profile-scoped docs under ``<working_dir>/<profile>/`` are unaffected.
+        The mirror writes ONLY into ``shared_dir()``, a directory nothing else
+        owns — profiles' own pages live under ``profiles/<uuid>`` beside it.
 
         The bundled ``[cli]cremind *.md`` CLI-reference docs are part of this
-        shared corpus (searched by ``cremind_documentation_search``). Older installs
-        that seeded them into a separate ``<working_dir>/cli`` scope are cleaned
-        up here — the stale tree is removed and its vector points are pruned by
-        ``prune_scope("cli")`` at boot.
+        shared corpus (searched by ``cremind_documentation_search``); leftover
+        ``cli``-scope points are pruned by ``prune_scope("cli")`` at boot.
         """
         if not app_documents_dir.exists():
             return
@@ -214,21 +282,16 @@ class CremindDocumentSyncService:
         sources = list(app_documents_dir.glob("**/*.md"))
         self._mirror_bundle(sources, app_documents_dir, self.shared_dir())
 
-        # Retire the legacy CLI scope directory from upgraded installs (its docs
-        # now live in the shared corpus above).
-        legacy_cli_dir = self._working_dir / _LEGACY_CLI_SCOPE
-        if legacy_cli_dir.exists():
-            shutil.rmtree(legacy_cli_dir, ignore_errors=True)
-
     def _mirror_bundle(
         self, sources: list[Path], app_documents_dir: Path, target: Path,
     ) -> None:
         """Mirror ``sources`` (a subset of the bundle) into ``target`` exactly.
 
         Copies new/changed files in and deletes any file in ``target`` that is
-        not one of ``sources``. Nested scope roots do not overlap
-        (``documents/`` vs ``cli/documents`` vs ``<profile>/documents``), so
-        this never deletes another scope's files.
+        not one of ``sources``. ``target`` is the dedicated shared directory
+        (``storage/cremind_documents/shared``); profile directories sit beside
+        it under ``profiles/``, never below it, so this never deletes another
+        scope's files.
         """
         target.mkdir(parents=True, exist_ok=True)
 
@@ -286,14 +349,24 @@ class CremindDocumentSyncService:
         """Reconcile a single scope (``shared`` or a profile name) end-to-end.
 
         - Upsert every eligible `.md` whose content hash differs from the store.
+          A point whose stored ``file_path`` no longer matches (the file was
+          relocated — e.g. from the pre-uuid layout) is re-upserted too: the
+          search tool reads bodies from that path.
         - Delete points for files that are no longer on disk or have lost
           their frontmatter.
+
+        A profile scope whose directory cannot be resolved (no uuid) is left
+        alone entirely — deleting its points on the strength of "no directory"
+        would wipe a live profile's index during a transient lookup failure.
         """
         store = self._store()
         if store is None:
             return
 
         directory = self.scope_dir(scope)
+        if directory is None:
+            logger.info(f"[cremind_documents] reconcile scope={scope!r} skipped: no directory")
+            return
         directory.mkdir(parents=True, exist_ok=True)
 
         with self._lock:
@@ -310,7 +383,11 @@ class CremindDocumentSyncService:
             points: list[StoredPoint] = []
             for fid, payload in disk_state.items():
                 cur = existing_ids.get(fid)
-                if cur and cur.get("content_hash") == payload["content_hash"]:
+                if (
+                    cur
+                    and cur.get("content_hash") == payload["content_hash"]
+                    and cur.get("file_path") == payload["file_path"]
+                ):
                     continue
                 embed_text = payload.pop("_embed_text")
                 vector = self._embed(embed_text)
@@ -388,7 +465,11 @@ class CremindDocumentSyncService:
             embed_text = _embedding_text(Path(relpath).stem, parsed.description)
             content_hash = _hash_text(embed_text + "\0" + parsed.body)
             existing = self._fetch_one(fid)
-            if existing and existing.get("content_hash") == content_hash:
+            if (
+                existing
+                and existing.get("content_hash") == content_hash
+                and existing.get("file_path") == str(path)
+            ):
                 return
 
             vector = self._embed(embed_text)
@@ -479,7 +560,36 @@ class CremindDocumentSyncService:
             return self._list_all_for_scopes(scopes=scopes)
 
         self._note_mode(MODE_VECTOR)
-        return hits
+        return [self._current_location(hit) for hit in hits]
+
+    def _current_location(self, hit: dict) -> dict:
+        """Point a vector hit's ``file_path`` at where the doc lives NOW.
+
+        The payload's absolute path was written when the doc was embedded, so
+        a relocated tree (the move to ``storage/cremind_documents``, a restore
+        onto another machine) leaves it stale until the next reconcile
+        re-upserts it — and the search tool reads the body from that path.
+        ``scope`` + ``relpath`` are layout-independent, so the path is rebuilt
+        from them. The result must still resolve inside the scope's directory;
+        anything else keeps the stored value (a hit that then fails to read is
+        reported as missing, never served from outside the scope).
+        """
+        scope, relpath = hit.get("scope"), hit.get("relpath")
+        if not isinstance(scope, str) or not isinstance(relpath, str) or not relpath:
+            return hit
+        base = self.scope_dir(scope)
+        if base is None:
+            return hit
+        candidate = base / relpath
+        try:
+            candidate.resolve().relative_to(base.resolve())
+        except (OSError, ValueError):
+            return hit
+        if str(candidate) == hit.get("file_path"):
+            return hit
+        out = dict(hit)
+        out["file_path"] = str(candidate)
+        return out
 
     def _list_all_for_scopes(
         self, *, scopes: list[str], profile_limit: int = FALLBACK_MAX_PROFILE_CANDIDATES,
@@ -634,7 +744,7 @@ class CremindDocumentSyncService:
         """Build ``{file_id: payload-dict-with-_embed_text}`` for a scope."""
         directory = self.scope_dir(scope)
         out: dict[int, dict] = {}
-        if not directory.exists():
+        if directory is None or not directory.exists():
             return out
 
         for path in directory.glob("**/*.md"):
@@ -789,6 +899,8 @@ class CremindDocumentSyncService:
 
     def _safe_relpath(self, scope: str, path: Path) -> Optional[str]:
         base = self.scope_dir(scope)
+        if base is None:
+            return None
         try:
             return str(path.resolve().relative_to(base.resolve())).replace("\\", "/")
         except ValueError:
@@ -819,6 +931,54 @@ class CremindDocumentSyncService:
             "content_hash": content_hash,
             "name": Path(relpath).stem,
         }
+
+
+def remove_profile_documents(
+    profile: str,
+    uid: Optional[str],
+    *,
+    service: Optional[CremindDocumentSyncService] = None,
+    system_dir: Optional[Path] = None,
+) -> bool:
+    """A profile was deleted: remove its authored manual pages and their points.
+
+    ``uid`` must be read BEFORE the profile row is deleted (the directory is
+    keyed by it and the row is the only place it lives). The vector points are
+    pruned by scope, i.e. by the profile NAME, which is what their payload
+    carries; a later profile of the same name writes its own points. The
+    cached uuid is dropped from ``service`` so that later profile resolves to
+    its own directory. Returns whether a directory was removed. Best effort
+    throughout — a deletion is never blocked by the manual.
+    """
+    removed = False
+    if uid and doc_paths.valid_uid(uid):
+        base = system_dir if system_dir is not None else (
+            service.working_dir if service is not None else doc_paths.system_dir()
+        )
+        target = doc_paths.profile_dir_for_uid(uid, base)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+            removed = not target.exists()
+            if removed:
+                logger.info(f"[cremind_documents] removed the manual pages of deleted profile {profile!r}")
+    if service is not None and profile == SHARED_SCOPE:
+        # A profile named like the shared scope (created before the name was
+        # reserved): its points are indistinguishable from the bundled
+        # manual's, and pruning the scope would empty the manual for every
+        # profile until the next restart. The next boot's shared reconcile
+        # drops whatever no longer has a file behind it.
+        logger.warning(
+            f"[cremind_documents] deleted profile {profile!r} shares the bundled manual's "
+            "scope; its points are left to the next shared reconcile"
+        )
+        service.forget_profile(profile)
+    elif service is not None:
+        try:
+            service.prune_scope(profile)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"[cremind_documents] could not prune the points of deleted profile {profile!r}")
+        service.forget_profile(profile)
+    return removed
 
 
 def _hash_text(text: str) -> str:

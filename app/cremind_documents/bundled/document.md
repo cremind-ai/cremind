@@ -1,14 +1,20 @@
 ---
-description: "How to write a Cremind documentation file: the required YAML frontmatter shape, how the `description` field drives retrieval in `cremind_documentation_search` and its 1,200-character limit, body conventions including the size budget and self-contained sections for long documents, and how to verify the document is indexed."
+description: "How to write a Cremind documentation file: the required YAML frontmatter shape, how the `description` field drives retrieval in `cremind_documentation_search` and its 1,200-character limit, body conventions including the size budget and self-contained sections for long documents, and how to verify the document is indexed. Not about indexing the user's own files (that is Documentation search, `cremind docs`)."
 ---
 
-# Writing an Cremind Document
+# Writing a Cremind Document
 
-An *Cremind document* is a Markdown (`.md`) file that lives under one of the
-two watched documentation roots:
+A *Cremind document* is a Markdown (`.md`) file that lives under one of the
+two watched documentation roots, both under
+`<CREMIND_SYSTEM_DIR>/storage/cremind_documents/`:
 
-- Shared: `<CREMIND_WORKING_DIR>/documents/*.md`
-- Per-profile: `<CREMIND_WORKING_DIR>/<profile>/documents/*.md`
+- Shared: `shared/*.md` — the manual bundled with Cremind, mirrored there on
+  every boot (see the note under Verification).
+- Per-profile: `profiles/<profile uuid>/*.md` — pages a profile writes for
+  itself, keyed by the profile's id, never its name. The agent reaches its
+  own with the Change Working Directory tool's `documents` target. Installs
+  from before this layout kept them at `<CREMIND_SYSTEM_DIR>/<profile>/documents/`;
+  they are moved automatically at boot.
 
 When a file appears in either tree, the documents watcher parses it and, if
 it is valid, indexes it into the vector store (Qdrant or Chroma) used by the
@@ -20,6 +26,13 @@ internal LLM judge picks the single best match from the top candidates'
 names + descriptions (with Vector Embedding off, the judge reviews every
 document instead). The body is read from disk on demand only after the
 judge picks a document.
+
+These documents are Cremind's own manual — what the agent reads to answer
+questions about Cremind. They are not the user's own files: those are indexed
+by **Documentation search** (the `documentation_search` tool, `cremind docs`),
+which reads ordinary files of any type from a folder the user picks and needs
+no frontmatter. (Before the rename, `documentation_search` was this manual's
+tool id.)
 
 ## File format
 
@@ -158,9 +171,9 @@ in the profile config and restart the server.
 
 After saving a new document:
 
-1. Place the file directly under one of the watched roots — `documents/`
-   for shared docs, or `<profile>/documents/` for per-profile docs. It
-   must not be nested in a subdirectory.
+1. Place the file under the profile's own root,
+   `storage/cremind_documents/profiles/<profile uuid>/` (the agent's
+   `documents` working directory); subfolders are indexed too.
 2. Wait ~1 second for the watcher's debounce to pick up the change. No
    server restart is required.
 3. Call the `cremind_documentation_search` built-in tool with a query whose
@@ -169,9 +182,10 @@ After saving a new document:
    `read_documentation_section` reads any section by its heading.
 
 > **System docs are different.** The watcher covers the two documentation
-> roots above. The docs *bundled with Cremind* are mirrored into the shared
-> root and re-embedded at server **boot**, so edits to a bundled doc take
-> effect on the next restart — not via the live watcher.
+> roots above. The docs *bundled with Cremind* (`app/cremind_documents/bundled/`)
+> are mirrored into the shared root and re-embedded at server **boot**, so
+> edits to a bundled doc take effect on the next restart — not via the live
+> watcher — and a file added to `shared/` by hand is deleted at the next boot.
 
 If the file doesn't appear, the most common causes are:
 
@@ -179,7 +193,8 @@ If the file doesn't appear, the most common causes are:
    exactly `---` and that there is a matching closing `---`.
 2. Missing or empty `description` — the parser silently rejects files
    without a non-empty description string.
-3. Wrong location — the file must be directly under a `documents/`
-   folder, not in a nested subdirectory.
+3. Wrong location — the file must be somewhere under the profile's
+   `storage/cremind_documents/profiles/<profile uuid>/` folder (subfolders are
+   indexed too), not in the old `<profile>/documents/` folder.
 4. YAML parse error — if the description contains colons, hashes, or
    other special characters, wrap the value in double quotes.

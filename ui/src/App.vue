@@ -3,6 +3,7 @@ import { computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useChatStore } from './stores/chat';
 import { useGroupChatStore } from './stores/groupChat';
+import { useSearchToolsStore } from './stores/searchTools';
 import { useSettingsStore } from './stores/settings';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
 import { useDocumentsStore } from './stores/documents';
@@ -80,6 +81,7 @@ const route = useRoute();
 const router = useRouter();
 const chatStore = useChatStore();
 const groupChatStore = useGroupChatStore();
+const searchToolsStore = useSearchToolsStore();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
 const documentsStore = useDocumentsStore();
@@ -200,6 +202,10 @@ async function handleProfileNavigation(
     // Group rooms and their per-group SSE are scoped to the previous profile's
     // token — drop them alongside the chat state, whatever route we land on.
     groupChatStore.resetForProfileSwitch();
+    // Search-tool selections, room ones included, and the new-chat draft are
+    // the previous profile's — cleared whatever route we land on (the chat
+    // store's own reset only runs on chat routes).
+    searchToolsStore.resetForProfileSwitch();
     // Reset chat state when switching to a different profile.
     if (onChatRoute) {
       await chatStore.resetForProfileSwitch();

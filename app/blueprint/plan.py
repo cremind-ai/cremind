@@ -127,7 +127,12 @@ def stage_upload(archive_bytes_path: Path, *, owner: str) -> ImportSession:
         # one), then imports into it.
         target_profile=owner,
         steps=[{"key": s["key"], "status": "pending", "requirements": s.get("requirements", []), "result": {}} for s in steps],
-        warnings=[{"kind": "compat", "message": w} for w in report.warnings],
+        warnings=(
+            [{"kind": "compat", "message": w} for w in report.warnings]
+            # What the plan builders found (a setting or a tool this install
+            # does not have) — shown before the step, not only after it.
+            + [{"kind": "plan", "message": w} for w in warnings]
+        ),
     )
     session.save()
     logger.info(f"[blueprint] staged import session {session_id} steps={[s['key'] for s in steps]}")
@@ -137,7 +142,9 @@ def stage_upload(archive_bytes_path: Path, *, owner: str) -> ImportSession:
 # ── plan ─────────────────────────────────────────────────────────────────────
 
 
-def load_component(payload_dir: Path, key: str) -> dict | None:
+def load_component_doc(payload_dir: Path, key: str) -> tuple[int, dict] | None:
+    """``(version, data)`` of ``components/<key>.json`` exactly as written, or
+    ``None`` when absent/unreadable. A document without a version is v1."""
     path = Path(payload_dir) / f"{COMPONENTS_PREFIX}{key}.json"
     if not path.is_file():
         return None
@@ -145,7 +152,27 @@ def load_component(payload_dir: Path, key: str) -> dict | None:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
+        return None
+    try:
+        version = int(doc.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    return version, doc["data"]
+
+
+def load_component(payload_dir: Path, key: str) -> dict | None:
+    """A component's ``data`` in the CURRENT shape — an older document is
+    lifted by :func:`app.blueprint.compat.upgrade_component` (e.g. a v1 tools
+    document's ids mapped), so plan builders and appliers never see an old
+    shape."""
+    from app.blueprint.compat import upgrade_component
+
+    loaded = load_component_doc(payload_dir, key)
+    if loaded is None:
+        return None
+    version, data = loaded
+    return upgrade_component(key, version, data)
 
 
 def build_import_plan(
@@ -266,8 +293,17 @@ def _plan_tools(data: dict, manifest: BlueprintManifest, warnings: list[str]) ->
         # Friendly name: a2a/mcp definition, else the tools-table row (built-ins
         # exist on the importing machine), else the raw id.
         defn = tool.get("definition") or {}
-        row = ts.get_tool(tool_id) or {}
+        found = ts.get_tool(tool_id) if tool_id else None
+        row = found or {}
         name = defn.get("name") or row.get("name") or tool_id
+        # A tool this install does not have (a built-in from a newer build or
+        # a feature that is not installed here) is skipped by the applier —
+        # say so up front rather than let it look applied.
+        available = found is not None
+        if not available:
+            warnings.append(
+                f"Tool {tool_id!r} is not available on this install; its settings will be skipped."
+            )
 
         # Flatten the non-secret config into {key: value} for display (secret
         # values are never in the doc; their names live in secret_variables).
@@ -282,6 +318,7 @@ def _plan_tools(data: dict, manifest: BlueprintManifest, warnings: list[str]) ->
                 "tool_id": tool_id,
                 "name": name,
                 "kind": tool.get("kind"),
+                "available": available,
                 "settings": settings,
                 "secret_variables": secrets,
                 "disabled_leaves": len(tool.get("disabled_leaves") or []),
@@ -383,4 +420,4 @@ _PLAN_BUILDERS = {
 }
 
 
-__all__ = ["build_import_plan", "load_component", "stage_upload"]
+__all__ = ["build_import_plan", "load_component", "load_component_doc", "stage_upload"]

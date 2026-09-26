@@ -11,11 +11,15 @@ Allowed targets:
   Selecting this clears any prior override so the conversation tracks the live
   default again.
 - ``skills``       -- ``<CREMIND_SYSTEM_DIR>/<profile>/skills``.
-- ``documents``    -- ``<CREMIND_SYSTEM_DIR>/<profile>/documents``.
+- ``documents``    -- the profile's own Cremind manual pages,
+  ``<CREMIND_SYSTEM_DIR>/storage/cremind_documents/profiles/<profile uuid>``
+  (created on first use). Keyed by the profile's uuid, resolved from its row;
+  see :mod:`app.cremind_documents.paths`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -78,7 +82,12 @@ def _resolve_target(
     if target == "skills":
         return profile_skills_dir(profile)
     if target == "documents":
-        return Path(BaseConfig.CREMIND_SYSTEM_DIR) / profile / "documents"
+        # The watched manual directory — pages written here are indexed for
+        # this profile's Cremind documentation search. None when the profile's
+        # uuid cannot be resolved: never a name-keyed guess.
+        from app.cremind_documents import paths as doc_paths
+
+        return doc_paths.profile_dir(profile, Path(BaseConfig.CREMIND_SYSTEM_DIR))
     if target == "user_working":
         return Path(get_user_working_directory())
     if target == "custom":
@@ -188,7 +197,11 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
             get_context(context_id, OVERRIDE_KEY)
             or get_user_working_directory()
         )
-        new_path = _resolve_target(target, profile, custom_path=custom_path)
+        # Off the event loop: 'documents' and a skill id both resolve through
+        # a DB row.
+        new_path = await asyncio.to_thread(
+            _resolve_target, target, profile, custom_path=custom_path,
+        )
         if new_path is None:
             return BuiltInToolResult(
                 content=[{"type": "text", "text": (

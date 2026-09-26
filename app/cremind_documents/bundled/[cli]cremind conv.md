@@ -1,5 +1,5 @@
 ---
-description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode investigates first — loading the relevant skills, searching the docs and listing live state — then asks clarifying questions, in more than one round when your answers raise new ones, and writes a plan you approve before it executes), plus attach, cancel an in-flight run, decline a pending plan (`plan-cancel`), inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
+description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode investigates first — loading the relevant skills, searching the docs and listing live state — then asks clarifying questions, in more than one round when your answers raise new ones, and writes a plan you approve before it executes), plus attach, cancel an in-flight run, decline a pending plan (`plan-cancel`), choose which search sources the agent may use (`search-tools`: Documentation search, Cremind documentation search, Memory search, Web search), inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
 ---
 
 # `cremind conv` — Conversation Management and Streaming
@@ -416,6 +416,79 @@ cremind conv rename <id> <title>
 ```bash
 $ cremind conv rename c_82bc "Daily Brief – May 2"
 ```
+
+### `cremind conv search-tools`
+
+**Purpose.** Show or set which search sources the agent may use in one
+conversation — the CLI twin of the chat composer's **Search tools** button.
+
+**Syntax.**
+
+```bash
+cremind conv search-tools <id>                       # show
+cremind conv search-tools <id> --enable <tool-id> …  # replace the selection
+cremind conv search-tools <id> --all                 # restore the defaults
+cremind conv search-tools <id> --none                # turn every source off
+```
+
+**Flags.**
+
+| Flag | Type | Default | Meaning |
+|------|------|---------|---------|
+| `--enable` | text (repeatable, or comma-separated) | — | Enable exactly these sources; the list **replaces** the selection. |
+| `--all` | bool | `false` | Restore the defaults: every search source. |
+| `--none` | bool | `false` | Turn every search source off. |
+
+`--enable`, `--all` and `--none` are mutually exclusive (checked by the CLI and
+again by the server). The tool ids, in their fixed **priority order**:
+
+| # | Tool id | Searches |
+|---|---------|----------|
+| 1 | `documentation_search` | The user's own indexed files (local folder and Google Drive). Only offered when Documentation search is allowed by the admin, turned on for the profile, and allowed for this conversation's origin. |
+| 2 | `cremind_documentation_search` | Cremind's own manuals (features, settings, the `cremind` CLI). |
+| 3 | `memory_search` | Long-term memory from past conversations. |
+| 4 | `web_search` | The public internet — the last-resort fallback. |
+
+The priority guides the agent toward the relevant source; it does not make it
+search every source for every message (casual chat needs no search).
+
+**Behavior.**
+
+- **Defaults.** Every new conversation starts with every available source on;
+  an event run's conversation starts with the defaults on each firing.
+- **Saved per conversation**, surviving reloads and restarts. The choice never
+  turns on a tool that is off in Tools settings, never starts indexing and
+  never grants document access — an unavailable source stays listed with its
+  reason (`AVAILABLE no`) and the next response simply cannot use it.
+- **Next response.** A response already running keeps the search tools it
+  started with (messages you inject into it too); the saved choice applies
+  from the next response. While it has not been adopted yet the output prints
+  `Saved for the next response (a response already running keeps its existing
+  search tools).`
+- **Prompt cache.** Changing the search tools of an established conversation
+  may reduce prompt-cache reuse on the next response and increase input-token
+  cost; the CLI then prints that warning. It is not printed for a new
+  conversation, a no-op, a change to an unavailable source only, or a change
+  back to what the last response used.
+- **Concurrency.** The write carries the version it read; if someone changed
+  the selection in between (another tab), the CLI retries once against the new
+  version, then reports the conflict.
+- A group-chat seat is refused — use `cremind group search-tools` for the room.
+- `--json` prints the full state:
+  `{"version", "enabled", "effective", "tools": [{"id", "label", "description", "available", "unavailable_reason"}], "pending_next_response", "cache_warning"}`.
+  `enabled` is what you chose; `effective` is what the next response will use.
+
+**Examples.**
+
+```bash
+$ cremind conv search-tools c_82bc
+$ cremind conv search-tools c_82bc --enable documentation_search --enable web_search
+$ cremind conv search-tools c_82bc --enable cremind_documentation_search,memory_search
+$ cremind --json conv search-tools c_82bc --none | jq .effective
+$ cremind conv search-tools c_82bc --all
+```
+
+Messages you then send with `cremind conv send` use the saved choice.
 
 ### `cremind conv set-id`
 

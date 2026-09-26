@@ -320,6 +320,33 @@ def conv_rename(
     asyncio.run(_run())
 
 
+@conv_app.command("search-tools")
+@graceful_errors
+def conv_search_tools(
+    ctx: typer.Context,
+    conv_id: str = typer.Argument(..., help="Conversation id (an ordinary or event-run conversation)."),
+    enable: Optional[list[str]] = typer.Option(
+        None, "--enable",
+        help="Enable exactly these sources, replacing the selection (repeatable or comma-separated): "
+             "documentation_search, cremind_documentation_search, memory_search, web_search.",
+    ),
+    all_: bool = typer.Option(False, "--all", help="Restore the defaults: every search source."),
+    none_: bool = typer.Option(False, "--none", help="Turn every search source off."),
+) -> None:
+    """Show or set which search sources the agent may use in a conversation.
+
+    The change is saved at once and applies from the next response; a response
+    already running keeps its search tools.
+    """
+    from app.cli.client.search_tools import conversation_path
+    from app.cli.commands import _search_tools
+
+    _search_tools.run(
+        ctx, conversation_path(conv_id), subject=f"conversation {conv_id}",
+        enable=enable, all_=all_, none_=none_,
+    )
+
+
 @conv_app.command("set-id")
 @graceful_errors
 def conv_set_id(

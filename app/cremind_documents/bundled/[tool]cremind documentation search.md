@@ -1,14 +1,37 @@
 ---
-description: "The Cremind Documentation Search (cremind_documentation_search) built-in tool: how the agent finds a document (vector ranking plus an LLM relevance judge, or the judge alone when Vector Embedding is off), how a long document is delivered (its head, a table of contents with section sizes, and the matching sections, sized to the profile's tool_result.max_tokens), reading one section with read_documentation_section, and its DEFAULT_TOP_K variable. How to view and change the cremind_documentation_search top-k and toggle its two sub-tools per profile."
+description: "The Cremind Documentation Search (cremind_documentation_search) built-in tool, which searches Cremind's own manuals — features, settings and the cremind CLI: how the agent finds a document (vector ranking plus an LLM relevance judge, or the judge alone when Vector Embedding is off), how a long document is delivered (its head, a table of contents with section sizes, and the matching sections, sized to the profile's tool_result.max_tokens), reading one section with read_documentation_section, and its DEFAULT_TOP_K variable. How to view and change the cremind_documentation_search top-k and toggle its two sub-tools per profile. Named documentation_search before the rename; that id is now the user's own files (Documentation search)."
 ---
 
 # Cremind Documentation Search Tool (cremind_documentation_search)
 
 The **Cremind Documentation Search** tool (`tool_id` `cremind_documentation_search`) is how the
 agent answers questions about Cremind, its skills, the `cremind` CLI, and any
-documents the user has added. It is always on (locked) and visible in Settings.
-It has two sub-tools: `search_documentation` finds a document, and
+Cremind documents the user has added (Markdown files with a `description`
+frontmatter — see `document.md`). It is always on (locked) and visible in
+Settings. It has two sub-tools: `search_documentation` finds a document, and
 `read_documentation_section` reads one section of it.
+
+It is not **Documentation search** (`documentation_search`), which searches the
+user's own indexed files (`cremind docs`).
+
+## Renamed from `documentation_search`
+
+Before the rename this tool's id was `documentation_search`, and the agent saw
+`documentation_search__search_documentation` and
+`documentation_search__read_documentation_section`; they are now
+`cremind_documentation_search__search_documentation` and
+`cremind_documentation_search__read_documentation_section`. The old id now
+belongs to Documentation search. Per-profile settings (`DEFAULT_TOP_K`, the two
+sub-tools) moved with the tool on upgrade. A model that copies an old function
+name from an older conversation's history is routed to the new function.
+
+## Per conversation
+
+Locked means no profile can turn it off in Settings. A single conversation or
+group room can still leave it out with the chat composer's **Search tools**
+button, where it ranks second: Documentation search → Cremind documentation
+search → Memory search → Web search. The choice applies from the next
+response; see `[tool]documentation search` and `cremind conv search-tools`.
 
 ## How a document is found
 

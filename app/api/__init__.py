@@ -32,6 +32,8 @@ from app.api.documents import get_documents_routes
 from app.api.documents_files import get_documents_files_routes
 from app.api.documents_query import get_documents_query_routes
 from app.api.documents_research import get_documents_research_routes
+from app.api.retired import get_retired_routes
+from app.api.search_tools import get_search_tools_routes
 
 
 def get_api_routes(
@@ -79,6 +81,10 @@ def get_api_routes(
     routes.extend(get_auth_routes(conversation_storage))
     routes.extend(get_system_vars_routes())
     routes.extend(get_file_routes())
+    # Before the conversation and group-chat routes: their own paths are
+    # distinct, but registering the more specific ones first keeps any future
+    # catch-all under /api/conversations/{id}/... from shadowing them.
+    routes.extend(get_search_tools_routes(conversation_storage))
     routes.extend(get_conversation_routes(
         conversation_storage, agent_executor=agent_executor,
     ))
@@ -93,6 +99,10 @@ def get_api_routes(
     routes.extend(get_file_watcher_routes())
     routes.extend(get_calendar_routes(conversation_storage))
     routes.extend(get_drive_routes())
+    # Retired prefixes (/api/userdocs/* → /api/documentation-search/*) answer
+    # 410 with the replacement path. Registered before the live routes they
+    # point at; they share no path with them, so the order is only for reading.
+    routes.extend(get_retired_routes())
     # The query, research and file routes come first: Starlette matches in
     # order, and /api/documentation-search/files/{fid}/text must not be shadowed by
     # /files/{fid}.

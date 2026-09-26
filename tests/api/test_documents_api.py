@@ -310,6 +310,26 @@ def test_status_reports_the_suspension_reason(env):
     assert (snap["state"], snap["reason"], snap["tool_mode"]) == ("suspended", "admin_gate", "hidden")
 
 
+def test_status_shows_a_profile_its_own_relocation_problems_by_uuid(env):
+    """An index step knows only the uuid, so a filter by name never showed a
+    profile its own index conflict; and a name can be reused, so a step that
+    names ``dog`` but belongs to an earlier profile of that name must stay
+    hidden from the current one. The admin sees them all."""
+    from app.documents import relocate
+
+    journal = relocate.Journal.load(env.sysdir)
+    journal.record("index:p1", state="conflict", kind="index", uid="p1", error="dog's index")
+    journal.record("index:p0", state="conflict", kind="index", uid="p0", profile="admin", error="admin's index")
+    journal.record("authored:p9", state="conflict", kind="authored", uid="p9", profile="dog",
+                   error="an earlier profile named dog")
+    journal.record("indexes", state="error", error="installation-wide")
+
+    dog = _body(_call("/api/documentation-search/status", "GET", username="dog"))["relocation_errors"]
+    assert [p["step"] for p in dog] == ["index:p1"]
+    admin = _body(_call("/api/documentation-search/status", "GET", username="admin"))["relocation_errors"]
+    assert {p["step"] for p in admin} == {"index:p1", "index:p0", "authored:p9", "indexes"}
+
+
 # ── browse ─────────────────────────────────────────────────────────────────
 
 

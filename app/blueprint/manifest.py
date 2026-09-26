@@ -54,8 +54,15 @@ COMPONENT_KEYS = ("persona", "tools", "llm", "settings", "skills", "events", "li
 
 # The component-document versions this build writes and can read. A blueprint
 # component whose version exceeds the value here is skipped on import (the rest
-# still applies) — this is the per-item forward-compatibility gate.
+# still applies) — this is the per-item forward-compatibility gate. Reading an
+# OLDER version is :mod:`app.blueprint.compat`'s job.
+#
+# tools v2: the two document searches swapped ids — Cremind's manual search is
+# ``cremind_documentation_search`` and the personal-document search is
+# ``documentation_search`` (it was ``user_documents``). A v1 document's ids are
+# mapped on import; a v1 build skips a v2 document rather than misreading it.
 SUPPORTED_COMPONENT_VERSIONS: dict[str, int] = {k: 1 for k in COMPONENT_KEYS}
+SUPPORTED_COMPONENT_VERSIONS["tools"] = 2
 
 # The minimum app version required to understand each (component, version). Used
 # purely to compute ``min_app_version`` in the manifest so an *older* importer
@@ -65,6 +72,11 @@ SUPPORTED_COMPONENT_VERSIONS: dict[str, int] = {k: 1 for k in COMPONENT_KEYS}
 COMPONENT_MIN_APP: dict[tuple[str, int], str] = {
     ("persona", 1): "0.0.8",
     ("tools", 1): "0.0.8",
+    # The first release that reads tools v2. ``app/__version__.py`` still says
+    # 0.0.18 while this is unreleased (it is bumped at release time) — and
+    # 0.0.18 itself skips a v2 tools document, so naming it here would send an
+    # old importer to a build that still cannot read it.
+    ("tools", 2): "0.0.19",
     ("llm", 1): "0.0.8",
     ("settings", 1): "0.0.8",
     ("skills", 1): "0.0.8",

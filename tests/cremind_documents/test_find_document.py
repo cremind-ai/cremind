@@ -32,18 +32,22 @@ def _write(directory: Path, stem: str, description: str, body: str = "Body.\n") 
     return path
 
 
+def _uid(profile: str) -> str:
+    return f"uid-{profile}"
+
+
 @pytest.fixture
 def svc(tmp_path) -> CremindDocumentSyncService:
-    return CremindDocumentSyncService(working_dir=tmp_path)
+    return CremindDocumentSyncService(working_dir=tmp_path, profile_uid_resolver=_uid)
 
 
 @pytest.fixture
 def shared(tmp_path) -> Path:
-    return tmp_path / "documents"
+    return tmp_path / "storage" / "cremind_documents" / "shared"
 
 
 def _profile_dir(tmp_path: Path, profile: str) -> Path:
-    return tmp_path / profile / "documents"
+    return tmp_path / "storage" / "cremind_documents" / "profiles" / _uid(profile)
 
 
 # ---------------------------------------------------------------------------

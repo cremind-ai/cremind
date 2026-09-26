@@ -363,6 +363,11 @@ def documents_status(
         warning = docker_warning(out)
         if warning:
             sys.stderr.write(warning + "\n")
+        # Files the rename upgrade could not move (both sides kept): each line
+        # says what to do. The admin sees every profile's; others their own.
+        for problem in out.get("relocation_errors") or []:
+            if isinstance(problem, dict) and problem.get("error"):
+                sys.stderr.write(f"upgrade: {problem['error']}\n")
 
 
 @docs_app.command("settings")

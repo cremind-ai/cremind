@@ -1,5 +1,5 @@
 ---
-description: "The Documentation Search (documentation_search) built-in tool: how the agent searches the user's OWN files indexed by Documentation search — find_files (files, folders and code projects by name, type, date, folder; counts by type, folder, month or extension), search (passages by meaning and keyword, grouped by file or folder, with date relaxation), read (pages, lines, a section or legal article such as 'Điều 203', sheet, slide) and research (deep research as a background job: verified legal/financial/compliance analysis with law-edition selection, or compiling every file in a folder into one table; continue_job, PRELIMINARY results, clarifications, coverage, dossier pages) — the [doc:…] citation tokens every answer must copy, the search modes (hybrid, lexical_only, …), when the tool is hidden (channels and group rooms), and its DEFAULT_TOP_K, RESEARCH_MODEL_GROUP and RESEARCH_TOKEN_BUDGET variables. Not Cremind's own documentation (that is cremind_documentation_search)."
+description: "The Documentation Search (documentation_search) built-in tool: how the agent searches the user's OWN files indexed by Documentation search — find_files (files, folders and code projects by name, type, date, folder; counts by type, folder, month or extension), search (passages by meaning and keyword, grouped by file or folder, with date relaxation), read (pages, lines, a section or legal article such as 'Điều 203', sheet, slide) and research (deep research as a background job: verified legal/financial/compliance analysis with law-edition selection, or compiling every file in a folder into one table; continue_job, PRELIMINARY results, clarifications, coverage, dossier pages) — the [doc:…] citation tokens every answer must copy, the search modes (hybrid, lexical_only, …), when the tool is hidden (channels and group rooms), the chat's per-conversation Search tools selector and source priority, and its DEFAULT_TOP_K, RESEARCH_MODEL_GROUP and RESEARCH_TOKEN_BUDGET variables. Formerly named user_documents. Not Cremind's own documentation (that is cremind_documentation_search)."
 ---
 
 # Documentation Search Tool (documentation_search)
@@ -8,14 +8,15 @@ The **Documentation Search** tool (`tool_id` `documentation_search`) is how the 
 searches and reads the files the user indexed with **Documentation search**
 (Settings → My Documents, or `cremind docs enable`): their documents,
 notes, reports, spreadsheets, photos and project folders. It never touches
-Cremind's own manual — that is `cremind_documentation_search`.
+Cremind's own manual — that is `cremind_documentation_search`, which held the
+`documentation_search` id before the rename; this tool was `user_documents`
+(`user_documents__search` is now `documentation_search__search`), and its old
+`[ud:…]` citations still verify.
 
 It has four sub-tools, which the agent sees as `documentation_search__find_files`,
 `documentation_search__search`, `documentation_search__read` and
-`documentation_search__research`. The same operations are available from a
-terminal: `cremind docs find|search|read|cite` (see
-`[cli]cremind docs search`) and `cremind docs research` (see
-`[cli]cremind docs research`).
+`documentation_search__research`. In a terminal the same operations are
+`cremind docs find|search|read|cite` and `cremind docs research`.
 
 ## When the agent can use it
 
@@ -32,6 +33,17 @@ The tool is on by default but only appears when all of these hold:
 
 When it cannot answer (no index yet, the first sync waiting for approval,
 disabled by the admin) the tool says why instead of failing.
+
+## Search tools per conversation
+
+The chat composer's **Search tools** button picks the search sources one
+conversation or group room may use, in priority order: Documentation search →
+Cremind documentation search → Memory search → Web search (all on by
+default). A change applies from the **next response** — one already running
+keeps its tools — and may lower prompt-cache reuse there (the picker warns).
+It only narrows: it never enables a tool turned off in Settings, starts
+indexing or widens `allow_in`. CLI: `cremind conv search-tools`, `cremind
+group search-tools`.
 
 ## find_files — files, folders and projects
 
@@ -79,11 +91,8 @@ typed without accents still matches accented text.
   check uses one image from the daily caption quota. When the vision model
   is off or not consented to, the result says so and ranks by captions only.
 
-Photos that are not captioned yet (no vision model, no consent, or over the
-daily cap) are still found by name, folder, date and camera; the result
-header counts them.
-
-If a date window finds no keyword match, it is widened to ±3 days, then ±14
+Uncaptioned photos (no vision model or consent, over the daily cap) are still
+found by name, folder, date and camera. If a date window finds no keyword match, it is widened to ±3 days, then ±14
 days, then dropped, and the result says which step matched.
 
 ## read — a file's text
@@ -117,12 +126,11 @@ and every quote it keeps is checked against the source text — a quote the
 model got wrong (a swapped word, a dropped "not") is dropped and counted.
 
 A job reads the text the index holds, so it first brings the index up to
-date: it checks the folder for new files (a scan, in polling mode), asks
-Google Drive for its latest changes when Drive is indexed, compares every
-local file in scope with the disk, and re-indexes the changed ones before
-reading. A file that could not be re-indexed in time (or while sync is
-paused) is never read from its old text: it is listed as "still being
-indexed", and the job asks whether to go on without it.
+date: new files in the folder, Google Drive's latest changes, and every
+changed local file in scope re-indexed before reading. A file that could not
+be re-indexed in time (or while sync is paused) is never read from its old
+text: it is listed as "still being indexed", and the job asks whether to go on
+without it.
 
 Two modes:
 
@@ -209,9 +217,8 @@ page=n)`, or `continue_job=<id>` with `page=n`. Every page fits the
 profile's tool-result budget, and every token printed is registered for the
 conversation, so the answer's citations verify like any other.
 
-While a job runs, the chat shows a **Research activity** panel with the
-question, the phase, progress, the latest steps and the tokens spent, and a
-Cancel button.
+While a job runs, the chat's **Research activity** panel shows its phase,
+progress, latest steps and tokens, with a Cancel button.
 
 ## Filters
 

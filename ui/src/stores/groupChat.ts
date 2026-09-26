@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { useSettingsStore } from './settings';
 import { useTerminalPanelStore } from './terminalPanel';
+import { useSearchToolsStore } from './searchTools';
 import type { TerminalAttachment, ThinkingStep, TokenUsage } from './chat';
 import {
   attachResultToSteps,
@@ -389,10 +390,25 @@ export const useGroupChatStore = defineStore('groupChat', {
         if (frame.data.state !== 'thinking' && this.liveTurns[groupId]) {
           delete this.liveTurns[groupId][frame.data.profile];
         }
+        // A member's turn ended: if it ran on a saved search-tools change, the
+        // room's "applies from the next response" marker may clear now.
+        if (frame.data.state !== 'thinking') {
+          useSearchToolsStore().refreshIfPending({ kind: 'group', id: groupId });
+        }
         return;
       }
       if (frame.type === 'group_updated') {
         this.mergeGroup(frame.data);
+        return;
+      }
+      if (frame.type === 'search_tools') {
+        // `adopted`: a member agent's new response started on the saved
+        // selection, so the room's pending indicator may clear.
+        if (frame.data.adopted) {
+          useSearchToolsStore().refreshIfPending({ kind: 'group', id: groupId });
+          return;
+        }
+        useSearchToolsStore().noteRemoteVersion({ kind: 'group', id: groupId }, frame.data.version);
         return;
       }
       if (frame.type === 'deleted') {
@@ -404,6 +420,7 @@ export const useGroupChatStore = defineStore('groupChat', {
         delete this.agentStatusByGroup[groupId];
         delete this.liveTurns[groupId];
         delete this.traceBySource[groupId];
+        useSearchToolsStore().forget({ kind: 'group', id: groupId });
         this.streamStatusByGroup[groupId] = 'closed';
         if (this.activeGroupId === groupId) this.activeGroupId = null;
         return;
@@ -805,6 +822,7 @@ export const useGroupChatStore = defineStore('groupChat', {
       delete this.liveTurns[groupId];
       delete this.traceBySource[groupId];
       delete this.streamStatusByGroup[groupId];
+      useSearchToolsStore().forget({ kind: 'group', id: groupId });
       if (this.activeGroupId === groupId) this.activeGroupId = null;
     },
 

@@ -3,7 +3,7 @@
 `[cli]cremind docs drive.md`.
 
 CLAUDE.md mandates that a CLI command and its bundled doc move in lockstep.
-This walks the nested Typer groups (`documents`, `docs excludes`,
+This walks the nested Typer groups (`docs`, `docs excludes`,
 `docs admin`, `docs research`, `docs drive`, `docs drive
 folders`) so a new subcommand or flag cannot land undocumented. The query
 subcommands (`search`, `find`, `read`, `cite`), the research jobs
@@ -173,3 +173,22 @@ def test_the_doc_covers_the_confirmation_trap():
 
 def test_the_doc_names_the_install_command_for_the_extras():
     assert "cremind features install documentation_search" in _doc_text()
+
+
+@pytest.mark.parametrize("doc", ALL_DOCS, ids=lambda d: d.name)
+def test_every_json_example_runs_the_docs_group(doc):
+    """The group was `userdocs`, and for a while the examples said
+    `cremind --json documents …` — a group that never existed. Every `--json`
+    example must name the real one."""
+    import re
+
+    groups = re.findall(r"cremind --json ([a-z][a-z-]*)", _doc_text(doc))
+    assert groups, f"{doc.name} shows no --json example"
+    assert set(groups) == {"docs"}, f"{doc.name}: --json examples run {sorted(set(groups))}"
+
+
+def test_the_doc_says_what_the_group_was_called_before_the_rename():
+    text = _doc_text()
+    assert "cremind userdocs" in text and "/api/userdocs" in text
+    assert "410 EndpointRenamed" in text
+    assert "formerly `cremind userdocs`" in _description().lower()

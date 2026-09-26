@@ -134,14 +134,26 @@ def _system_dir() -> str:
 
 
 def _query_profiles() -> list[str]:
+    return [name for name, _uid in _query_profile_rows()]
+
+
+def _query_profile_rows(engine: Any = None) -> list[tuple[str, str]]:
+    """``(name, uuid)`` of every profile. The uuid keys the profile's Cremind
+    manual pages (``storage/cremind_documents/profiles/<uuid>``), which live
+    outside its name-keyed tree."""
     from sqlalchemy import text
 
-    from app.databases import get_database_provider
-
     try:
-        engine = get_database_provider().sync_engine()
+        if engine is None:
+            from app.databases import get_database_provider
+
+            engine = get_database_provider().sync_engine()
         with engine.connect() as conn:
-            return [r[0] for r in conn.execute(text("SELECT name FROM profiles"))]
+            return [
+                (str(r[0]), str(r[1]))
+                for r in conn.execute(text("SELECT name, id FROM profiles"))
+                if r[0] and r[1]
+            ]
     except Exception as e:  # noqa: BLE001 — no profiles table on a bare DB
         logger.warning(f"[backup] could not list profiles: {e}")
         return []
@@ -188,7 +200,9 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
 
     system_dir = _system_dir()
     provider = get_database_provider()
-    profiles = _query_profiles()
+    profile_rows = _query_profile_rows()
+    profiles = [name for name, _uid in profile_rows]
+    profile_uids = [uid for _name, uid in profile_rows]
 
     dest = Path(options.dest) if options.dest else _default_dest()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +267,7 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
                 for abs_path, arc in iter_backup_files(
                     system_dir, profiles,
                     include_browser_profiles=options.include_browser_profiles,
+                    profile_uids=profile_uids,
                 ):
                     member = FILES_PREFIX + arc
                     try:
@@ -550,6 +565,9 @@ def apply_staged_restore(
             "server_config", "jwt_secret", local_secret, is_secret=True
         )
         _reissue_profile_tokens(engine, target_system_dir, local_secret)
+        # The restored profiles' (name, uuid): what the relocation below maps
+        # an older archive's name-keyed manual pages with.
+        restored_profiles = _query_profile_rows(engine)
     finally:
         try:
             engine.dispose()
@@ -565,6 +583,26 @@ def apply_staged_restore(
         "installation (not restored from the backup); token files were "
         "re-issued for each restored profile."
     ]
+
+    # An archive from before the Cremind manual moved puts each profile's
+    # pages back at ``<profile>/documents``: move them to the uuid-keyed
+    # directory now, while nothing runs. The next boot runs the same
+    # relocation again (a no-op by then, or the finish of what this could
+    # not do) BEFORE any document service starts.
+    try:
+        from app.documents.relocate import run_after_restore
+
+        moved = run_after_restore(target_system_dir, restored_profiles)
+        for err in moved.errors:
+            warnings.append(str(err.get("error") or err))
+        if moved.busy:
+            warnings.append(
+                "Document folders could not be relocated right after the restore "
+                "(another process held the lock); the next start relocates them."
+            )
+    except Exception as e:  # noqa: BLE001 — the boot relocation is the backstop
+        logger.warning(f"[backup:restore] post-restore document relocation failed: {e}")
+        warnings.append(f"Document folders were not relocated after the restore ({e}); the next start retries.")
     if report.unmapped:
         warnings.append(
             f"{len(report.unmapped)} stored path(s) point outside the backed-up "

@@ -10,6 +10,7 @@ CLAUDE.md "keep docs in sync with the feature" mandate for these docs.
 from __future__ import annotations
 
 import importlib
+import re
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,34 @@ def test_doc_mentions_every_variable_and_enum(module_stem: str, doc_stem: str) -
             assert str(val) in text, (
                 f"{doc_stem}.md is missing arg enum value '{val}' for '{arg_name}'"
             )
+
+
+_CLI_RECIPE_RE = re.compile(
+    r"cremind (?:--json )?tools "
+    r"(?:set-var|get|leaves|set-leaf|options|set-args|get-args|enable|disable) "
+    r"([A-Za-z0-9_.\-]+)"
+)
+
+
+@pytest.mark.parametrize("module_stem,doc_stem", sorted(DOC_MAP.items()))
+def test_cli_recipes_configure_the_documented_tool(module_stem: str, doc_stem: str) -> None:
+    """A tool doc's `cremind tools …` recipes must target that tool's own id.
+
+    The search-tool rename moved ``documentation_search`` from Cremind's manual
+    to the user's own documents. A recipe left on the old id would still run —
+    and quietly retune the other tool — so every recipe is checked against the
+    id the registry derives for the module (``slugify(SERVER_NAME)``).
+    """
+    from app.tools.ids import slugify
+
+    mod = importlib.import_module(f"app.tools.builtin.{module_stem}")
+    tool_id = slugify(getattr(mod, "SERVER_NAME", module_stem))
+    text = _doc_text(doc_stem)
+    targets = set(_CLI_RECIPE_RE.findall(text))
+    assert targets <= {tool_id}, f"{doc_stem}.md configures {sorted(targets - {tool_id})}, not {tool_id}"
+    assert re.search(rf"(?<![\w]){re.escape(tool_id)}(?![\w])", text), (
+        f"{doc_stem}.md never names its tool id {tool_id!r}"
+    )
 
 
 def test_all_configurable_visible_tools_are_documented() -> None:

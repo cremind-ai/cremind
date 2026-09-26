@@ -32,8 +32,12 @@ from app.utils.logger import logger
 # memory has no rebuild source, and tool-card embeddings no longer exist.
 _OWNED_COLLECTION_PREFIXES: tuple[str, ...] = ()
 # ``documentation_search`` is the Cremind manual's collection from before it
-# was renamed; it has no rebuild of its own, so a re-sync simply drops it.
-# (Personal-document collections start with ``doc_`` and are never owned.)
+# was renamed; it has no rebuild of its own, so a re-sync simply drops it —
+# the same retirement the boot runs once the replacement is populated
+# (app/documents/relocate.py ``retire_legacy_manual_collection``, whose journal
+# the rebuild below closes). Personal-document collections (``doc_*``, and the
+# pre-rename ``ud_*`` still being copied to their ``doc_`` names) are never
+# owned: they are rebuilt from each profile's index, not from here.
 _OWNED_COLLECTIONS_EXACT = (
     "gg_places_types", "cremind_documentation_search", "documentation_search",
 )
@@ -281,6 +285,20 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
                     service.full_reconcile(profile)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[embedding] documentation collection reconcile failed; continuing: {e}")
+
+    # The pre-rename manual collection was dropped with the owned set above;
+    # record that in the relocation journal (kept in the manual service's
+    # system dir), so the boot-time retirement stops waiting for it.
+    try:
+        from app.cremind_documents import get_service
+
+        service = get_service()
+        if service is not None and vector_store is not None:
+            from app.documents.relocate import retire_legacy_manual_collection
+
+            retire_legacy_manual_collection(vector_store, system_dir=service.working_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[embedding] manual collection retirement check failed: {e}")
 
     embedding_state.set_phase(None)
 

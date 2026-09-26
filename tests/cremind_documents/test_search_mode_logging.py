@@ -41,10 +41,11 @@ class _Emb:
 
 
 def _svc(tmp_path):
-    docs = tmp_path / "documents"
+    svc = CremindDocumentSyncService(working_dir=tmp_path, profile_uid_resolver=lambda p: f"uid-{p}")
+    docs = svc.shared_dir()
     docs.mkdir(parents=True)
     (docs / "widgets.md").write_text(_DOC, encoding="utf-8")
-    return CremindDocumentSyncService(working_dir=tmp_path)
+    return svc
 
 
 def _capture(fn):

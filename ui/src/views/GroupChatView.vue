@@ -430,6 +430,7 @@ const handleSend = async (text: string) => {
           :group-id="props.groupId!"
           :disabled="!canPost"
           :sending="store.sending"
+          :running="thinkingSeats.length > 0"
           disabled-hint="Only the admin and this group's member profiles can post here."
           @send="handleSend"
         />

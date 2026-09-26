@@ -2,6 +2,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+# Re-exported so the server's middleware stack imports every guard from one place.
+from app.middleware.client_protocol import (  # noqa: F401
+    CLIENT_PROTOCOL_HEADER,
+    CLIENT_PROTOCOL_VERSION,
+    ClientProtocolGuard,
+)
+
 # Connection-specific header fields, which RFC 9113 §8.2.2 forbids in HTTP/2.
 # Same set as h2's own ``CONNECTION_HEADERS``.
 _CONNECTION_HEADERS = frozenset(

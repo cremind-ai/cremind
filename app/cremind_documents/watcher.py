@@ -1,7 +1,8 @@
 """Watch a documents directory and forward `.md` events to the sync service.
 
 Modeled on :class:`app.skills.watcher.SkillsWatcher`. One :class:`CremindDocumentWatcher`
-runs per scope (the shared root and each profile's ``documents`` directory).
+runs per scope (the shared root and each profile's uuid-keyed directory under
+``storage/cremind_documents/profiles``), registered by :func:`start_scope_watcher`.
 Events are debounced -- multiple rapid filesystem events on the same path
 collapse into a single ``apply_event`` call -- and only ``.md`` files are
 relevant.
@@ -93,6 +94,10 @@ class CremindDocumentWatcher:
         self._observer = Observer()
         self._observer.daemon = True
 
+    @property
+    def directory(self) -> Path:
+        return self._directory
+
     def start(self) -> None:
         self._directory.mkdir(parents=True, exist_ok=True)
         self._observer.schedule(self._handler, str(self._directory), recursive=True)
@@ -109,3 +114,42 @@ class CremindDocumentWatcher:
         except Exception:  # noqa: BLE001
             logger.exception(f"[cremind_documents] watcher stop failed (scope={self._scope!r})")
         logger.info(f"[cremind_documents] watcher stopped for scope={self._scope!r}")
+
+
+# One live watcher per scope. Kept here (not in the server's boot locals) so a
+# profile deletion can stop the watcher on a directory it is about to remove,
+# and so arming a scope twice (boot, then the post-setup hook) replaces rather
+# than stacks observers.
+_watchers: dict[str, CremindDocumentWatcher] = {}
+_watchers_lock = threading.Lock()
+
+
+def start_scope_watcher(
+    sync_service: CremindDocumentSyncService, scope: str,
+) -> CremindDocumentWatcher | None:
+    """Watch ``scope``'s directory, replacing any watcher already on it.
+
+    Returns None — with a log line, never a name-keyed fallback — when the
+    scope has no directory (a profile whose uuid cannot be resolved)."""
+    directory = sync_service.scope_dir(scope)
+    if directory is None:
+        logger.info(f"[cremind_documents] no watcher for scope={scope!r}: no directory")
+        return None
+    watcher = CremindDocumentWatcher(scope=scope, directory=directory, sync_service=sync_service)
+    watcher.start()
+    with _watchers_lock:
+        previous = _watchers.get(scope)
+        _watchers[scope] = watcher
+    if previous is not None:
+        previous.stop()
+    return watcher
+
+
+def stop_scope_watcher(scope: str) -> bool:
+    """Stop ``scope``'s watcher if one runs. Returns whether one was stopped."""
+    with _watchers_lock:
+        watcher = _watchers.pop(scope, None)
+    if watcher is None:
+        return False
+    watcher.stop()
+    return True

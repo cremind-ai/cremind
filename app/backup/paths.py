@@ -30,11 +30,19 @@ from app.backup.manifest import Manifest
 
 # (column, mode) per table. Mode "path" is a full-value relocation; "command"
 # is a best-effort token-by-token substitution inside a command string.
+#
+# Keys are the table names AT THE ARCHIVE'S REVISION: rows are relocated while
+# they are loaded into the schema the dump was taken at, before the upgrade to
+# head renames anything. So a table that was renamed appears under both names
+# — Documentation search's per-profile folder root lived in ``userdoc_sources``
+# before it became ``document_sources``.
 _PATH_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "conversations": [("working_directory", "path")],
     "autostart_processes": [("working_dir", "path"), ("command", "command")],
     "tools": [("source", "path")],
     "file_watcher_subscriptions": [("root_path", "path")],
+    "document_sources": [("root_path", "path")],
+    "userdoc_sources": [("root_path", "path")],
 }
 
 # server_config is a key/value table; only this key holds a filesystem path.

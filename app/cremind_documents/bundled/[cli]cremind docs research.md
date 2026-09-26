@@ -113,7 +113,7 @@ or `--all-pages`). Check any token with `cremind docs cite '[doc:…]'`.
 ## Global flags
 
 All subcommands accept the root-level `--json` flag, right after `cremind`
-(`cremind --json documents research status 3f9c2e1b7a40`): it prints the job
+(`cremind --json docs research status 3f9c2e1b7a40`): it prints the job
 (status, progress, the whole dossier) and the rendered text. Progress lines
 go to stderr, the result to stdout.
 

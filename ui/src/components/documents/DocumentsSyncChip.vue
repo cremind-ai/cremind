@@ -39,7 +39,7 @@ function open() {
     <button
       type="button"
       class="rail-item doc-chip"
-      :class="[`ud-${mode}`, { active: onPage, 'doc-has-failed': store.isActive && store.needsAttention }]"
+      :class="[`doc-${mode}`, { active: onPage, 'doc-has-failed': store.isActive && store.needsAttention }]"
       :aria-label="tooltip"
       @click="open"
     >

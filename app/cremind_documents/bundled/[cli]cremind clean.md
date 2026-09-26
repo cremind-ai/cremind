@@ -26,6 +26,14 @@ recoverable, whole-system operation instead, use
 Presets are expanded on the server, so the two clients (CLI + web UI) always agree
 on exactly what `working` and `factory` mean.
 
+Two components were renamed with the search tools. `--cremind-documents`
+(component `cremind_documents`) is the profile's own Cremind documentation —
+the old `--documents` / `documents`. `--documentation-search` (component
+`documentation_search`; `--user-documents` in pre-release builds) is the index
+of the user's own files. A client from
+before the rename is refused with `426 ClientUpgradeRequired` rather than let
+guess which one it meant.
+
 ## Components
 
 The custom mode selects from these components (grouped as they appear in the web UI).
@@ -161,7 +169,7 @@ cremind clean factory [--confirm-profile <name>] [--yes]
 
 **Behavior.** On top of the `working` set it also removes LLM config, OAuth tokens,
 tools/MCP registrations + configs, external channels (keeping `main`), the profile's
-own Cremind documentation + embeddings, the document index and browser login, and resets persona + skills + app settings to their
+own Cremind documentation + embeddings, the Documentation search index and browser login, and resets persona + skills + app settings to their
 shipped defaults. The result is a profile that looks brand-new (no LLM configured),
 but the profile itself and all server-wide config are kept, so **the Setup Wizard
 does not re-run** and you stay signed in.
@@ -207,6 +215,10 @@ data and customization.
 **`409 busy`** — A backup, restore, or blueprint import is in progress. `clean`
 refuses to run concurrently with those (they touch the same data). Wait for it to
 finish (`cremind backup status`) and retry.
+
+**`426 ClientUpgradeRequired`** — This `cremind` (or web UI tab) predates the
+search-tool rename; update with `pip install -U cremind` (reload the tab) and
+retry. Nothing was cleaned.
 
 **I want it all back** — There is no undo. Restore from a backup archive with
 `cremind backup restore` if you have one; otherwise the data is gone.

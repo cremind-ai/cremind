@@ -74,7 +74,11 @@ def validate_profile_name(name: str) -> str | None:
         return "Profile names cannot start with an underscore."
     if not _PROFILE_NAME_RE.match(name):
         return "Profile name may contain only lowercase letters, numbers, hyphens, and underscores."
-    return None
+    # ``shared`` / ``cli``: scope names of Cremind's own manual, which a
+    # profile of that name would share (app/cremind_documents/paths.py).
+    from app.cremind_documents.paths import reserved_profile_name_error
+
+    return reserved_profile_name_error(name)
 
 
 async def create_target_profile(session: ImportSession, profile_name: str, deps: Deps) -> dict:
@@ -285,6 +289,19 @@ def _apply_tool_config_bundle(mgr, tool_id: str, profile: str, entry: dict, secr
 
 
 def apply_tools(session: ImportSession, inputs: dict, deps: Deps) -> dict:
+    """Apply the tools component to the target profile.
+
+    ``load_component`` hands over the CURRENT document shape: a v1 document's
+    ids were already mapped (see :mod:`app.blueprint.compat`), so the two
+    document searches land on the right tools.
+
+    A tool this install does not have — a built-in from a newer build, a
+    feature that is not installed, an A2A/MCP server never added here — is
+    skipped with a warning instead of written: ``tool_configs.tool_id`` is a
+    foreign key to ``tools``, so writing it would raise and abort every entry
+    after it. One entry failing for any other reason is reported the same way
+    and the rest still apply.
+    """
     from app.tools.config_manager import ToolConfigManager
 
     data = load_component(session.payload_dir, "tools") or {}
@@ -297,17 +314,36 @@ def apply_tools(session: ImportSession, inputs: dict, deps: Deps) -> dict:
     for tool in data.get("tools") or []:
         tool_id = tool.get("tool_id")
         kind = tool.get("kind")
-        if kind in ("a2a", "mcp"):
-            enabled = tool.get("enabled")
-            if enabled is not None:
-                if ts.get_tool(tool_id) is not None:
+        if not tool_id or ts.get_tool(tool_id) is None:
+            if kind in ("a2a", "mcp"):
+                warnings.append(
+                    f"tool {tool_id!r} ({kind}) is not installed here — its settings were not applied"
+                )
+            else:
+                warnings.append(
+                    f"tool {tool_id!r} is not available on this install — its settings were not applied"
+                )
+            continue
+        # Secrets keyed by the id the (older) manifest printed still apply.
+        secrets = per_tool_secrets.get(tool_id)
+        if secrets is None and tool.get("legacy_tool_id"):
+            secrets = per_tool_secrets.get(tool["legacy_tool_id"])
+        try:
+            if kind in ("a2a", "mcp"):
+                enabled = tool.get("enabled")
+                if enabled is not None:
                     ts.set_profile_tool(profile, tool_id, bool(enabled))
                     applied.append(f"{tool_id} enabled={enabled}")
-                else:
-                    warnings.append(
-                        f"tool {tool_id!r} ({kind}) is not installed here — enable state not applied"
-                    )
-        _apply_tool_config_bundle(mgr, tool_id, profile, tool, per_tool_secrets.get(tool_id, {}))
+            _apply_tool_config_bundle(mgr, tool_id, profile, tool, secrets or {})
+        except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the step
+            # The class name only: a DB error's text carries the statement's
+            # parameters — possibly a secret value being written — and this
+            # warning is persisted in session.json.
+            logger.warning(
+                f"[blueprint] applying tool {tool_id!r} failed: {type(exc).__name__}"
+            )
+            warnings.append(f"tool {tool_id!r} could not be configured ({type(exc).__name__})")
+            continue
         applied.append(f"configured {tool_id}")
 
     return _result(applied=applied, warnings=warnings)

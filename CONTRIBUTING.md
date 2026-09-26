@@ -20,6 +20,7 @@ see [RELEASING.md](RELEASING.md).
 | `.github/workflows/` | `pr.yml`, `release.yml`, `release-test.yml`. |
 | `pyproject.toml` | Python deps + hatch config. |
 | `RELEASING.md` | How to ship a new version. |
+| `docs/` | Upgrade notes for releases that change what an existing identifier means (e.g. [`docs/upgrade-search-tool-rename.md`](docs/upgrade-search-tool-rename.md)). Repo-only: runtime assets belong under `app/`, and the agent's own docs under `app/cremind_documents/bundled/`. |
 
 ## First-time setup
 
@@ -364,6 +365,17 @@ Caveats:
 - **Don't edit `ui/package.json`'s `version` field** — it's regenerated
   from `app/__version__.py` by `scripts/sync_ui_version.py` (runs as
   the `prebuild`/`preweb:build` npm hook).
+- **Two tools share a confusable name.** `documentation_search` is the
+  user's own files (package `app/documents`, CLI `cremind docs`, REST
+  `/api/documentation-search/*`); `cremind_documentation_search` is
+  Cremind's own manual (package `app/cremind_documents`, the bundled docs).
+  Before the rename the first id meant the second tool — see
+  [docs/upgrade-search-tool-rename.md](docs/upgrade-search-tool-rename.md).
+- **`426 ClientUpgradeRequired` from a hand-rolled request** — tool-config
+  writes (`/api/tools/**`, `PUT /api/agents/{id}/enabled` and `/config`),
+  `POST /api/config/setup` and `POST /api/clean` require the header
+  `X-Cremind-Client-Protocol: 2`. The web UI and the CLI send it; add it to
+  a `curl` or a test client that drives the full server stack.
 
 ## Tests
 

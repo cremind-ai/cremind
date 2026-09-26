@@ -393,6 +393,81 @@ async def _resolve_message_origin(
         return None
 
 
+async def _search_snapshot_for(
+    conversation_storage: Any, conversation_id: str, conv: Optional[dict],
+) -> Any:
+    """The search-tool selection a run adopts, frozen at its start.
+
+    A seat in a group chat reads its room's shared selection; every other
+    conversation reads its own; anything unreadable falls back to the
+    defaults (every source) rather than failing the run.
+    """
+    from app.agent import search_tools
+
+    try:
+        return await search_tools.snapshot_for_conversation(
+            conversation_id, conv=conv, conversation_storage=conversation_storage,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"stream_runner: could not read the search-tool selection of {conversation_id}; "
+            "using the defaults"
+        )
+        return search_tools.DEFAULT_SNAPSHOT
+
+
+async def _save_search_baseline(
+    conversation_storage: Any,
+    conversation_id: str,
+    profile: str,
+    conv: Optional[dict],
+    baseline: dict,
+) -> None:
+    """Persist a run's search cache baseline and tell open views.
+
+    A new response adopting a saved selection is what clears the composer's
+    "saved for the next response" indicator, so the conversation (and, for a
+    seat, its room) gets a ``search_tools`` frame to refetch its state.
+    """
+    version = int(baseline.get("version") or 0)
+    previous_version: Optional[int] = None
+    try:
+        row = await conversation_storage.get_search_tools_row(conversation_id)
+        previous = (row or {}).get("search_cache_baseline") or None
+        if isinstance(previous, dict):
+            previous_version = int(previous.get("version") or 0)
+    except Exception:  # noqa: BLE001 — only decides whether to announce
+        previous_version = None
+    await conversation_storage.record_search_cache_baseline(conversation_id, baseline)
+    # Announce only an actual adoption — the first response ever, or one that
+    # started on a newer saved choice than the last — not every turn, so a
+    # busy room's replay ring is not filled with re-read hints.
+    if previous_version is not None and previous_version >= version:
+        return
+    try:
+        await get_event_stream_bus().publish_transient(
+            conversation_id, "search_tools", {"version": version, "adopted": True},
+            profile=profile,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(f"stream_runner: search_tools frame failed for {conversation_id}", exc_info=True)
+    if (conv or {}).get("kind") == "group_chat":
+        try:
+            from app.groups.bus import get_group_stream_bus
+            from app.groups.shadow import group_id_from_context
+
+            group_id = group_id_from_context((conv or {}).get("context_id"))
+            if group_id:
+                # Ephemeral: a re-read hint for open views, not room history a
+                # reconnecting client needs to replay.
+                await get_group_stream_bus().publish(
+                    group_id, "search_tools", {"version": version, "adopted": True},
+                    ephemeral=True,
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug(f"stream_runner: room search_tools frame failed for {conversation_id}", exc_info=True)
+
+
 # ── unified runner ──────────────────────────────────────────────────────────
 
 
@@ -522,6 +597,20 @@ async def run_agent_to_bus(
         conversation_storage, conv, conversation_id, event_run=event_run,
     )
 
+    # Freeze this run's search-tool selection: the conversation's (a seat reads
+    # its room's). The agent holds this snapshot for the whole run, so a choice
+    # saved mid-response — or a message injected into it — never changes the
+    # tools of the response already running; the next run adopts it.
+    search_snapshot = await _search_snapshot_for(conversation_storage, conversation_id, conv)
+
+    async def _record_search_baseline(baseline: dict) -> None:
+        """Called once, at this run's first real main-model request: remember
+        what the model was sent, which is what a later change is compared with
+        (cache warning) and what clears the "next response" pending flag."""
+        await _save_search_baseline(
+            conversation_storage, conversation_id, profile, conv, baseline,
+        )
+
     # Plan mode: decide the phase for this turn from the request + the
     # conversation's persisted plan state (see _compute_plan_phase).
     plan_phase: str | None = None
@@ -647,6 +736,12 @@ async def run_agent_to_bus(
         #    is_active fork a stale flag would park every later result for this
         #    conversation with no turn-end flush to rescue it.)
         task_result_inbox.bind_run(run_id, conversation_id)
+        # The snapshot this response adopted, so a choice saved while it runs
+        # reads as "saved for the next response" even before the run reaches
+        # the model and records a baseline. Released in the finally.
+        from app.agent import search_tools as _search_tools
+
+        _search_tools.begin_run(conversation_id, run_id, getattr(search_snapshot, "version", 0))
 
         # 0b. In a group, everyone can see who is composing. Published here so
         #     the indicator appears the moment the turn is claimed rather than
@@ -776,6 +871,8 @@ async def run_agent_to_bus(
         # ``search_memory`` tool.
         try:
             async for chunk in cremind_agent.run(
+                search_tools=search_snapshot,
+                on_search_baseline=_record_search_baseline,
                 query=agent_query,
                 task_history=history_messages,
                 context_id=context_id,
@@ -1316,6 +1413,10 @@ async def run_agent_to_bus(
                     profile,
                     conversation_storage,
                     context_id=context_id,
+                    # The fold exposes the same search groups as the turn that
+                    # just warmed the cache, even if a new choice was saved
+                    # mid-turn (that one is the NEXT response's).
+                    search_tools=search_snapshot,
                     # Both kinds of room fold without asking. A Cremind seat is
                     # hidden from the sidebar; a platform group's conversation is
                     # visible but nobody is watching it — the people talking are
@@ -1520,6 +1621,12 @@ async def run_agent_to_bus(
         # than parking with nobody left to read it.
         task_result_inbox.unbind_run(run_id)
         _running_runs.pop(run_id, None)
+        try:
+            from app.agent import search_tools as _search_tools
+
+            _search_tools.end_run(conversation_id, run_id)
+        except Exception:  # noqa: BLE001
+            pass
         # Drop the room's "thinking" indicator for this member, whatever ended
         # the turn — a crashed turn that left one lit would read as an agent
         # stuck composing forever.

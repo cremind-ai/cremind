@@ -64,7 +64,7 @@ different Google account re-indexes Drive from scratch automatically.
 ## Subcommands
 
 All accept the root-level `--json` flag right after `cremind`
-(`cremind --json documents drive status`).
+(`cremind --json docs drive status`).
 
 ### `cremind docs drive status`
 

@@ -6,6 +6,7 @@ import { getA2AClient, getApiOrigin } from '../services/a2aClient';
 import { useSettingsStore } from './settings';
 import { useNotificationsStore } from './notifications';
 import { useTerminalPanelStore } from './terminalPanel';
+import { useSearchToolsStore } from './searchTools';
 import {
   fetchConversations as apiFetchConversations,
   fetchConversationMessages,
@@ -737,8 +738,15 @@ export const useChatStore = defineStore('chat', {
       const settings = useSettingsStore();
       const agentUrl = settings.agentUrl;
       const authToken = settings.authToken;
+      // The new-chat slot's search-tools draft rides the create, so the
+      // conversation exists with the selection already saved — no follow-up
+      // save for the first message to wait on or race.
+      const searchTools = useSearchToolsStore();
       try {
-        const conv = await apiCreateConversation(agentUrl, authToken);
+        const conv = await apiCreateConversation(agentUrl, authToken, undefined, {
+          searchTools: searchTools.newChatSelection(),
+        });
+        searchTools.clearNewChatDraft();
         this.conversations = [
           {
             id: conv.id,
@@ -792,8 +800,14 @@ export const useChatStore = defineStore('chat', {
       let cid = options?.conversationId ?? this.activeConversationId ?? null;
       let createdNew = false;
       if (!cid) {
+        // Carry the new-chat search-tools draft into the create (see
+        // ensureConversation); the message POST below never resends it.
+        const searchTools = useSearchToolsStore();
         try {
-          const conv = await apiCreateConversation(agentUrl, authToken);
+          const conv = await apiCreateConversation(agentUrl, authToken, undefined, {
+            searchTools: searchTools.newChatSelection(),
+          });
+          searchTools.clearNewChatDraft();
           cid = conv.id;
           createdNew = true;
           // Inject into the saved-conversations list so the sidebar shows it
@@ -1396,6 +1410,9 @@ export const useChatStore = defineStore('chat', {
       this.agentActivityByConversation = {};
       this.researchActivityByConversation = {};
       useTodoPanelsStore().closeAll();
+      // Search-tool selections (and the new-chat draft) are the previous
+      // profile's; nothing of them may show under the next one.
+      useSearchToolsStore().resetForProfileSwitch();
       this.error = null;
 
       if (this.isConnected) {
@@ -1634,6 +1651,10 @@ export const useChatStore = defineStore('chat', {
         // for runs we kicked off ourselves (sendMessage already sets this),
         // but matters for skill-event runs we discover via the stream.
         this.trackConversation(conversationId, 'streaming');
+        // The model has answered, so this response's request — the moment a
+        // saved search-tools change is adopted — has been made. A no-op
+        // unless a change is waiting for exactly that.
+        useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
         return bucket[bucket.length - 1];
       };
 
@@ -1666,6 +1687,22 @@ export const useChatStore = defineStore('chat', {
               conversationId, data.working_directory,
             );
           }
+          return;
+
+        case 'search_tools':
+          // Someone saved this conversation's search tools — another tab, the
+          // CLI, or this tab's own save echoing back. Carries only the new
+          // version; the store re-reads the state unless it already holds it.
+          // Never touches the run in progress (it froze its selection).
+          // `adopted: true` is the server saying a new response just started
+          // on that version: the "next response" indicator can clear now.
+          if (data?.adopted) {
+            useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
+            return;
+          }
+          useSearchToolsStore().noteRemoteVersion(
+            { kind: 'conversation', id: conversationId }, data.version,
+          );
           return;
 
         case 'user_message': {
@@ -2205,6 +2242,10 @@ export const useChatStore = defineStore('chat', {
           if (!followupQueued) {
             this.untrackConversation(conversationId, 'streaming');
           }
+          // A saved search-tools change counts as adopted once a response has
+          // run on it; re-read so the "applies from the next response" marker
+          // clears (no-op when nothing is pending).
+          useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
           // Sidebar refresh is handled by the conversations-list SSE stream
           // — the backend's stream_runner publishes a list-changed event on
           // the same `complete` it just emitted.
@@ -2232,6 +2273,7 @@ export const useChatStore = defineStore('chat', {
           runtime.requestSentAt = undefined;
           scratch.currentTextPart = '';
           this.untrackConversation(conversationId, 'streaming');
+          useSearchToolsStore().refreshIfPending({ kind: 'conversation', id: conversationId });
           // Surface a top-level notification. Setup-required errors include
           // a settings_path so we can offer a one-click jump straight to the
           // page that fixes them; generic agent errors just show the text.
@@ -2455,6 +2497,7 @@ export const useChatStore = defineStore('chat', {
       delete this.agentActivityByConversation[id];
       delete this.researchActivityByConversation[id];
       useTodoPanelsStore().closeForConversation(id);
+      useSearchToolsStore().forget({ kind: 'conversation', id });
       const settingsStore = useSettingsStore();
       if (settingsStore.profileId) {
         useNotificationsStore().clearForConversation(settingsStore.profileId, id);

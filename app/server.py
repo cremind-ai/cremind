@@ -98,7 +98,7 @@ from app.cremind_documents import (
     set_service as set_cremind_document_service,
 )
 from app.cremind_documents.sync import SHARED_SCOPE
-from app.cremind_documents.watcher import CremindDocumentWatcher
+from app.cremind_documents.watcher import start_scope_watcher as start_cremind_document_watcher
 from app.lib.embedding import LocalEmbeddings
 from app.lib.llm.model_groups import ModelGroupManager
 from app.databases import create_database_provider, get_database_provider, set_database_provider
@@ -1378,7 +1378,7 @@ async def main(
     # Where those callbacks send the consent window once their work is done.
     routes.extend(get_oauth_close_routes())
 
-    from app.middleware import ConnectionHeaderFilter
+    from app.middleware import ClientProtocolGuard, ConnectionHeaderFilter
 
     from app.api.tls_recovery import EdgeTlsRecovery, TlsHandoffCors
 
@@ -1395,6 +1395,11 @@ async def main(
             allow_methods=["*"],
             allow_headers=["*"],
         ),
+        # Refuses tool-config / setup / cleanup writes from a UI or CLI built
+        # before tool ids changed meaning (426 ClientUpgradeRequired). Inside
+        # CORS, so preflights are answered first and the refusal still carries
+        # CORS headers the browser needs to read it.
+        Middleware(ClientProtocolGuard),
         Middleware(
             AuthenticationMiddleware,
             backend=JWTAuthBackend(secret_provider=BaseConfig.get_jwt_secret),
@@ -1565,6 +1570,23 @@ async def main(
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to run event-run boot recovery")
 
+            # 6a-ter. Move the document trees of an older install to where
+            #     this build keeps them — Cremind manual pages a profile wrote
+            #     (``<SYS>/<name>/documents`` → ``storage/cremind_documents/
+            #     profiles/<uuid>``) and Documentation search indexes
+            #     (``storage/userdocs`` → ``storage/documents``). BEFORE 6b's
+            #     manual service and watchers, and before 7h's engine, its
+            #     workers, research recovery (12b) and GC: nothing may hold an
+            #     index open while its directory moves. Journaled and
+            #     resumable; a conflict keeps both sides and is reported, never
+            #     fatal to boot. Off the event loop: a cross-device move copies.
+            try:
+                from app.documents import relocate as doc_relocate
+
+                await asyncio.to_thread(doc_relocate.run_at_boot, BaseConfig.CREMIND_SYSTEM_DIR)
+            except Exception:  # noqa: BLE001
+                logger.exception("Document relocation failed; continuing with what is in place")
+
             # 6b. Cremind Documentation Search
             #
             # The reconcile step embeds existing ``.md`` files; the watcher
@@ -1576,7 +1598,8 @@ async def main(
                 # embedding model / vector store from ``embedding_state`` on
                 # every call, so a Settings toggle takes effect without a
                 # restart. ``embedding_state`` is already READY or DISABLED by
-                # the time we get here (step 3 above).
+                # the time we get here (step 3 above). Profile directories are
+                # keyed by uuid, resolved through the profiles table.
                 cremind_document_service = CremindDocumentSyncService(
                     working_dir=Path(BaseConfig.CREMIND_SYSTEM_DIR),
                 )
@@ -1584,20 +1607,28 @@ async def main(
 
                 bundled_docs = Path(__file__).resolve().parent / "cremind_documents" / "bundled"
                 cremind_document_service.seed_shared_from_app(bundled_docs)
+                # Only now that the new shared mirror exists: retire the old
+                # one (``<SYS>/documents``) and the old ``cli`` scope tree —
+                # unless a profile of that name owns the directory.
+                try:
+                    from app.documents import relocate as doc_relocate
+
+                    doc_relocate.retire_legacy_trees(BaseConfig.CREMIND_SYSTEM_DIR, known_profiles)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Retiring the old Cremind manual trees failed")
 
                 cremind_document_service.full_reconcile(SHARED_SCOPE)
-                CremindDocumentWatcher(
-                    scope=SHARED_SCOPE,
-                    directory=cremind_document_service.shared_dir(),
-                    sync_service=cremind_document_service,
-                ).start()
+                start_cremind_document_watcher(cremind_document_service, SHARED_SCOPE)
 
                 # One-shot cleanup for upgraded installs: the retired `cli`
                 # built-in tool once indexed CLI-reference docs into a separate
                 # `cli` scope. They now live in the shared corpus above, so drop
-                # any leftover `cli`-scope points (the on-disk tree is removed by
-                # seed_shared_from_app).
-                cremind_document_service.prune_scope("cli")
+                # any leftover `cli`-scope points — unless a profile named `cli`
+                # (created before the name was reserved) owns that scope now:
+                # its own pages' points would be deleted and re-embedded on
+                # every boot.
+                if "cli" not in known_profiles:
+                    cremind_document_service.prune_scope("cli")
 
                 for profile_name in known_profiles:
                     try:
@@ -1605,13 +1636,22 @@ async def main(
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Document reconcile failed for profile '{profile_name}'")
                     try:
-                        CremindDocumentWatcher(
-                            scope=profile_name,
-                            directory=cremind_document_service.profile_dir(profile_name),
-                            sync_service=cremind_document_service,
-                        ).start()
+                        start_cremind_document_watcher(cremind_document_service, profile_name)
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Document watcher failed for profile '{profile_name}'")
+
+                # The manual's pre-rename collection goes only once its
+                # replacement holds points (journaled; retried next boot while
+                # the store is down or the rebuild has not happened yet).
+                try:
+                    from app.documents import relocate as doc_relocate
+
+                    doc_relocate.retire_legacy_manual_collection(
+                        embedding_state.vector_store if embedding_state.is_ready() else None,
+                        system_dir=BaseConfig.CREMIND_SYSTEM_DIR,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Retiring the pre-rename manual collection failed")
             except Exception:  # noqa: BLE001
                 logger.exception("Cremind Documentation Search subsystem failed to initialize")
 
@@ -1799,11 +1839,10 @@ async def main(
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Post-setup document reconcile failed for profile '{profile}'")
                     try:
-                        CremindDocumentWatcher(
-                            scope=profile,
-                            directory=cremind_document_service.profile_dir(profile),
-                            sync_service=cremind_document_service,
-                        ).start()
+                        # Replaces a watcher boot may already have armed for
+                        # this scope. The profile's directory is keyed by its
+                        # uuid, which exists now that setup created the row.
+                        start_cremind_document_watcher(cremind_document_service, profile)
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Post-setup document watcher failed for profile '{profile}'")
 

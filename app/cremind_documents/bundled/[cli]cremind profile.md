@@ -374,7 +374,11 @@ cremind profile create <profile name>
 
 **Arguments** (required):
 
-- `<profile name>` — Profile name. Must not already exist.
+- `<profile name>` — Profile name. Must not already exist. Lowercase
+  letters, numbers, `-` and `_` only. `shared` and
+  `cli` are **reserved** (Cremind's own manual uses them as scope names) and
+  are refused with `400 The profile name '<name>' is reserved …` — here, in
+  the setup wizard and in a blueprint import alike.
 
 **Behavior.** Calls the server's create endpoint and, on success, prints
 the new profile name on stdout (so the command is pipe-friendly). The

@@ -83,7 +83,7 @@ The Cremind assistant can run any `cremind tools` command through its Shell
 Executor tool — the shell it spawns already has `CREMIND_SERVER` and
 `CREMIND_TOKEN` set for the active profile, so no flags are needed. That is how
 the agent answers "what permission modes can Claude Code use?" (via
-`cremind --json tools options claude_code`, or by searching its documentation)
+`cremind --json tools options claude_code`, or by searching Cremind's documentation)
 and applies "set Claude Code's permission mode to plan" (via
 `cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan`). It is also
 how the agent handles "use Opus for Claude Code": discover the account's models
@@ -95,8 +95,9 @@ allowed values, see the per-tool reference docs below.
 ## Per-tool reference
 
 The variables and arguments differ per tool. Each configurable built-in tool
-has its own reference document — search the documentation for the tool's name to
-get its full variable list, allowed values, defaults, and CLI recipes:
+has its own reference document — search Cremind's documentation
+(`cremind_documentation_search`) for the tool's name to get its full variable
+list, allowed values, defaults, and CLI recipes:
 
 | Tool | `tool_id` | Reference doc | Notable variables |
 |------|-----------|---------------|-------------------|
@@ -111,11 +112,35 @@ get its full variable list, allowed values, defaults, and CLI recipes:
 | Audio Understanding | `audio_understanding` | *Audio Understanding Tool* | max audio bytes |
 | Google Places | `google_places` | *Google Places Tool* | Maps API key; lat/long arguments |
 | AccuWeather Weather | `accuweather_weather` | *AccuWeather Weather Tool* | AccuWeather API key |
-| Cremind Documentation Search | `cremind_documentation_search` | *Cremind Documentation Search Tool* | `DEFAULT_TOP_K` |
+| Cremind Documentation Search | `cremind_documentation_search` | *Cremind Documentation Search Tool* | `DEFAULT_TOP_K`; searches Cremind's own manuals |
+| Documentation Search | `documentation_search` | *Documentation Search Tool* | `DEFAULT_TOP_K`, `RESEARCH_MODEL_GROUP`, `RESEARCH_TOKEN_BUDGET`; searches the user's own files (`cremind docs`) |
 
 For any tool not listed, `cremind --json tools get <tool_id>` prints its live
 variable schema (including any `enum` of allowed values) and current per-profile
 values.
+
+### Two search tools swapped ids
+
+The search-tool rename reassigned a tool id, so an old script can do the wrong
+thing without an error:
+
+| Before the rename | Now | What it searches |
+|---|---|---|
+| `documentation_search` | `cremind_documentation_search` | Cremind's own manuals |
+| `user_documents` | `documentation_search` | the user's own indexed files |
+
+`cremind tools set-var documentation_search DEFAULT_TOP_K=12` now tunes the
+user's own documents; for the manual use `cremind tools set-var
+cremind_documentation_search DEFAULT_TOP_K=12`. Saved settings moved with each
+tool on upgrade. The server refuses tool-configuration writes from a client
+built before the rename — see **`426 ClientUpgradeRequired`** under
+Troubleshooting.
+
+Enabling a tool here is per profile. Which of the four search tools
+(Documentation search, Cremind documentation search, Memory search, Web
+search) one *conversation* may use is chosen separately, with the chat
+composer's **Search tools** button or `cremind conv search-tools`; that never
+turns on a tool disabled here.
 
 ## Global flags
 
@@ -819,6 +844,12 @@ pass `--json '{}'`. The empty default is a deliberate forcing function.
 hang around until you set them to an empty string or restart from
 scratch via the Tools UI. Use `cremind tools get` to inspect the live
 state.
+
+**`426 ClientUpgradeRequired`** — This `cremind` (or web UI tab) predates the
+search-tool rename, so the server will not let it write tool settings, run
+setup or clean data: its `documentation_search` would mean the wrong tool.
+Update with `pip install -U cremind` (reload a web UI tab) and retry. Reading
+(`list`, `get`, `leaves`, `options`) still works with the old client.
 
 **`register-long-running` says "duplicate command"** — The tool already
 has an autostart with the same command line. Pass `--force` if you

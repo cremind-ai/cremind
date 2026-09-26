@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN files with Documentation search via `cremind docs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind docs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind docs research`. Not for Cremind's own documentation (that is cremind_documentation_search)."
+description: "Search the user's OWN files with Documentation search via `cremind docs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind docs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind docs research`. Formerly `cremind userdocs`. Not for Cremind's own documentation (that is cremind_documentation_search)."
 ---
 
 # `cremind docs` — Documentation search
@@ -10,7 +10,9 @@ that the agent can search by meaning, by keyword, by date and by folder, and
 cite back to the exact page or lines. It mirrors **Settings → My Documents**.
 
 It is separate from `cremind_documentation_search`, which only covers Cremind's own
-manual. Searching and reading the index from the terminal (`search`, `find`,
+manual. Before the rename this group was `cremind userdocs` (REST
+`/api/userdocs/*`, now `/api/documentation-search/*`) and the agent's tool was
+`user_documents`; the tool is now `documentation_search`. Searching and reading the index from the terminal (`search`, `find`,
 `read`, `cite`) is documented in **`cremind docs search`**; deep research
 jobs over many files (`research run|status|continue|cancel|list` — compile a
 folder into one table, or a legal or financial analysis with verified quotes)
@@ -50,7 +52,7 @@ the index so re-enabling is fast.
 ## Global flags
 
 All subcommands accept the root-level `--json` flag, right after `cremind`
-(`cremind --json documents status`).
+(`cremind --json docs status`).
 
 ## Subcommands
 
@@ -67,6 +69,12 @@ cremind docs status [--follow/-f]
 processed, and how search behaves right now (`search: lexical_only` when
 Vector Embedding is off). With `--follow`, prints one line per update until
 Ctrl-C; with `--json`, one JSON snapshot per line.
+
+After an upgrade that moved the index to its new folder, anything that could
+not be moved safely (the destination already held something different) is kept
+on both sides and printed as an `upgrade: …` line saying what to do; the
+snapshot carries the same list as `relocation_errors` (the admin sees every
+profile's, other profiles only their own).
 
 ```bash
 $ cremind docs status
@@ -314,3 +322,8 @@ folder with `set-root PATH`, or ask the admin to change the working directory.
 
 **Exit code 2** — The change needs confirmation; the printed plan says what
 would be removed. Re-run with `--yes`.
+
+**`410 EndpointRenamed`** or **`No such command 'userdocs'`** — A client from
+before the rename. The CLI is updated with `pip install -U cremind` (the
+command is `cremind docs`, the feature `documentation_search`, the pip extra
+`documentation-search`); a web UI tab is updated by reloading it.

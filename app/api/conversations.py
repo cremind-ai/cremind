@@ -234,8 +234,23 @@ def get_conversation_routes(
                     status_code=403,
                 )
 
+        # The composer's new-chat draft of the search-tools selection, carried
+        # by whichever request creates the conversation (the first message or
+        # the first attachment upload) so it lands atomically with the row.
+        # Absent/null means the defaults.
+        search_tools = None
+        if body.get("search_tools") is not None:
+            from app.agent.search_tools import SelectionError, normalize_selection
+
+            try:
+                search_tools = normalize_selection(body.get("search_tools"))
+            except SelectionError as exc:
+                return JSONResponse(
+                    {"error": "InvalidSelection", "message": str(exc)}, status_code=400,
+                )
+
         conv = await conversation_storage.create_conversation(
-            profile=profile, title=title,
+            profile=profile, title=title, search_tools=search_tools,
         )
         publish_conversations_changed(profile)
         return JSONResponse({"conversation": conv}, status_code=201)

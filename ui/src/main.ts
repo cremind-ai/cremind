@@ -16,6 +16,8 @@ import { useSettingsStore } from './stores/settings'
 import { installExternalLinkInterceptor } from './utils/externalLinks'
 import { handleUnauthorized, shouldHandle401 } from './services/sessionExpiry'
 import { installConsentWindowOpener } from './services/oauthReturn'
+import { getApiOrigin } from './services/a2aClient'
+import { withClientProtocol } from './services/clientProtocol'
 
 document.title = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI'
 
@@ -96,6 +98,16 @@ async function maybePivotToBackend(): Promise<boolean> {
   return true
 }
 
+// The backend origin, for the client-protocol marker. Never throws: a
+// resolution failure just means no marker (see services/clientProtocol.ts).
+function backendOriginForProtocol(): string {
+  try {
+    return getApiOrigin()
+  } catch {
+    return ''
+  }
+}
+
 // Global 401 handler. Any backend API/SSE/A2A call that comes back 401 (an
 // expired or invalidated token mid-session) ejects the user to the profile
 // selector with a ``?redirect=`` back to where they were. Wrapping
@@ -105,11 +117,22 @@ async function maybePivotToBackend(): Promise<boolean> {
 // boot probes (``/health``, ``/electron-renderer``) and before mount, so it
 // deterministically wraps mount-time SSE opens and the lazily-built A2A fetch
 // factory without touching those probes.
+//
+// The same chokepoint stamps the client-protocol marker onto every request for
+// the backend's own origin (except the cross-origin HTTPS hand-off under
+// ``/api/tls/``), which is how the server tells this updated UI from a stale tab
+// that still means the old tool ids.
 function installUnauthorizedInterceptor() {
   if (typeof window === 'undefined' || !window.fetch) return
   const orig = window.fetch.bind(window)
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const res = await orig(input, init)
+    let effectiveInit = init
+    try {
+      effectiveInit = withClientProtocol(input, init, backendOriginForProtocol())
+    } catch {
+      // Marking a request must never break it.
+    }
+    const res = await orig(input, effectiveInit)
     if (res.status === 401) {
       try {
         const raw = input instanceof Request ? input.url : String(input)

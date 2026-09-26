@@ -51,7 +51,14 @@ from app.utils.working_directory import (
 # of live paths to enumerate, so the name is the rule. The set itself lives in
 # :mod:`app.utils.credential_paths` so Documentation search can share it.
 from app.utils.credential_paths import CREDENTIAL_DIR_NAMES as _CREDENTIAL_DIR_NAMES  # noqa: E402
-from app.utils.credential_paths import is_documents_index_path  # noqa: E402
+from app.utils.credential_paths import (  # noqa: E402
+    DocumentTreeGuard,
+    authored_docs_owner,
+    holds_authored_docs,
+    holds_documents_index,
+    is_documents_index_path,
+    same_uid,
+)
 
 # Directory names directly under a profile's own directory that only that
 # profile may reach through these routes: ``<system dir>/<profile>/<name>/...``.
@@ -98,6 +105,60 @@ def _is_documents_index_path(target: str) -> bool:
     """Documentation search's index store — every profile's indexed text —
     is never served here, to anyone (see ``is_documents_index_path``)."""
     return is_documents_index_path(target, BaseConfig.CREMIND_SYSTEM_DIR)
+
+
+# A profile's own Cremind manual pages live at
+# ``<system dir>/storage/cremind_documents/profiles/<profile uuid>/`` — outside
+# the name-keyed ``<system dir>/<profile>/`` slice, keyed by the uuid so no
+# profile name can collide with it. Only the owner reaches its directory here
+# (admin is not exempt, for the reason given for ``exports`` above); the
+# ``profiles`` directory itself lists only the caller's own entry.
+
+
+def _caller_manual_uid(profile: str | None) -> str | None:
+    """The caller's uuid, read from its profile row. Only asked when a path is
+    actually inside the manual root, so ordinary requests never pay for it."""
+    if not profile:
+        return None
+    from app.cremind_documents.paths import resolve_profile_uid
+
+    return resolve_profile_uid(profile)
+
+
+def _is_other_profiles_authored_docs(target: str, profile: str | None) -> bool:
+    """Is ``target`` inside some *other* profile's manual directory?
+
+    ``None`` (no caller known) and a caller whose uuid cannot be resolved both
+    deny every such path — failing closed, like the private-directory rule."""
+    owner = authored_docs_owner(target, BaseConfig.CREMIND_SYSTEM_DIR)
+    if owner is None:
+        return False
+    return not same_uid(owner, _caller_manual_uid(profile))
+
+
+def _document_trees_matcher(profile: str | None):
+    """Predicate over *resolved* paths: the index store, or another profile's
+    manual directory. For per-entry listing filters and per-event watch
+    filters — built once per request, no ``realpath`` per call (the paths are
+    built from a root that was resolved before the route accepted it), and the
+    caller's uuid is looked up at most once, and only if a path needs it.
+
+    The rule itself (case-insensitive filesystems included) is
+    :class:`~app.utils.credential_paths.DocumentTreeGuard`, shared with the
+    agent's file tool so the two can never disagree about what is hidden."""
+    guard = DocumentTreeGuard(
+        BaseConfig.CREMIND_SYSTEM_DIR, own_uid=lambda: _caller_manual_uid(profile),
+    )
+    return guard.hides
+
+
+def _holds_protected_document_tree(target: str) -> bool:
+    """Does ``target`` contain every profile's manual pages or the index
+    store? Moving or deleting such a parent (``storage``,
+    ``storage/cremind_documents``, …) would carry off or destroy other
+    profiles' data wholesale, so neither route accepts it."""
+    system_dir = BaseConfig.CREMIND_SYSTEM_DIR
+    return holds_authored_docs(target, system_dir) or holds_documents_index(target, system_dir)
 
 
 def _shared_credential_homes() -> tuple[str, ...]:
@@ -293,6 +354,8 @@ def _is_inside_allowed(
         return False
     if _is_documents_index_path(target):
         return False
+    if _is_other_profiles_authored_docs(target, profile):
+        return False
     for base in _allowed_bases_for_conversation(context_key):
         if target == base or target.startswith(base + os.sep):
             return True
@@ -364,6 +427,8 @@ def _safe_resolve(relative_path: str, profile: str | None = None) -> str | None:
     if _is_other_profiles_private_path(target, profile):
         return None
     if _is_documents_index_path(target):
+        return None
+    if _is_other_profiles_authored_docs(target, profile):
         return None
     return target
 
@@ -491,6 +556,7 @@ async def _list_directory(request: Request):
 
     entries: list[dict] = []
     is_credential = _credential_matcher()
+    is_protected_doc_tree = _document_trees_matcher(_profile_of(request))
     try:
         with os.scandir(target) as it:
             for de in it:
@@ -511,7 +577,7 @@ async def _list_directory(request: Request):
                 # install browsing the user's home, is an ordinary entry here.
                 if de.name in _CREDENTIAL_DIR_NAMES or is_credential(
                     os.path.join(target, de.name)
-                ) or _is_documents_index_path(os.path.join(target, de.name)):
+                ) or is_protected_doc_tree(os.path.join(target, de.name)):
                     continue
                 entries.append({
                     "name": de.name,
@@ -579,6 +645,7 @@ async def _watch_directory(request: Request):
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=_WATCH_QUEUE_SIZE)
     is_credential = _credential_matcher()
+    is_protected_doc_tree = _document_trees_matcher(_profile_of(request))
 
     def _enqueue(payload: dict) -> None:
         # The observer is recursive, so a watch on the System Directory (or on
@@ -587,9 +654,12 @@ async def _watch_directory(request: Request):
         # back exactly what the listing filter is there to withhold. Filtered
         # at the single choke point all four handlers go through, and on both
         # ends of a move. No ``realpath``: watchdog builds these paths from the
-        # already-resolved watch root, and this runs once per event.
+        # already-resolved watch root, and this runs once per event. The same
+        # goes for the index store and other profiles' manual pages, whose
+        # file names the listing withholds too.
         if any(
             is_credential(os.path.normpath(payload[key]))
+            or is_protected_doc_tree(os.path.normpath(payload[key]))
             for key in ("path", "dest_path")
             if payload.get(key)
         ):
@@ -894,6 +964,13 @@ async def _delete_entry(request: Request):
         return JSONResponse({"error": "Refusing to delete an allowed base"}, status_code=400)
     if not os.path.exists(resolved):
         return JSONResponse({"error": "Not found"}, status_code=404)
+    # Unlike a credential store's parent, this parent holds OTHER profiles'
+    # data: deleting it would erase every profile's manual pages or indexes.
+    if _holds_protected_document_tree(resolved):
+        return JSONResponse(
+            {"error": "Refusing to delete a directory that holds other profiles' documents"},
+            status_code=403,
+        )
 
     try:
         if os.path.isdir(resolved) and not os.path.islink(resolved):
@@ -947,6 +1024,14 @@ async def _move_entry(request: Request):
     if _holds_credential_store(src_resolved):
         return JSONResponse(
             {"error": "Refusing to move a directory that holds a credential store"},
+            status_code=403,
+        )
+    # Same reasoning for the document trees: carrying their parent elsewhere
+    # takes other profiles' manual pages and every index out from under the
+    # rules that keep them to their owners.
+    if _holds_protected_document_tree(src_resolved):
+        return JSONResponse(
+            {"error": "Refusing to move a directory that holds other profiles' documents"},
             status_code=403,
         )
 
@@ -1083,6 +1168,12 @@ async def _set_cwd(request: Request):
     # agent's own shell, and every tool that follows the cwd, straight at it.
     if _is_credential_path(new_path):
         return JSONResponse({"error": "Access denied"}, status_code=403)
+    # ...and for the same reason the document rules: the agent's shell must
+    # not be aimed at the index store or another profile's manual pages.
+    if _is_documents_index_path(new_path) or _is_other_profiles_authored_docs(
+        new_path, _profile_of(request)
+    ):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
 
     # The agent reads the override back under the conversation's context_id,
     # while the durable column and the SSE channel belong to the row — one and
@@ -1126,7 +1217,14 @@ def get_file_routes() -> list[Route]:
     therefore a ``_profile_of(request)`` argument at every call site. Omitting
     it fails closed -- every private path is denied -- so a forgotten argument
     shows up as a 403 in a test rather than as another profile's export on the
-    wire.
+    wire. They also carry the two document rules: the Documentation search
+    index store (``storage/documents``, and ``storage/userdocs`` before the
+    rename) is refused to everyone, and a profile's Cremind manual pages
+    (``storage/cremind_documents/profiles/<uuid>``) to everyone but their
+    owner (``_is_other_profiles_authored_docs``, same fail-closed default).
+    ``/list`` and ``/watch`` hide both from their entries and events,
+    ``/delete`` and ``/move`` refuse any directory that *contains* them, and
+    ``POST /cwd`` restates both.
 
     ``GET  /list``
         ``_is_inside_allowed`` on the directory, plus the per-entry filter that

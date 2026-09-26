@@ -124,6 +124,7 @@ class CremindAgentExecutor(AgentExecutor):
         # Load history from DB.
         # Fall back to task.history when no DB conversation exists yet.
         history_messages = []
+        conv = None
         if self.conversation_storage and profile and context_id:
             try:
                 conv = await self.conversation_storage.get_conversation_by_context(
@@ -141,6 +142,11 @@ class CremindAgentExecutor(AgentExecutor):
 
         if not history_messages:
             history_messages = convert_task_history_to_messages(task.history or [])
+
+        # The conversation's search-tool selection, frozen for this run exactly
+        # as the stream runner freezes it (a seat reads its room's). No
+        # conversation row yet (a first A2A message) → the defaults.
+        search_snapshot, on_search_baseline = await self._search_tools_for(conv)
 
         # Extract reasoning preference from request metadata (default: True).
         # A2A clients may also send an explicit ``mode``; plan mode is UI/CLI-only
@@ -163,7 +169,10 @@ class CremindAgentExecutor(AgentExecutor):
         ctx_token = current_task_id_var.set(task_key)
 
         try:
-            async for chunk in self.cremind_agent.run(query, history_messages, context_id, profile=profile, reasoning=reasoning, mode=mode):
+            async for chunk in self.cremind_agent.run(
+                query, history_messages, context_id, profile=profile, reasoning=reasoning, mode=mode,
+                search_tools=search_snapshot, on_search_baseline=on_search_baseline,
+            ):
                 # logger.debug(f"Received chunk from CremindAgent: {chunk}")
                 if chunk["type"] == ChatCompletionTypeEnum.CONTENT:
                     content = chunk.get("data")
@@ -475,6 +484,38 @@ class CremindAgentExecutor(AgentExecutor):
 
         current_task_id_var.reset(ctx_token)
         self._running_tasks.pop(task_key, None)
+
+    async def _search_tools_for(self, conv: dict | None) -> Tuple[Any, Any]:
+        """``(snapshot, baseline hook)`` for a run on ``conv``.
+
+        The snapshot comes from the shared resolver
+        (:func:`app.agent.search_tools.snapshot_for_conversation`), so this path
+        and the stream runner can never disagree about which selection applies.
+        The hook records what the run's first main-model request sent, which is
+        what clears the conversation's "saved for the next response" notice —
+        best-effort, and absent when there is no conversation row to write to
+        or the storage cannot record baselines.
+        """
+        from app.agent import search_tools
+
+        if not conv:
+            return search_tools.DEFAULT_SNAPSHOT, None
+        try:
+            snapshot = await search_tools.snapshot_for_conversation(
+                conv.get("id"), conv=conv, conversation_storage=self.conversation_storage,
+            )
+        except Exception:  # noqa: BLE001 — the resolver never raises; belt and braces
+            logger.debug("A2A: search-tool selection read failed; using defaults", exc_info=True)
+            snapshot = search_tools.DEFAULT_SNAPSHOT
+        recorder = getattr(self.conversation_storage, "record_search_cache_baseline", None)
+        conversation_id = conv.get("id")
+        if recorder is None or not conversation_id:
+            return snapshot, None
+
+        async def _record(baseline: dict) -> None:
+            await recorder(conversation_id, baseline)
+
+        return snapshot, _record
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue):
         """A2A-protocol cancel hook: cancel the running asyncio task for ``task_id``."""

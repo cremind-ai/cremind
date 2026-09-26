@@ -575,7 +575,7 @@ written.
 - `cremind event-runs` — the per-firing run history: each matching filesystem
   event runs in its own isolated conversation with a status and token usage,
   viewable (and replyable, when pending) here.
-- `documents/document.md` — how to write Cremind docs (this file's
-  conventions).
+- `document.md` in Cremind's documentation — how to write Cremind docs (this
+  file's conventions).
 - `app/tools/builtin/register_file_watcher.py` — the in-process
   builtin tool the assistant calls when a user asks for a watch.

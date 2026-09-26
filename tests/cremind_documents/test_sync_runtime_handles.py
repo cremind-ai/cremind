@@ -68,11 +68,19 @@ class _FakeEmbedder:
         return [0.1, 0.2, 0.3]
 
 
+def _uid(profile: str) -> str:
+    return f"uid-{profile}"
+
+
+def _shared(tmp_path: Path) -> Path:
+    return tmp_path / "storage" / "cremind_documents" / "shared"
+
+
 def _service_with_doc(tmp_path: Path) -> CremindDocumentSyncService:
-    docs = tmp_path / "documents"
+    docs = _shared(tmp_path)
     docs.mkdir(parents=True)
     (docs / "widgets.md").write_text(_DOC, encoding="utf-8")
-    return CremindDocumentSyncService(working_dir=tmp_path)
+    return CremindDocumentSyncService(working_dir=tmp_path, profile_uid_resolver=_uid)
 
 
 def test_search_uses_state_handles_when_ready(tmp_path):
@@ -135,11 +143,13 @@ def test_collection_is_created_again_in_a_swapped_store(tmp_path):
 
 
 def test_constructor_override_wins_over_the_state(tmp_path):
-    docs = tmp_path / "documents"
+    docs = _shared(tmp_path)
     docs.mkdir(parents=True)
     (docs / "widgets.md").write_text(_DOC, encoding="utf-8")
     store, emb = _FakeStore(), _FakeEmbedder()
-    svc = CremindDocumentSyncService(working_dir=tmp_path, vector_store=store, embedding=emb)
+    svc = CremindDocumentSyncService(
+        working_dir=tmp_path, vector_store=store, embedding=emb, profile_uid_resolver=_uid,
+    )
 
     # State says disabled, but an explicitly injected store still wins.
     hits = svc.search(query="widgets", profile="admin", limit=5)
@@ -222,7 +232,67 @@ def test_a_store_error_never_recreates_the_collection(tmp_path):
     embedding_state.mark_ready(_FakeEmbedder(), store)
 
     svc.full_reconcile(SHARED_SCOPE)
-    svc.apply_event(SHARED_SCOPE, tmp_path / "documents" / "widgets.md")
+    svc.apply_event(SHARED_SCOPE, _shared(tmp_path) / "widgets.md")
 
     assert store.created == [], "a failed existence check must not recreate"
     assert store.added == [], "and the write is skipped rather than attempted blind"
+
+
+class _PointStore(_FakeStore):
+    """Keeps the points it is given and answers scope listings from them."""
+
+    def __init__(self):
+        super().__init__(has_collection=True)
+        self.points: dict[int, dict] = {}
+
+    def add_points(self, *, collection_name, points):
+        super().add_points(collection_name=collection_name, points=points)
+        for p in points:
+            self.points[p["id"]] = dict(p["payload"])
+
+    def list_all_points(self, *, collection_name, with_vectors=False, filter=None):
+        scope = (filter or {}).get("scope")
+        return [
+            {"id": pid, "vector": None, "payload": dict(payload)}
+            for pid, payload in self.points.items()
+            if scope is None or payload.get("scope") == scope
+        ]
+
+
+def test_a_relocated_doc_is_re_upserted_with_its_new_path(tmp_path):
+    """The search tool reads a hit's body from the payload's ``file_path``.
+    After the move to ``storage/cremind_documents`` the content hash is the
+    same but the path is not — the point must be rewritten, or every hit
+    would point at a file that no longer exists."""
+    svc = _service_with_doc(tmp_path)
+    store, emb = _PointStore(), _FakeEmbedder()
+    embedding_state.mark_ready(emb, store)
+    svc.full_reconcile(SHARED_SCOPE)
+    (pid, payload), = store.points.items()
+    stale = str(tmp_path / "documents" / "widgets.md")
+    store.points[pid] = dict(payload, file_path=stale)
+    store.added.clear()
+
+    svc.full_reconcile(SHARED_SCOPE)
+
+    assert len(store.added) == 1
+    assert store.points[pid]["file_path"] == str(_shared(tmp_path) / "widgets.md")
+
+    svc.full_reconcile(SHARED_SCOPE)
+    assert len(store.added) == 1, "an unchanged doc at its current path is not re-embedded"
+
+
+def test_a_vector_hit_is_served_from_where_the_doc_lives_now(tmp_path):
+    """Until the reconcile rewrites it, a stale stored path is rebuilt from
+    ``scope`` + ``relpath`` — and never pointed outside the scope's folder."""
+    svc = _service_with_doc(tmp_path)
+    stale = {"name": "widgets", "scope": SHARED_SCOPE, "relpath": "widgets.md",
+             "file_path": str(tmp_path / "documents" / "widgets.md"), "score": 0.9}
+    escape = {"name": "x", "scope": SHARED_SCOPE, "relpath": "../../../etc/passwd",
+              "file_path": "/nowhere", "score": 0.5}
+    embedding_state.mark_ready(_FakeEmbedder(), _FakeStore(hits=[stale, escape]))
+
+    hits = svc.search(query="widgets", profile="admin", limit=5)
+
+    assert hits[0]["file_path"] == str(_shared(tmp_path) / "widgets.md")
+    assert hits[1]["file_path"] == "/nowhere"

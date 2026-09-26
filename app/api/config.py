@@ -964,6 +964,16 @@ def get_config_routes(state: BootedState) -> list[Route]:
         adopt_existing = (not is_first_setup) and (
             raw_adopt is True or str(raw_adopt or "").strip().lower() in ("true", "1")
         )
+        # A NEW profile may not take a name Cremind's manual uses as a scope
+        # (``shared``, ``cli``; app/cremind_documents/paths.py). Adopting one
+        # that already exists — created before the names were reserved — is
+        # still allowed: refusing it would strand that profile unconfigured.
+        if not adopt_existing:
+            from app.cremind_documents.paths import reserved_profile_name_error
+
+            reserved = reserved_profile_name_error(profile_name)
+            if reserved:
+                return JSONResponse({"error": reserved}, status_code=400)
         # Never ``admin``. This endpoint is reachable from the admin agent's own
         # shell (exec_shell injects its token), so a prompt-injected payload
         # could otherwise re-run setup over the administering profile: rewrite

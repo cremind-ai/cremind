@@ -657,7 +657,7 @@ def _auto_fold_threshold(window: int, suggest_percent: float, ceiling: int) -> i
 
 async def run_model_fold(
     agent: Any, conversation_id: str, profile: str, conversation_storage: Any,
-    *, context_id: str | None = None,
+    *, context_id: str | None = None, search_tools: Any = None,
 ) -> bool:
     """Run the model-driven fold and report whether it applied.
 
@@ -676,12 +676,29 @@ async def run_model_fold(
     binding below keeps it out of the inboxes belonging to the turn it runs
     inside. Without them a fold looks exactly like a plain chat turn, because
     every other identity signal (``message_origin``, ``event_run``) is absent.
+
+    ``search_tools`` is the conversation's search-tool selection
+    (``search_tools.Snapshot``). The fold exists to reuse the turns' warm cache,
+    and the tools block leads that prefix — so the fold must expose the same
+    search groups the conversation's turns do, or a conversation that turned a
+    source off would pay a full cache write for every fold. The post-turn
+    caller passes the snapshot of the run it follows (whose cache is the warm
+    one); ``None`` reads the conversation's current selection (a group seat
+    reads its room's). It carries no baseline hook: a fold is not a response
+    of the conversation and must not clear its "next response" notice.
     """
     try:
         cfg = resolve_compaction_config(profile)
         budget = cfg.max_tokens
     except Exception:  # noqa: BLE001
         budget = 2048
+
+    if search_tools is None:
+        from app.agent import search_tools as st
+
+        search_tools = await st.snapshot_for_conversation(
+            conversation_id, conversation_storage=conversation_storage,
+        )
 
     before = await conversation_storage.get_compaction_state(conversation_id)
     history = await build_compacted_history(
@@ -724,6 +741,7 @@ async def run_model_fold(
             profile=profile,
             reasoning=True,
             maintenance=True,
+            search_tools=search_tools,
         ):
             # The terminal DONE chunk carries the turn's per-call usage records
             # (see ReasoningAgent._token_fields); every other chunk is UI
@@ -777,7 +795,7 @@ async def _record_fold_usage(
 
 async def after_turn_compaction(
     agent: Any, conversation_id: str, profile: str, conversation_storage: Any,
-    *, context_id: str | None = None, force_auto: bool = False,
+    *, context_id: str | None = None, force_auto: bool = False, search_tools: Any = None,
 ) -> dict | None:
     """Post-turn compaction step — returns an event ``{"type", "data"}`` to publish, or ``None``.
 
@@ -795,6 +813,10 @@ async def after_turn_compaction(
     DROPS the oldest turns rather than summarising them. For the same reason the
     suggestion is suppressed on this path: an event no one can click is noise, so a
     fold that did not happen returns ``None``.
+
+    ``search_tools`` is the search-tool snapshot of the turn that just ended, handed
+    to the fold so its tools block matches that turn's warm cache entry (see
+    :func:`run_model_fold`; ``None`` reads the conversation's current selection).
     """
     try:
         cfg = resolve_compaction_config(profile)
@@ -832,7 +854,7 @@ async def after_turn_compaction(
                 folded = await asyncio.wait_for(
                     run_model_fold(
                         agent, conversation_id, profile, conversation_storage,
-                        context_id=context_id,
+                        context_id=context_id, search_tools=search_tools,
                     ),
                     timeout=_AUTO_FOLD_TIMEOUT_SEC,
                 )

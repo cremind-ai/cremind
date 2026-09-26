@@ -102,7 +102,7 @@ The session's turn mode is fixed at launch with `--mode` (default
 workflow. Its planning phase investigates before it asks anything: the
 agent loads the skills that look relevant — loading a skill is read-only,
 it only pulls that skill's own instructions into the conversation —
-searches the documentation, and runs read-only `cremind` commands such
+searches Cremind's documentation, and runs read-only `cremind` commands such
 as `list`, `get`, `show`, `status`, and `catalog` to see what this
 install actually has. Only then does it ask the clarifying questions
 that research could not answer, and it may ask a further round once you
@@ -154,7 +154,7 @@ $ cremind chat c_82bc
 
 ```bash
 $ cremind chat c_82bc --mode plan
-# The agent investigates first — loads the relevant skills, searches the
+# The agent investigates first — loads the relevant skills, searches Cremind's
 # docs, runs read-only `cremind ... list/show/status` probes — then asks
 # what that research could not answer. Answer it (a further round of
 # questions may follow), then type "accept" on the proposed plan and it
