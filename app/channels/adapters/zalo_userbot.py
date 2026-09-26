@@ -44,7 +44,11 @@ from typing import Any
 
 from app.channels.attachments import files_from_sidecar_frame
 from app.channels.base import BaseChannelAdapter, _split_for_messaging
-from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
+from app.channels.exceptions import (
+    ChannelAuthError,
+    ChannelNotImplemented,
+    DeliveryUnconfirmed,
+)
 from app.channels.sidecars.bootstrap import ensure_sidecar_ready
 from app.config.settings import BaseConfig
 from app.utils.logger import logger
@@ -224,7 +228,9 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
                 await self._ws.send(json.dumps({**payload, "request_id": request_id}))
             reply = await asyncio.wait_for(fut, timeout=_FILE_ACK_TIMEOUT)
         except asyncio.TimeoutError as exc:
-            raise ChannelAuthError(
+            # The frame was written, so the upload may well have gone out and
+            # only its answer is missing — unconfirmed, not failed.
+            raise DeliveryUnconfirmed(
                 f"Zalo sidecar did not confirm the file send within "
                 f"{_FILE_ACK_TIMEOUT:.0f}s (thread {thread_id})",
             ) from exc

@@ -40,6 +40,7 @@ _ATTACHMENT_TYPES = ("image", "video", "audio", "file")
 
 class MessengerAdapter(BaseChannelAdapter):
     supports_file_send = True
+    max_file_send_bytes = _MESSENGER_UPLOAD_LIMIT
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)

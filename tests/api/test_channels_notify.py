@@ -124,8 +124,10 @@ def _body(resp) -> dict:
 
 
 def _profile_file(monkeypatch, tmp_path, profile="p1", name="report.pdf") -> str:
+    # The profile's uploads folder: its system-dir slice's own root holds
+    # Cremind's settings and logins, which are never sent.
     monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
-    target = tmp_path / profile
+    target = tmp_path / profile / "uploads_tmp" / "conv1"
     target.mkdir(parents=True, exist_ok=True)
     path = target / name
     path.write_bytes(b"pdf")

@@ -179,6 +179,13 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     # receiving silence.
     supports_file_send: bool = False
 
+    # The largest file this transport accepts outward, in bytes, where the
+    # platform has a hard cap — ``None`` where it has none worth checking up
+    # front. Read off the CLASS before a batch goes out, so a file the platform
+    # would refuse is caught before the others are sent rather than after.
+    # The adapter still enforces it at send time.
+    max_file_send_bytes: int | None = None
+
     # Telegram's legacy markdown — the dialect this codebase has always written.
     # Adapters whose platform spells emphasis differently override them; one
     # whose platform has no markup at all sets ``("", "")`` and gets plain text.
@@ -869,6 +876,19 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             return False
         return bool((self.channel.get("config") or {}).get("group_chats_enabled"))
 
+    @classmethod
+    def looks_like_room_address(cls, value: str) -> bool:
+        """Whether ``value`` is shaped like one of this platform's ROOM ids.
+
+        For the people-addressed paths (``send_channel_message``, which must
+        never treat a group as a person): where a platform spells rooms and
+        people differently — a WhatsApp ``…@g.us`` JID, a Slack ``C…`` channel
+        id, a negative Telegram chat id — this answers from the shape alone.
+        Where it does not (a Discord snowflake, a Zalo id) this says no, and the
+        caller asks the groups this channel knows instead.
+        """
+        return False
+
     def self_identity(self) -> dict:
         """The platform account this channel speaks as, as last recorded.
 
@@ -971,6 +991,24 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             logger.exception(
                 f"channels[{self.channel_type}]: file send to chat {chat_id} failed",
             )
+
+    async def send_file_to_chat_strict(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Room file send that RAISES (the room twin of :meth:`send_file_strict`).
+
+        For a caller that reports what happened to each file — the agent asked
+        to share one in the group it is answering in — rather than logging a
+        failure nobody reads. ``ChannelNotImplemented`` propagates too: that
+        caller refuses up front on a transport without file support, and one
+        that slips through should say so rather than post a notice nobody
+        asked for.
+        """
+        await self._send_file_to_chat(
+            chat_id, path, name=name, mime=mime, caption=caption,
+        )
 
     def _relay_group_post(self, target: ReplyTarget, text: str) -> None:
         """Hand a post we just made in a room to Cremind's other agents in it.
@@ -1746,11 +1784,13 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         artifact — the web UI's chip for a file some tool read, wrote, moved or
         converted along the way — and how a file came about says nothing about
         whether the person on the platform asked for it. A file reaches the
-        platform only when something sends it on purpose: the ``attachments`` of
-        the ``send_channel_message`` / ``send_notification`` tools, or an
-        operator's ``--file`` (CLI) / ``attachments`` (REST API). The retired
-        ``config.auto_send_files`` is not read, so an older channel that still
-        carries it changes nothing.
+        platform only when something sends it on purpose: the
+        ``send_files_to_chat`` tool (into this very chat — a private one or a
+        group — when somebody in it asked; see :mod:`app.channels.chat_files`),
+        the ``attachments`` of the ``send_channel_message`` /
+        ``send_notification`` tools, or an operator's ``--file`` (CLI) /
+        ``attachments`` (REST API). The retired ``config.auto_send_files`` is not
+        read, so an older channel that still carries it changes nothing.
 
         Each bubble is sent through :meth:`send` which already isolates
         per-message exceptions, so a transient failure on one bubble can't

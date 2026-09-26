@@ -387,7 +387,9 @@ this key says — they have no client record to exempt, and it is the send most
 likely to be going to the wrong person.
 
 This key only affects the agent's `send_channel_message` tool. `cremind channels
-message` is unaffected: there `--send` is itself your approval.
+message` is unaffected: there `--send` is itself your approval. So is
+`send_files_to_chat`, which sends a file someone asked for into the very chat
+they asked in: the person receiving it is the one who asked.
 
 ### Group `agent` — Reasoning Agent
 

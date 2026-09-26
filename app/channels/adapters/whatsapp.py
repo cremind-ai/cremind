@@ -50,7 +50,11 @@ from typing import Any
 
 from app.channels.attachments import IncomingFile, files_from_sidecar_frame
 from app.channels.base import BaseChannelAdapter
-from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
+from app.channels.exceptions import (
+    ChannelAuthError,
+    ChannelNotImplemented,
+    DeliveryUnconfirmed,
+)
 from app.channels.sidecars.bootstrap import ensure_sidecar_ready
 from app.config.settings import BaseConfig
 from app.utils.logger import logger
@@ -188,6 +192,14 @@ class WhatsappAdapter(BaseChannelAdapter):
                 f"WhatsApp send failed: {reply.get('error') or 'unknown error'}",
             )
 
+    @classmethod
+    def looks_like_room_address(cls, value: str) -> bool:
+        """A group (``@g.us``), a broadcast list or a channel — anything but a
+        person's ``@s.whatsapp.net`` / ``@lid`` JID."""
+        return str(value or "").strip().lower().endswith(
+            ("@g.us", "@broadcast", "@newsletter"),
+        )
+
     async def send_to_chat(self, chat_id: str, text: str) -> None:
         """Post into a ``@g.us`` room, through the same acked path as a DM.
 
@@ -242,7 +254,9 @@ class WhatsappAdapter(BaseChannelAdapter):
                 }))
             reply = await asyncio.wait_for(fut, timeout=_FILE_ACK_TIMEOUT)
         except asyncio.TimeoutError as exc:
-            raise ChannelAuthError(
+            # The frame was written, so the upload may well have gone out and
+            # only its answer is missing — unconfirmed, not failed.
+            raise DeliveryUnconfirmed(
                 f"WhatsApp sidecar did not confirm the file send within "
                 f"{_FILE_ACK_TIMEOUT:.0f}s (recipient {jid})",
             ) from exc

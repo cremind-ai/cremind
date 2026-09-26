@@ -544,6 +544,13 @@ class SlackAdapter(BaseChannelAdapter):
         # Already a channel id (or a group/DM id supplied directly).
         return sender_id
 
+    @classmethod
+    def looks_like_room_address(cls, value: str) -> bool:
+        """A public (``C…``) or private (``G…``) channel id. ``D…`` is a DM
+        channel — one person's — and user ids start ``U``/``W``."""
+        text = str(value or "").strip()
+        return len(text) >= 9 and text[0] in "CG" and text[1:].isalnum() and text.isupper()
+
     async def _send_text(self, sender_id: str, text: str) -> None:
         if self._app is None:
             raise ChannelAuthError("Slack app not connected")

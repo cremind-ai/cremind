@@ -85,6 +85,7 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "send_notification",
     "send_channel_message",
     "send_group_message",
+    "send_files_to_chat",
 )
 
 

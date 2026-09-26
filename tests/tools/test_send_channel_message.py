@@ -396,11 +396,13 @@ def test_unresolvable_recipient_is_reported_not_raised():
 
 
 def _profile_file(monkeypatch, tmp_path, profile="p", name="report.pdf") -> str:
-    """A real file inside the profile's own system-dir slice."""
+    """A real file in the profile's uploads folder — one of the places in its
+    system-dir slice a file may be sent from (the slice's own root holds
+    Cremind's settings and logins, which never are)."""
     from app.config.settings import BaseConfig
 
     monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
-    target_dir = tmp_path / profile
+    target_dir = tmp_path / profile / "uploads_tmp" / "conv1"
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / name
     path.write_bytes(b"%PDF-1.7 report")

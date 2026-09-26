@@ -23,7 +23,11 @@ from typing import Any
 
 from app.channels.attachments import IncomingFile, dest_for
 from app.channels.base import BaseChannelAdapter, platform_message_timestamp
-from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
+from app.channels.exceptions import (
+    ChannelAuthError,
+    ChannelNotImplemented,
+    DeliveryUnconfirmed,
+)
 from app.utils.logger import logger
 
 # Hard Bot API caps, both below Cremind's own upload ceiling: ``getFile``
@@ -31,6 +35,38 @@ from app.utils.logger import logger
 # neither limit — the bundled doc points people there for big files.
 _TG_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 _TG_BOT_UPLOAD_LIMIT = 50 * 1024 * 1024
+
+# The longest flood-control pause a file upload waits out before retrying.
+# Telegram asks a bot posting quickly into one group for a few seconds, and a
+# longer demand than this is better reported than sat through inside a tool
+# call.
+_FLOOD_WAIT_CAP_SECONDS = 30.0
+
+
+def _retry_after_seconds(exc: Any) -> float:
+    """``RetryAfter.retry_after`` in seconds — an int before PTB 22, and a
+    ``timedelta`` once PTB finishes that migration."""
+    value = getattr(exc, "retry_after", 0)
+    if hasattr(value, "total_seconds"):
+        return float(value.total_seconds())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _timed_out_before_sending(exc: Any) -> bool:
+    """Whether a PTB ``TimedOut`` provably sent nothing.
+
+    PTB raises ``TimedOut`` for every httpx timeout. Waiting for a pooled
+    connection or for the connect itself means the request never left, so it
+    is safe to try again; a write or read timeout may come after Telegram
+    already has the file. Matched by name so httpx need not be imported here.
+    """
+    cause = getattr(exc, "__cause__", None)
+    if type(cause).__name__ in ("ConnectTimeout", "PoolTimeout"):
+        return True
+    return "pool timeout" in str(exc).lower()
 
 
 def _full_name(user: Any) -> str | None:
@@ -63,6 +99,7 @@ class TelegramAdapter(BaseChannelAdapter):
     # which is what :mod:`app.channels.groups.relay` exists to fix.
     receives_bot_posts = False
     supports_file_send = True
+    max_file_send_bytes = _TG_BOT_UPLOAD_LIMIT
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
@@ -526,6 +563,13 @@ class TelegramAdapter(BaseChannelAdapter):
         chat_id = int(sender_id)
         await self._send_with_retry(chat_id, text)
 
+    @classmethod
+    def looks_like_room_address(cls, value: str) -> bool:
+        """A negative chat id: a group, supergroup or channel. A person's id
+        is always positive."""
+        text = str(value or "").strip()
+        return text.startswith("-") and text[1:].isdigit()
+
     async def send_to_chat(self, chat_id: str, text: str) -> None:
         """Send to a room by its chat id (negative for Telegram groups)."""
         if self._bot is None:
@@ -680,18 +724,34 @@ class TelegramAdapter(BaseChannelAdapter):
         Everything goes out as a document (not ``send_photo``) so the file
         arrives byte-identical with its filename — Telegram recompresses
         photos. Captions are clipped to Telegram's 1024-char cap.
+
+        Only a failure that provably sent nothing is retried, because an upload
+        retried after it landed posts the file twice. PTB files two very
+        different errors under ``NetworkError``: ``BadRequest`` is Telegram
+        refusing this exact request (no right to post documents, an empty file,
+        a chat that is gone), which a retry only repeats; and ``TimedOut`` can
+        arrive after Telegram already has the file, so unless it timed out
+        before anything left it surfaces as :class:`DeliveryUnconfirmed`.
+        Flood control (``RetryAfter``) is waited out once when the pause asked
+        for is short.
         """
         import os
 
-        from telegram.error import NetworkError  # type: ignore
+        from telegram.error import (  # type: ignore
+            BadRequest,
+            NetworkError,
+            RetryAfter,
+            TimedOut,
+        )
 
+        display = name or os.path.basename(path)
         try:
             size = os.path.getsize(path)
         except OSError as exc:
             raise ValueError(f"cannot read file to send: {path}") from exc
         if size > _TG_BOT_UPLOAD_LIMIT:
             raise ValueError(
-                f"'{name or os.path.basename(path)}' is {size} bytes; Telegram "
+                f"'{display}' is {size} bytes; Telegram "
                 f"bots can only upload files up to {_TG_BOT_UPLOAD_LIMIT} bytes",
             )
         clipped = (caption or "")[:1024] or None
@@ -699,6 +759,7 @@ class TelegramAdapter(BaseChannelAdapter):
         attempts = 0
         last_exc: Exception | None = None
         max_attempts = 3
+        waited_for_flood = False
         while attempts < max_attempts:
             attempts += 1
             if self._bot is None:
@@ -713,12 +774,39 @@ class TelegramAdapter(BaseChannelAdapter):
                     await self._bot.send_document(
                         chat_id=chat_id,
                         document=handle,
-                        filename=name or os.path.basename(path),
+                        filename=display,
                         caption=clipped,
                         read_timeout=120.0,
                         write_timeout=120.0,
                     )
                 return
+            except BadRequest:
+                # Before ``NetworkError``, which it subclasses: a refusal is not
+                # a dead connection, and resetting the pool will not change it.
+                raise
+            except TimedOut as exc:
+                if not _timed_out_before_sending(exc):
+                    raise DeliveryUnconfirmed(
+                        f"Telegram did not confirm the upload of '{display}' in "
+                        "time — it may or may not have arrived",
+                    ) from exc
+                last_exc = exc
+                await self._reset_bot()
+                await asyncio.sleep(0.75 * attempts)
+                continue
+            except RetryAfter as exc:
+                wait = _retry_after_seconds(exc)
+                if waited_for_flood or wait > _FLOOD_WAIT_CAP_SECONDS:
+                    raise
+                # Telegram refused before taking the file, so nothing landed;
+                # the pause is not a failed attempt.
+                waited_for_flood = True
+                attempts -= 1
+                logger.info(
+                    f"telegram: flood control on a file send; waiting {wait:.0f}s",
+                )
+                await asyncio.sleep(max(wait, 0.0) + 0.5)
+                continue
             except NetworkError as exc:
                 last_exc = exc
                 logger.warning(

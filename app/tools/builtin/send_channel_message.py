@@ -128,7 +128,10 @@ class SendChannelMessageTool(BuiltInTool):
         "(WhatsApp, Telegram, Slack, Discord, ...). Handles one recipient or a "
         "bulk list, e.g. a thank-you to every customer in a spreadsheet. This "
         "is NOT send_notification: that one notifies the user themselves, this "
-        "one messages their contacts.\n\n"
+        "one messages their contacts. Nor is it for the chat you are answering: "
+        "a file for the person you are talking to, or for the group you are "
+        "in, goes through send_files_to_chat when that tool is offered. Groups "
+        "are never recipients here.\n\n"
         + _CONFIRM_STEPS +
         "Recipients: 'to' is a platform sender id or a phone number. Phone "
         "numbers must be international (+84901234567); a leading-zero national "
