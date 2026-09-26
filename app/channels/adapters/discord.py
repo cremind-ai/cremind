@@ -128,6 +128,7 @@ class DiscordAdapter(BaseChannelAdapter):
     # Every text channel of every server the bot is in.
     supports_group_listing = True
     supports_file_send = True
+    max_file_send_bytes = _DISCORD_UPLOAD_LIMIT
 
     # Discord reads a single asterisk as ITALIC, so the base ``*bold*`` default
     # would quietly emphasise every mirrored name and step header the wrong way.

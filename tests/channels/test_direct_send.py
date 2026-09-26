@@ -677,3 +677,114 @@ def test_circuit_breaker_stops_after_repeated_failures(monkeypatch):
     statuses = [r["status"] for r in out["results"]]
     assert statuses.count("failed") == ds.CIRCUIT_BREAKER_FAILURES
     assert statuses.count("skipped") == len(jids) - ds.CIRCUIT_BREAKER_FAILURES
+
+
+# ── a group is never a person ──────────────────────────────────────────────
+#
+# A raw id nobody had messaged used to be sent to as-is. On WhatsApp and Slack
+# a room's id handed over that way posted into the room AND registered the room
+# as a "contact" with a private conversation of its own. Rooms are refused
+# before resolution now; a group gets a message or a file only from its own
+# conversation.
+
+
+class _WhatsappLike(_FakeAdapter):
+    supports_group_chats = True
+
+    @classmethod
+    def looks_like_room_address(cls, value):
+        from app.channels.adapters.whatsapp import WhatsappAdapter
+
+        return WhatsappAdapter.looks_like_room_address(value)
+
+
+class _RoomsLookLikePeople(_FakeAdapter):
+    """Discord or Zalo: a room's id has the same shape as a person's."""
+
+    supports_group_chats = True
+
+
+class _KnownGroups:
+    def __init__(self, by_channel=None, *, broken=False):
+        self.by_channel = by_channel or {}
+        self.broken = broken
+
+    async def list_groups(self, channel_id, *, status=None):
+        if self.broken:
+            raise RuntimeError("database is locked")
+        return [{"platform_chat_id": c} for c in self.by_channel.get(channel_id, [])]
+
+
+@pytest.fixture
+def known_groups(monkeypatch):
+    import app.storage as storage_mod
+
+    groups = _KnownGroups()
+    monkeypatch.setattr(storage_mod, "get_channel_group_storage", lambda *a, **k: groups)
+    monkeypatch.setattr(ds, "_delay_for", lambda adapter: 0.0)
+    return groups
+
+
+_GROUP_JID = "120363041234567@g.us"
+
+
+def test_a_group_jid_is_refused_and_never_becomes_a_contact(known_groups):
+    wa = _WhatsappLike("whatsapp", "c-wa")
+    storage = _FakeStorage({"c-wa": []})
+    out = _send(adapters=[wa], storage=storage, recipients=[{"to": _GROUP_JID}],
+                message="hi")
+    result = out["results"][0]
+    assert result["status"] == "failed" and result["error"] == "not_a_person"
+    assert "group chat" in result["detail"]
+    assert wa.sent == [] and storage.messages == []
+    assert storage._senders["c-wa"] == []  # no "contact" was created for it
+
+
+def test_a_room_an_older_version_registered_as_a_contact_is_still_refused(known_groups):
+    """Checked before the exact-sender match, which that stale row would win."""
+    wa = _WhatsappLike("whatsapp", "c-wa")
+    storage = _FakeStorage({"c-wa": [_sender("c-wa", _GROUP_JID, conversation_id="conv-x")]})
+    out = _send(adapters=[wa], storage=storage, recipients=[{"to": _GROUP_JID}],
+                message="hi")
+    assert out["results"][0]["error"] == "not_a_person"
+    assert wa.sent == []
+
+
+def test_a_known_group_is_refused_where_its_id_looks_like_a_person(known_groups):
+    known_groups.by_channel = {"c-dc": ["998877665544332211"]}
+    dc = _RoomsLookLikePeople("discord", "c-dc")
+    person = "112233445566778899"
+    storage = _FakeStorage({"c-dc": [_sender("c-dc", person, conversation_id="c1")]})
+    out = _send(adapters=[dc], storage=storage,
+                recipients=[{"to": "998877665544332211"}, {"to": person}], message="hi")
+    assert [r.get("error") for r in out["results"]] == ["not_a_person", None]
+    assert dc.sent == [(person, "hi")]
+
+
+def test_people_on_a_group_capable_channel_are_unaffected(known_groups):
+    wa = _WhatsappLike("whatsapp", "c-wa")
+    jid = "84901234567@s.whatsapp.net"
+    storage = _FakeStorage({"c-wa": [_sender("c-wa", jid, conversation_id="c1")]})
+    out = _send(adapters=[wa], storage=storage, recipients=[{"to": jid}], message="hi")
+    assert out["sent"] == 1 and wa.sent == [(jid, "hi")]
+
+
+def test_a_broken_group_lookup_never_fails_the_send(known_groups):
+    """Without the lookup the shape check still stands, and people still go."""
+    known_groups.broken = True
+    wa = _WhatsappLike("whatsapp", "c-wa")
+    jid = "84901234567@s.whatsapp.net"
+    storage = _FakeStorage({"c-wa": [_sender("c-wa", jid, conversation_id="c1")]})
+    out = _send(adapters=[wa], storage=storage,
+                recipients=[{"to": jid}, {"to": _GROUP_JID}], message="hi")
+    assert [r.get("error") for r in out["results"]] == [None, "not_a_person"]
+
+
+def test_channels_without_groups_are_never_asked(monkeypatch):
+    import app.storage as storage_mod
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("group storage consulted for a channel with no groups")
+
+    monkeypatch.setattr(storage_mod, "get_channel_group_storage", _must_not_be_called)
+    assert asyncio.run(ds.known_rooms([_FakeAdapter("messenger", "c-m")])) == {}

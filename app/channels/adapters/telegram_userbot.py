@@ -695,6 +695,13 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
         peer = await self._resolve_peer(sender_id)
         await self._client.send_message(peer, text, parse_mode="md")
 
+    @classmethod
+    def looks_like_room_address(cls, value: str) -> bool:
+        """A negative chat id: a group, supergroup or channel. A person's id
+        is always positive."""
+        text = str(value or "").strip()
+        return text.startswith("-") and text[1:].isdigit()
+
     async def send_to_chat(self, chat_id: str, text: str) -> None:
         """Send to a room by its chat id, through the same peer cache as DMs."""
         if self._client is None:

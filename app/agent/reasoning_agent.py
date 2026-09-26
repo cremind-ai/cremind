@@ -494,6 +494,7 @@ _MAINTENANCE_BLOCKED_TOOLS = frozenset({
     "send_group_message",
     "send_notification",
     "send_channel_message",
+    "send_files_to_chat",
 })
 
 
@@ -2006,6 +2007,17 @@ class ReasoningAgent:
         # once-per-run evaluation and same registry-missing fallback.
         if not has_any_channel(profile):
             tools = [t for t in tools if t.tool_id != "send_channel_message"]
+        # ``send_files_to_chat`` delivers files into the chat THIS conversation
+        # is with — a person's private chat or a platform group — so it exists
+        # only in a channel conversation, and only while a channel is live to
+        # carry it. Everywhere else (the web UI, an automation's hidden run, a
+        # Cremind group seat) there is no chat to send into. The origin comes
+        # from the conversation row, so the gate is conversation-constant like
+        # the ones above and the tools block stays byte-stable.
+        if (message_origin or {}).get("source") not in ("channel", "channel_group") or (
+            not has_any_channel(profile)
+        ):
+            tools = [t for t in tools if t.tool_id != "send_files_to_chat"]
         # ``send_group_message`` posts INTO a group from outside it — from an
         # ordinary chat ("Dog, ask Cat in the group for today's status") or from
         # a scheduled run. Withheld on two conversation-constant facts: a profile

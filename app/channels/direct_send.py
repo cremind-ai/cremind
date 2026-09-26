@@ -15,7 +15,9 @@ pn-JID derived from the number, and only then a cold send. Matching is exact —
 never a suffix or "close enough" comparison — because the failure mode of a
 loose match is delivering someone's message to a stranger, which is far worse
 than failing to deliver it at all. Anything ambiguous is reported back rather
-than guessed.
+than guessed. And a group chat is refused before any of it: a room's id handed
+over as a "recipient" is nobody's inbox, and sending to it raw would post into
+the room while registering it as a contact.
 
 **Reach.** Only WhatsApp can start a conversation from a phone number, and only
 after ``onWhatsApp`` confirms the number exists. Telegram bots, Messenger and
@@ -217,6 +219,58 @@ def _describe(adapter: Any, sender: dict | None) -> str:
     return f"{adapter.channel_type}:{who}"
 
 
+def _is_room_on(
+    adapter: Any, target: str, rooms_by_channel: dict[str, set[str]] | None,
+) -> bool:
+    """Whether ``target`` addresses a ROOM on ``adapter``'s platform.
+
+    By shape where the platform spells rooms differently from people (see
+    :meth:`BaseChannelAdapter.looks_like_room_address`), and otherwise by the
+    groups this channel already knows. Both matter: a Discord channel id and a
+    Zalo group id look exactly like somebody's user id.
+    """
+    shaped = getattr(type(adapter), "looks_like_room_address", None)
+    try:
+        if shaped is not None and shaped(target):
+            return True
+    except Exception:  # noqa: BLE001 — an unreadable shape is not a room
+        pass
+    return target in (rooms_by_channel or {}).get(adapter.channel_id, ())
+
+
+async def known_rooms(adapters: list[Any]) -> dict[str, set[str]]:
+    """``{channel_id: {platform chat id}}`` for every group each channel knows.
+
+    Any status: a pending or blocked group is still not a person. Only asked of
+    channels whose transport has groups at all, and never allowed to fail a
+    send — without it the shape check still stands.
+    """
+    rooms: dict[str, set[str]] = {}
+    capable = [a for a in adapters if getattr(type(a), "supports_group_chats", False)]
+    if not capable:
+        return rooms
+    try:
+        from app.storage import get_channel_group_storage
+
+        storage = get_channel_group_storage()
+    except Exception:  # noqa: BLE001
+        logger.debug("[direct_send] no group storage; room check by shape only", exc_info=True)
+        return rooms
+    for adapter in capable:
+        try:
+            groups = await storage.list_groups(adapter.channel_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                f"[direct_send] could not list the groups of {adapter.channel_id}",
+                exc_info=True,
+            )
+            continue
+        rooms[adapter.channel_id] = {
+            str(g.get("platform_chat_id") or "") for g in groups
+        } - {""}
+    return rooms
+
+
 def _reach_alternatives(adapters: list[Any]) -> list[str]:
     """Channel types on this profile that *could* reach a phone number."""
     out: list[str] = []
@@ -235,6 +289,7 @@ async def resolve_recipient(
     *,
     channel: str | None = None,
     default_country_code: str | None = None,
+    rooms_by_channel: dict[str, set[str]] | None = None,
 ) -> tuple[Any, str, dict | None, dict]:
     """Resolve ``to`` to ``(adapter, platform_sender_id, sender_row, info)``.
 
@@ -242,7 +297,8 @@ async def resolve_recipient(
     carries what the send path needs afterwards (``phone``, ``wa_lid``,
     ``cold``). Raises :class:`RecipientError` when the recipient cannot be
     addressed, including when it resolves two different ways — an ambiguous
-    recipient is reported, never guessed.
+    recipient is reported, never guessed — and when it is a group chat
+    (``rooms_by_channel``, see :func:`known_rooms`), which is nobody's inbox.
     """
     target = str(to or "").strip()
     if not target:
@@ -255,6 +311,20 @@ async def resolve_recipient(
             "unknown_channel",
             f"No connected channel matches {channel!r}. "
             f"Available: {', '.join(available) or '(none)'}.",
+        )
+
+    # 0. A group chat is not a person. Checked before everything below: a raw
+    #    id used to be sent to as-is, and on WhatsApp and Slack that posted
+    #    into the room AND registered it as a "contact" — whose row step 1
+    #    would now match exactly. A group gets a file or a message only from
+    #    its own conversation (``send_files_to_chat``, and the agent's answer).
+    rooms = [a for a in candidates if _is_room_on(a, target, rooms_by_channel)]
+    if rooms:
+        raise RecipientError(
+            "not_a_person",
+            f"{target} is a group chat on {rooms[0].channel_type}, not a "
+            "person. Only people can be messaged this way; something goes "
+            "into a group only while the agent is answering in that group.",
         )
 
     # 1. Exact platform sender id. First because it is the only certain match,
@@ -487,6 +557,7 @@ async def send_direct_messages(
                 f"[direct_send] could not list senders for {adapter.channel_id}",
             )
             senders_by_channel[adapter.channel_id] = []
+    rooms_by_channel = await known_rooms(adapters)
 
     # ── pass 1: resolve everything before anything is sent ──
     #
@@ -503,6 +574,7 @@ async def send_direct_messages(
                 target, adapters, senders_by_channel,
                 channel=entry.get("channel") or channel,
                 default_country_code=default_country_code,
+                rooms_by_channel=rooms_by_channel,
             )
         except RecipientError as exc:
             plan.append({"outcome": RecipientOutcome(

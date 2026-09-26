@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage messaging channels — Telegram, WhatsApp, Discord, Slack, Messenger and Zalo (official Bot API, or a QR-paired userbot): `list`, `add` from a JSON config, `edit`, `enable`/`disable`, `delete`, `catalog`; `pair` (QR pairing, or a Telegram code) and `repair` a stuck pairing that shows no QR (saved session invalidated elsewhere); per-channel authentication (open, passcode, otp, admin approval, allowlist) with `approve`/`revoke` and `senders`; push-only notification mode with `notify-filter` and `send`; `message`, `set-phone`, `set-confirm` to reach named individuals by sender id or phone number (bulk lists, preview before `--send`, `--file`); `clear-history` and `forget` for one client; inbound files reach the agent; outbound files only via explicit `--file` or tool `attachments`, never auto-attached to replies. Group chats: opt in with `--group-chats`, then `channels groups approve`/`list`/`members`/`policy`/`allow`/`deny`/`respond`/`brakes`/`refresh`/`block`/`forget` — the agent answers when mentioned or relevant, and several of your bots can talk in one group under loop brakes. Not `cremind group` (Cremind's own multi-profile rooms)."
+description: "Connect and manage messaging channels — Telegram, WhatsApp, Discord, Slack, Messenger and Zalo (official Bot API, or a QR-paired userbot): `list`, `add` from a JSON config, `edit`, `enable`/`disable`, `delete`, `catalog`; `pair` (QR pairing, or a Telegram code) and `repair` a stuck pairing that shows no QR (saved session invalidated elsewhere); per-channel authentication (open, passcode, otp, admin approval, allowlist) with `approve`/`revoke` and `senders`; push-only notification mode with `notify-filter` and `send`; `message`, `set-phone`, `set-confirm` to reach named individuals by sender id or phone number (bulk lists, preview before `--send`, `--file`); `clear-history` and `forget` for one client; inbound files reach the agent; it sends one into a chat or group only when asked (or via `--file`/tool `attachments`), never auto-attached. Group chats: opt in with `--group-chats`, then `channels groups approve`/`list`/`members`/`policy`/`allow`/`deny`/`respond`/`brakes`/`refresh`/`block`/`forget` — the agent answers when mentioned or relevant, and several of your bots can talk in one group under loop brakes. Not `cremind group` (Cremind's own multi-profile rooms)."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -142,11 +142,12 @@ approved first — see **Group chats on a channel** below.
 Files follow the same rules: a platform user's attachment becomes a file the
 agent can read (see **Files on channels** below), but the agent's reply is its
 answer and nothing else — a file it read, wrote or converted along the way is
-never attached to it. A file goes out only when it is sent on purpose: the
-agent's `send_channel_message` / `send_notification` tools take `attachments`,
-and the two outbound push commands take `--file`. What the inbound-only rule
-still forbids is composing into a channel conversation from the web UI or
-CLI — file or not.
+never attached to it. A file goes out only when it is sent on purpose: when
+somebody in the chat asks for one, the agent sends it into that chat — a
+private one or a group — with `send_files_to_chat`; its `send_channel_message`
+/ `send_notification` tools take `attachments`; and the two outbound push
+commands take `--file`. What the inbound-only rule still forbids is composing
+into a channel conversation from the web UI or CLI — file or not.
 
 Use `cremind conv get <id>` and `cremind conv attach <id>` to inspect channel
 conversations; use the corresponding platform (Telegram, etc.) to
@@ -179,18 +180,58 @@ chip is the web UI's view of the work, not a message to anyone.
 
 To get a file to somebody, send it deliberately:
 
-- **The agent** — `send_channel_message` (named clients, under its usual
+- **Into the chat being answered** — ask the agent for it. In a private chat,
+  or in an approved group where it answers you, "send me the report" or "post
+  the photo here" makes it call `send_files_to_chat`, which delivers the files
+  into that same chat at once, ahead of its written answer. There is no
+  approval round trip: the person asking is in the chat receiving it. The
+  destination is always the chat the conversation is with — never one the
+  agent names — so nobody can use it to reach a different chat. In a group
+  everyone sees what is posted. Asking the agent to *send* you a file is what
+  gets one delivered; asking it to *write* one does not.
+- **To other people** — `send_channel_message` (named clients, under its usual
   approval rules) and `send_notification` (a notification channel's
-  subscribers) both take an `attachments` list of absolute paths, restricted to
-  the profile's own directories. Asking the agent to *send* you a file is what
-  gets one delivered; asking it to *write* one does not. `send_channel_message`
-  addresses people, not rooms, so no tool uploads a file into a platform group
-  the agent is answering in.
+  subscribers) both take an `attachments` list of absolute paths.
+  `send_channel_message` addresses people only: a group's id given to it as a
+  recipient (a WhatsApp `…@g.us` JID, a Slack `C…` channel, a negative Telegram
+  chat id, or any group the channel knows) is refused as `not_a_person`, so a
+  group gets a file only from its own conversation.
 - **You** — `cremind channels message <id> ... --file <path>` and
   `cremind channels send <id> -F <path>` upload local files with the request
   (multipart), so they work from a remote CLI; the REST endpoints behind them
   (`/api/channels/{id}/message`, `/api/channels/{id}/notify`) take the same
   attachments.
+
+**What `send_files_to_chat` checks.** Every file in a call is checked before any
+is sent — one refused file means none go, and the agent is told why for each:
+at most 10 files; not empty; within the platform's cap (Telegram bot 50 MB,
+Discord 10 MB, Messenger 25 MB) and the server's `uploads.tmp_max_bytes` (100
+MiB by default); and a file the agent may send at all (below). It is refused up
+front, sending nothing, when the conversation is not a channel chat (the web
+UI, an automation's hidden run, a `cremind group` seat), the channel is not
+running, the group is pending or blocked, group chats are off on the channel,
+the person no longer has access, or the transport has no file support (the Zalo
+bot). Files then go one at a time, each reported as sent, failed (with the
+platform's reason — a bot removed from the group, no permission to post files,
+a missing Slack `files:write` scope) or **unconfirmed**: handed over but never
+acknowledged, so it may or may not have arrived, and it is not sent again. Two
+failures in a row stop the batch, and so does the tool call's clock, before it
+could cut the report off. The same unchanged file is never posted twice in one
+turn.
+
+**Files that are never sent**, by any of these tools or the REST `attachments`,
+whoever asks: anything outside the profile's own folders or inside another
+profile's; Cremind's own data — in the system folder only the workspaces and
+the profile's `uploads_tmp`, `plans`, `exports` and `skills` folders count, so
+never the database, `tokens/`, `tls/`, channel logins, the browser profile, the
+persona or another profile's slice, even when a working directory contains the
+system folder; hidden files and folders (`.env`, `.ssh`, `.aws`, a skill's
+`.google_token.json`); credential stores (`coding-cli`, `codex-home`,
+`cli-wizards`, `AppData`, `Keychains`); credential files by type or name
+(`.session`, `.p12`, `.pfx`, `.jks`, `.kdbx`, `.ppk`, `.token`, `*.env`,
+`id_rsa`, `credentials.json`, `token.json`, browser `Cookies`/`Login Data`);
+and any file that holds a PEM private key, whatever it is called. A
+certificate or a `.pub` key is public and can be sent.
 
 **`auto_send_files` is retired.** Older versions attached the files the agent
 created to its channel replies, and this config key turned that off. It is now
@@ -822,7 +863,11 @@ messaged the channel is always confirmed regardless.
 
 **Addressing.** `--to` takes a platform sender id (Telegram numeric id,
 WhatsApp JID, Slack `U…`, Discord id, …) or a phone number. Resolution is
-exact, never fuzzy — an ambiguous recipient is reported rather than guessed:
+exact, never fuzzy — an ambiguous recipient is reported rather than guessed.
+A group is never a recipient: a group's id (a WhatsApp `…@g.us` JID, a Slack
+`C…`/`G…` channel, a negative Telegram chat id, or any group the channel knows)
+comes back as `not_a_person` before anything is sent — a group gets a message
+or a file only from its own conversation.
 
 1. An exact sender-id match among the channel's known contacts.
 2. A stored phone number (`channels senders` PHONE column, set automatically
