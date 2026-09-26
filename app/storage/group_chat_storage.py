@@ -33,7 +33,7 @@ import time
 import uuid
 from typing import Any, Iterable, Optional
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
@@ -44,6 +44,14 @@ from app.storage.models import (
     GroupChatModel,
 )
 from app.utils.logger import logger
+
+
+def _search_policy():
+    """:mod:`app.agent.search_tools`, imported on first use (importing
+    ``app.agent`` runs the executor package ``__init__``)."""
+    from app.agent import search_tools
+
+    return search_tools
 
 
 class GroupChatStorage:
@@ -181,6 +189,78 @@ class GroupChatStorage:
             row.updated_at = time.time() * 1000
             session.add(row)
         return await self.get_group(group_id)
+
+    # ── search-tool selection ─────────────────────────────────────────────
+    #
+    # One selection per ROOM, shared by every seat (each seat still filters it
+    # against its own profile's availability). Same CAS contract as
+    # ``ConversationStorage.set_search_tools``. ``updated_at`` is NOT bumped:
+    # the group list sorts by recent activity (``touch_group``), and choosing
+    # search sources is a setting, not a post.
+
+    async def get_group_search_tools(self, group_id: str) -> dict[str, Any] | None:
+        """``{id, search_tools, search_tools_version}`` for one room, or
+        ``None`` — the cheap read a starting seat turn freezes its snapshot
+        from (no member rows)."""
+        if not group_id:
+            return None
+        async with self.async_session_maker() as session:
+            row = (await session.execute(
+                select(
+                    GroupChatModel.id,
+                    GroupChatModel.search_tools,
+                    GroupChatModel.search_tools_version,
+                ).where(GroupChatModel.id == group_id)
+            )).first()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "search_tools": _search_policy().read_stored(row.search_tools),
+                "search_tools_version": int(row.search_tools_version or 0),
+            }
+
+    async def set_group_search_tools(
+        self, group_id: str, *, expected_version: int, selection: list[str] | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Compare-and-set the room's selection.
+
+        ``(status, group)`` where ``status`` is ``"ok"`` (saved, version + 1),
+        ``"noop"`` (normalized selection already stored; version unchanged),
+        ``"conflict"`` (``expected_version`` is stale or a concurrent save won;
+        checked first) or ``"missing"`` (``group`` is ``None``). ``group`` is
+        the full group dict (members included — the caller aggregates their
+        availability). An invalid ``selection`` raises
+        :class:`app.agent.search_tools.SelectionError` before anything is read.
+        """
+        policy = _search_policy()
+        wanted = policy.normalize_selection(selection)
+        expected = int(expected_version)
+        # Checks in their own read; the write transaction starts with the
+        # conditional UPDATE (see ConversationStorage.set_search_tools for
+        # why a read-then-write transaction is wrong on SQLite).
+        current = await self.get_group(group_id)
+        if current is None:
+            return "missing", None
+        if expected != current["search_tools_version"]:
+            return "conflict", current
+        if wanted == current["search_tools"]:
+            return "noop", current
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                update(GroupChatModel)
+                .where(
+                    GroupChatModel.id == group_id,
+                    GroupChatModel.search_tools_version == expected,
+                )
+                .values(search_tools=wanted, search_tools_version=expected + 1)
+                .execution_options(synchronize_session=False)
+            )
+            won = (result.rowcount or 0) == 1
+        after = await self.get_group(group_id)
+        if after is None:
+            return "missing", None
+        return ("ok" if won else "conflict"), after
 
     async def touch_group(self, group_id: str) -> None:
         """Bump ``updated_at`` so the group list sorts by recent activity."""
@@ -541,6 +621,8 @@ class GroupChatStorage:
             "created_by": row.created_by,
             "members": [m.profile for m in members],
             "member_rows": [self._member_to_dict(m) for m in members],
+            "search_tools": _search_policy().read_stored(getattr(row, "search_tools", None)),
+            "search_tools_version": int(getattr(row, "search_tools_version", 0) or 0),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }

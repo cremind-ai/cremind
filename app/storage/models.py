@@ -10,7 +10,9 @@ Tables
 - channels            : per-profile messaging channels; one ``main`` row per
                         profile is auto-created. UNIQUE(profile, channel_type).
                         (FK profile, CASCADE)
-- conversations       : chat threads (FK profile CASCADE, FK channel CASCADE)
+- conversations       : chat threads (FK profile CASCADE, FK channel CASCADE);
+                        carries the conversation's search-tool selection, its
+                        CAS version and the last request's cache baseline
 - messages            : per-conversation messages (FK conversation, CASCADE)
 - channel_senders     : external sender state per channel — auth + per-sender
                         conversation pointer (FK channel CASCADE,
@@ -26,7 +28,8 @@ Tables
 - user_config         : per-profile general application settings (FK profile, CASCADE)
 - group_chats         : a room several profiles' agents share. SYSTEM-WIDE by
                         design (a shared resource), with per-profile membership
-                        below (FK created_by SET NULL)
+                        below (FK created_by SET NULL); carries the room's
+                        shared search-tool selection + CAS version
 - group_chat_members  : which profiles sit in a group + the hidden per-profile
                         "shadow" conversation that is that agent's seat
                         (FK group CASCADE, FK profile CASCADE)
@@ -169,6 +172,31 @@ class ConversationModel(Base):
     )
     compaction_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     compaction_last_compacted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Which of the four search sources this conversation lets the agent use
+    # (see :mod:`app.agent.search_tools`). ``NULL`` = the default, every
+    # source; ``[]`` = none; a list = those ids, in priority order. "All four"
+    # is stored as ``NULL`` too, so Reset and Select-all compare equal.
+    # ``none_as_null``: a Python ``None`` is SQL ``NULL``, not the JSON text
+    # ``'null'`` (SQLAlchemy's default for an explicit ``None``), so "the
+    # default" is one value in SQL too. Python-side only — the DDL is JSON.
+    search_tools: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    # Compare-and-set counter for ``search_tools``: an edit names the version
+    # it read and loses (409) when another tab saved first. A no-op keeps it.
+    # ``server_default`` is the STRING "0" on purpose — an expression default
+    # would make Alembic rebuild ``conversations`` on SQLite, and that rebuild
+    # cascade-deletes every message.
+    search_tools_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # What the last main-model request actually sent for search (effective
+    # ids + a fingerprint of their schemas and guidance, and the selection
+    # version it ran on), recorded at the request itself. Drives the
+    # prompt-cache warning and "saved for the next response". Kept out of
+    # the generic conversation dict — read it with
+    # ``ConversationStorage.get_search_tools_row``.
+    search_cache_baseline: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -789,6 +817,14 @@ class GroupChatModel(Base):
     settings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(
         String(128), ForeignKey("profiles.name", ondelete="SET NULL"), nullable=True
+    )
+    # The room's search-source selection, shared by every seat (same shape and
+    # CAS rules as ``conversations.search_tools``). Each seat keeps its own
+    # cache baseline on its seat conversation row, because each member agent
+    # sends its own request. ``none_as_null`` as on the conversation column.
+    search_tools: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    search_tools_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)

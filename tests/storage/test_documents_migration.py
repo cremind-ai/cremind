@@ -1,17 +1,22 @@
 """Migration 20260925_userdocs on a real pre-feature install, plus its storage.
 
-Three purely additive tables. What is worth pinning:
+The revision is historical: it creates ``userdoc_sources`` /
+``userdoc_captions`` / ``userdoc_vision_usage``, and a later revision
+(``20260928b_document_tables``) renames them to ``document_*``. So the
+revision itself is checked at its own head, against the names it really
+creates, and everything else runs on the same old install carried on to head —
+the path a real install takes. What is worth pinning:
 
-- ``UNIQUE(profile, kind)`` on ``document_sources`` — it is what makes "turn it
+- ``UNIQUE(profile, kind)`` on the sources table — it is what makes "turn it
   on" an idempotent upsert, and what lets two concurrent enables settle on one
-  row instead of two;
+  row instead of two — both as created and after the rename's rebuild;
 - every table cascades with its profile, so deleting a profile leaves no
   settings, cached captions or quota counters behind;
 - the daily vision cap is enforced by the database, not by a read-then-write,
   so the last slot of the day cannot be taken twice.
 
-PostgreSQL takes the same DDL but is not exercised here; per CLAUDE.md that
-branch is verified manually against a real PG instance.
+PostgreSQL takes the same DDL; the rename is exercised on PostgreSQL by
+``test_search_tool_ids_migration_pg.py`` when a throwaway database is set up.
 """
 
 from __future__ import annotations
@@ -29,8 +34,9 @@ from app.databases.sqlite import SqliteDatabaseProvider  # noqa: E402
 from app.storage.documents_storage import DocumentsStorage  # noqa: E402
 
 _PRIOR_HEAD = "20260829_channel_groups"
-_NEW_HEAD = "20260925_userdocs"
-_NEW_TABLES = ("document_sources", "document_captions", "document_vision_usage")
+_REVISION = "20260925_userdocs"
+_HISTORICAL_TABLES = ("userdoc_sources", "userdoc_captions", "userdoc_vision_usage")
+_TABLES = ("document_sources", "document_captions", "document_vision_usage")
 
 
 def _build_old_db(provider: SqliteDatabaseProvider) -> None:
@@ -40,6 +46,13 @@ def _build_old_db(provider: SqliteDatabaseProvider) -> None:
             "CREATE TABLE profiles (id VARCHAR(128), name VARCHAR(128) PRIMARY KEY, "
             "created_at FLOAT, updated_at FLOAT)"
         ))
+        # Every real install has one, and the later revisions on the way to
+        # head add tables that reference it: with foreign keys on, SQLite
+        # refuses to delete a profile while an FK names a missing table.
+        c.execute(text(
+            "CREATE TABLE conversations (id VARCHAR(128) PRIMARY KEY, profile VARCHAR(128) "
+            "REFERENCES profiles(name) ON DELETE CASCADE, created_at FLOAT, updated_at FLOAT)"
+        ))
         c.execute(text(
             "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
         ))
@@ -48,7 +61,7 @@ def _build_old_db(provider: SqliteDatabaseProvider) -> None:
         c.execute(text("INSERT INTO profiles VALUES ('p2','bob',0,0)"))
 
 
-def _upgraded(tmp_path: Path, monkeypatch) -> SqliteDatabaseProvider:
+def _upgraded(tmp_path: Path, monkeypatch, target: str = "head") -> SqliteDatabaseProvider:
     provider = SqliteDatabaseProvider(str(tmp_path / "old.db"))
 
     import app.databases as dbs
@@ -57,29 +70,48 @@ def _upgraded(tmp_path: Path, monkeypatch) -> SqliteDatabaseProvider:
     monkeypatch.setattr(mig, "get_database_provider", lambda *a, **k: provider)
 
     _build_old_db(provider)
-    mig.upgrade(_NEW_HEAD)
-    mig.upgrade(_NEW_HEAD)  # idempotent re-run: the guards must swallow this
+    mig.upgrade(target)
+    mig.upgrade(target)  # idempotent re-run: the guards must swallow this
     return provider
 
 
 def test_documents_migration_sqlite(tmp_path: Path, monkeypatch) -> None:
-    provider = _upgraded(tmp_path, monkeypatch)
+    import app.storage.migrations as mig
+
+    provider = _upgraded(tmp_path, monkeypatch, _REVISION)
     with provider.sync_engine().connect() as c:
         insp = inspect(c)
-        assert set(_NEW_TABLES) <= set(insp.get_table_names())
+        assert set(_HISTORICAL_TABLES) <= set(insp.get_table_names())
+        assert "ix_userdoc_sources_profile" in {
+            i["name"] for i in insp.get_indexes("userdoc_sources")
+        }
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == _REVISION
+
+    # The same install carried on to head: renamed, with the ORM's names.
+    mig.upgrade("head")
+    with provider.sync_engine().connect() as c:
+        insp = inspect(c)
+        names = set(insp.get_table_names())
+        assert set(_TABLES) <= names and not (set(_HISTORICAL_TABLES) & names)
         assert "ix_document_sources_profile" in {
             i["name"] for i in insp.get_indexes("document_sources")
         }
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == _NEW_HEAD
+        assert {u["name"] for u in insp.get_unique_constraints("document_sources")} == {
+            "uq_document_sources_profile_kind"
+        }
 
 
-def test_one_source_row_per_profile_and_kind(tmp_path: Path, monkeypatch) -> None:
-    provider = _upgraded(tmp_path, monkeypatch)
+@pytest.mark.parametrize("target,table", [
+    (_REVISION, "userdoc_sources"),
+    ("head", "document_sources"),
+])
+def test_one_source_row_per_profile_and_kind(tmp_path: Path, monkeypatch, target, table) -> None:
+    provider = _upgraded(tmp_path, monkeypatch, target)
     with pytest.raises(IntegrityError):
         with provider.sync_engine().begin() as c:
             for i in (1, 2):
                 c.execute(text(
-                    "INSERT INTO document_sources (id,profile,kind,created_at,updated_at) "
+                    f"INSERT INTO {table} (id,profile,kind,created_at,updated_at) "
                     f"VALUES ('s{i}','alice','local',0,0)"
                 ))
 
@@ -133,6 +165,6 @@ def test_deleting_a_profile_cascades(tmp_path: Path, monkeypatch) -> None:
         c.execute(text("PRAGMA foreign_keys=ON"))
         c.execute(text("DELETE FROM profiles WHERE name='alice'"))
     with provider.sync_engine().connect() as c:
-        for table in _NEW_TABLES:
+        for table in _TABLES:
             n = c.execute(text(f"SELECT COUNT(*) FROM {table} WHERE profile='alice'")).scalar()
             assert n == 0, f"{table} kept rows of a deleted profile"
