@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElPopover, ElNotification } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
@@ -268,15 +268,23 @@ const closeMenu = () => {
 };
 
 // ── caret coordinates (mirror trick) ──
+// Everything that shapes, wraps or narrows the text, so the mirror lays the
+// value out exactly like the textarea (and the highlight layer) does —
+// including the reserved scrollbar gutter.
 const MIRROR_PROPS = [
   'boxSizing', 'width', 'height', 'overflowX', 'overflowY',
+  'scrollbarGutter', 'scrollbarWidth',
   'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
   'borderStyle',
   'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
   'fontStyle', 'fontVariant', 'fontWeight', 'fontStretch', 'fontSize',
   'fontSizeAdjust', 'lineHeight', 'fontFamily',
+  'fontKerning', 'fontFeatureSettings', 'fontVariationSettings', 'fontSynthesis',
+  'textRendering',
   'textAlign', 'textTransform', 'textIndent', 'textDecoration',
   'letterSpacing', 'wordSpacing', 'tabSize',
+  'whiteSpace', 'overflowWrap', 'wordBreak', 'lineBreak', 'hyphens',
+  'direction', 'writingMode',
 ] as const;
 
 const computeCaretCoords = (
@@ -288,8 +296,6 @@ const computeCaretCoords = (
 
   style.position = 'absolute';
   style.visibility = 'hidden';
-  style.whiteSpace = 'pre-wrap';
-  style.wordWrap = 'break-word';
   style.top = '0';
   style.left = '-9999px';
   for (const prop of MIRROR_PROPS) {
@@ -320,8 +326,13 @@ const updateMenuPosition = () => {
 const adjustHeight = () => {
   const ta = taRef.value;
   if (!ta) return;
+  // The textarea is border-box, but scrollHeight stops at the padding: add the
+  // borders back, or the text ends up 2px taller than the box and scrolls.
+  const style = window.getComputedStyle(ta);
+  const borders = (parseFloat(style.borderTopWidth) || 0)
+    + (parseFloat(style.borderBottomWidth) || 0);
   ta.style.height = 'auto';
-  const next = Math.max(MIN_HEIGHT_PX, Math.min(ta.scrollHeight, MAX_HEIGHT_PX));
+  const next = Math.max(MIN_HEIGHT_PX, Math.min(ta.scrollHeight + borders, MAX_HEIGHT_PX));
   ta.style.height = `${next}px`;
 };
 
@@ -333,15 +344,44 @@ const syncScroll = () => {
   layer.scrollLeft = ta.scrollLeft;
 };
 
+// Height, then the layer's scroll (a new height can clamp the textarea's), then
+// an open menu, which is placed from both.
+const refreshLayout = () => {
+  adjustHeight();
+  syncScroll();
+  if (menuVisible.value) updateMenuPosition();
+};
+
 watch(inputText, () => {
-  nextTick(() => {
-    adjustHeight();
-    syncScroll();
-  });
+  nextTick(refreshLayout);
+});
+
+// A width change rewraps the text, so the height, scroll and menu position all
+// go stale. Height-only changes are our own autosize and are ignored. The
+// refresh waits a frame: resizing an observed element from inside the
+// observer's callback would trip the ResizeObserver loop error.
+let resizeObserver: ResizeObserver | null = null;
+let observedWidth = -1;
+let resizeFrame = 0;
+
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  resizeObserver = null;
+  cancelAnimationFrame(resizeFrame);
 });
 
 onMounted(async () => {
   adjustHeight();
+  if (taRef.value) {
+    resizeObserver = new ResizeObserver((entries) => {
+      const width = entries[entries.length - 1].contentRect.width;
+      if (width === observedWidth) return;
+      observedWidth = width;
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(refreshLayout);
+    });
+    resizeObserver.observe(taRef.value);
+  }
   // Pre-fetch so the highlight layer can start marking unknown tokens
   // immediately. Failures are silent; tokens stay flagged as "known"
   // (no warning style) until a successful fetch.
@@ -438,8 +478,8 @@ const handleInput = () => {
       }
     }
   }
-
-  if (triggerKind.value !== null) updateMenuPosition();
+  // An open menu follows the caret from refreshLayout, once the new text has
+  // been laid out and the height settled.
 };
 
 // ── click-to-edit on existing tokens ──
@@ -755,13 +795,21 @@ const selectMode = (mode: ChatMode) => {
 }
 
 /* Shared text-shape rules — every property that affects glyph positioning
-   must match between layer and textarea. */
+   must match between layer and textarea. The textarea's UA stylesheet resets
+   the font longhands (kerning, ligatures, weight…), text-rendering and the
+   text-* properties, while the layer inherits the page's (`optimizeLegibility`
+   on :root), so each is set here for both rather than left to defaults. */
 .hl-layer,
 .composer-input {
   box-sizing: border-box;
-  font-family: inherit;
+  margin: 0;
+  font: inherit;
   font-size: 0.95em;
   line-height: 1.6;
+  text-rendering: inherit;
+  text-transform: none;
+  text-indent: 0;
+  text-align: start;
   /* The buttons sit in the toolbar row below, not over the text, so no right
      gutter. Layer + textarea share this rule so the caret never drifts. */
   padding: 10px 14px;
@@ -770,9 +818,14 @@ const selectMode = (mode: ChatMode) => {
   white-space: pre-wrap;
   word-wrap: break-word;
   overflow-wrap: break-word;
+  word-break: normal;
   letter-spacing: normal;
   word-spacing: normal;
   tab-size: 4;
+  /* Reserve the scrollbar's width whether or not the text overflows: the
+     textarea's scrollbar would otherwise appear only once it scrolls, narrow
+     its text 8px and rewrap it differently from the (never-scrolling) layer. */
+  scrollbar-gutter: stable;
 }
 
 .hl-layer {
@@ -792,6 +845,7 @@ const selectMode = (mode: ChatMode) => {
   width: 100%;
   min-height: 80px;
   max-height: 192px;
+  overflow-y: auto;
   background: transparent;
   color: transparent;
   caret-color: var(--text-primary);
