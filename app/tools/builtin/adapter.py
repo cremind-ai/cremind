@@ -17,6 +17,7 @@ import json
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from a2a.types import (
@@ -126,6 +127,23 @@ def resolve_sandbox_recovery_dir(
     if is_foreign(recovery_real, profile) or is_foreign(target, profile):
         return None
     return recovery_real
+
+
+@dataclass(frozen=True)
+class InternalToolEvidence:
+    """A built-in tool's typed facts about its own result
+    (``BuiltInToolResult.evidence``), yielded by :meth:`BuiltInToolAdapter.request`
+    beside the A2A events.
+
+    Deliberately not an A2A event: it never becomes a part, an artifact or
+    text, so neither the model nor a client sees it and nothing can forge it
+    by writing text. ``BuiltInToolGroup`` takes it out of the stream and puts
+    it on the ``ToolResultEvent``; any other consumer of the stream ignores it
+    (``parse_agent_events`` reads A2A events only).
+    """
+
+    tool_name: str
+    evidence: Any
 
 
 class BuiltInToolAdapter:
@@ -327,6 +345,18 @@ class BuiltInToolAdapter:
             total_cache_creation_input_tokens += tu.get("cache_creation_input_tokens", 0) or 0
             total_output_tokens += tu.get("output_tokens", 0) or 0
 
+        # Typed facts the tools reported about their results, by tool name —
+        # the last run of a tool wins, like its result (a retried call replaces
+        # the first attempt's). Handed on after the results, never as a part.
+        evidence_by_tool: Dict[str, Any] = {}
+
+        def _note_evidence(name: str, result: Any) -> None:
+            evidence = getattr(result, "evidence", None)
+            if evidence is not None:
+                evidence_by_tool[name] = evidence
+            else:
+                evidence_by_tool.pop(name, None)
+
         # Execute tool calls if any
         tool_results: Dict[str, Any] = {}
         if function_calls:
@@ -469,6 +499,7 @@ class BuiltInToolAdapter:
                                     f"Sandbox auto-recovery failed for '{tool_name}'"
                                 )
                     _fold_result_usage(result)
+                    _note_evidence(tool_name, result)
                     tool_results[tool_name] = result_data
                     logger.info(f"Built-in tool '{tool_name}' result received")
                 except asyncio.TimeoutError:
@@ -499,6 +530,7 @@ class BuiltInToolAdapter:
                                     result = await tool.run(tool_args)
                                 result_data = self._extract_tool_result(result)
                                 _fold_result_usage(result)
+                                _note_evidence(tool_name, result)
                                 tool_results[tool_name] = result_data
                                 logger.info(f"Built-in tool '{tool_name}' succeeded after token refresh")
                                 continue
@@ -575,6 +607,9 @@ class BuiltInToolAdapter:
                         parts=artifact_parts,
                     ),
                 )
+
+        for tool_name, evidence in evidence_by_tool.items():
+            yield InternalToolEvidence(tool_name=tool_name, evidence=evidence)
 
         # If we have text content from LLM, yield it as artifact
         if content_parts:

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.documents import types as t
-from app.documents.cite import mentions_citation, parse_tokens
+from app.documents.cite import escape_in_document_text, mentions_citation, parse_tokens
 from app.documents.query.terms import analyze, matches_text
 from app.documents.textnorm import fold, normalize_for_match
 
@@ -73,6 +73,9 @@ class ReadOutcome:
     stale: bool = False
     notes: list[str] = field(default_factory=list)
     focus_id: int | None = None          # the chunk a token or ``around`` pointed at
+    # A passage token the file no longer has (it was edited): the read falls
+    # back to the whole file, and the focus it asked for stays unresolved.
+    focus_unresolved: str | None = None
     page: int = 1
     tz_name: str = ""
     tz: Any = None
@@ -345,9 +348,7 @@ def _select(body: list[dict[str, Any]], toc: list[TocEntry], *, pages, lines, se
             exact = [c for c in chosen if any(fold(h) == want for h in _heading_path(c))]
             picked = exact or [c for c in chosen if any(want in fold(h) for h in _heading_path(c))]
         if not picked:
-            labels = [e.arg.get("section") for e in toc if e.arg.get("section")]
-            raise ReadError("SectionNotFound", f"No part of this file matches section={section!r}.",
-                            _closest(section, [x for x in labels if x]))
+            raise _section_not_found(section, body, toc)
         chosen = picked
         desc.append(f"section={section}")
     if sheet:
@@ -405,6 +406,116 @@ def _closest(want: str, options: list[str], n: int = 8) -> list[str]:
     return [folded[h] for h in hits] or options[:n]
 
 
+# ── when a section is not found ────────────────────────────────────────────
+
+_WORD_RE = re.compile(r"[^\W_]+")
+_SECTION_CANDIDATES = 8
+# A heading must beat this to be suggested; below it the table of contents'
+# closest labels are offered instead.
+_MIN_SECTION_SCORE = 0.25
+
+
+def _words(text: str) -> list[str]:
+    return _WORD_RE.findall(fold(text or ""))
+
+
+def _contains_run(seq: list[str], run: list[str]) -> bool:
+    """Whether ``run`` occurs in ``seq`` as consecutive words."""
+    n = len(run)
+    return bool(n) and any(seq[i:i + n] == run for i in range(len(seq) - n + 1))
+
+
+def _headings_of(body: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every heading the file's passages sit under — any level, not just the
+    table of contents' — once each, in reading order, with the pages it spans
+    and the first words written under it (where a PDF keeps a heading's
+    subtitle: "PHẦN 9" is followed by "MULTI-AGENT - XÂY DỰNG ĐỘI AI")."""
+    seen: dict[str, dict[str, Any]] = {}
+    for c in body:
+        span = _span(c.get("locator") or {}, "page", "page_end")
+        for h in _heading_path(c):
+            key = fold(h).strip()
+            if not key:
+                continue
+            entry = seen.get(key)
+            if entry is None:
+                entry = seen[key] = {"heading": h, "lo": None, "hi": None, "lead": _first_words([c], 12)}
+            if span:
+                entry["lo"] = span[0] if entry["lo"] is None else min(entry["lo"], span[0])
+                entry["hi"] = span[1] if entry["hi"] is None else max(entry["hi"], span[1])
+    return list(seen.values())
+
+
+def _section_score(want: list[str], entry: dict[str, Any]) -> float:
+    """How likely ``entry`` is the section a request for ``want`` meant.
+
+    A request often names a section the way a table of contents printed it —
+    "Phần 9: Multi-Agent - Xây Dựng Đội AI" — while the index holds the
+    heading "PHẦN 9" with the rest as the text below it. So the heading
+    written inside the request counts most, then the words the request shares
+    with the heading and its first lines; a number that differs ("Phần 9" vs
+    "PHẦN 1") counts against."""
+    head = _words(entry["heading"])
+    wanted = set(want)
+    if not head or not wanted:
+        return 0.0
+    score = 0.0
+    if _contains_run(want, head):
+        score += 1.0 + 2.0 * len(head) / len(want)
+    if _contains_run(head, want):
+        score += 1.5
+    score += len(wanted & (set(head) | set(_words(entry["lead"])))) / len(wanted)
+    numbers, head_numbers = {w for w in wanted if w.isdigit()}, {w for w in head if w.isdigit()}
+    if numbers and head_numbers:
+        score += 0.5 if numbers & head_numbers else -1.5
+    return score
+
+
+def _pages_label(entry: dict[str, Any]) -> str:
+    lo, hi = entry.get("lo"), entry.get("hi")
+    if lo is None:
+        return ""
+    return f"p. {lo}" if hi in (None, lo) else f"p. {lo}–{hi}"
+
+
+def _section_not_found(section: str, body: list[dict[str, Any]], toc: list[TocEntry]) -> ReadError:
+    """``SectionNotFound`` with suggestions that work: the headings the file
+    really has that come closest to what was asked (each one a value
+    ``section`` accepts), and the other ways in — a passage token or pages.
+    Never a silent substitute: which section was meant is the caller's call."""
+    want = _words(section)
+    scored = []
+    for i, entry in enumerate(_headings_of(body)):
+        score = _section_score(want, entry)
+        if score >= _MIN_SECTION_SCORE:
+            scored.append((score, i, entry))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    best = [e for _, _, e in scored[:_SECTION_CANDIDATES]]
+    if best:
+        candidates = [e["heading"] for e in best]
+        where = _pages_label(best[0])
+        first = f" (the first is on {where})" if where else ""
+        pages = ""
+        if best[0].get("lo") is not None:
+            lo, hi = best[0]["lo"], best[0]["hi"]
+            pages = f', or choose pages (e.g. pages="{lo}-{hi}")' if hi not in (None, lo) else \
+                f', or choose pages (e.g. pages="{lo}")'
+        else:
+            pages = ", or choose pages or lines"
+    else:
+        labels = [e.arg.get("section") for e in toc if e.arg.get("section")]
+        candidates = _closest(section, [x for x in labels if x])
+        first, pages = "", ", or choose pages or lines"
+    message = (
+        f"No part of this file matches section={section!r}. The candidates are the closest headings this "
+        f"file has{first}: pass one of them exactly as section. Or read a passage you saw in a search "
+        f"result by passing its [doc:…#…] token as file{pages}."
+    )
+    # Headings are the document's own words and travel outside its data
+    # block here: a heading must not be able to plant a citation.
+    return ReadError("SectionNotFound", message, [escape_in_document_text(c) for c in candidates])
+
+
 def _rank_toc(toc: list[TocEntry], query: str | None) -> list[TocEntry]:
     if not query:
         return []
@@ -453,6 +564,7 @@ def read(
     notes: list[str] = []
     selection: str | None = None
     focus: int | None = None
+    unresolved: str | None = None
     selected = body
     asked = any(v not in (None, "") for v in (pages, lines, section, sheet, rows, slide, around))
     if asked:
@@ -464,7 +576,10 @@ def read(
     elif c8:
         idx = next((i for i, c in enumerate(body) if (c.get("text_hash") or "").startswith(c8)), None)
         if idx is None:
-            notes.append(f"The passage [doc:{row['cite_id']}#{c8}] is no longer in this file (it was edited); "
+            # Still useful to show the file, but the passage asked for is not
+            # in what follows — the result must not pass for having read it.
+            unresolved = f"[doc:{row['cite_id']}#{c8}]"
+            notes.append(f"The passage {unresolved} is no longer in this file (it was edited); "
                          "showing the file instead.")
         else:
             focus = int(body[idx]["id"])
@@ -482,6 +597,7 @@ def read(
     return ReadOutcome(
         file=row, card=card, body=body, selected=selected, selection=selection, toc=toc,
         ranked=_rank_toc(toc, query), query=query, stale=stale, notes=notes, focus_id=focus,
+        focus_unresolved=unresolved,
         page=max(1, int(page or 1)), tz_name=getattr(engine, "tz_name", ""), tz=getattr(engine, "tz", None),
     )
 

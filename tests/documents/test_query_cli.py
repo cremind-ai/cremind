@@ -83,6 +83,21 @@ def test_json_prints_the_structured_result(monkeypatch):
     assert json.loads(result.stdout)["mode"] == "lexical_only"
 
 
+def test_json_carries_the_delivery_object(monkeypatch):
+    """`--json` prints the server's result as is, the additive ``delivery``
+    object included: which passage tokens the text shows, whole or in part."""
+    delivery = {"v": 1, "rendered_tokens": 812, "truncated": True, "continuation": {"page": 2},
+                "passages": [{"token": "[doc:k7m2xq9a#3f9c2e1b]", "role": "body", "complete": False}],
+                "focus": {"token": "[doc:k7m2xq9a#3f9c2e1b]", "status": "partial"}}
+    _patch_query(monkeypatch, answer={"text": "t", "shape": "focus", "delivery": delivery})
+    result = _run("--json", "docs", "read", "[doc:k7m2xq9a#3f9c2e1b]")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["delivery"] == delivery
+    # Without --json the text alone is printed, as before.
+    result = _run("docs", "read", "[doc:k7m2xq9a#3f9c2e1b]")
+    assert result.stdout.strip() == "t"
+
+
 def test_errors_print_the_message_and_candidates(monkeypatch):
     _patch_query(monkeypatch, error={"error": "NotFound", "message": "No indexed file matches 'x'.",
                                      "candidates": ["[doc:k7m2xq9a] Reports/x.md"]})

@@ -372,17 +372,32 @@ class LeafResult:
     error: dict[str, Any] | None = None
     # unavailable | invalid | not_found | busy — lets the API choose a status code.
     error_kind: str | None = None
+    # What the text delivered (search and read): see app.documents.delivery.
+    evidence: Any = None
 
 
-def render_context(profile: Optional[str], *, budgeted: bool = True):
+# The smallest budget a caller may ask a result to fit (below the profile's
+# own): a smaller one would leave room for a header and nothing else.
+MIN_RENDER_TOKENS = 200
+
+
+def render_context(profile: Optional[str], *, budgeted: bool = True, max_tokens: Optional[int] = None):
     """How results are sized and wrapped. ``budgeted`` sizes them to the
     profile's ``tool_result.max_tokens`` exactly as cremind_documentation_search
     does (synchronous: it reads the profile's config); the CLI asks for the
-    whole result instead."""
+    whole result instead.
+
+    ``max_tokens`` asks for a smaller result still — the agent's automatic
+    source review divides its allowance between several reads this way. It
+    can only shrink a result: the profile's budget, when there is one, stays
+    the ceiling."""
     from app.tools.builtin.cremind_documentation_search import _cut_tokens, _delivery_budget, _fit_lines, _tokens
     from app.documents.query.render import RenderContext
 
     limit = _delivery_budget(profile or "admin", "") if budgeted else None
+    if max_tokens is not None:
+        wanted = max(MIN_RENDER_TOKENS, int(max_tokens))
+        limit = wanted if limit is None else min(limit, wanted)
     return RenderContext(limit=limit, tokens=_tokens, fit_lines=_fit_lines, cut_tokens=_cut_tokens,
                          wrap=wrap_document_content)
 
@@ -410,6 +425,7 @@ async def execute(
     variables: Optional[Dict[str, Any]] = None,
     budgeted: bool = True,
     context_id: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ) -> LeafResult:
     """Run one leaf for ``profile``. Every blocking step (index reads, the
     query embedding, rendering) runs in a worker thread. "Not available",
@@ -420,7 +436,10 @@ async def execute(
     ``research`` and ``read`` of a ``research:<id>`` dossier are answered
     by the job layer before the index is opened: a job's state is in the
     main database, and cancelling a job must work even while the index is
-    not. ``context_id`` ties a new job to its conversation."""
+    not. ``context_id`` ties a new job to its conversation. ``max_tokens``
+    fits a find/search/read result into a smaller budget than the profile's
+    (see :func:`render_context`)."""
+    from app.documents.delivery import error_evidence
     from app.documents.query import FilterError, ReadError, open_engine
     from app.documents.query import render as R
 
@@ -430,18 +449,22 @@ async def execute(
     if leaf == LEAF_READ and str(args.get("file") or "").strip().lower().startswith(RESEARCH_REF_PREFIX):
         return await _research_page(profile, args, budgeted=budgeted)
 
+    def ctx() -> Any:
+        return render_context(profile, budgeted=budgeted, max_tokens=max_tokens)
+
     access = await asyncio.to_thread(open_engine, profile)
     if access.engine is None:
         return LeafResult(
             text=R.render_status(access.message or "not available", code=access.code),
             error={"error": "DocumentsUnavailable", "status": access.code, "message": access.message},
-            error_kind="unavailable",
+            error_kind="unavailable", evidence=error_evidence(leaf, "DocumentsUnavailable"),
         )
     engine = access.engine
     variables = variables or {}
     try:
         if leaf == LEAF_SEARCH:
-            return await _search(engine, profile, args, llm=llm, variables=variables, budgeted=budgeted)
+            return await _search(engine, profile, args, llm=llm, variables=variables, budgeted=budgeted,
+                                 max_tokens=max_tokens)
         if leaf == LEAF_FIND:
             outcome = await asyncio.to_thread(
                 engine.find, _str(args.get("query")),
@@ -449,8 +472,7 @@ async def execute(
                 sort=_str(args.get("sort")), limit=_int(args.get("limit"), 20, 1, 100),
                 aggregate=_str(args.get("aggregate")), page=_int(args.get("page"), 1, 1, 10_000),
             )
-            rendered = await asyncio.to_thread(
-                lambda: R.render_find(outcome, render_context(profile, budgeted=budgeted)))
+            rendered = await asyncio.to_thread(lambda: R.render_find(outcome, ctx()))
         elif leaf == LEAF_READ:
             outcome = await asyncio.to_thread(
                 engine.read, str(args.get("file") or ""),
@@ -459,22 +481,23 @@ async def execute(
                 around=_str(args.get("around")), query=_str(args.get("query")),
                 page=_int(args.get("page"), 1, 1, 10_000),
             )
-            rendered = await asyncio.to_thread(
-                lambda: R.render_read(outcome, render_context(profile, budgeted=budgeted)))
+            rendered = await asyncio.to_thread(lambda: R.render_read(outcome, ctx()))
         else:
             return LeafResult(error={"error": "UnknownLeaf", "message": f"unknown leaf {leaf!r}"},
                               error_kind="invalid")
     except FilterError as exc:
-        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid")
+        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid",
+                          evidence=error_evidence(leaf, "InvalidFilter"))
     except ReadError as exc:
         kind = "not_found" if exc.code in ("NotFound", "IsAFolder") else "invalid"
         return LeafResult(error={"error": exc.code, "message": exc.message, "candidates": exc.candidates},
-                          error_kind=kind)
-    return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files)
+                          error_kind=kind, evidence=error_evidence(leaf, exc.code))
+    return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files,
+                      evidence=rendered.evidence)
 
 
 async def _search(engine: Any, profile: str, args: Dict[str, Any], *, llm: Any, variables: Dict[str, Any],
-                  budgeted: bool) -> LeafResult:
+                  budgeted: bool, max_tokens: Optional[int] = None) -> LeafResult:
     from app.documents.query import render as R
     from app.documents.query.rerank import RERANK_TOP, add_usage, query_variants, rerank
 
@@ -523,9 +546,10 @@ async def _search(engine: Any, profile: str, args: Dict[str, Any], *, llm: Any, 
         notes.append(f"thorough: {'reranked the best ' + str(len(ranked)) if order else 'rerank unavailable'}"
                      + (f"; also searched: {', '.join(variants)}" if variants else ""))
     outcome.notes = notes + outcome.notes
-    rendered = await asyncio.to_thread(lambda: R.render_search(outcome, render_context(profile, budgeted=budgeted)))
+    rendered = await asyncio.to_thread(
+        lambda: R.render_search(outcome, render_context(profile, budgeted=budgeted, max_tokens=max_tokens)))
     return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files,
-                      token_usage=usage or None)
+                      token_usage=usage or None, evidence=rendered.evidence)
 
 
 # ── research ───────────────────────────────────────────────────────────────
@@ -700,29 +724,56 @@ async def _render_research(profile: str, view: Any, *, page: int, budgeted: bool
                       token_usage=None)
 
 
+def _budget_arg(value: Any) -> Optional[int]:
+    """The caller's smaller budget (``BUDGET_ARG``), or None. It can only
+    shrink a result (see :func:`render_context`), so a model that happens to
+    send it gains nothing."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+# Internal argument: fit this call's result into fewer tokens than the
+# profile's budget. Underscore arguments never reach the leaves; the agent's
+# automatic source review sets this one.
+BUDGET_ARG = "_budget_tokens"
+
+
 async def _tool_result(leaf: str, arguments: Dict[str, Any]) -> BuiltInToolResult:
+    """Run a leaf for the agent. Every answer — an error too — carries the
+    leaf's delivery record (``evidence``) for the agent's own bookkeeping;
+    it never reaches the model."""
+    from app.documents.delivery import error_evidence
+
     profile = arguments.get("_profile") or "admin"
     context_id = arguments.get("_context_id")
     args = {k: v for k, v in arguments.items() if not k.startswith("_")}
     try:
         result = await execute(leaf, profile, args, llm=arguments.get("_llm"),
-                               variables=arguments.get("_variables") or {}, context_id=context_id)
+                               variables=arguments.get("_variables") or {}, context_id=context_id,
+                               max_tokens=_budget_arg(arguments.get(BUDGET_ARG)))
     except Exception as exc:  # noqa: BLE001 — a search failure is an observation, not a crash
         logger.exception(f"[documents] {leaf} failed for {profile}")
         return BuiltInToolResult(structured_content={
-            "error": "SearchFailed", "message": f"User document {leaf} failed: {exc}"})
+            "error": "SearchFailed", "message": f"User document {leaf} failed: {exc}"},
+            evidence=error_evidence(leaf, "SearchFailed"))
     if result.error is not None:
         if result.error_kind == "unavailable":
-            return BuiltInToolResult(structured_content={**result.error, "text": result.text})
-        return BuiltInToolResult(structured_content=result.error)
+            return BuiltInToolResult(structured_content={**result.error, "text": result.text},
+                                     evidence=result.evidence)
+        return BuiltInToolResult(structured_content=result.error, evidence=result.evidence)
     if result.citations:
         await _issue(profile, context_id, result.citations)
     if result.files:
         return BuiltInToolResult(
             structured_content={"text": result.text, "_files": result.files},
-            token_usage=result.token_usage,
+            token_usage=result.token_usage, evidence=result.evidence,
         )
-    return BuiltInToolResult(content=[{"type": "text", "text": result.text}], token_usage=result.token_usage)
+    return BuiltInToolResult(content=[{"type": "text", "text": result.text}], token_usage=result.token_usage,
+                             evidence=result.evidence)
 
 
 async def _issue(profile: str, context_id: Optional[str], citations: list[Any]) -> None:

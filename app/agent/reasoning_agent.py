@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 from a2a.types import DataPart, Part, TextPart
 
+from app.agent import document_review as dr
 from app.agent import search_tools as st
 from app.agent.usage import UsageRecord
 from app.utils.formatting import dict_to_text
@@ -1149,6 +1150,16 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
     ``has_gps: true``) that exclude every file, and then to conclude the files
     are not there and fall back to web search. It names no sibling source, so
     the text is the same whichever other search tools the run exposes.
+
+    The several-sources sentence exists because a model given two relevant
+    guides will read one, answer from it, and never open the other — the
+    answer's citations all verify, so nothing downstream notices. It asks for
+    each relevant file to be weighed (read by its passage token, not by a
+    section title guessed from a table of contents), for differences to be
+    attributed and for an unreviewed source to be admitted; it names the read
+    function only when the run exposes it, and sets no citation count. The
+    agent backs it with automatic reads (``_run_document_review``); the
+    sentence is what makes the model use them.
     """
     by_id = {getattr(t, "tool_id", None): t for t in tools}
     group = by_id.get(st.DOCUMENTATION_SEARCH)
@@ -1205,6 +1216,23 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
             "For legal, financial or compliance questions, read the relevant sections in full "
             f"with {read} before answering — never conclude from snippets alone."
         )
+    if "read" in leaves:
+        read_each = (
+            f" — for an explanation, an overview or a comparison, read the matching passage of every "
+            f"relevant file (pass its [doc:…#…] passage token as file to {read}) rather than a section "
+            "title guessed from a table of contents —"
+        )
+    else:
+        read_each = ","
+    sources = (
+        "When the results come from several files, assess each relevant one before answering"
+        f"{read_each} then combine what they add, whatever language each is in, attribute any "
+        "difference between them to the file it comes from, and say so when a relevant file could "
+        "not be read; never state that a file does not cover something unless you read that part of "
+        "it. When the user limits the question to one file or folder, put that in filters "
+        "— name_query or path_glob for a file they name, file_ids for one from earlier results, "
+        "folder for a folder — and stay within it. "
+    )
     body = (
         "USER DOCUMENTS — THE USER'S OWN FILES: " + ", ".join(own) + " search and read the files "
         "the user indexed with Documentation search (their own documents, notes, reports, "
@@ -1218,7 +1246,8 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
         "anywhere else; keep the restrictions the user did ask for. "
         "Cite every claim taken from these results by copying the [doc:…] token printed next to "
         "its passage exactly, right after the claim; never invent or alter a token. Quote only "
-        "text that appears in the results, in quotation marks, followed by its token. " + research
+        "text that appears in the results, in quotation marks, followed by its token. "
+        + sources + research
     )
     return "\n" + body + "\n"
 
@@ -1617,15 +1646,21 @@ def _is_readonly_cremind_command(command: str) -> bool:
 
 
 class _LeafOutcome:
-    """Collected output of one leaf tool run (so leaves can run concurrently)."""
+    """Collected output of one leaf tool run (so leaves can run concurrently).
 
-    __slots__ = ("call_id", "status_chunks", "tool_text", "parts")
+    ``evidence`` is the delivery record of a Documentation Search result
+    (``app.documents.delivery.DocumentEvidence``), present only when the
+    trusted built-in group produced it — see ``document_review.trusted_evidence``.
+    """
 
-    def __init__(self, call_id: str, status_chunks: list, tool_text: str, parts: list):
+    __slots__ = ("call_id", "status_chunks", "tool_text", "parts", "evidence")
+
+    def __init__(self, call_id: str, status_chunks: list, tool_text: str, parts: list, evidence: Any = None):
         self.call_id = call_id
         self.status_chunks = status_chunks
         self.tool_text = tool_text
         self.parts = parts
+        self.evidence = evidence
 
 
 def _coerce_args(raw: Any) -> Dict[str, Any]:
@@ -1730,6 +1765,12 @@ class ReasoningAgent:
     # Event-task chain depth (see ``__init__``). Same class-level-default
     # rationale as above.
     _task_chain_depth: int = 0
+
+    # This turn's document evidence and automatic source review
+    # (``document_review.DocumentReview``), created fresh by ``run`` — on the
+    # run, never shared between turns, conversations or profiles. None on a
+    # skeleton agent that never ran.
+    _doc_review: Optional["dr.DocumentReview"] = None
 
     def __init__(
         self,
@@ -2903,6 +2944,9 @@ class ReasoningAgent:
         self._turn_messages = []
         self._final_answer_text = ""
         self.current_step_count = 0
+        # What this turn's document searches and reads delivered, and the
+        # automatic reads that calls for (see _run_document_review).
+        self._doc_review = dr.DocumentReview()
         # The search cache baseline is recorded once per RUN (see ``_loop``).
         self._search_baseline_recorded = False
         # A mid-turn reply already streamed to the user, waiting to be folded
@@ -3044,6 +3088,28 @@ class ReasoningAgent:
             # tools param, and dropping them would bust the tools+system cache
             # prefix) — tool_choice "none" forbids new calls instead.
             instant_final = self._mode == "instant" and self.current_step_count >= 2
+
+            # Automatic document review: the last step's searches showed
+            # relevant passages from several files, and some were not read
+            # yet — read them now, before the model answers from half the
+            # sources. Here, after the new-input check and before the request,
+            # so the model sees what was read and nothing streams first. A
+            # user message that just arrived may have changed the scope: it
+            # goes first and the pending candidates are dropped. An
+            # automation's result landing meanwhile changes nothing about the
+            # question, so the review still runs.
+            review = getattr(self, "_doc_review", None)
+            if review is not None and review.has_pending():
+                if drained:
+                    review.suppress(dr.REASON_NEW_INPUT)
+                elif self._mode == "instant":
+                    # One round of tool calls is Instant mode's contract.
+                    review.suppress(dr.REASON_INSTANT)
+                elif getattr(self, "_maintenance", False):
+                    review.suppress(dr.REASON_NOT_REVIEWED)
+                else:
+                    async for item in self._run_document_review(dispatch):
+                        yield item
 
             messages: List["ChatCompletionMessageParam"] = [
                 {"role": "system", "content": instruction},
@@ -3277,6 +3343,17 @@ class ReasoningAgent:
                     truncate=(entry[1].tool_id, entry[2]) not in self._UNCLAMPED_LEAVES,
                 )
                 yield self._result_artifact(step_no, call_id, outcome.parts)
+                if outcome.evidence is not None and self._doc_review is not None:
+                    self._doc_review.observe(outcome.evidence)
+
+            # A batch that hands the question to a research job leaves the
+            # reading to the job: no ordinary automatic review on top of it.
+            if self._doc_review is not None and any(
+                e and e[0] == "leaf" and getattr(e[1], "tool_id", None) == st.DOCUMENTATION_SEARCH
+                and e[2] == "research"
+                for (_c, _n, _a, e) in resolved
+            ):
+                self._doc_review.suppress(dr.REASON_RESEARCH)
 
             # Event run parked pending: the agent called request_user_input this
             # step (the tool recorded the question in run_state, keyed by the
@@ -3333,12 +3410,38 @@ class ReasoningAgent:
         if self.context_id:
             clear_context(self.context_id, "current_shell_directory")
         final_answer = data or self._final_answer_text
-        return {
+        chunk = {
             "type": ChatCompletionTypeEnum.DONE,
             "data": data,
             "llm_messages": self._build_llm_messages(final_answer),
             **self._token_fields(),
         }
+        review = self._document_review_summary(final_answer)
+        if review:
+            chunk["document_review"] = review
+        return chunk
+
+    def _document_review_summary(self, final_answer: str) -> Optional[Dict[str, Any]]:
+        """The turn's ``document_review`` record (see ``document_review``), or
+        None when it touched no documents. Candidates still pending here had
+        no model step left to be reviewed before (the turn parked, or hit
+        its step limit). Logged as counts with the run's identifiers —
+        never document names or text. Bookkeeping: never fails the turn."""
+        review = getattr(self, "_doc_review", None)
+        if review is None:
+            return None
+        try:
+            review.suppress(dr.REASON_NO_STEP)
+            summary = review.summary(final_answer)
+            if summary:
+                from app.utils.task_context import current_task_id_var
+
+                logger.info(dr.log_line(summary, profile=self.profile, conversation=self.context_id,
+                                        run=current_task_id_var.get()))
+            return summary
+        except Exception:  # noqa: BLE001
+            logger.exception("[document_review] could not summarise the turn")
+            return None
 
     def _build_llm_messages(self, final_answer: str) -> Optional[List[Dict[str, Any]]]:
         """Assemble the turn's canonical native message trace for replay/persistence.
@@ -3384,25 +3487,30 @@ class ReasoningAgent:
     # ── per-call dispatch ──────────────────────────────────────────────
 
     def _thinking_artifact(self, step: int, call_id: str, tool_name: str,
-                           args: Dict[str, Any], tool) -> Dict[str, Any]:
+                           args: Dict[str, Any], tool, *, origin: Optional[str] = None) -> Dict[str, Any]:
         """UI artifact announcing one tool call in a step (Thought removed).
 
         ``Token_Usage`` carries the reasoning call's four-way token split for this
         step so the Thinking Process can show per-step token detail; the reasoning
         usage is recorded on the step's DONE chunk before these artifacts are
         yielded, so it is already available here.
+
+        ``origin`` marks a call the agent made itself rather than the model
+        (``document_review.ORIGIN`` for an automatic document read): it is
+        carried as ``Origin`` so the activity trace can say so, and such a
+        call has no reasoning call of its own, so it carries no token usage.
         """
-        return {
-            "type": ChatCompletionTypeEnum.THINKING_ARTIFACT,
-            "data": {
-                "Step": step,
-                "Call_Id": call_id,
-                "Tool": tool_name,
-                "Tool_Input": json.dumps(args, ensure_ascii=False),
-                "Model_Label": self._model_label_for(tool) if tool is not None else self.llm.model_label,
-                "Token_Usage": self._reasoning_usage_for_step(step),
-            },
+        data = {
+            "Step": step,
+            "Call_Id": call_id,
+            "Tool": tool_name,
+            "Tool_Input": json.dumps(args, ensure_ascii=False),
+            "Model_Label": self._model_label_for(tool) if tool is not None else self.llm.model_label,
+            "Token_Usage": None if origin else self._reasoning_usage_for_step(step),
         }
+        if origin:
+            data["Origin"] = origin
+        return {"type": ChatCompletionTypeEnum.THINKING_ARTIFACT, "data": data}
 
     def _result_artifact(self, step: int, call_id: str, parts: List[Part]) -> Dict[str, Any]:
         return {
@@ -3485,7 +3593,8 @@ class ReasoningAgent:
             Part(root=TextPart(text=result_event.observation_text or ""))
         ]
         text = self._render_result_text(parts, result_event.observation_text or "")
-        return _LeafOutcome(call_id, status_chunks, text, parts)
+        evidence = dr.trusted_evidence(tool, result_event, tool_id=st.DOCUMENTATION_SEARCH)
+        return _LeafOutcome(call_id, status_chunks, text, parts, evidence)
 
     def _append_tool_result(
         self, call_id: str, observation_text: str, fn_name: str | None = None,
@@ -3514,6 +3623,99 @@ class ReasoningAgent:
             "tool_call_id": call_id,
             "content": text,
         })
+
+    # ── automatic document review ─────────────────────────────────────────
+
+    def _auto_read_cap(self) -> Optional[int]:
+        """The most one automatic read may render so that its result, with
+        the line introducing it, passes this run's tool-result clamp
+        untouched (the Documentation Search budget keeps 100 tokens of slack
+        under the clamp); None when nothing is clamped."""
+        if not getattr(self, "_tool_result_enabled", False):
+            return None
+        return int(self._tool_result_max_tokens) - 100 - dr.NOTE_RESERVE
+
+    async def _run_document_review(
+        self, dispatch: Dict[str, tuple],
+    ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
+        """Read the matching passage of each file a search returned but did
+        not show whole, before the next model response.
+
+        The reads go through the normal tool path, with the read function
+        taken from this step's dispatch table — so a read the profile
+        disabled, or a conversation without Documentation search, reads
+        nothing — as one tool-call group of the agent's own: unique call ids,
+        every call answered by its result, each call announced to the
+        activity trace with ``Origin`` set. No LLM request is made and no
+        step is counted. Which files, and the limits, are the review's (see
+        ``document_review``): each read renders into its share of the
+        allowance and within the profile's tool-result budget, one at a time
+        so what one leaves is the next one's, and the round's last result
+        carries a short summary of it. An automatic read never makes
+        candidates of its own.
+        """
+        review = self._doc_review
+        fn = make_leaf_name(st.DOCUMENTATION_SEARCH, "read")
+        entry = dispatch.get(fn)
+        if (
+            not entry or entry[0] != "leaf"
+            or getattr(entry[1], "tool_id", None) != st.DOCUMENTATION_SEARCH or entry[2] != "read"
+            or self._is_plan_blocked_leaf(entry, {}) or self._is_event_blocked_leaf(entry, {})
+        ):
+            review.suppress(dr.REASON_READ_UNAVAILABLE)
+            return
+        cap = self._auto_read_cap()
+        if cap is not None and cap - dr.SUMMARY_RESERVE < dr.MIN_READ_TOKENS:
+            review.suppress(dr.REASON_TOKEN_BUDGET)
+            return
+        chosen = review.plan()
+        if not chosen:
+            return
+        from app.tools.builtin.documentation_search import BUDGET_ARG
+
+        tool = entry[1]
+        step_no = max(1, self.current_step_count - 1)
+        calls = [(f"call_docreview_{uuid.uuid4().hex[:16]}", src) for src in chosen]
+        for call_id, src in calls:
+            yield self._thinking_artifact(step_no, call_id, fn, {"file": src.candidate}, tool, origin=dr.ORIGIN)
+        # A reply to an interruption, already streamed this step, belongs
+        # before these reads — which is where the user saw it.
+        ack, self._pending_ack_text = getattr(self, "_pending_ack_text", "") or "", ""
+        self._turn_messages.append({
+            "role": "assistant",
+            "content": ack or None,
+            "tool_calls": [
+                {"id": call_id, "type": "function",
+                 "function": {"name": fn, "arguments": json.dumps({"file": src.candidate})}}
+                for call_id, src in calls
+            ],
+        })
+        attempts: List[dr.Attempt] = []
+        texts: List[Tuple[str, str]] = []
+        for i, (call_id, src) in enumerate(calls):
+            budget = review.budget_for(len(calls) - i)
+            if cap is not None:
+                budget = min(budget, cap - (dr.SUMMARY_RESERVE if i == len(calls) - 1 else 0))
+            note = (f"[Automatic document review, read {i + 1} of {len(calls)} — made for you, not a call "
+                    f"you chose: the passage the search matched in {src.token}.]")
+            outcome = await self._collect_leaf(
+                tool=tool, leaf_name="read", args={"file": src.candidate, BUDGET_ARG: budget}, call_id=call_id,
+            )
+            for status_chunk in outcome.status_chunks:
+                yield status_chunk
+            attempts.append(review.record_attempt(src, outcome.evidence, note_tokens=dr.count_tokens(note)))
+            texts.append((call_id, f"{note}\n{outcome.tool_text}"))
+            yield self._result_artifact(step_no, call_id, outcome.parts)
+        summary = review.round_note(attempts, fn)
+        review.add_tokens(dr.count_tokens(summary))
+        for j, (call_id, text) in enumerate(texts):
+            if j == len(texts) - 1:
+                text = f"{text}\n\n{summary}"
+            self._append_tool_result(call_id, text, fn_name=fn)
+        logger.info(
+            f"[document_review] profile={self.profile} conversation={self.context_id} automatic reads: "
+            + ", ".join(f"{a.token} {a.outcome}" + (f" ({a.reason})" if a.reason else "") for a in attempts)
+        )
 
     def _drain_task_notices(self) -> List[Dict[str, Any]]:
         """Tell the agent, mid-turn, that an awaited task result has landed.

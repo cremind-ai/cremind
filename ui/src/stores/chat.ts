@@ -268,6 +268,10 @@ export interface ThinkingStep {
   elapsedMs?: number;
   modelLabel?: string | null;
   tokenUsage?: StepTokenUsage | null;
+  // Set on a call the agent made itself rather than the model:
+  // 'document_review' = an automatic read of a source a document search
+  // returned. Undefined for ordinary model tool calls.
+  origin?: string | null;
 }
 
 export interface ArtifactInfo {

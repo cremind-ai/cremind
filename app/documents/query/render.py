@@ -8,17 +8,26 @@ sizes its own output and shrinks it deliberately instead:
 - ``search`` drops context expansions first, then shortens snippets, then
   shows fewer results (and says how to page to the rest). The header and every
   token that is printed survive; a token is never cut in half.
-- ``read`` shows the whole selection when it fits; otherwise, for the whole
-  file, an envelope (beginning, table of contents with part sizes, parts
-  matching the query), and for an explicit selection, the selection in parts.
+- ``read`` shows the whole selection when it fits. A read centred on a
+  passage (its token, or ``around`` a phrase) puts that passage first: it is
+  shown whole, then as many neighbours as fit, in reading order — or, when it
+  cannot fit, a marked excerpt with the rest on the next page. A read of the
+  whole file comes back as an envelope (beginning, table of contents with part
+  sizes, parts matching the query), and any other selection in parts.
 - ``find_files`` lists fewer entries when it must, with a page cursor.
+
+Every result is measured whole — header, data block and footer — against the
+limit after it is assembled, never estimated from its parts.
 
 Everything derived from the user's files — names, paths, snippets — is
 untrusted content: it goes inside one document-content block per result, and
 any ``[doc:`` inside it is defanged, so a file cannot forge a citation or a
 block boundary. The renderers also return the tokens they printed, as
-:class:`~app.documents.cite.IssuedCitation` records for the citation registry,
-and the image thumbnails to attach as file chips.
+:class:`~app.documents.cite.IssuedCitation` records for the citation registry
+(only for passages whose text is actually shown, with the text shown as the
+snippet), the image thumbnails to attach as file chips, and a
+:class:`~app.documents.delivery.DocumentEvidence` record of what the final text
+delivered: which passages, whole or in part, and where a read's focus stands.
 
 Token counting, line fitting and the content wrapper are injected (see
 :class:`RenderContext`), so this module does not depend on the tool layer.
@@ -33,6 +42,20 @@ from typing import Any, Callable
 
 from app.documents import types as t
 from app.documents.cite import IssuedCitation, escape_in_document_text, locator_label, make_token
+from app.documents.delivery import (
+    FOCUS_COMPLETE,
+    FOCUS_OMITTED,
+    FOCUS_PARTIAL,
+    FOCUS_UNRESOLVED,
+    OP_READ,
+    OP_SEARCH,
+    ROLE_BODY,
+    ROLE_CONTEXT,
+    ROLE_MATCH,
+    DocumentEvidence,
+    PassageDelivery,
+    SourceDelivery,
+)
 from app.documents.query.filters import DATE_LABELS, type_of_kind
 from app.documents.query.terms import analyze
 from app.documents.textnorm import fold
@@ -77,6 +100,8 @@ class Rendered:
     citations: list[IssuedCitation] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
+    # What ``text`` delivered (search and read only).
+    evidence: DocumentEvidence | None = None
 
 
 # ── small formatting helpers ───────────────────────────────────────────────
@@ -187,16 +212,73 @@ def cite_folder(row: dict[str, Any], leaf: str) -> IssuedCitation:
     )
 
 
-def cite_chunk(owner: dict[str, Any], chunk: dict[str, Any], leaf: str, *, folder: bool = False) -> IssuedCitation:
+def cite_chunk(owner: dict[str, Any], chunk: dict[str, Any], leaf: str, *, folder: bool = False,
+               snippet: str | None = None) -> IssuedCitation:
+    """The registry record of a passage token. ``snippet`` is the text the
+    result actually showed of it (a search window, a cut passage); without it
+    the passage's own beginning is recorded."""
     loc = chunk.get("locator") or {}
+    shown = (chunk.get("text") or "") if snippet is None else snippet
     return IssuedCitation(
         token=make_token(owner["cite_id"], chunk.get("text_hash") or ""), cite_id=owner["cite_id"],
         target="folder" if folder else "file", ref_id=int(owner["id"]),
         text_hash=chunk.get("text_hash"), source_kind=owner.get("source") or "local",
         locator=dict(loc) if isinstance(loc, dict) else {}, label=_label_for(chunk),
-        rel_path=owner.get("rel_path") or "", snippet=(chunk.get("text") or "")[:SNIPPET_MAX_CHARS],
+        rel_path=owner.get("rel_path") or "", snippet=shown[:SNIPPET_MAX_CHARS],
         leaf=leaf, web_link=None if folder else owner.get("drive_web_link"),
     )
+
+
+# A contents page's title: "Mục lục", "Table of contents", or "Contents" as a
+# line of its own (the word inside a sentence is not a title).
+_CONTENTS_TITLE_RE = re.compile(r"\b(?:muc luc|table of contents)\b|(?:^|\n)[ \t]*contents[ \t]*(?:\n|$)")
+_CONTENTS_ENTRY_RE = re.compile(
+    r"\b(?:phan|chuong|muc|bai|part|chapter|section|unit|lesson|step)\s+(?:\d+|[ivxlc]+)\s*[:.\-–]")
+_CONTENTS_LEADER_RE = re.compile(r"\.{4,}\s*\d+")
+
+
+def _looks_like_contents(chunk: dict[str, Any]) -> bool:
+    """A table-of-contents page: a contents title near the top with numbered
+    entries under it, or rows of dotted page leaders ("Setup ....... 12").
+    It names what the document covers without saying any of it — a file
+    matched only there has not been read. Numbered entries alone are not
+    enough: a step-by-step procedure ("Step 1: … Step 6: …") is content."""
+    text = fold(chunk.get("text") or "")
+    if len(_CONTENTS_LEADER_RE.findall(text)) >= 4:
+        return True
+    entries = len(_CONTENTS_ENTRY_RE.findall(text)) + len(_CONTENTS_LEADER_RE.findall(text))
+    return entries >= 3 and _CONTENTS_TITLE_RE.search(text[:160]) is not None
+
+
+def _substantive(chunk: dict[str, Any]) -> bool:
+    """A passage of real content — body text, scanned text, an image's
+    caption — rather than a file's or folder's card (name, path, dates) or a
+    table of contents."""
+    return chunk.get("ctype") in (t.CTYPE_BODY, t.CTYPE_OCR, t.CTYPE_CAPTION) and not _looks_like_contents(chunk)
+
+
+def _position(chunk: dict[str, Any]) -> str:
+    """Where a passage sits, by numbers only ("p. 9", "lines 40–58",
+    "slide 5") — safe to print outside the document block, unlike a heading
+    or a sheet name, which are the document's own words."""
+    loc = chunk.get("locator") or {}
+    for key, end, one, many in (("page", "page_end", "p.", "p."), ("slide", None, "slide", "slides"),
+                                ("line_start", "line_end", "line", "lines")):
+        a = loc.get(key)
+        if isinstance(a, int):
+            b = loc.get(end) if end else None
+            return f"{many} {a}–{b}" if isinstance(b, int) and b > a else f"{one} {a}"
+    return ""
+
+
+def _unmarked(snippet: str) -> str:
+    """A shown snippet without the … marks where it was cut."""
+    s = snippet
+    if s.startswith("… "):
+        s = s[2:]
+    if s.endswith(" …"):
+        s = s[:-2]
+    return s
 
 
 class _Issued:
@@ -273,24 +355,46 @@ def _folder_line(n: int, row: dict[str, Any] | None, issued: _Issued, leaf: str,
 # ── search ─────────────────────────────────────────────────────────────────
 
 
+@dataclass
+class _Shown:
+    """A passage a search result printed, and how much of it."""
+
+    owner: dict[str, Any]      # the file (or, for a folder card, the folder) it belongs to
+    chunk: dict[str, Any]
+    role: str                  # match | context
+    complete: bool             # the snippet is the passage's whole text
+    order: int                 # the rank of the result it is printed under
+    confidence: str | None
+    folder: bool = False
+
+
+def _shown_snippet(chunk: dict[str, Any], tokens: tuple[str, ...], snippet_chars: int) -> tuple[str, bool]:
+    """The snippet printed for a passage, and whether it is the whole passage."""
+    cleaned = _clean(chunk.get("text") or "")
+    return _snippet(cleaned, tokens, snippet_chars), len(_one_line(cleaned)) <= snippet_chars
+
+
 def _passage_line(hit: Any, issued: _Issued, leaf: str, *, snippet_chars: int, tokens: tuple[str, ...],
-                  with_file: bool) -> str | None:
+                  with_file: bool, order: int) -> tuple[str, _Shown] | None:
     chunk = hit.chunk
     owner = hit.file if hit.file is not None else hit.folder
     if owner is None:
         return None
-    token = issued.add(cite_chunk(owner, chunk, leaf, folder=hit.file is None))
+    text, complete = _shown_snippet(chunk, tokens, snippet_chars)
+    token = issued.add(cite_chunk(owner, chunk, leaf, folder=hit.file is None, snippet=_unmarked(text)))
     label = _label_for(chunk)
     # Grouped by folder, a passage names the file it is from.
     prefix = f"{_clean(owner.get('name') or '')} › " if with_file else ""
-    text = _snippet(_clean(chunk.get("text") or ""), tokens, snippet_chars)
-    return f"   {prefix}{label + ' ' if label else ''}{token}: {text}"
+    shown = _Shown(owner, chunk, ROLE_MATCH, complete, order, hit.confidence, folder=hit.file is None)
+    return f"   {prefix}{label + ' ' if label else ''}{token}: {text}", shown
 
 
 def _search_body(outcome: Any, groups: list[Any], issued: _Issued, *, expand: bool, snippet_chars: int,
-                 passages: int, tz: _dt.tzinfo, offset: int) -> str:
+                 passages: int, tz: _dt.tzinfo, offset: int) -> tuple[str, list[_Shown]]:
+    """The results block, and every passage it prints (matches and context)."""
     tokens = analyze(outcome.query).tokens
     out: list[str] = []
+    shown: list[_Shown] = []
     for i, g in enumerate(groups, start=offset + 1):
         best = g.best
         conf = f"confidence {best.confidence}"
@@ -302,23 +406,35 @@ def _search_body(outcome: Any, groups: list[Any], issued: _Issued, *, expand: bo
             out.append(_folder_line(i, g.folder, issued, LEAF_SEARCH, tz, [conf]))
             with_file = True
         for hit in g.passages[:passages]:
-            line = _passage_line(hit, issued, LEAF_SEARCH, snippet_chars=snippet_chars, tokens=tokens,
-                                 with_file=with_file and hit.file is not None)
-            if line:
-                out.append(line)
+            placed = _passage_line(hit, issued, LEAF_SEARCH, snippet_chars=snippet_chars, tokens=tokens,
+                                   with_file=with_file and hit.file is not None, order=i)
+            if placed:
+                out.append(placed[0])
+                shown.append(placed[1])
             if expand and hit.expansion and hit.file is not None:
                 for ctx_chunk in hit.expansion:
-                    token = issued.add(cite_chunk(hit.file, ctx_chunk, LEAF_SEARCH))
+                    text, complete = _shown_snippet(ctx_chunk, tokens, snippet_chars)
+                    token = issued.add(cite_chunk(hit.file, ctx_chunk, LEAF_SEARCH, snippet=_unmarked(text)))
                     label = _label_for(ctx_chunk)
-                    text = _snippet(_clean(ctx_chunk.get("text") or ""), tokens, snippet_chars)
                     out.append(f"   context {label + ' ' if label else ''}{token}: {text}")
+                    shown.append(_Shown(hit.file, ctx_chunk, ROLE_CONTEXT, complete, i, None))
             if hit.also_in:
                 also = ", ".join(
                     f"{_clean(o.get('rel_path') or '')} {issued.add(cite_file(o, LEAF_SEARCH))}"
                     for o in hit.also_in[:3])
                 more = f" (+{len(hit.also_in) - 3} more)" if len(hit.also_in) > 3 else ""
                 out.append(f"   same text also in: {also}{more}")
-    return "\n".join(out)
+    return "\n".join(out), shown
+
+
+def _shown_files(shown: list[_Shown]) -> list[_Shown]:
+    """The first shown passage of each file, in result order (folder cards
+    are not files)."""
+    seen: dict[str, _Shown] = {}
+    for s in shown:
+        if not s.folder:
+            seen.setdefault(s.owner["cite_id"], s)
+    return list(seen.values())
 
 
 def render_search(outcome: Any, ctx: RenderContext) -> Rendered:
@@ -337,7 +453,7 @@ def render_search(outcome: Any, ctx: RenderContext) -> Rendered:
     offset = (outcome.page - 1) * outcome.top_k
     groups = list(outcome.groups)
 
-    def assemble(n: int, expand: bool, chars: int, passages: int) -> tuple[str, _Issued]:
+    def assemble(n: int, expand: bool, chars: int, passages: int) -> tuple[str, _Issued, list[_Shown]]:
         issued = _Issued()
         shown = groups[:n]
         if not shown:
@@ -345,48 +461,146 @@ def render_search(outcome: Any, ctx: RenderContext) -> Rendered:
                 summary = f"No results on page {outcome.page}; there are {outcome.total} in all."
             else:
                 summary = "No results. Try other words, fewer filters, or documentation_search__find_files by name."
-            return "\n".join(head + [summary]), issued
+            return "\n".join(head + [summary]), issued, []
         summary = (f"Results {offset + 1}–{offset + len(shown)} of {outcome.total} "
                    f"(grouped by {outcome.group_by}; best first):")
-        body = _search_body(outcome, shown, issued, expand=expand, snippet_chars=chars, passages=passages,
-                            tz=tz, offset=offset)
-        foot = [
-            "Cite every claim with the [doc:…] token printed next to the passage it comes from, copied "
-            f"exactly. Read more of a file with {FN_READ} (file=its token).",
-        ]
-        remaining = outcome.total - (offset + len(shown))
-        if remaining > 0:
-            if len(shown) < outcome.top_k:
-                nxt = (offset + len(shown)) // len(shown) + 1
-                foot.append(f"{remaining} more: call again with top_k={len(shown)} and page={nxt}.")
-            else:
-                foot.append(f"{remaining} more: call again with page={outcome.page + 1}.")
+        body, printed = _search_body(outcome, shown, issued, expand=expand, snippet_chars=chars,
+                                     passages=passages, tz=tz, offset=offset)
+        foot = [_search_cite_line(len(_shown_files(printed)))]
+        more = _search_more(outcome, offset, len(shown))
+        if more:
+            foot.append(more[0])
         text = "\n".join(head + [summary, ctx.wrap(body)] + foot)
-        return text, issued
+        return text, issued, printed
 
     levels = [(True, _SNIPPET_STEPS[0], 2), (False, _SNIPPET_STEPS[0], 2), (False, _SNIPPET_STEPS[1], 2),
               (False, _SNIPPET_STEPS[1], 1), (False, _SNIPPET_STEPS[2], 1)]
     n = len(groups)
-    text, issued, level = "", _Issued(), levels[0]
+    text, issued, printed, level = "", _Issued(), [], levels[0]
+    shrunk = False
     for level in levels:
-        text, issued = assemble(n, *level)
+        text, issued, printed = assemble(n, *level)
         if ctx.fits(text):
             break
+        shrunk = True
     else:
         while n > 1 and not ctx.fits(text):
             n -= 1
-            text, issued = assemble(n, *level)
+            text, issued, printed = assemble(n, *level)
         chars = level[1]
         while not ctx.fits(text) and chars > 40:
             chars = max(40, chars // 2)
-            text, issued = assemble(n, False, chars, 1)
+            text, issued, printed = assemble(n, False, chars, 1)
+        if not ctx.fits(text):
+            # Not even one result fits beside the header: say so, within the
+            # limit, rather than send something the agent's clamp would cut.
+            n = 0
+            text, issued, printed = _search_too_small(head, outcome, ctx), _Issued(), []
     shown = groups[:n]
     files = [_chip(g.file, ctx) for g in shown if g.file is not None and g.file.get("kind") == t.KIND_IMAGE]
-    return Rendered(text=text, citations=issued.list, files=files[:MAX_IMAGE_CHIPS],
-                    data=_search_data(outcome, shown, issued, tz))
+    more = _search_more(outcome, offset, n) if n else None
+    evidence = _search_evidence(printed, shown, offset, ctx.tokens(text), truncated=shrunk or n < len(groups),
+                                continuation=more[1] if more else None)
+    data = _search_data(outcome, shown, issued, tz, printed)
+    data["delivery"] = evidence.public()
+    return Rendered(text=text, citations=issued.list, files=files[:MAX_IMAGE_CHIPS], data=data,
+                    evidence=evidence)
 
 
-def _search_data(outcome: Any, shown: list[Any], issued: _Issued, tz: _dt.tzinfo) -> dict[str, Any]:
+def _search_cite_line(files: int) -> str:
+    """The footer's instructions. With passages from several files the agent
+    is asked to weigh each one before answering — the failure this exists
+    for is an answer drawn from one of two relevant guides, the other left
+    unread though it ranked first."""
+    cite = ("Cite every claim with the [doc:…] token printed next to the passage it comes from, copied "
+            "exactly. ")
+    if files > 1:
+        return cite + (f"These results come from {files} files: before answering, assess each relevant one "
+                       f"— read a passage in full with {FN_READ} (file=its passage token) — and attribute "
+                       "any difference between them to the file it comes from.")
+    return cite + f"Read more of a file with {FN_READ} (file=its token)."
+
+
+def _search_more(outcome: Any, offset: int, shown: int) -> tuple[str, dict[str, int]] | None:
+    """The paging line for the results not shown, and the same as arguments."""
+    remaining = outcome.total - (offset + shown)
+    if remaining <= 0 or not shown:
+        return None
+    if shown < outcome.top_k:
+        nxt = (offset + shown) // shown + 1
+        return (f"{remaining} more: call again with top_k={shown} and page={nxt}.",
+                {"page": nxt, "top_k": shown})
+    return f"{remaining} more: call again with page={outcome.page + 1}.", {"page": outcome.page + 1}
+
+
+def _search_too_small(head: list[str], outcome: Any, ctx: RenderContext) -> str:
+    note = (f"{outcome.total} result(s) found, but the reply budget is too small to show any of them: "
+            "call again with top_k=1, or narrow the search.")
+    return _too_small(head, [note], ctx)
+
+
+def _too_small(head: list[str], lines: list[str], ctx: RenderContext) -> str:
+    """A result that can show nothing, fitted to the limit: the first header
+    line, then what to do, then the rest of the header — so a long header is
+    what gets cut, never the explanation."""
+    text = "\n".join(head[:1] + lines + head[1:])
+    return text if ctx.fits(text) else _fit_plain(text, ctx)
+
+
+def _fit_plain(text: str, ctx: RenderContext) -> str:
+    """``text`` — headers and notes, no document block and no token — cut to
+    the limit. The last resort of a budget smaller than a header."""
+    limit = int(ctx.limit or 0)
+    fitted, _ = ctx.fit_lines(text, limit)
+    while fitted and not ctx.fits(fitted):
+        fitted = ctx.cut_tokens(fitted, max(0, ctx.tokens(fitted) - 8)).rstrip()
+    return fitted
+
+
+def _search_evidence(printed: list[_Shown], shown: list[Any], offset: int, rendered_tokens: int, *,
+                     truncated: bool, continuation: dict[str, int] | None) -> DocumentEvidence:
+    """What a search text delivered: every passage it printed (each token
+    once, whole if any copy was whole), and the files its results name in
+    rank order — a file result itself, or, for a folder result, the files of
+    the passages it printed (grouped by chunk, each result is one file)."""
+    passages: dict[str, PassageDelivery] = {}
+    for s in printed:
+        token = make_token(s.owner["cite_id"], s.chunk.get("text_hash") or "")
+        prev = passages.get(token)
+        # A passage printed twice (a result's second match is often the first
+        # match's context too) is one delivery: whole if either copy was, a
+        # match if either was one.
+        match = s if s.role == ROLE_MATCH else None
+        if prev is not None and prev.role == ROLE_MATCH:
+            match = None
+        passages[token] = PassageDelivery(
+            token=token, fid=s.owner["cite_id"],
+            role=ROLE_MATCH if (match or (prev and prev.role == ROLE_MATCH)) else s.role,
+            complete=s.complete or bool(prev and prev.complete),
+            substantive=_substantive(s.chunk) and not s.folder,
+            order=min(s.order, prev.order) if prev else s.order,
+            confidence=match.confidence if match else (prev.confidence if prev else s.confidence),
+            position=_position(s.chunk),
+        )
+    sources: dict[str, SourceDelivery] = {}
+    for j, g in enumerate(shown):
+        rank = offset + j + 1
+        if g.kind == "file" and g.file is not None:
+            owners = [g.file]
+        else:
+            owners = [s.owner for s in printed if s.order == rank and not s.folder]
+        for f in owners:
+            sources.setdefault(f["cite_id"], SourceDelivery(fid=f["cite_id"], token=make_token(f["cite_id"]),
+                                                            order=rank))
+    return DocumentEvidence(op=OP_SEARCH, passages=list(passages.values()), sources=list(sources.values()),
+                            rendered_tokens=rendered_tokens, truncated=truncated, continuation=continuation)
+
+
+def _search_data(outcome: Any, shown: list[Any], issued: _Issued, tz: _dt.tzinfo,
+                 printed: list[_Shown] | None = None) -> dict[str, Any]:
+    # ``visible``: whether the passage is in the text (a result lists up to
+    # two passages; the text may print fewer when the budget is tight).
+    visible = {make_token(s.owner["cite_id"], s.chunk.get("text_hash") or "") for s in (printed or [])}
     items = []
     for g in shown:
         owner = g.file if g.file is not None else g.folder
@@ -395,13 +609,15 @@ def _search_data(outcome: Any, shown: list[Any], issued: _Issued, tz: _dt.tzinfo
             o = h.file if h.file is not None else h.folder
             if o is None:
                 continue
+            token = make_token(o["cite_id"], h.chunk.get("text_hash") or "")
             passages.append({
-                "token": make_token(o["cite_id"], h.chunk.get("text_hash") or ""),
+                "token": token,
                 "label": _label_for(h.chunk),
                 "file": o.get("rel_path"),
                 "snippet": _one_line(h.chunk.get("text") or "")[:SNIPPET_MAX_CHARS],
                 "score": round(h.score, 6),
                 "confidence": h.confidence,
+                "visible": token in visible,
             })
         items.append({
             "kind": g.kind,
@@ -521,6 +737,13 @@ def render_find(outcome: Any, ctx: RenderContext) -> Rendered:
             for it in shown
         ],
     }
+    remaining = outcome.total - (offset + n)
+    data["delivery"] = {
+        "v": 1, "rendered_tokens": ctx.tokens(text), "truncated": n < len(items), "passages": [],
+        "continuation": (None if not n or remaining <= 0 else
+                         {"page": outcome.page + 1} if n >= outcome.limit else
+                         {"page": (offset + n) // n + 1, "limit": n}),
+    }
     return Rendered(text=text, citations=issued.list, files=files[:MAX_IMAGE_CHIPS], data=data)
 
 
@@ -528,12 +751,117 @@ def render_find(outcome: Any, ctx: RenderContext) -> Rendered:
 
 _HEAD_SHARE = 0.35
 _TOC_SHARE = 0.25
+# Kept free when a part is packed by adding up its passages' sizes, for what
+# adding cannot see (a join that tokenizes differently); every part is still
+# measured whole before it goes out.
+_PACK_MARGIN = 16
+# The least room worth showing a piece of a passage in; below it the result
+# says the budget is too small rather than print a few words.
+_MIN_PIECE_TOKENS = 24
+_CITE_LINE = "Cite passages with the tokens above, copied exactly."
 
 
-def _chunk_block(row: dict[str, Any], chunk: dict[str, Any], issued: _Issued) -> str:
-    token = issued.add(cite_chunk(row, chunk, LEAF_READ))
-    label = _label_for(chunk)
-    return f"{token}{' ' + label if label else ''}\n{_clean(chunk.get('text') or '').strip()}"
+@dataclass
+class _Piece:
+    """A passage as a read shows it: whole, or one piece of it when it had to
+    be cut or split (``first`` / ``last``: which ends of it the piece holds)."""
+
+    chunk: dict[str, Any]
+    text: str
+    complete: bool = True
+    first: bool = True
+    last: bool = True
+
+
+def _whole(chunk: dict[str, Any]) -> _Piece:
+    return _Piece(chunk, _clean(chunk.get("text") or "").strip())
+
+
+def _piece_block(row: dict[str, Any], p: _Piece) -> str:
+    """A passage's token line and text; a piece says which part of the
+    passage it is, so a cut passage never reads as a whole one."""
+    token = make_token(row["cite_id"], p.chunk.get("text_hash") or "")
+    label = _label_for(p.chunk)
+    line = f"{token}{' ' + label if label else ''}"
+    if p.complete:
+        return f"{line}\n{p.text}"
+    if p.first:
+        return f"{line} (beginning of the passage)\n{p.text} …"
+    if p.last:
+        return f"{line} (end of the passage)\n… {p.text}"
+    return f"{line} (continued)\n… {p.text} …"
+
+
+def _read_text(ctx: RenderContext, head: list[str], showing: str, row: dict[str, Any], pieces: list[_Piece],
+               tail: list[str]) -> str:
+    body = "\n\n".join(_piece_block(row, p) for p in pieces)
+    return "\n".join(head + [showing, ctx.wrap(body) if body else "(nothing to show)"] + tail)
+
+
+def _piece_room(ctx: RenderContext, render_one: Callable[[_Piece], str], chunk: dict[str, Any]) -> int | None:
+    """Tokens of text one piece of ``chunk`` may hold in a result that
+    ``render_one`` lays out around it; None when the budget leaves no useful
+    room."""
+    base = ctx.tokens(render_one(_Piece(chunk, "", False, first=False, last=False)))
+    room = int(ctx.limit or 0) - base - _PACK_MARGIN
+    return room if room >= _MIN_PIECE_TOKENS else None
+
+
+def _split(ctx: RenderContext, chunk: dict[str, Any], room: int) -> list[_Piece]:
+    """A passage too long for one result, as consecutive pieces of at most
+    ``room`` tokens of text each, cut at a word break where one is close."""
+    text = _clean(chunk.get("text") or "").strip()
+    texts: list[str] = []
+    rest = text
+    while rest:
+        if ctx.tokens(rest) <= room:
+            texts.append(rest)
+            break
+        cut = ctx.cut_tokens(rest, room)
+        if not cut.strip():
+            # One word longer than the room (a URL, a hash): cut inside it.
+            cut = rest[: max(1, room // 3)]
+        texts.append(cut.rstrip())
+        rest = rest[len(cut):].lstrip()
+    if len(texts) <= 1:
+        return [_Piece(chunk, text)]
+    return [_Piece(chunk, s, False, first=i == 0, last=i == len(texts) - 1) for i, s in enumerate(texts)]
+
+
+def _shrink_to_fit(ctx: RenderContext, pieces: list[_Piece],
+                   render: Callable[[list[_Piece]], str]) -> tuple[str, list[_Piece]]:
+    """The text of ``pieces``, cut to the limit if it still overflows once
+    assembled: the last piece listed is shortened (then dropped) first, so a
+    caller lists what matters most first. What comes back is exactly what the
+    text shows."""
+    pieces = list(pieces)
+    text = render(pieces)
+    while pieces and not ctx.fits(text):
+        last = pieces[-1]
+        keep = ctx.tokens(last.text) - (ctx.tokens(text) - int(ctx.limit or 0)) - 4
+        if keep < _MIN_PIECE_TOKENS:
+            pieces.pop()
+        else:
+            pieces[-1] = _Piece(last.chunk, ctx.cut_tokens(last.text, keep).rstrip(), False,
+                                first=last.first, last=False)
+        text = render(pieces)
+    if not ctx.fits(text):
+        text, pieces = _fit_plain(text, ctx), []
+    return text, pieces
+
+
+def _neighbour(chunk: dict[str, Any], which: str) -> str:
+    where = _position(chunk)
+    return f"the passage {which} it" + (f" ({where})" if where else "")
+
+
+def _left_out(items: list[str], next_page: int) -> str:
+    listed = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+    return f"Left out here to fit the budget: {listed} — call again with page={next_page} for the next part."
+
+
+def _next_part(page: int) -> str:
+    return f"Call again with page={page} for the next part."
 
 
 def _toc_line(e: Any) -> str:
@@ -564,82 +892,202 @@ def render_read(outcome: Any, ctx: RenderContext) -> Rendered:
         return (f"To read another part, call {FN_READ} with file=\"{ftoken}\" and the argument shown in the "
                 f"contents{eg}. Cite passages with the tokens above, copied exactly.")
 
-    def base_issued() -> _Issued:
-        issued = _Issued()
-        issued.add(cite_file(row, LEAF_READ))
-        return issued
-
     chunks = list(outcome.selected)
     if not outcome.body and outcome.card is not None:
         chunks = [outcome.card]  # metadata only: the card is all there is
 
     # 1. The selection fits: show it whole.
-    issued = base_issued()
+    pieces = [_whole(c) for c in chunks]
     what = f"Showing: {outcome.selection}" if outcome.selection else "Showing: the whole file"
-    body = "\n\n".join(_chunk_block(row, c, issued) for c in chunks)
-    text = "\n".join(head + [what, ctx.wrap(body) if body else "(nothing to show)",
-                             "Cite passages with the tokens above, copied exactly."])
-    if ctx.fits(text) or not chunks:
-        return Rendered(text=text, citations=issued.list, data=_read_data(outcome, issued, "whole"))
+    text = _read_text(ctx, head, what, row, pieces, [_CITE_LINE])
+    if ctx.fits(text):
+        return _read_result(outcome, ctx, text, pieces, shape="whole")
+    if not chunks:
+        return _read_result(outcome, ctx, _fit_plain(text, ctx), [], shape="whole", truncated=True)
 
-    limit = int(ctx.limit or 0)
-    overhead = ctx.tokens("\n".join(head)) + 120
+    # 2. A read centred on a passage: that passage first.
+    fidx = next((i for i, c in enumerate(chunks)
+                 if outcome.focus_id is not None and int(c["id"]) == int(outcome.focus_id)), None)
+    if fidx is not None:
+        return _render_focus(outcome, ctx, head, chunks, fidx)
 
-    # 2. An explicit selection too big to show: deliver it in parts.
+    # 3. Any other selection too big to show: in parts.
     if outcome.selection:
-        parts: list[list[dict[str, Any]]] = []
-        size = 0
-        room = max(200, limit - overhead)
-        for c in chunks:
-            n = ctx.tokens(c.get("text") or "") + 12
-            if parts and size + n <= room:
-                parts[-1].append(c)
-                size += n
-            else:
-                parts.append([c])
-                size = n
-        idx = min(outcome.page, len(parts)) - 1
-        issued = base_issued()
-        body = "\n\n".join(_chunk_block(row, c, issued) for c in parts[idx])
-        nav = f"Part {idx + 1} of {len(parts)} of {outcome.selection}."
-        if idx + 1 < len(parts):
-            nav += f" Call again with page={idx + 2} for the next part."
-        text = "\n".join(head + [f"Showing: {outcome.selection} — {nav}", ctx.wrap(body), how_to(None)])
-        if not ctx.fits(text):
-            # A single chunk larger than the whole budget: its beginning.
-            fitted, _ = ctx.fit_lines(body, max(100, limit - overhead))
-            text = "\n".join(head + [f"Showing: {outcome.selection} — {nav} (cut to fit)", ctx.wrap(fitted),
-                                     how_to(None)])
-        return Rendered(text=text, citations=issued.list, data=_read_data(outcome, issued, "part"))
+        return _render_parts(outcome, ctx, head, chunks, how_to(None))
 
-    # 3. The whole file is too long: beginning + contents + matching parts.
-    issued = base_issued()
+    # 4. The whole file is too long: beginning + contents + matching parts.
+    return _render_envelope(outcome, ctx, head, chunks, how_to, total_tokens)
+
+
+def _render_focus(outcome: Any, ctx: RenderContext, head: list[str], chunks: list[dict[str, Any]],
+                  fidx: int) -> Rendered:
+    """A read centred on one passage (its token, or ``around`` a phrase) that
+    does not fit whole with its neighbours.
+
+    The first page is built around the passage: it goes in first, whole when
+    it fits, then the passage after it and the one before it, each only if
+    it fits whole — shown in reading order. A neighbour that could not go in,
+    and the rest of a passage too long for any page, follow on later pages,
+    and the first page says what was left out and how to get it. So the
+    passage asked for is never pushed out by a long one before it.
+    """
+    row = outcome.file
+    order = {int(c["id"]): i for i, c in enumerate(chunks)}
+    focus = chunks[fidx]
+    neighbours = [(nb, which) for nb, which in ((chunks[fidx + 1] if fidx + 1 < len(chunks) else None, "after"),
+                                               (chunks[fidx - 1] if fidx > 0 else None, "before"))
+                  if nb is not None]
+    sel = outcome.selection or "the passage asked for"
+
+    def text_of(pieces: list[_Piece], part: int, total: int, notes: list[str]) -> str:
+        showing = f"Showing: {sel}" + (" — the passage asked for first" if part == 1 else "") + (
+            f"; part {part} of {total}." if total > 1 else ".")
+        ordered = sorted(pieces, key=lambda p: order[int(p.chunk["id"])])
+        return _read_text(ctx, head, showing, row, ordered, notes + [_CITE_LINE])
+
+    # Every layout is measured with the longest note it could carry, so what
+    # fits here still fits once the real note is written.
+    worst_first = [_left_out(["the rest of the passage asked for"]
+                             + [_neighbour(nb, w) for nb, w in neighbours], 99)]
+    worst_later = [_next_part(99)]
+
+    parts: list[list[_Piece]] = []
+    whole = _whole(focus)
+    if ctx.fits(text_of([whole], 1, 99, worst_first)):
+        first = [whole]
+        for nb, _which in neighbours:
+            trial = first + [_whole(nb)]
+            if ctx.fits(text_of(trial, 1, 99, worst_first)):
+                first = trial
+        parts.append(first)
+    else:
+        room = _piece_room(ctx, lambda p: text_of([p], 1, 99, worst_first), focus)
+        if room is None:
+            note = "The reply budget is too small to show the passage asked for; ask with a larger budget."
+            text = _too_small(head, [f"Showing: {sel}.", note], ctx)
+            return _read_result(outcome, ctx, text, [], shape="focus", truncated=True,
+                                continuation=None, focus_status=FOCUS_OMITTED)
+        parts += [[p] for p in _split(ctx, focus, room)]
+    placed = {int(p.chunk["id"]) for part in parts for p in part if p.complete}
+    for nb, _which in sorted(neighbours, key=lambda x: order[int(x[0]["id"])]):
+        if int(nb["id"]) in placed:
+            continue
+        if ctx.fits(text_of([_whole(nb)], 99, 99, worst_later)):
+            parts.append([_whole(nb)])
+            continue
+        room = _piece_room(ctx, lambda p: text_of([p], 99, 99, worst_later), nb)
+        # A later page's layout is never larger than the first's, so a room
+        # the focus had is there for its neighbour; should it not be, the
+        # neighbour is left out rather than promised on a page that is empty.
+        if room:
+            parts += [[p] for p in _split(ctx, nb, room)]
+
+    total = len(parts)
+    idx = min(outcome.page, total) - 1
+    notes: list[str] = []
+    if idx == 0 and total > 1:
+        # Only what the later pages really hold is announced.
+        later = {int(p.chunk["id"]) for part in parts[1:] for p in part}
+        left = [] if parts[0][0].complete else ["the rest of the passage asked for"]
+        left += [_neighbour(nb, w) for nb, w in neighbours if int(nb["id"]) in later]
+        notes.append(_left_out(left, 2) if left else _next_part(2))
+    elif idx + 1 < total:
+        notes.append(_next_part(idx + 2))
+    # The focus is listed first, so a last-resort cut takes a neighbour first.
+    shown = sorted(parts[idx], key=lambda p: 0 if int(p.chunk["id"]) == int(focus["id"]) else 1)
+    text, shown = _shrink_to_fit(ctx, shown, lambda ps: text_of(ps, idx + 1, total, notes))
+    return _read_result(outcome, ctx, text, shown, shape="focus", truncated=total > 1,
+                        continuation={"page": idx + 2} if idx + 1 < total else None)
+
+
+def _render_parts(outcome: Any, ctx: RenderContext, head: list[str], chunks: list[dict[str, Any]],
+                  how_to: str) -> Rendered:
+    """An explicit selection (pages, a section, a sheet…) too long for one
+    result, in parts of whole passages; ``page`` picks the part. Parts are
+    packed by the passages' measured sizes, and a passage longer than a whole
+    part is split across consecutive parts rather than cut short."""
+    row = outcome.file
+    sel = outcome.selection
+
+    def text_of(pieces: list[_Piece], part: int, total: int) -> str:
+        nav = f"Part {part} of {total} of {sel}."
+        if part < total:
+            nav += f" Call again with page={part + 1} for the next part."
+        return _read_text(ctx, head, f"Showing: {sel} — {nav}", row, pieces, [how_to])
+
+    probe = _whole(chunks[0])
+    base = ctx.tokens(text_of([probe], 99, 99)) - ctx.tokens(_piece_block(row, probe))
+    room = int(ctx.limit or 0) - base - _PACK_MARGIN
+
+    def too_small() -> Rendered:
+        # Parts that could show nothing would still point to "the next
+        # part" forever; say so once instead, with nothing to continue.
+        note = "The reply budget is too small to show any part of this selection."
+        return _read_result(outcome, ctx, _too_small(head, [f"Showing: {sel}.", note], ctx), [],
+                            shape="part", truncated=True)
+
+    if room < _MIN_PIECE_TOKENS:
+        return too_small()
+    parts: list[list[_Piece]] = []
+    current: list[_Piece] = []
+    size = 0
+    for c in chunks:
+        p = _whole(c)
+        cost = ctx.tokens(_piece_block(row, p)) + 2
+        if current and size + cost > room:
+            parts.append(current)
+            current, size = [], 0
+        if not current and cost > room:
+            proom = _piece_room(ctx, lambda q: text_of([q], 99, 99), c)
+            if proom is None:
+                return too_small()
+            parts += [[q] for q in _split(ctx, c, proom)]
+            continue
+        current.append(p)
+        size += cost
+    if current:
+        parts.append(current)
+    total = len(parts)
+    idx = min(outcome.page, total) - 1
+    text, shown = _shrink_to_fit(ctx, parts[idx], lambda ps: text_of(ps, idx + 1, total))
+    return _read_result(outcome, ctx, text, shown, shape="part", truncated=total > 1,
+                        continuation={"page": idx + 2} if idx + 1 < total else None)
+
+
+def _render_envelope(outcome: Any, ctx: RenderContext, head: list[str], chunks: list[dict[str, Any]],
+                     how_to: Callable[[dict[str, str] | None], str], total_tokens: int) -> Rendered:
+    """The whole file, too long to show: its beginning, the table of contents
+    with the size of each part, and the parts matching the query."""
+    row = outcome.file
+    limit = int(ctx.limit or 0)
     head_budget = int(limit * _HEAD_SHARE)
-    begin: list[str] = []
+    begin: list[_Piece] = []
     used = 0
     for c in chunks:
-        block = _chunk_block(row, c, _Issued())
-        cost = ctx.tokens(block) + 2
+        p = _whole(c)
+        cost = ctx.tokens(_piece_block(row, p)) + 2
         if begin and used + cost > head_budget:
             break
         if not begin and cost > head_budget:
-            fitted, _ = ctx.fit_lines(block, head_budget)
-            begin.append(fitted)
-            issued.add(cite_chunk(row, c, LEAF_READ))
-            used += head_budget
+            # The first passage alone is longer than the beginning's share.
+            room = head_budget - ctx.tokens(_piece_block(row, _Piece(c, "", False))) - 4
+            if room >= _MIN_PIECE_TOKENS:
+                begin.append(_Piece(c, ctx.cut_tokens(p.text, room).rstrip(), False, first=True, last=False))
             break
-        begin.append(_chunk_block(row, c, issued))
+        begin.append(p)
         used += cost
-    toc_text, cut = ctx.fit_lines("\n".join(_toc_line(e) for e in outcome.toc), int(limit * _TOC_SHARE),
-                                  split_long_line=False)
-    toc_note = f"\n({len(outcome.toc) - toc_text.count(chr(10)) - 1} more parts not listed)" if cut else ""
 
-    def assemble(matched: list[Any], iss: _Issued) -> str:
-        sections = []
-        for e in matched:
-            sections.append(f"## {_clean(e.label)}\n" + "\n\n".join(_chunk_block(row, c, iss) for c in e.chunks))
-        inner = ["## Beginning", "\n\n".join(begin), "",
-                 "## Contents (part → how to ask for it → size)", toc_text + toc_note]
+    def contents(cap: int) -> str:
+        if cap <= 0:
+            return "(not listed: the reply budget is too small)"
+        listed, cut = ctx.fit_lines("\n".join(_toc_line(e) for e in outcome.toc), cap, split_long_line=False)
+        return listed + (f"\n({len(outcome.toc) - listed.count(chr(10)) - 1} more parts not listed)" if cut else "")
+
+    def assemble(start: list[_Piece], toc: str, matched: list[Any]) -> str:
+        sections = [f"## {_clean(e.label)}\n" + "\n\n".join(_piece_block(row, _whole(c)) for c in e.chunks)
+                    for e in matched]
+        inner = ["## Beginning", "\n\n".join(_piece_block(row, p) for p in start), "",
+                 "## Contents (part → how to ask for it → size)", toc]
         if outcome.query:
             inner += ["", f"## Parts matching \"{_one_line(_clean(outcome.query))}\""]
             if sections:
@@ -659,23 +1107,70 @@ def render_read(outcome: Any, ctx: RenderContext) -> Rendered:
         example = (structural or [e.arg for e in unshown] or [None])[0]
         return "\n".join(head + [intro, ctx.wrap("\n".join(inner)), how_to(example)])
 
+    cap = int(limit * _TOC_SHARE)
+    toc = contents(cap)
+    text = assemble(begin, toc, [])
+    # The shares cannot see a long header: shrink the beginning, then the
+    # contents, until the envelope itself fits.
+    while not ctx.fits(text) and begin:
+        begin.pop()
+        text = assemble(begin, toc, [])
+    while not ctx.fits(text) and cap > 0:
+        cap //= 2
+        toc = contents(cap)
+        text = assemble(begin, toc, [])
+    if not ctx.fits(text):
+        note = "The reply budget is too small to show any part of this file."
+        return _read_result(outcome, ctx, _too_small(head, [note], ctx), [], shape="envelope", truncated=True)
     matched: list[Any] = []
-    text = assemble(matched, _copy(issued))
     for e in outcome.ranked[:8]:
-        trial_issued = _copy(issued)
-        trial = assemble(matched + [e], trial_issued)
+        trial = assemble(begin, toc, matched + [e])
         if ctx.fits(trial):
             matched.append(e)
             text = trial
-    final = _copy(issued)
-    text = assemble(matched, final)
-    return Rendered(text=text, citations=final.list, data=_read_data(outcome, final, "envelope"))
+    pieces = begin + [_whole(c) for e in matched for c in e.chunks]
+    return _read_result(outcome, ctx, text, pieces, shape="envelope", truncated=True)
 
 
-def _copy(issued: _Issued) -> _Issued:
-    out = _Issued()
-    out.items = dict(issued.items)
-    return out
+def _read_result(outcome: Any, ctx: RenderContext, text: str, pieces: list[_Piece], *, shape: str,
+                 truncated: bool = False, continuation: dict[str, int] | None = None,
+                 focus_status: str | None = None) -> Rendered:
+    """A read's result from its final text and the pieces that text shows:
+    the citations (the file, and each passage shown, with the text shown as
+    its snippet) and the delivery record — which passages are whole, and
+    where the passage a read was centred on stands."""
+    row = outcome.file
+    issued = _Issued()
+    issued.add(cite_file(row, LEAF_READ))
+    delivered: dict[str, PassageDelivery] = {}
+    for p in pieces:
+        token = issued.add(cite_chunk(row, p.chunk, LEAF_READ, snippet=p.text))
+        prev = delivered.get(token)
+        if prev is None or (p.complete and not prev.complete):
+            delivered[token] = PassageDelivery(token=token, fid=row["cite_id"], role=ROLE_BODY,
+                                               complete=p.complete, substantive=_substantive(p.chunk),
+                                               position=_position(p.chunk))
+    focus: str | None = None
+    status = focus_status
+    if outcome.focus_unresolved:
+        focus, status = outcome.focus_unresolved, FOCUS_UNRESOLVED
+    elif outcome.focus_id is not None:
+        chunk = next((c for c in outcome.selected if int(c["id"]) == int(outcome.focus_id)), None)
+        if chunk is not None:
+            focus = make_token(row["cite_id"], chunk.get("text_hash") or "")
+            if status is None:
+                got = delivered.get(focus)
+                status = FOCUS_COMPLETE if got and got.complete else FOCUS_PARTIAL if got else FOCUS_OMITTED
+    evidence = DocumentEvidence(
+        op=OP_READ, passages=list(delivered.values()),
+        sources=[SourceDelivery(fid=row["cite_id"], token=make_token(row["cite_id"]), order=1)],
+        rendered_tokens=ctx.tokens(text), truncated=truncated, continuation=continuation,
+        fid=row["cite_id"], focus=focus, focus_status=status, stale=bool(outcome.stale),
+        metadata_only=not outcome.body, shape=shape,
+    )
+    data = _read_data(outcome, issued, shape)
+    data["delivery"] = evidence.public()
+    return Rendered(text=text, citations=issued.list, data=data, evidence=evidence)
 
 
 def _read_data(outcome: Any, issued: _Issued, shape: str) -> dict[str, Any]:

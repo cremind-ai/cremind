@@ -30,7 +30,7 @@ from app.tools.base import (
     ToolThinkingEvent,
     ToolType,
 )
-from app.tools.builtin.adapter import BuiltInToolAdapter
+from app.tools.builtin.adapter import BuiltInToolAdapter, InternalToolEvidence
 from app.tools.builtin.base import BuiltInTool as BuiltInFunction
 from app.utils.event_parser import parse_agent_events
 from app.utils.logger import logger
@@ -166,6 +166,7 @@ class BuiltInToolGroup(Tool):
         yield ToolThinkingEvent()
 
         events: list = []
+        evidence = None
         metadata: dict = {}
         if arguments:
             metadata["arguments"] = arguments
@@ -177,6 +178,13 @@ class BuiltInToolGroup(Tool):
                 query=leaf_name, context_id=context_id, metadata=metadata, profile=profile,
                 decided_calls=[{"name": leaf_name, "arguments": args}],
             ):
+                if isinstance(ev, InternalToolEvidence):
+                    # The leaf's facts about its own result: kept off the
+                    # event stream (no status chunk, nothing to parse into
+                    # text) and handed to the agent on the result event.
+                    if ev.tool_name == leaf_name:
+                        evidence = ev.evidence
+                    continue
                 events.append(ev)
                 yield ToolStatusEvent(raw=ev)
         except Exception as e:  # noqa: BLE001
@@ -189,6 +197,7 @@ class BuiltInToolGroup(Tool):
             observation_text=observation_text,
             observation_parts=observation_parts,
             token_usage=token_usage or {},
+            evidence=evidence,
         )
 
     # ── runtime LLM refresh ────────────────────────────────────────────
@@ -247,6 +256,8 @@ class BuiltInToolGroup(Tool):
             async for ev in self._adapter.request(
                 query=query, context_id=context_id, metadata=metadata, profile=profile,
             ):
+                if isinstance(ev, InternalToolEvidence):
+                    continue  # bookkeeping for the leaf path only
                 events.append(ev)
                 yield ToolStatusEvent(raw=ev)
         except Exception as e:  # noqa: BLE001

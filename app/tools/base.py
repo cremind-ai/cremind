@@ -118,11 +118,15 @@ class ToolResultEvent(ToolEvent):
     observation_parts : original A2A Parts (preserved for downstream rendering)
     token_usage : ``{'input_tokens': int, 'output_tokens': int}``
     behavior : the post-execution behavior to apply (default OBSERVE)
+    evidence : typed facts a built-in tool reported about its own result (see
+        ``BuiltInToolResult.evidence``), for the agent's bookkeeping only. Set
+        only by ``BuiltInToolGroup``; ``None`` from every other kind of tool.
     """
     observation_text: str
     observation_parts: List[Part] = field(default_factory=list)
     token_usage: Dict[str, int] = field(default_factory=dict)
     behavior: ToolBehavior = ToolBehavior.OBSERVE
+    evidence: Any = None
 
 
 @dataclass

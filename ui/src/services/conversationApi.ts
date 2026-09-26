@@ -54,6 +54,8 @@ export interface MessageRecord {
       cache_read_input_tokens?: number;
       cache_creation_input_tokens?: number;
     } | null;
+    // A call the agent made itself ('document_review': an automatic read).
+    origin?: string | null;
   }[] | null;
   token_usage: {
     input_tokens: number;

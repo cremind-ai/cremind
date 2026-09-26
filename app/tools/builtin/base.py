@@ -42,10 +42,18 @@ class BuiltInToolResult:
             vision call). The adapter folds this into the tool result's token_usage
             so it lands in a ``source_kind="tool"`` usage record; ``None`` for tools
             that make no LLM call.
+        evidence: Optional typed facts about the result for the reasoning agent's
+            own bookkeeping — never shown to the model or a client, never parsed
+            from text. Today only Documentation Search sets it (an
+            :class:`~app.documents.delivery.DocumentEvidence`: which passages its
+            text actually delivered). The adapter hands it on as an
+            :class:`~app.tools.builtin.adapter.InternalToolEvidence` event and the
+            group puts it on the ``ToolResultEvent``.
     """
     content: Optional[List[Any]] = None
     structured_content: Optional[Dict[str, Any]] = None
     token_usage: Optional[Dict[str, int]] = None
+    evidence: Optional[Any] = None
 
 
 class BuiltInTool:

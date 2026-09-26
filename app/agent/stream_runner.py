@@ -704,6 +704,10 @@ async def run_agent_to_bus(
     # answer), carried on the terminal DONE chunk. Persisted so later turns can replay
     # it into history. ``None`` for turns with no tool calls (those replay content-only).
     collected_llm_messages: list | None = None
+    # What the turn's document searches and reads delivered, and its automatic
+    # source review (versioned; see app.agent.document_review), carried on the
+    # terminal DONE chunk and stamped on the answer's metadata.
+    collected_document_review: dict | None = None
     # Where the visible flow was cut by a mid-turn message, as offsets into this
     # turn's text and thinking steps. Collected as the breaks happen rather than
     # on the terminal chunk: a cancelled turn never sends one, and its partial
@@ -919,6 +923,9 @@ async def run_agent_to_bus(
                         # Elapsed from the turn clock, so a reload can rebuild the
                         # same per-step timings the live timeline showed.
                         "elapsed_ms": step_elapsed,
+                        # A call the agent made itself (an automatic document
+                        # read), so a reload labels it like the live trace did.
+                        **({"origin": thinking_data["Origin"]} if thinking_data.get("Origin") else {}),
                     })
 
                 elif ctype == ChatCompletionTypeEnum.RESULT_ARTIFACT:
@@ -1064,6 +1071,8 @@ async def run_agent_to_bus(
                         collected_usage_records = chunk["usage_records"]
                     if chunk.get("llm_messages"):
                         collected_llm_messages = chunk["llm_messages"]
+                    if chunk.get("document_review"):
+                        collected_document_review = chunk["document_review"]
         except asyncio.CancelledError:
             cancelled = True
             logger.info(f"stream_runner: run {run_id} cancelled")
@@ -1242,6 +1251,16 @@ async def run_agent_to_bus(
                 **(agent_message_metadata or {}),
                 "mid_turn_breaks": collected_mid_turn_breaks,
                 "run_id": run_id,
+            }
+
+        # What the turn's document searches delivered, and its automatic source
+        # review: which files were returned, examined, partly read or left out
+        # (and why). File ids and counts only — the diagnostic record; the
+        # Sources shown to the user are the answer's citations, below.
+        if collected_document_review:
+            agent_message_metadata = {
+                **(agent_message_metadata or {}),
+                "document_review": collected_document_review,
             }
 
         # Documentation search citations: verify every "[doc:…]" token (or a

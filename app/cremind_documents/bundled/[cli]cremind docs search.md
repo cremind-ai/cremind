@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN indexed files (local folder and Google Drive) from the terminal with `cremind docs search` (passages by meaning and keyword, with --folder, --type, --from/--to dates, --source local|drive, --group-by folder, --thorough), `cremind docs find` (files, folders or code projects by name, type or date, --kind project), `cremind docs read` (a file's text by --pages, --lines, --section such as 'Điều 203', --sheet, --slide) and `cremind docs cite` (where a [doc:…] citation points). Same results the agent's documentation_search tool gets. Needs Documentation search enabled. Not for Cremind's own documentation (that is cremind_documentation_search)."
+description: "Search the user's OWN indexed files (local folder and Google Drive) from the terminal with `cremind docs search` (passages by meaning and keyword, with --folder, --type, --from/--to dates, --source local|drive, --group-by folder, --thorough), `cremind docs find` (files, folders or code projects by name, type or date, --kind project), `cremind docs read` (a file's text by --pages, --lines, --section such as 'Điều 203', --sheet, --slide) and `cremind docs cite` (where a [doc:…] citation points). Same results the agent's documentation_search tool gets; --json adds a delivery object saying which passages the text shows whole. Needs Documentation search enabled. Not for Cremind's own documentation (that is cremind_documentation_search)."
 ---
 
 # `cremind docs search` — searching your own files
@@ -13,7 +13,27 @@ Each prints the same text the agent reads: a header with the search mode and
 index status, the results inside a marked data block, and a `[doc:…]` citation
 token on every file and passage. Unlike the agent's copy it is not cut to a
 token budget. `cremind --json docs …` prints the structured result
-instead (`mode`, `items` with tokens, paging).
+instead (`mode`, `items` with tokens, paging) plus a `delivery` object: what
+the printed text actually shows.
+
+```json
+"delivery": {"v": 1, "rendered_tokens": 812, "truncated": false, "continuation": null,
+             "passages": [{"token": "[doc:k7m2xq9a#3f9c2e1b]", "role": "match", "complete": false}],
+             "focus": {"token": "[doc:k7m2xq9a#3f9c2e1b]", "status": "complete"}}
+```
+
+`passages` lists each passage token the text shows — `role` is `match` or
+`context` for a search, `body` for a read — and whether its whole text is
+shown (`complete`) or only a snippet or excerpt. `truncated` says something
+was left out to fit a budget, and `continuation` how to get it (`{"page":
+2}`). A read also reports its `focus` (the passage a passage token asked
+for: `complete`, `partial`, `omitted` on this page, or `unresolved` when the
+file no longer has it), `stale` and `metadata_only`. Search results'
+`items[].passages[]` gain `visible`. Indexing `coverage` keeps its meaning.
+
+These commands only search and read. The automatic review a conversation
+makes when a search returns several relevant files (see `[tool]documentation
+search`) is the agent's; `cremind docs search` never reads files on its own.
 
 If the profile has no index yet, or the feature is off or disabled by the
 admin, the command says why and exits 1.
@@ -120,8 +140,21 @@ file name (quote tokens in the shell: `'[doc:k7m2xq9a]'`).
 
 Without a locator a short file prints whole; a long one prints its
 beginning, a table of contents (each part with its size and the flag that
-reads it) and nothing more. Errors list candidates: `NotFound`,
-`AmbiguousFile`, `SectionNotFound`, `SheetNotFound`.
+reads it) and nothing more. A passage token as `FILE` prints that passage
+with its neighbours — the passage first when a budget would not fit them all.
+Errors list candidates: `NotFound`, `AmbiguousFile`, `SectionNotFound`,
+`SheetNotFound`. For `SectionNotFound` the candidates are the file's closest
+real headings, each a value `--section` accepts, and the message gives the
+first one's pages: a title copied from a document's contents page
+(`"Phần 9: Multi-Agent - Xây Dựng Đội AI"`) is often indexed as a shorter
+heading (`"PHẦN 9"`) — pass that, or `--pages`.
+
+```bash
+$ cremind docs read '[doc:k7m2xq9a]' --section "Phần 9: Multi-Agent - Xây Dựng Đội AI"
+No part of this file matches section='Phần 9: Multi-Agent - Xây Dựng Đội AI'. The candidates are the
+closest headings this file has (the first is on p. 43–44): pass one of them exactly as section. …
+  PHẦN 9
+```
 
 ### `cremind docs cite`
 

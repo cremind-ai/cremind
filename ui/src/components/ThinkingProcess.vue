@@ -11,9 +11,10 @@
 import { computed, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import { ElMessage } from 'element-plus';
-import type { StepTokenUsage, ThinkingStep } from '../stores/chat';
+import type { ThinkingStep } from '../stores/chat';
 import { formatTokens } from '../utils/usageFormat';
 import { stepElapsedLabel } from '../utils/latencyLabels';
+import { groupThinkingSteps } from '../utils/streamFrames';
 import { useSettingsStore } from '../stores/settings';
 
 const props = withDefaults(
@@ -37,26 +38,11 @@ const props = withDefaults(
 
 const settingsStore = useSettingsStore();
 
-// Group per-tool thinking steps by ``step`` so parallel tool calls in one model
-// turn render together under a single "Step N". Each group also carries the
-// reasoning call's token usage (``tokens``) for that step — every tool call in a
-// group shares the one reasoning call, so the first tool with usage is
-// authoritative; null for steps persisted before per-step tokens shipped.
-const thinkingGroups = computed(() => {
-  const groups: { step: number | null; tools: any[]; tokens: StepTokenUsage | null }[] = [];
-  for (const s of props.steps) {
-    const last = groups[groups.length - 1];
-    if (last && s.step != null && last.step === s.step) {
-      last.tools.push(s);
-    } else {
-      groups.push({ step: s.step ?? null, tools: [s], tokens: null });
-    }
-  }
-  for (const g of groups) {
-    g.tokens = (g.tools.find(t => t.tokenUsage)?.tokenUsage as StepTokenUsage) ?? null;
-  }
-  return groups;
-});
+// Per-tool thinking steps grouped by step (see utils/streamFrames): parallel
+// calls of one model turn share a row and its reasoning-call token usage, and
+// calls the agent made itself (its automatic document reads) get a row of
+// their own.
+const thinkingGroups = computed(() => groupThinkingSteps(props.steps));
 
 /**
  * How long the turn spent getting to a grouped step — from the step before it,
@@ -71,6 +57,13 @@ const groupLatency = (group: any, gIdx: number): string => stepElapsedLabel(
   gIdx > 0 ? thinkingGroups.value[gIdx - 1]?.tools?.[0] : undefined,
   props.requestSentAt,
 );
+
+// Who made a group's calls, when it was not the model.
+const ORIGIN_LABELS: Record<string, string> = {
+  document_review: 'automatic document review',
+};
+const originLabel = (origin: string | null | undefined): string =>
+  origin ? ORIGIN_LABELS[origin] || 'automatic' : '';
 
 // Extract text-only observation parts for display in code block
 const formatObservationText = (parts: any[]): string => {
@@ -279,7 +272,7 @@ const handleThinkingClick = (event: MouseEvent) => {
             :key="gIdx"
             :type="group.tools.some(t => t.result?.length) ? 'success' : 'primary'"
             :hollow="!group.tools.some(t => t.result?.length)"
-            :timestamp="`Step ${gIdx + 1}${groupLatency(group, gIdx)}`"
+            :timestamp="`Step ${gIdx + 1}${groupLatency(group, gIdx)}${group.origin ? ' · ' + originLabel(group.origin) : ''}`"
             placement="top"
           >
             <el-card shadow="never" class="timeline-card">
@@ -304,6 +297,13 @@ const handleThinkingClick = (event: MouseEvent) => {
               <div v-for="(tool, tIdx) in group.tools" :key="tIdx" class="step-content">
                 <span v-if="tool.modelLabel" class="model-badge step-model">
                   {{ tool.modelLabel }}
+                </span>
+                <span
+                  v-if="tool.origin"
+                  class="model-badge step-model step-origin"
+                  :title="`Made by the agent itself (${originLabel(tool.origin)}), not by the model`"
+                >
+                  automatic
                 </span>
                 <div class="step-detail">
                   <span class="step-label">
@@ -409,6 +409,11 @@ const handleThinkingClick = (event: MouseEvent) => {
 .step-model {
   float: right;
   font-size: 0.75em;
+}
+
+/* Beside the model badge, on a call the agent made itself. */
+.step-origin {
+  margin-right: 6px;
 }
 
 /* Per-step reasoning-call token counts, above the step's tool calls. */
