@@ -12,6 +12,7 @@ state the caller was actually shown, and the list never carries dossiers.
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -422,6 +423,26 @@ def test_the_real_renderer_serves_every_state(status):
     assert pages >= 1
     if status == T.NEEDS_CLARIFICATION:
         assert "Which edition of the Land Law?" in text
+
+
+def test_the_outcome_travels_in_the_job_json_and_older_dossiers_still_load():
+    """REST, the CLI's --json and the UI read the same ``dossier.outcome``;
+    a dossier saved before it existed has none, and still loads."""
+    outcome = T.Outcome(reason=T.OUTCOME_NO_CANDIDATES, detail="the searches found no candidate document",
+                        queries=6, trace={"queries": [{"q": "work permit", "kind": "topic", "found": []}]})
+    dossier = T.Dossier(job_id="j1", mode=T.MODE_ANALYZE, domain=T.DOMAIN_LEGAL, question="q?", status=T.PARTIAL,
+                        outcome=outcome)
+    view = T.JobView(job_id="j1", profile="alice", status=T.PARTIAL, mode=T.MODE_ANALYZE, domain=T.DOMAIN_LEGAL,
+                     question="q?", dossier=dossier)
+    body = json.loads(json.dumps(view.to_dict()))
+    assert body["dossier"]["outcome"]["reason"] == "no_candidates"
+    assert body["dossier"]["outcome"]["trace"]["queries"][0]["q"] == "work permit"
+    assert T.dossier_from_dict(body["dossier"]).outcome == outcome
+    old = {k: v for k, v in body["dossier"].items() if k != "outcome"}
+    assert T.dossier_from_dict(old).outcome is None
+    text, _pages = api._render("alice", view, 1)
+    assert "Status: partial — the searches found no candidate document." in text
+    assert "Outcome: no_candidates — 0 verified findings" in text
 
 
 def test_a_job_gone_before_its_claim_still_answers(env, monkeypatch):

@@ -55,6 +55,7 @@ from app.documents.research.context import (
     Cancelled,
     NeedsInput,
     ResearchContext,
+    StructuredOutputError,
     TimeUp,
     estimate_tokens,
 )
@@ -62,6 +63,11 @@ from app.documents.research.evidence import EVIDENCE_SCHEMA, check_evidence
 from app.documents.research.types import (
     COMPLETE,
     NEEDS_CONFIRMATION,
+    OUTCOME_BUDGET,
+    OUTCOME_COMPILED,
+    OUTCOME_TEXT,
+    OUTCOME_TIME,
+    OUTCOME_UNREADABLE,
     PARTIAL,
     READ_FULL,
     READ_NONE,
@@ -74,6 +80,7 @@ from app.documents.research.types import (
     Dossier,
     Evidence,
     Finding,
+    Outcome,
 )
 from app.documents.research.windows import WINDOW_TOKENS, Window, body_chunks, build_windows, refs_for
 from app.documents.textnorm import fold
@@ -384,7 +391,13 @@ async def _plan(ctx: ResearchContext, files: list[dict[str, Any]], readable: lis
         user += f"The beginning of {len(samples)} of them:\n{wrap_document_content(chr(10).join(samples))}\n"
     system = _PLAN_SYSTEM.format(language=_LANGUAGES[lang])
     for _attempt in range(2):
-        raw = await ctx.llm.call(system=system, user=user, tool=_PLAN_TOOL, max_tokens=PLAN_MAX_TOKENS)
+        try:
+            raw = await ctx.llm.call(system=system, user=user, tool=_PLAN_TOOL, max_tokens=PLAN_MAX_TOKENS)
+        except StructuredOutputError as exc:
+            # A malformed answer is retried, then the generic plan is used —
+            # never taken for an empty one.
+            logger.warning(f"[documents] research {ctx.job_id}: table plan: {exc}")
+            continue
         plan = clean_plan(raw, lang)
         if plan is not None:
             return plan
@@ -726,6 +739,11 @@ class _Mapper:
                                               max_tokens=MAP_MAX_TOKENS)
             except (BudgetExceeded, TimeUp, Cancelled):
                 raise
+            except StructuredOutputError as exc:
+                # The provider answered, badly: retried like an unusable
+                # answer, and no sign the provider is down.
+                logger.info(f"[documents] research {self.ctx.job_id}: {w.label}: {exc}")
+                continue
             except Exception as exc:  # noqa: BLE001 — a provider error: this window failed, the job goes on
                 self.errors += 1
                 logger.warning(f"[documents] research {self.ctx.job_id}: model call failed for {w.label}: {exc}")
@@ -1005,7 +1023,12 @@ async def _summarize_once(ctx: ResearchContext, lang: str, text: str, allowed: d
     if ctx.llm.soft_limit_reached() or not ctx.llm.can_afford(prompt, SUMMARY_MAX_TOKENS):
         return None
     ctx.check()
-    raw = await ctx.llm.call(system=system, user=user, tool=_SUMMARY_TOOL, max_tokens=SUMMARY_MAX_TOKENS)
+    try:
+        raw = await ctx.llm.call(system=system, user=user, tool=_SUMMARY_TOOL, max_tokens=SUMMARY_MAX_TOKENS)
+    except StructuredOutputError as exc:
+        # The table stands without its summary; a malformed one is none.
+        logger.warning(f"[documents] research {ctx.job_id}: summary: {exc}")
+        return [], 0
     findings: list[Finding] = []
     rejected = 0
     for item in ((raw or {}).get("findings") or [])[:MAX_FINDINGS]:
@@ -1218,6 +1241,17 @@ def _assemble(ctx: ResearchContext, st: dict[str, Any], run: _Run, *, stop_reaso
         notes.append(f"{len(d.compiled.conflicts)} value(s) differ between sources; each conflict lists every "
                      "value with its source.")
     d.notes = notes
+    reason = {"budget": OUTCOME_BUDGET, "time": OUTCOME_TIME}.get(stop_reason or "", OUTCOME_COMPILED)
+    readable = [f for f in run.files if cov.unread_reason(f) is None]
+    detail = OUTCOME_TEXT[reason]
+    if reason == OUTCOME_COMPILED and not run.files:
+        detail = "no file matched the scope, so there was nothing to compile"
+    elif reason == OUTCOME_COMPILED and not readable:
+        detail = "no file in scope could be read, so the table is empty"
+    d.outcome = Outcome(
+        reason=reason, detail=detail, files_read=sum(1 for r in d.coverage if r.read == READ_FULL),
+        findings=len(d.compiled.rows) if d.compiled is not None else 0, stopped_early=reason != OUTCOME_COMPILED,
+    )
 
 
 # ── the pipeline ──────────────────────────────────────────────────────────
@@ -1282,6 +1316,9 @@ async def run_compile(ctx: ResearchContext) -> Dossier:
             run.notes.append("Not compiled: you chose not to continue without the files that cannot be read.")
             _assemble(ctx, st, run, stop_reason=None)
             d.status = PARTIAL
+            if d.outcome is not None:
+                d.outcome.reason, d.outcome.stopped_early = OUTCOME_UNREADABLE, True
+                d.outcome.detail = "not compiled: the user chose not to go on without the files that cannot be read"
             await ctx.save()
             return d
     if not readable:

@@ -192,6 +192,22 @@ test('reload: a settled job is restored as saved, without asking the server', as
   assert.equal(chat.researchActivityByConversation.none, null)
 })
 
+test('a settled snapshot keeps its outcome, and "partial" says which kind', async () => {
+  const { chat, id, emit } = freshConversation()
+  const outcome = { reason: 'candidates_rejected', detail: 'candidate documents were found but none was relevant',
+    findings: 0, queries: 6, candidates: 2, selected: 0 }
+  emit('research_activity', snapshot({ status: 'partial', updated_at: 1_700_000_070, outcome }))
+  assert.deepEqual(chat.researchActivityByConversation[id].outcome, outcome)
+
+  const { researchStatusLabel } = await load('src/utils/researchStatus.ts')
+  assert.equal(researchStatusLabel('partial', outcome), 'Partial — insufficient evidence')
+  assert.equal(researchStatusLabel('partial', { reason: 'budget' }), 'Partial — stopped early')
+  assert.equal(researchStatusLabel('partial', { reason: 'time' }), 'Partial — stopped early')
+  // A snapshot saved before outcomes existed: neutral wording, never "stopped early".
+  assert.equal(researchStatusLabel('partial', null), 'Partial — incomplete or insufficient evidence')
+  assert.equal(researchStatusLabel('complete', { reason: 'evidenced' }), 'Complete')
+})
+
 test('reload: a live frame that arrives first wins over the restore check', async () => {
   setActivePinia(createPinia())
   const settings = useSettingsStore()

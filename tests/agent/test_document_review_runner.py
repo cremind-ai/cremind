@@ -104,6 +104,44 @@ def test_the_reads_label_and_the_review_record_survive_a_reload(tmp_path, monkey
     asyncio.run(scenario())
 
 
+def test_a_research_delivery_turn_hands_its_record_to_the_agent(tmp_path, monkeypatch):
+    """A research job reporting back: the record its delivery built reaches
+    the agent (which answers from it before any model call); any other
+    trigger passes none."""
+
+    class _Capturing(_Agent):
+        def __init__(self):
+            super().__init__([{"type": T.DONE, "data": "summary", "input_tokens": 0, "output_tokens": 0}])
+            self.kwargs: list[dict] = []
+
+        async def run(self, **kwargs):
+            self.kwargs.append(kwargs)
+            async for chunk in super().run(**kwargs):
+                yield chunk
+
+    async def scenario():
+        cs, _published = _setup(tmp_path, monkeypatch)
+        conv = await cs.create_conversation(profile="p1", title="c", kind="chat")
+        record = {"job_id": "j1", "status": "partial", "insufficiency": "summary"}
+        for trigger in ({"kind": "research_result", "event_type": "document research partial: q", "action": "",
+                         "content": "Research job j1", "job_id": "j1", "research_delivery": record},
+                        {"kind": "event_task_result", "event_type": "done", "action": "", "content": "x",
+                         "research_delivery": record}):
+            agent = _Capturing()
+            await sr.run_agent_to_bus(
+                cremind_agent=agent, conversation_storage=cs, conversation_id=conv["id"],
+                run_id=sr.make_run_id(conv["id"], kind="research"), profile="p1", query="q", history_messages=[],
+                push_user_message=False, update_title_from_query=False, trigger_event=trigger,
+            )
+            yield_kw = agent.kwargs[0]
+            if trigger["kind"] == "research_result":
+                assert yield_kw["research_delivery"] == record
+            else:
+                assert "research_delivery" not in yield_kw
+
+    asyncio.run(scenario())
+
+
 def test_a_turn_without_documents_stores_no_review(tmp_path, monkeypatch):
     async def scenario():
         cs, _published = _setup(tmp_path, monkeypatch)

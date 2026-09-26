@@ -77,6 +77,13 @@ class NeedsInput(Exception):
         self.status = status
 
 
+class StructuredOutputError(Exception):
+    """The model answered, but not with a usable call of the function it was
+    asked for: no call, another function, arguments that are not JSON, or
+    arguments that miss a required field or have the wrong type. Never an
+    empty result: a caller retries it, then reports it."""
+
+
 @dataclass
 class ResearchSpec:
     """What the user asked for. ``scope`` / ``reference_scope`` are filter
@@ -107,14 +114,62 @@ def estimate_tokens(text: str) -> int:
     return int(len(text or "") / CHARS_PER_TOKEN) + 1
 
 
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "object": (dict,), "array": (list,), "string": (str,), "boolean": (bool,),
+    "integer": (int,), "number": (int, float), "null": (type(None),),
+}
+
+
+def _type_error(schema: dict[str, Any], value: Any, path: str) -> str | None:
+    types = schema.get("type")
+    allowed = [types] if isinstance(types, str) else list(types or [])
+    if not allowed:
+        return None
+    for name in allowed:
+        if isinstance(value, bool) and name in ("integer", "number"):
+            continue  # a boolean is not a number
+        if isinstance(value, _JSON_TYPES.get(name, ())):
+            return None
+    return f"{path}: expected {'/'.join(allowed)}, got {type(value).__name__}"
+
+
+def schema_errors(schema: dict[str, Any], value: Any, path: str = "$", *, root: bool = True) -> list[str]:
+    """Where ``value`` breaks ``schema`` (the subset of JSON Schema the
+    research tools use): the root's required fields, and the type of every
+    field and of every array item. Deeper than that — one fact without its
+    evidence, one finding with an odd field — is left to the pipeline, which
+    drops such an item on its own; one bad item must not cost the whole
+    answer. Extra fields are tolerated. Empty when it fits."""
+    err = _type_error(schema, value, path)
+    if err:
+        return [err]
+    errors: list[str] = []
+    if isinstance(value, dict):
+        if root:
+            errors += [f"{path}.{key}: missing" for key in schema.get("required") or [] if key not in value]
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in value and isinstance(sub, dict):
+                errors += schema_errors(sub, value[key], f"{path}.{key}", root=False)
+    elif isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for i, item in enumerate(value):
+            err = _type_error(schema["items"], item, f"{path}[{i}]")
+            if err:
+                errors.append(err)
+                break
+    return errors
+
+
 class ResearchLLM:
     """The research model, with a token budget.
 
-    ``call`` is one function-calling completion: the model must answer by
-    calling ``tool`` (an OpenAI-style ``{"type": "function", "function":
-    {...}}``); the parsed arguments come back, or None when the model
-    answered anything else. Every call's usage is added to ``spent`` and
-    reported to ``on_usage`` (the runner turns it into usage records).
+    ``call`` is one function-calling completion: the model is asked to call
+    ``tool`` (an OpenAI-style ``{"type": "function", "function": {...}}``)
+    by name, and its parsed arguments come back — checked against the
+    tool's schema. Anything else (no call, another function, arguments that
+    are not JSON or break the schema) raises :class:`StructuredOutputError`:
+    a malformed answer must never pass for an empty one. Every call's usage
+    is added to ``spent`` and reported to ``on_usage`` (the runner turns it
+    into usage records), whatever the call's outcome.
     """
 
     def __init__(
@@ -182,7 +237,7 @@ class ResearchLLM:
         user: str,
         tool: dict[str, Any],
         max_tokens: int | None = 4000,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         from app.constants import ChatCompletionTypeEnum
         from app.lib.llm.base import done_chunk_token_usage
 
@@ -194,7 +249,10 @@ class ResearchLLM:
         name = tool["function"]["name"]
         calls: list[dict[str, Any]] = []
         usage: dict[str, int] = {}
-        kwargs: dict[str, Any] = {"tools": [tool], "tool_choice": "auto", "temperature": 0}
+        # The function is named, not merely offered: a model left to choose
+        # may answer in prose, which is no answer here.
+        kwargs: dict[str, Any] = {"tools": [tool], "tool_choice": {"type": "function", "function": {"name": name}},
+                                  "temperature": 0}
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
         self.calls += 1
@@ -220,17 +278,7 @@ class ResearchLLM:
                 # reports zeros: count the estimate, so neither makes a job
                 # free.
                 self._count({"input_tokens": prompt, "output_tokens": 0})
-        for call in calls:
-            if call.get("name") != name:
-                continue
-            args = call.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except (ValueError, TypeError):
-                    return None
-            return args if isinstance(args, dict) else None
-        return None
+        return _parse_call(name, calls, tool["function"].get("parameters") or {})
 
     def _count(self, usage: dict[str, int]) -> None:
         tin = int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0) \
@@ -243,6 +291,30 @@ class ResearchLLM:
                 self._on_usage(usage)
             except Exception:  # noqa: BLE001 — accounting never fails a job
                 logger.debug("[documents] research usage callback failed", exc_info=True)
+
+
+def _parse_call(name: str, calls: list[dict[str, Any]], parameters: dict[str, Any]) -> dict[str, Any]:
+    """The arguments of the call to ``name``, checked against its schema;
+    :class:`StructuredOutputError` for anything else."""
+    wanted = [c for c in calls if isinstance(c, dict) and c.get("name") == name]
+    if not wanted:
+        other = sorted({str(c.get("name")) for c in calls if isinstance(c, dict)})
+        raise StructuredOutputError(f"the model did not call {name}"
+                                    + (f" (it called {', '.join(other)})" if other else ""))
+    args = wanted[0].get("arguments")
+    if args is None or args == "":
+        args = {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError) as exc:
+            raise StructuredOutputError(f"{name}: the arguments are not valid JSON ({exc})") from None
+    if not isinstance(args, dict):
+        raise StructuredOutputError(f"{name}: the arguments are a {type(args).__name__}, not an object")
+    errors = schema_errors(parameters, args)
+    if errors:
+        raise StructuredOutputError(f"{name}: malformed arguments: " + "; ".join(errors[:5]))
+    return args
 
 
 class ProgressSink:
@@ -336,6 +408,6 @@ class ResearchContext:
 
 __all__ = [
     "BudgetExceeded", "CHARS_PER_TOKEN", "Cancelled", "MAX_JOB_SECONDS", "NeedsInput", "ProgressSink",
-    "ResearchContext", "ResearchLLM", "ResearchSpec", "SOFT_BUDGET_FRACTION", "TimeUp", "Usage",
-    "estimate_tokens",
+    "ResearchContext", "ResearchLLM", "ResearchSpec", "SOFT_BUDGET_FRACTION", "StructuredOutputError", "TimeUp",
+    "Usage", "estimate_tokens", "schema_errors",
 ]

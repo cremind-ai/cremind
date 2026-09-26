@@ -267,16 +267,21 @@ def done_chunk_token_usage(response: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def model_label_for(provider_name: Optional[str], model_name: Optional[str]) -> str:
+    """Human-readable label combining provider and model, e.g. 'Groq GPT-OSS-120B'
+    — :attr:`LLMProvider.model_label` without building the provider."""
+    if provider_name and model_name:
+        return f"{provider_name.capitalize()} {model_name}"
+    return model_name or "unknown"
+
+
 class LLMProvider(ABC):
     provider_name: str = ""
 
     @property
     def model_label(self) -> str:
         """Human-readable label combining provider and model, e.g. 'Groq GPT-OSS-120B'."""
-        name = getattr(self, "model_name", "")
-        if self.provider_name and name:
-            return f"{self.provider_name.capitalize()} {name}"
-        return name or "unknown"
+        return model_label_for(self.provider_name, getattr(self, "model_name", ""))
 
     @abstractmethod
     def chat_completion_stream(

@@ -890,6 +890,9 @@ async def run_agent_to_bus(
                 plan_phase=plan_phase,
                 message_origin=message_origin,
                 task_chain_depth=int((trigger_event or {}).get("task_chain_depth") or 0),
+                **({"research_delivery": trigger_event.get("research_delivery")}
+                   if (trigger_event or {}).get("kind") == "research_result"
+                   and isinstance(trigger_event.get("research_delivery"), dict) else {}),
             ):
                 ctype = chunk.get("type")
 

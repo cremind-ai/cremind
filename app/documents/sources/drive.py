@@ -671,6 +671,14 @@ class DriveSource:
         self._clear_hold(since=started)
         with self._lock:
             self._next_poll_at = _now() + POLL_INTERVAL_S
+        # Drive is working: files an older chunker cut differently are
+        # re-read once (a no-op when there are none).
+        try:
+            requeue = getattr(self.rt, "queue_stale_chunking", None)
+            if requeue is not None:
+                requeue(SOURCE)
+        except Exception:  # noqa: BLE001 — never fails a sync that succeeded
+            logger.exception(f"[documents] {self.profile}: queueing Drive files for the new chunker failed")
 
     # ── identity and account ───────────────────────────────────────────────
 

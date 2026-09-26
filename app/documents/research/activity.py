@@ -106,6 +106,10 @@ class ResearchActivity:
         self.budget = 0
         self.summary: Optional[str] = None
         self.error: Optional[str] = None
+        # Why a settled job ended as it did (the dossier's outcome: reason,
+        # detail, counts), so the panel can tell "stopped early" from
+        # "insufficient evidence".
+        self.outcome: Optional[Dict[str, Any]] = None
         self._steps: List[_Step] = []
         self.total_steps = 0
         self._seq = 0
@@ -133,6 +137,7 @@ class ResearchActivity:
             activity.status = "running"
             activity.summary = None
             activity.error = None
+            activity.outcome = None
             activity.persist_message_id = None
             activity._patched = False
             activity.updated_at = time.time()
@@ -197,12 +202,16 @@ class ResearchActivity:
         self.updated_at = time.time()
         self._schedule_flush()
 
-    async def finish(self, *, status: str, summary: str | None = None, error: str | None = None) -> None:
+    async def finish(self, *, status: str, summary: str | None = None, error: str | None = None,
+                     outcome: Optional[Dict[str, Any]] = None) -> None:
         """The run ended (final, or stopped to ask): publish now and patch
-        the saved message when one is known."""
+        the saved message when one is known. ``outcome`` is the dossier's
+        (counts and the reason; its diagnostic trace is left out)."""
         self.status = status
         self.summary = _truncate(summary, _SUMMARY_MAX)
         self.error = _truncate(error, _DETAIL_MAX)
+        self.outcome = ({k: v for k, v in outcome.items() if k != "trace"} if isinstance(outcome, dict)
+                        else None)
         self.updated_at = time.time()
         # Steps left "running" belong to a run that is over.
         if status not in _WORKING:
@@ -264,6 +273,7 @@ class ResearchActivity:
             "usage": {"tokens_in": self.tokens_in, "tokens_out": self.tokens_out, "budget": self.budget},
             "summary": self.summary,
             "error": self.error,
+            "outcome": self.outcome,
         }
 
     def _schedule_flush(self) -> None:

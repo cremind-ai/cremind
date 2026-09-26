@@ -11,13 +11,16 @@ What the reader gets depends on where the job is:
   the question, the candidates to choose from, and the answer keys with the
   exact call that answers them.
 - **settled** (``complete`` / ``partial``, and ``failed`` / ``cancelled`` with
-  whatever the dossier held): the dossier, in pages. Page 1 is the summary —
-  coverage first (how many files were read, which were not and why), the
-  authorities and the edition used, the findings per issue with their
-  verified quotes, the head of the compiled table and its conflicts, the gaps.
-  Later pages carry the long tails (every file of the coverage table, every
-  row of the table), read with ``documentation_search__read(file='research:<id>',
-  page=n)``.
+  whatever the dossier held): the dossier, in pages. Page 1 opens with the
+  status, the outcome (why the job ended as it did, in counts) and the
+  coverage totals — outside the document block and before it, so no budget
+  pushes them off the page — then the summary: which files were not read and
+  why, the authorities and the edition used, the findings per issue with
+  their verified quotes, the head of the compiled table and its conflicts, the
+  gaps. Later pages carry the long tails (every file of the coverage table,
+  every row of the table), read with
+  ``documentation_search__read(file='research:<id>', page=n)``. A settled
+  analysis ends with the response contract (:data:`.handoff.RESPONSE_CONTRACT`).
 
 Budget: like the other renderers (:mod:`app.documents.query.render`), the
 result is sized to the profile's tool-result budget by construction — quotes
@@ -42,6 +45,7 @@ from typing import Any, Callable, Iterable
 
 from app.documents.cite import TOKEN_RE, IssuedCitation, escape_in_document_text, make_token, parse_tokens
 from app.documents.query.render import RenderContext, Rendered, cite_chunk, cite_file, cite_folder
+from app.documents.research.handoff import RESPONSE_CONTRACT, evidence_tokens
 from app.documents.research.types import (
     ACTIVE,
     CANCELLED,
@@ -49,6 +53,7 @@ from app.documents.research.types import (
     DOMAIN_LEGAL,
     FAILED,
     INTERRUPTED,
+    MODE_ANALYZE,
     NEEDS_CLARIFICATION,
     NEEDS_CONFIRMATION,
     PARTIAL,
@@ -359,9 +364,15 @@ def _status_line(view: JobView) -> str:
     """How far the dossier can be trusted — outside the untrusted block, as
     it is an instruction to the agent, not document content."""
     status = view.status
+    outcome = view.dossier.outcome if view.dossier is not None else None
     if status == COMPLETE:
+        if outcome is not None and view.mode == MODE_ANALYZE:
+            return "Status: complete — every issue has verified findings."
         return "Status: complete."
     if status == PARTIAL:
+        if outcome is not None and outcome.detail:
+            return (f"Status: partial — {_line(outcome.detail, 400)}. The gaps and notes below say what is missing; "
+                    "an answer may rest only on the verified findings.")
         return ("Status: partial — the job stopped before covering everything; the gaps and notes below say "
                 "what is missing.")
     if status == FAILED:
@@ -384,10 +395,11 @@ def _layout(view: JobView, quote_chars: int, *, paged: bool) -> _Layout:
     if d.notes:
         out.summary.append(_Block([f"Note: {_line(n, 400)}" for n in d.notes]))
 
-    # Coverage first: what the answer rests on, and what it does not.
+    # Coverage first: what the answer rests on, and what it does not (the
+    # totals are in page 1's head).
     rows = list(d.coverage)
     if rows:
-        cov = [_coverage_totals(rows)]
+        cov: list[str] = []
         if len(rows) <= _COVERAGE_INLINE:
             cov += [_coverage_line(r) for r in rows]
         else:
@@ -405,9 +417,8 @@ def _layout(view: JobView, quote_chars: int, *, paged: bool) -> _Layout:
                 for j in range(0, len(part), 15):
                     lines = (title if j == 0 else []) + [_coverage_line(r) for r in part[j:j + 15]]
                     out.detail.append(_Block(lines, page_break=paged and j == 0))
-        out.summary.append(_Block(cov))
-    else:
-        out.summary.append(_Block(["Coverage: no files in scope."]))
+        if cov:
+            out.summary.append(_Block(cov))
 
     if d.authorities or d.version_notes:
         lines = ["Authorities and the edition used:"] if d.authorities else []
@@ -486,8 +497,31 @@ def _artifact_names(view: JobView) -> list[str]:
     return [str(a.get("name") or a.get("uri") or "file") for a in d.compiled.artifacts if isinstance(a, dict)]
 
 
+def _outcome_line(view: JobView) -> str | None:
+    """The outcome in counts — no document text, so outside the block."""
+    d = view.dossier
+    o = d.outcome if d is not None else None
+    if o is None:
+        return None
+    bits = [f"{_n(o.findings, 'verified finding', 'verified findings')}"]
+    if view.mode == MODE_ANALYZE:
+        bits.append(f"{_n(o.files_read, 'file', 'files')} and {_n(o.provisions_read, 'provision', 'provisions')} "
+                    "read")
+        if o.queries or o.candidates:
+            bits.append(f"{_n(o.queries, 'discovery search', 'discovery searches')} found "
+                        f"{_n(o.candidates, 'candidate document', 'candidate documents')}, {o.selected:,} selected")
+        if o.unresolved:
+            bits.append(f"{o.unresolved:,} unresolved")
+        if o.incomplete_provisions:
+            bits.append(f"{_n(len(o.incomplete_provisions), 'provision', 'provisions')} read only in part")
+    else:
+        bits.append(f"{_n(o.files_read, 'file', 'files')} read in full")
+    return f"Outcome: {_line(o.reason, 40)} — " + "; ".join(bits) + "."
+
+
 def _foot(view: JobView, page: int, pages: int) -> list[str]:
-    lines = [CITE_RULE]
+    settled_analysis = view.mode == MODE_ANALYZE and view.status in (COMPLETE, PARTIAL, FAILED)
+    lines = [RESPONSE_CONTRACT if settled_analysis else CITE_RULE]
     if view.domain == DOMAIN_LEGAL:
         lines.append(NOT_LEGAL_ADVICE)
     if page == 1:
@@ -508,6 +542,12 @@ def _head(view: JobView, page: int, pages: int) -> list[str]:
         head = [_header(view), _question(view), _status_line(view)]
         if view.dossier is None:
             head.append("(The job recorded no dossier.)")
+            return head
+        outcome = _outcome_line(view)
+        if outcome:
+            head.append(outcome)
+        rows = list(view.dossier.coverage)
+        head.append(_coverage_totals(rows) if rows else "Coverage: no files in scope.")
         return head
     return [_header(view), f"Dossier page {page} of {pages} (continued)."]
 
@@ -737,6 +777,7 @@ def render_job(view: JobView, *, ctx: RenderContext, db: Any | None, page: int =
     pages = 1
     shown = 1
     files: list[dict[str, Any]] = []
+    evidence_pages: list[int] = []
     if status in ACTIVE or status == INTERRUPTED:
         text = _fit(ctx, [lambda n=n: _progress_text(view, ctx, n) for n in _STEP_STEPS])
     elif status in (NEEDS_CLARIFICATION, NEEDS_CONFIRMATION):
@@ -750,9 +791,19 @@ def render_job(view: JobView, *, ctx: RenderContext, db: Any | None, page: int =
             text += f"\n(There is no page {int(page)}; the dossier has {_n(pages, 'page', 'pages')}.)"
         if status in (COMPLETE, PARTIAL) and view.dossier is not None and view.dossier.compiled is not None:
             files = [dict(a) for a in view.dossier.compiled.artifacts if isinstance(a, dict)]
+        # Where the verified findings' evidence is printed: what a reader of
+        # page 1 alone has not seen yet.
+        evidence = set(evidence_tokens(view))
+        if evidence:
+            evidence_pages = [i + 1 for i, t in enumerate(texts)
+                              if any(m.group(0) in evidence for m in TOKEN_RE.finditer(t))]
     citations = _citations(text, db, leaf)
+    outcome = view.dossier.outcome if view.dossier is not None else None
     data = {"leaf": leaf, "job_id": view.job_id, "status": status, "mode": view.mode, "domain": view.domain,
-            "page": shown, "pages": pages}
+            "page": shown, "pages": pages, "evidence_pages": evidence_pages,
+            "outcome": outcome.reason if outcome is not None else None,
+            # The token budget every page was cut to (None: whole pages).
+            "page_tokens": ctx.limit}
     return Rendered(text=text, citations=citations, files=files, data=data)
 
 

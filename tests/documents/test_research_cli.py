@@ -212,6 +212,43 @@ def test_status_follow_keeps_the_page(client):
     assert result.stdout.strip() == "p2"
 
 
+def _outcome(reason: str, detail: str, **kw) -> dict:
+    return {"outcome": {"reason": reason, "detail": detail, "findings": 0, "queries": 6, "candidates": 2,
+                        "selected": 0, **kw}}
+
+
+def test_insufficient_evidence_is_said_plainly_and_keeps_the_exit_code(client):
+    client["gets"] = [_answer("running"),
+                      _answer("partial", text="FINAL", dossier=_outcome(
+                          "candidates_rejected", "candidate documents were found but none was a relevant legal "
+                                                 "document"))]
+    result = _run("docs", "research", "status", "job1", "--follow")
+    assert result.exit_code == 0, result.output
+    assert "job1: partial · outcome: candidates_rejected" in result.stderr
+    assert ("Insufficient evidence (candidates_rejected): candidate documents were found but none was a relevant "
+            "legal document. 0 verified finding(s)") in result.stderr
+
+
+def test_a_job_the_budget_stopped_is_not_called_insufficient(client):
+    client["gets"] = [_answer("partial", text="FINAL", dossier=_outcome("budget", "stopped at the token budget"))]
+    result = _run("docs", "research", "status", "job1")
+    assert result.exit_code == 0
+    assert "Stopped early: stopped at the token budget" in result.stderr and "Insufficient" not in result.stderr
+
+
+def test_json_carries_the_outcome(client):
+    client["gets"] = [{**_answer("partial", text="t", dossier=_outcome("no_candidates", "no candidate")), "pages": 1}]
+    result = _run("--json", "docs", "research", "status", "job1")
+    assert json.loads(result.stdout)["job"]["dossier"]["outcome"]["reason"] == "no_candidates"
+
+
+def test_the_insufficient_reasons_mirror_the_server():
+    import app.cli.commands.docs as cmd
+    from app.documents.research import types as T
+
+    assert cmd._RESEARCH_INSUFFICIENT == T.INSUFFICIENT_OUTCOMES
+
+
 def test_json_prints_the_whole_answer(client):
     client["gets"] = [{**_answer("partial", text="t"), "pages": 1}]
     result = _run("--json", "docs", "research", "status", "job1")

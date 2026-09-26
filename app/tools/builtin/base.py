@@ -77,6 +77,14 @@ class BuiltInTool:
         """
         raise NotImplementedError
 
+    def model_label(self, arguments: Dict[str, Any], profile: str, group_llm: Any) -> Optional[str]:
+        """The model a call with ``arguments`` runs on, as the Thinking Process
+        names it on the call: the group's child LLM unless the function knows
+        better. None: the call runs no model of its own — the Thinking Process
+        then shows the model that chose the call, or nothing when the agent
+        made it itself. Asked before the call runs, so keep it cheap."""
+        return getattr(group_llm, "model_label", None)
+
 
 def missing_dependency_result(
     *,

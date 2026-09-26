@@ -37,6 +37,7 @@ import { normalizeTodos, allTodosCompleted } from '../utils/todos';
 import { splitMidTurnSegments } from '../utils/midTurnSplit';
 import { backfillLegacyTotals } from '../utils/latencyLabels';
 import { normalizeCitationsMeta, type CitationsMeta } from '../utils/citations';
+import type { ResearchOutcome } from '../utils/researchStatus';
 import {
   attachResultToSteps,
   terminalAttachmentFromFrame,
@@ -494,6 +495,9 @@ export interface ResearchActivitySnapshot {
   usage?: { tokens_in: number; tokens_out: number; budget: number } | null;
   summary?: string | null;
   error?: string | null;
+  /** Why a settled job ended as it did (absent while running, and in
+   *  snapshots saved before outcomes existed). */
+  outcome?: ResearchOutcome | null;
 }
 
 export interface ResearchActivityState extends ResearchActivitySnapshot {

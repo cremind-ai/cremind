@@ -85,7 +85,15 @@ from app.documents import textnorm
 from app.documents.chunking import legal as _legal
 from app.documents.types import ANCHOR_HARD, ANCHOR_SOFT, CTYPE_BODY, Block, Chunk
 
-CHUNKER_VERSION = 1
+# 2: the legal overlay no longer reads a wrapped cross-reference ("Điều 23
+# Nghị định này.", "Article 23(2) of …") as a new article heading.
+CHUNKER_VERSION = 2
+# The versions whose output differs from the version before only for
+# documents with legal structure: an indexed file chunked before one of them
+# is re-read only if it has articles (see ProfileRuntime.queue_stale_chunking).
+# Add a new version here only when that holds; any other bump re-reads every
+# text file once.
+LEGAL_ONLY_BUMPS = frozenset({2})
 
 MIN_TOKENS = 120
 TARGET_TOKENS = 300

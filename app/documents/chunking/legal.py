@@ -21,7 +21,14 @@ at the start of a line and only when what follows the number looks like a
 heading (end of line, "." ":" "–", or a capital letter): a wrapped line that
 happens to begin "Điều 5 của Luật này …" is a cross-reference, not an article.
 Keywords must be Title Case or UPPER CASE, never lower case, for the same
-reason. Labels are canonicalised ("CHƯƠNG II" → "Chương II") so the
+reason. A capital or a parenthesis is not enough either when the line is
+plainly a reference carried over from the line before: "Điều 23 Nghị định
+này." (a document named after the number), "Article 23(2) of this
+Regulation." (a clause of the article), or any label right after a line
+ending in a reference lead-in ("quy định tại khoản 2", "pursuant to").
+Such a line stays in the article it belongs to, and its reference stays
+extractable. Article numbers need not increase: annexes and model contracts
+restart at 1. Labels are canonicalised ("CHƯƠNG II" → "Chương II") so the
 breadcrumb — and therefore every chunk hash under it — does not depend on
 the document's typography.
 
@@ -91,8 +98,44 @@ def _rest_is_heading(rest: str) -> bool:
     return c in ".:–—-()" or c.isupper()
 
 
-def _match_heading(line: str) -> tuple[int, str, str] | None:
-    """(level, canonical keyword, number) when ``line`` is a structural heading."""
+# A document named right after the number: "Điều 23 Nghị định này.", "Điều 5
+# Luật Đất đai", "Điều 7 Nghị định số 152/2020/NĐ-CP" — the tail of a
+# reference, never an article's title ("Điều 5. Luật áp dụng" has its dot).
+_VI_DOC_AFTER_RE = re.compile(
+    r"^(?:của\s+)?(?:Bộ luật|Luật|Nghị định|Thông tư(?: liên tịch)?|Nghị quyết|Pháp lệnh|Hiến pháp|"
+    r"Quyết định|Văn bản|Hợp đồng)\s+(\S)"
+)
+# A clause or point of the article: "Article 23(2)", "Điều 5(a)". An article
+# heading never carries one; an annotation such as "(repealed)" is a word.
+_CLAUSE_AFTER_RE = re.compile(r"^\((?:\d{1,3}[a-z]?|[a-zđ]|[ivxlc]{2,5})\)")
+# A line ending like this continues into a reference on the next line: "…
+# quy định tại khoản 2" / "Điều 23 …", "… pursuant to" / "Article 7 …".
+_LEAD_IN_RE = re.compile(
+    r"(?:\b(?:tại|theo|của|và|hoặc|trừ)"
+    r"|\b(?:khoản|điểm)\s+[\w]{1,4}"
+    r"|\b(?:of|under|in|to|and|or|with|by|see|per|pursuant\s+to|referred\s+to|set\s+out)"
+    r"|\b(?:paragraph|clause|subsection|point)\s*\(?\w{1,4}\)?)\s*,?$",
+    re.IGNORECASE,
+)
+
+
+def _continues_reference(rest: str, prev: str | None) -> bool:
+    """Is a line that starts like a heading ("Điều 23 …") really the tail of
+    a cross-reference wrapped from the previous line?"""
+    s = rest.lstrip()
+    m = _VI_DOC_AFTER_RE.match(s)
+    if m and (m.group(1).isupper() or m.group(1).isdigit()
+              or s[m.start(1):].startswith(("này", "số"))):
+        return True
+    if _CLAUSE_AFTER_RE.match(s):
+        return True
+    return bool(prev and _LEAD_IN_RE.search(prev.strip()))
+
+
+def _match_heading(line: str, prev: str | None = None) -> tuple[int, str, str] | None:
+    """(level, canonical keyword, number) when ``line`` is a structural
+    heading. ``prev`` is the line before it (None when unknown): a label
+    right after a reference lead-in continues that reference."""
     s = line.strip()
     # Every keyword starts with one of these capitals; most lines of a long
     # document are rejected here without running nine patterns.
@@ -100,7 +143,7 @@ def _match_heading(line: str) -> tuple[int, str, str] | None:
         return None
     for pat, level, kw in _HEADING_PATTERNS:
         m = pat.match(s)
-        if m and _rest_is_heading(m.group(2)):
+        if m and _rest_is_heading(m.group(2)) and not _continues_reference(m.group(2), prev):
             num = m.group(1)
             if num[:3].lower() == "thứ":
                 num = num.lower()
@@ -108,20 +151,23 @@ def _match_heading(line: str) -> tuple[int, str, str] | None:
     return None
 
 
-def _is_article_line(line: str) -> bool:
-    h = _match_heading(line)
+def _is_article_line(line: str, prev: str | None = None) -> bool:
+    h = _match_heading(line, prev)
     return h is not None and h[0] == LV_ARTICLE
 
 
 def looks_legal(blocks: Iterable[Block]) -> bool:
     """True when the document has at least 5 article headings."""
     count = 0
+    prev: str | None = None
     for b in blocks:
         for line in (b.text or "").splitlines():
-            if _is_article_line(line):
+            if _is_article_line(line, prev):
                 count += 1
                 if count >= LEGAL_MIN_ARTICLES:
                     return True
+            if line.strip():
+                prev = line
     return False
 
 
@@ -153,7 +199,7 @@ def _detect_title(blocks: list[Block]) -> str | None:
             s = line.strip()
             if not s:
                 continue
-            if _match_heading(s):
+            if _match_heading(s, lines[-1] if lines else None):
                 break
             lines.append(s)
         else:
@@ -199,12 +245,13 @@ class _State:
         return head + [label for _, label in self.stack]
 
 
-def _classify(line: str, st: _State) -> tuple[str, int, int] | None:
+def _classify(line: str, st: _State, prev: str | None = None) -> tuple[str, int, int] | None:
     """Update ``st`` for a structural line; return (kind, anchor, level).
 
     kind is "heading", "clause" or "point"; None for ordinary text.
+    ``prev`` is the last non-blank line before it.
     """
-    h = _match_heading(line)
+    h = _match_heading(line, prev)
     if h:
         level, kw, num = h
         st.vi = kw in _VI_KEYWORDS
@@ -259,6 +306,9 @@ def apply_legal_structure(blocks: list[Block]) -> list[Block]:
     st = _State(_detect_title(blocks))
     out: list[Block] = []
     prev_section_heading = False
+    # The last non-blank line seen, across blocks: a PDF paragraph wrapped
+    # into the next block still continues the line before it.
+    prev_line: str | None = None
     for b in blocks:
         text = (b.text or "").replace("\r\n", "\n").replace("\r", "\n")
         lines = text.split("\n")
@@ -266,7 +316,9 @@ def apply_legal_structure(blocks: list[Block]) -> list[Block]:
         # starts at every structural line; the first one may be plain text.
         segs: list[tuple[int, tuple[str, int, int] | None, dict[str, Any]]] = []
         for i, line in enumerate(lines):
-            cls = _classify(line, st)
+            cls = _classify(line, st, prev_line)
+            if line.strip():
+                prev_line = line
             if cls is not None or i == 0:
                 loc = dict(b.locator)
                 _set_legal_locator(loc, st)
@@ -314,7 +366,8 @@ def section_key_for(locator: dict[str, Any]) -> str | None:
 
 # ── Cross-references ───────────────────────────────────────────────────────
 
-_VI_DOC_KW = r"(?:Bộ luật|Luật|Nghị định|Thông tư|Nghị quyết|Pháp lệnh|Hiến pháp)"
+# A line may wrap inside a two-word keyword ("Nghị" / "định").
+_VI_DOC_KW = r"(?:Bộ\s+luật|Luật|Nghị\s+định|Thông\s+tư|Nghị\s+quyết|Pháp\s+lệnh|Hiến\s+pháp)"
 # A cited document's name runs to the next punctuation, but never into the
 # next reference ("Điều 3 của Luật này và Điều 5 Nghị định này" is two).
 _VI_DOC_CH = r"(?:(?!\b(?:và|hoặc)\s+(?:Điều|điều|khoản|Khoản|điểm|Điểm)\b|\b(?:Điều|điều)\s+\d)[^,.;()\n])"
@@ -325,6 +378,10 @@ _VI_REF_RE = re.compile(
     rf"(?:\s+(?:của\s+)?(?P<doc>{_VI_DOC_KW}{_VI_DOC_CH}{{0,80}}))?"
 )
 _VI_SELF_RE = re.compile(rf"^{_VI_DOC_KW}\s+này(?!\w)")
+# "… Điều 18 Nghị định" / "này;": the document's name stops at the line end,
+# and "này" (this one) on the next line makes it the document itself.
+_VI_BARE_DOC_RE = re.compile(rf"{_VI_DOC_KW}\s*")
+_WRAPPED_SELF_RE = re.compile(r"\s*\n\s*này(?!\w)")
 # Words that end a law's name when the name runs on into the sentence
 # ("Điều 12 của Luật Đất đai quy định …"). Deliberately short: "và", "theo",
 # "với" occur inside real law names.
@@ -353,7 +410,15 @@ def _at_heading_line(text: str, pos: int) -> bool:
         return False
     line_end = text.find("\n", pos)
     line = text[line_start: line_end if line_end >= 0 else len(text)]
-    return _match_heading(line) is not None
+    # The last non-blank line before it: a label right after a reference
+    # lead-in is that reference, not a heading.
+    prev, end = None, line_start - 1
+    while end > 0 and prev is None:
+        start = text.rfind("\n", 0, end) + 1
+        if text[start:end].strip():
+            prev = text[start:end]
+        end = start - 1
+    return _match_heading(line, prev) is not None
 
 
 def _clean_vi_doc(doc: str | None) -> tuple[str | None, str]:
@@ -389,6 +454,9 @@ def extract_refs(text: str) -> list[dict[str, Any]]:
         if m.group("doc"):
             # Trim ``raw`` to the document name as cleaned.
             raw = raw[: m.start("doc") - m.start()] + cited
+            if doc != "self" and _VI_BARE_DOC_RE.fullmatch(m.group("doc")) and _WRAPPED_SELF_RE.match(text, m.end()):
+                doc, raw = "self", f"{raw} này"
+        raw = " ".join(raw.split())
         found.append((m.start(), {
             "raw": raw.strip(), "article": m.group("article"), "clause": m.group("clause"),
             "point": m.group("point"), "doc": doc,

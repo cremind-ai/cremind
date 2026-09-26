@@ -13,7 +13,11 @@ so the rules here never substitute an edition silently:
   (cached) from the research model reading only those pages, whose answer is
   kept only where the text itself shows it;
 - documents are grouped into instrument *families* ("Luật Đất đai": the 2013
-  law, its consolidated text, the 2024 law) by their title;
+  law, its consolidated text, the 2024 law) by their title — a descriptive
+  one; a title that only names the kind of instrument ("NGHỊ ĐỊNH",
+  "DECREE") says nothing about which instrument it is, so such a document
+  is its own family, keyed by its number (``number:…``) or its file
+  (``file:…``), and never an edition of another decree;
 - each family's edition is chosen by an explicit rule — the user's answer, a
   number or year the question names, else the edition in force on the case's
   date — and when the named year matches no edition, or a newer edition was
@@ -50,6 +54,11 @@ from app.documents.textnorm import fold
 from app.documents.types import Block
 
 LEGAL_META_VERSION = 1
+# Part of the key a job's cached identities are checked against (with the
+# file's content hash and chunker version): bump when how a LegalDoc is read
+# from the index changes, so a waiting job re-reads every identity.
+# 2: generic titles no longer make a family.
+IDENTITY_VERSION = 2
 # How much of each end of a document the regexes and the model read: the
 # number, title and issue date sit on the first page; the effective date,
 # repeals and "passed on" line on the last.
@@ -96,6 +105,22 @@ _FAMILY_DROP = frozenset({"van", "ban", "hop", "nhat", "vbhn", "so", "nam", "no"
                           "text", "version", "of", "the"})
 _AMENDING_RE = re.compile(
     r"^(?:.*?\b)?(?:sua doi,? bo sung|amending|amendment to|amendments to)\b(?:\s+mot so dieu)?(?:\s+cua)?\s*"
+)
+# Words that only say what kind of instrument something is ("NGHỊ ĐỊNH",
+# "Luật số …", "Law No. …", "HỢP ĐỒNG"): a title or a name made only of these
+# names no particular instrument.
+_GENERIC_WORDS = frozenset({
+    "luat", "bo", "nghi", "dinh", "thong", "tu", "lien", "tich", "quyet", "phap", "lenh", "hien", "chi", "thi",
+    "dong", "law", "laws", "act", "code", "decree", "circular", "joint", "regulation", "regulations",
+    "ordinance", "resolution", "decision", "directive", "constitution", "contract", "agreement", "policy",
+})
+# A legal instrument's kind, as a word of its own ("Contract" is not "Act",
+# "Luật sư" — a lawyer — is not a law).
+_INSTRUMENT_WORD_RE = re.compile(
+    r"(?<!\w)(?:Bộ\s+luật|Luật(?!\s+sư)|Nghị\s+định|Thông\s+tư|Nghị\s+quyết|Pháp\s+lệnh|Hiến\s+pháp|"
+    r"Quyết\s+định|Chỉ\s+thị|Law|Act|Code|Decree|Circular|Regulations?|Ordinance|Resolution|Directive|"
+    r"Constitution|Statute)(?!\w)",
+    re.IGNORECASE,
 )
 
 
@@ -146,6 +171,33 @@ def family_key(title: str) -> tuple[str, bool]:
     s = re.sub(r"[^\w\s]", " ", s)
     words = [w for w in s.split() if w not in _FAMILY_DROP and not w.isdigit()]
     return " ".join(words), amending
+
+
+def is_generic_key(key: str) -> bool:
+    """A family key made only of instrument-kind words ("nghi dinh",
+    "decree"), or empty: it names no particular instrument."""
+    words = key.split()
+    return not words or set(words) <= _GENERIC_WORDS
+
+
+def is_generic_title(title: str) -> bool:
+    """"NGHỊ ĐỊNH", "Nghị định 219/2025/NĐ-CP", "DECREE": the kind of
+    instrument (and at most its number), not which one it is."""
+    return is_generic_key(family_key(title)[0])
+
+
+def is_identity_key(doc_key: str) -> bool:
+    """Whether a family key is an identity key (``number:…``/``file:…``),
+    which fuzzy title matching must never pick."""
+    return doc_key.startswith(("file:", "number:"))
+
+
+def is_explicit_instrument(names: list[str], number: str | None) -> bool:
+    """Whether a name the planner reported is a legal instrument at all: it
+    has a document number, or it says what kind of instrument it is ("Luật
+    Đất đai", "Labour Code", "Decree 12/2030"). "Work permit" or "land
+    dispute" is a topic to search for, not a law to find."""
+    return bool(number) or any(_INSTRUMENT_WORD_RE.search(n or "") for n in names)
 
 
 # ── one document ───────────────────────────────────────────────────────────
@@ -233,24 +285,71 @@ def _text(chunks: list[dict[str, Any]]) -> str:
     return "\n".join((c.get("text") or "") for c in chunks)
 
 
+# What ends a decree's subject line in its header: the legal basis, the
+# preamble, the first structural label, a number or date line.
+_SUBJECT_STOP_RE = re.compile(
+    r"^(?:Căn\s+cứ|Theo\s+đề\s+nghị|Pursuant\s+to|Having\s+regard|Whereas|Số\s*:|No\.|Hà\s+Nội|"
+    r"(?:Phần|Chương|Mục|Điều|Part|Chapter|Section|Article)\s)",
+    re.IGNORECASE,
+)
+_EN_TITLE_LINE_RE = re.compile(r"^(?:LAW|ACT|CODE|DECREE|CIRCULAR|REGULATIONS?|ORDINANCE|RESOLUTION|DECISION)(?!\w)")
+
+
+def _head_title(lines: list[str]) -> str | None:
+    """A title line in a document's head ("LUẬT" / "ĐẤT ĐAI", "NGHỊ ĐỊNH" /
+    "Quy định về …", "DECREE" / "On the employment of …"): a keyword line
+    in capitals, joined with its subject when the keyword alone says only
+    what kind of instrument it is."""
+    for i, ln in enumerate(lines):
+        if not ((_TITLE_LINE_RE.match(ln) or _EN_TITLE_LINE_RE.match(ln)) and ln == ln.upper()):
+            continue
+        rest = lines[i + 1:i + 3]
+        if " " not in ln and rest and rest[0] == rest[0].upper() and not _SUBJECT_STOP_RE.match(rest[0]):
+            ln = f"{ln} {rest[0]}"
+            rest = rest[1:]
+        if not is_generic_title(ln):
+            return ln
+        subject: list[str] = []
+        for nxt in rest:
+            if _SUBJECT_STOP_RE.match(nxt) or NUMBER_RE.fullmatch(nxt.strip()) or len(" ".join(subject + [nxt])) > 220:
+                break
+            subject.append(nxt)
+            if nxt.rstrip().endswith((".", ";", ":")):
+                break
+        if subject:
+            text = " ".join(subject).rstrip(" .;:")
+            return f"{display_title(ln)} {text[0].lower()}{text[1:]}"
+        return ln
+    return None
+
+
 def _title(body: list[dict[str, Any]], file_row: dict[str, Any]) -> str:
     """The document's own name: the legal overlay's breadcrumb root, the
-    extractor's title, a title line in the head, else the file name."""
+    extractor's title, a title line in the head, else the file name. A
+    title that only names the kind of instrument ("NGHỊ ĐỊNH", "Nghị định
+    219/2025/NĐ-CP") gives way to a more substantive one — the decree's own
+    subject line — and is used only when there is none."""
+    candidates: list[str] = []
     for c in body[:40]:
         heading = (c.get("locator") or {}).get("heading")
         if isinstance(heading, list) and heading:
             first = str(heading[0]).strip()
             if first and not _STRUCT_LABEL_RE.match(first):
-                return first
+                candidates.append(first)
+                break
     meta_title = str((file_row.get("doc_meta") or {}).get("title") or "").strip()
     if meta_title:
-        return meta_title
+        candidates.append(meta_title)
     lines = [ln.strip() for c in body[:6] for ln in (c.get("text") or "").splitlines() if ln.strip()]
-    for i, ln in enumerate(lines):
-        if _TITLE_LINE_RE.match(ln) and ln == ln.upper():
-            if " " not in ln and i + 1 < len(lines) and lines[i + 1] == lines[i + 1].upper():
-                return f"{ln} {lines[i + 1]}"
-            return ln
+    head = _head_title(lines)
+    if head:
+        candidates.append(head)
+    for cand in candidates:
+        if not is_generic_title(cand):
+            return cand
+    if candidates:
+        # All generic: the one that also carries the number says the most.
+        return next((c for c in candidates if NUMBER_RE.search(c)), candidates[0])
     name = str(file_row.get("name") or file_row.get("rel_path") or "")
     return name.rsplit(".", 1)[0] if "." in name else name
 
@@ -316,8 +415,20 @@ def doc_from_index(file_row: dict[str, Any], chunks: list[dict[str, Any]]) -> Le
         name=str(file_row.get("name") or ""), title=title, number=number, issued=iso_day(issued),
         effective=iso_day(effective), consolidated=consolidated, repeals=list(dict.fromkeys(repeals)),
         amends=list(dict.fromkeys(amends)), amending=amending, legal=legal,
-        family=fkey if (legal and fkey) else f"file:{fid}", source=source, sha256=file_row.get("sha256"),
+        family=family_for(fkey, legal=legal, number=number, fid=fid), source=source,
+        sha256=file_row.get("sha256"),
     )
+
+
+def family_for(fkey: str, *, legal: bool, number: str | None, fid: str) -> str:
+    """The family a document belongs to. A descriptive title groups editions
+    ("luat dat dai"); a generic one ("nghi dinh") would group every decree
+    in the folder, so it keys the document by its own number, or its file."""
+    if not legal:
+        return f"file:{fid}"
+    if not is_generic_key(fkey):
+        return fkey
+    return f"number:{norm_number(number)}" if number else f"file:{fid}"
 
 
 def needs_model(doc: LegalDoc) -> bool:
@@ -407,8 +518,14 @@ def _apply_model_meta(doc: LegalDoc, args: dict[str, Any], text: str) -> list[st
         doc.repeals += new
         filled.append("repeals")
     title = str(args.get("title") or "").strip()
-    if title and fold(title) in fold(text) and doc.family.startswith("file:"):
-        doc.title = title
+    if is_identity_key(doc.family):
+        # A generic or missing title: the model's, where the text shows it, is
+        # a better name — but only its number (never a title) may change
+        # which family the document is in.
+        if title and fold(title) in fold(text) and not is_generic_title(title):
+            doc.title = title
+        if doc.family.startswith("file:") and doc.number and doc.legal:
+            doc.family = f"number:{norm_number(doc.number)}"
     return filled
 
 
@@ -602,26 +719,64 @@ def named_from_text(question: str) -> list[Named]:
     return out
 
 
+def plan_names(item: dict[str, Any]) -> list[str]:
+    """A planner instrument's names: as written, then its aliases. Reads the
+    current shape (``name``, ``aliases``) and the one older checkpoints hold
+    (``name_vi``, ``name_en``)."""
+    names = [str(item.get("name") or "").strip()]
+    names += [str(a).strip() for a in (item.get("aliases") or []) if isinstance(a, str)]
+    names += [str(item.get(k) or "").strip() for k in ("name_vi", "name_en")]
+    return [n for n in dict.fromkeys(names) if n][:6]
+
+
+def _named_in(question: str, name: str) -> bool:
+    """Does the question itself name ``name`` — every distinctive word of it,
+    in any order, accents and case aside ("the 2020 land law" names "Land
+    Law 2020")?"""
+    key = family_key(name)[0].split()
+    words = set(re.findall(r"\w+", fold(question)))
+    return bool(key) and set(key) <= words
+
+
 def named_from_plan(question: str, items: list[dict[str, Any]] | None) -> list[Named]:
     """Instruments from the model's reading of the question, keeping only a
     number or year the question itself contains — the model may "know" the
     number of the law the user meant, and that is exactly the substitution
-    this module refuses to make."""
+    this module refuses to make. Only what the question names *as an
+    instrument* counts: a number it writes, or a name with the kind of
+    instrument in it ("Luật Đất đai", "Labour Code") that the question
+    contains. A topic ("work permit") the model listed is left to the
+    topical search (:func:`topics_from_plan`)."""
     out: list[Named] = []
     for it in items or []:
         if not isinstance(it, dict):
             continue
-        names = [str(it.get(k) or "").strip() for k in ("name", "name_vi", "name_en")]
-        names = [n for n in dict.fromkeys(names) if n]
+        names = plan_names(it)
         num = str(it.get("number") or "").strip()
         num = num if num and _squash(num) in _squash(question) else None
         year: int | None = None
         ym = re.search(r"(?:19|20)\d{2}", str(it.get("year") or ""))
         if ym and _YEAR_RE.search(question) and ym.group(0) in question:
             year = int(ym.group(0))
-        if names or num:
+        written = str(it.get("name") or "").strip()
+        explicit = bool(num) or (is_explicit_instrument(names, None) and bool(written)
+                                 and _named_in(question, written) and not is_generic_title(written))
+        if explicit and (names or num):
             out.append(Named(names=names, number=num, year=year))
     return out
+
+
+def topics_from_plan(question: str, items: list[dict[str, Any]] | None) -> list[str]:
+    """The names the planner reported as instruments that are not (see
+    :func:`named_from_plan`): searched as topics instead, never dropped."""
+    kept = {tuple(n.names) for n in named_from_plan(question, items)}
+    out: list[str] = []
+    for it in items or []:
+        if isinstance(it, dict):
+            names = plan_names(it)
+            if names and tuple(names) not in kept:
+                out += names[:2]
+    return list(dict.fromkeys(out))
 
 
 def merge_named(primary: list[Named], extra: list[Named]) -> list[Named]:
@@ -646,9 +801,12 @@ MATCH_MIN = 0.6
 
 
 def _best_family(names: list[str], fams: dict[str, list[LegalDoc]]) -> tuple[str | None, float]:
+    """The family whose title words best match one of ``names``. Identity
+    keys (a generic title's ``number:…``, ``file:…``) are never matched by
+    words: "Nghị định" would otherwise match every decree."""
     best, best_score = None, 0.0
     for key in fams:
-        if key.startswith("file:"):
+        if is_identity_key(key):
             continue
         for nm in names:
             score = overlap(key, family_key(nm)[0])
@@ -657,17 +815,17 @@ def _best_family(names: list[str], fams: dict[str, list[LegalDoc]]) -> tuple[str
     return best, best_score
 
 
-# Words that only say what kind of instrument something is ("Luật số …",
-# "Law No. …"): a name made only of these names no particular law.
-_GENERIC_WORDS = frozenset({"luat", "bo", "nghi", "dinh", "thong", "tu", "quyet", "phap", "lenh", "hien",
-                            "law", "act", "code", "decree", "circular", "regulation", "regulations"})
-
-
-def match_family(named: Named, fams: dict[str, list[LegalDoc]]) -> str | None:
+def match_family(named: Named, fams: dict[str, list[LegalDoc]], *,
+                 loose: set[str] | None = None) -> str | None:
     """The family ``named`` refers to: by number, else by title words. With a
     single legal family in scope, a name in another language ("the land
     law" for "Luật Đất đai") or a bare "Luật số …" refers to it — but a
-    Vietnamese name that does not match ("Bộ luật Dân sự") does not."""
+    Vietnamese name that does not match ("Bộ luật Dân sự") does not.
+
+    ``loose``: the families that single-family rule may pick (None: any).
+    A job that found its authorities by topic passes the ones found for
+    this very name, so a regulation found for the topic never stands in
+    for a law the question named."""
     if named.number:
         for key, members in fams.items():
             if any(norm_number(m.number) == norm_number(named.number) for m in members):
@@ -676,8 +834,8 @@ def match_family(named: Named, fams: dict[str, list[LegalDoc]]) -> str | None:
     if best is not None and score >= MATCH_MIN:
         return best
     legal_keys = [k for k in fams if not k.startswith("file:")]
-    if len(legal_keys) == 1 and all(
-            n.isascii() or set(family_key(n)[0].split()) <= _GENERIC_WORDS for n in named.names):
+    if len(legal_keys) == 1 and (loose is None or legal_keys[0] in loose) and all(
+            n.isascii() or is_generic_key(family_key(n)[0]) for n in named.names):
         return legal_keys[0]
     return None
 
@@ -777,12 +935,16 @@ def select_editions(
     prior: dict[str, list[str]] | None = None,
     prior_why: dict[str, str] | None = None,
     lang: str = "en",
+    loose: dict[str, set[str]] | None = None,
 ) -> Selection:
     """Choose each family's edition (see the module docstring). Stops at the
     first family that needs the user (``clarification`` set; families
     decided before it are in ``chosen``). ``prior`` is what an earlier run
     of the job decided (kept, so answering the question about one law does
-    not reopen another); an answer naming an edition still overrides it."""
+    not reopen another); an answer naming an edition still overrides it.
+    ``loose`` maps a named instrument's label to the families its own search
+    found (see :func:`match_family`); None when the reference scope was
+    given and every document in it is a candidate for every name."""
     fams = families(docs)
     statuses = judge_status(docs, today)
     answered = _answer_tokens(answers)
@@ -791,7 +953,7 @@ def select_editions(
     prior_why = prior_why or {}
     named_by_family: dict[str, list[Named]] = {}
     for n in named:
-        key = match_family(n, fams)
+        key = match_family(n, fams, loose=None if loose is None else loose.get(n.label, set()))
         if key is None:
             if n.year or n.number:
                 sel.gaps.append(f"The question names {n.label}, but no document of it is among the reference "
@@ -964,9 +1126,10 @@ def resolve_ref(ref: dict[str, Any], current: LegalDoc | None, docs: dict[str, L
 
 
 __all__ = [
-    "EDGE_PAGES", "EDGE_TOKENS", "LEGAL_META_TOOL", "LegalDoc", "NUMBER_RE", "Named", "Selection", "StatusNote",
-    "authorities_for", "authority", "display_title", "doc_from_index", "edge_chunks", "editions", "families",
-    "family_key", "in_force_at", "iso_day", "judge_status", "match_family", "merge_named", "model_meta",
-    "named_from_plan", "named_from_text", "needs_model", "norm_number", "resolve_ref", "select_editions",
-    "version_notes",
+    "EDGE_PAGES", "EDGE_TOKENS", "IDENTITY_VERSION", "LEGAL_META_TOOL", "LegalDoc", "NUMBER_RE", "Named",
+    "Selection", "StatusNote", "authorities_for", "authority", "display_title", "doc_from_index", "edge_chunks",
+    "editions", "families", "family_for", "family_key", "in_force_at", "is_explicit_instrument", "is_generic_key",
+    "is_generic_title", "is_identity_key", "iso_day", "judge_status", "match_family", "merge_named", "model_meta",
+    "named_from_plan", "named_from_text", "needs_model", "norm_number", "plan_names", "resolve_ref",
+    "select_editions", "topics_from_plan", "version_notes",
 ]

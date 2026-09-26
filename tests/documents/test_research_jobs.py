@@ -152,7 +152,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "_configured_variables", lambda profile: {})
     monkeypatch.setattr(jobs, "_pipeline_for", lambda mode: e.pipeline)
     monkeypatch.setattr(jobs, "_activity_module", lambda: None)
-    monkeypatch.setattr(jobs, "_render", lambda profile, view: (f"RENDERED {view.job_id} {view.status}", []))
+    monkeypatch.setattr(jobs, "_render", lambda profile, view: (
+        f"RENDERED {view.job_id} {view.status}", [], {"job_id": view.job_id, "status": view.status}))
     monkeypatch.setattr(jobs, "CANCEL_GRACE_S", 0.2)
     monkeypatch.setattr(event_queue, "enqueue_user_message", enqueue)
     monkeypatch.setattr(storage_pkg, "get_usage_storage", lambda *a, **k: e.usage)
@@ -526,6 +527,51 @@ def test_a_failure_keeps_what_the_job_found(env):
     assert done.finished_at is not None
 
 
+def test_an_invalid_pipeline_status_fails_the_job_instead_of_completing_it(env):
+    async def pipeline(ctx):
+        ctx.dossier.status = RUNNING  # a pipeline bug: never read as success
+        return ctx.dossier
+
+    env.pipeline = pipeline
+    done = asyncio.run(_run_to_end(env))
+    assert done.status == FAILED and "invalid status 'running'" in done.error
+    assert done.dossier.outcome.reason == "execution_failed"
+
+
+def test_every_ending_leaves_an_outcome_that_says_why(env):
+    from app.documents.research.types import Outcome
+
+    async def over_budget(ctx):
+        ctx.dossier.outcome = Outcome(reason="running", queries=4, candidates=3, selected=1)
+        await ctx.save()
+        raise BudgetExceeded("estimate")
+
+    async def failed_itself(ctx):
+        ctx.dossier.outcome = Outcome(reason="model_failed", detail="the research model's answers failed")
+        ctx.dossier.status = FAILED
+        return ctx.dossier
+
+    env.pipeline = over_budget
+    done = asyncio.run(_run_to_end(env))
+    # The counts the last checkpoint had are kept; the reason is the stop's.
+    assert (done.status, done.dossier.outcome.reason, done.dossier.outcome.stopped_early) == (PARTIAL, "budget", True)
+    assert (done.dossier.outcome.queries, done.dossier.outcome.selected) == (4, 1)
+    env.pipeline = failed_itself
+    done = asyncio.run(_run_to_end(env))
+    assert done.status == FAILED and done.error == "the research model's answers failed"
+    assert done.dossier.outcome.reason == "model_failed"
+
+
+def test_the_completion_log_is_counts_only():
+    from app.documents.research.types import Dossier, Outcome
+
+    d = Dossier(job_id="j", mode="analyze", domain="legal", question="Secret question about ACME", status=PARTIAL,
+                outcome=Outcome(reason="no_candidates", queries=6, detail="the searches found no candidate"))
+    line = jobs._completion_log("j", "alice", PARTIAL, d, 12.0)
+    assert "reason=no_candidates" in line and "queries=6" in line and "candidates=0" in line
+    assert "ACME" not in line and "Secret" not in line
+
+
 def test_no_model_configured_fails_the_job_with_a_reason(env, monkeypatch):
     def no_model(group, profile):
         raise ValueError("no provider")
@@ -613,6 +659,10 @@ def test_an_idle_conversation_gets_the_result_once(env):
     assert call["agent_message_metadata"]["source"] == "research_result"
     assert f"RENDERED {done.job_id} complete" in call["query"]
     assert "Present these research results to the user" in call["query"]
+    # The same response contract as the tool's pages, and the record of what
+    # the delivery shows, for the turn's agent (never text it reads).
+    assert "Never say an indexed document is missing" in call["query"]
+    assert call["trigger_event"]["research_delivery"] == {"job_id": done.job_id, "status": "complete"}
     row = env.store.get("alice", done.job_id)
     assert row["delivered_rev"] == row["rev"] == 1
 

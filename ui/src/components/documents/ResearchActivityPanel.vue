@@ -25,6 +25,7 @@ import {
 import { useSettingsStore } from '../../stores/settings';
 import { cancelResearchJob } from '../../services/conversationApi';
 import { formatTokensCompact } from '../../utils/usageFormat';
+import { researchStatusLabel } from '../../utils/researchStatus';
 
 const props = defineProps<{ state: ResearchActivityState }>();
 const emit = defineEmits<{ (e: 'dismiss'): void }>();
@@ -37,19 +38,9 @@ const isWaiting = computed(() =>
   props.state.status === 'needs_clarification' || props.state.status === 'needs_confirmation',
 );
 
-const STATUS_LABELS: Record<string, string> = {
-  queued: 'Queued',
-  planning: 'Planning',
-  running: 'Running',
-  needs_clarification: 'Waiting for your answer',
-  needs_confirmation: 'Waiting for your confirmation',
-  complete: 'Complete',
-  partial: 'Partial — stopped early',
-  failed: 'Failed',
-  cancelled: 'Cancelled',
-  interrupted: 'Interrupted — ask the agent to continue it',
-};
-const statusLabel = computed(() => STATUS_LABELS[props.state.status] ?? props.state.status);
+// "Partial" is either a job a limit stopped or one without enough evidence;
+// the outcome says which (see researchStatusLabel).
+const statusLabel = computed(() => researchStatusLabel(props.state.status, props.state.outcome));
 
 const tone = computed(() => {
   const s = props.state.status;
