@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage messaging channels — Telegram, WhatsApp, Discord, Slack, Messenger and Zalo (official Bot API, or a QR-paired userbot): `list`, `add` from a JSON config, `edit`, `enable`/`disable`, `delete`, `catalog`; `pair` (QR pairing, or a Telegram code) and `repair` a stuck pairing that shows no QR (saved session invalidated elsewhere); per-channel authentication (open, passcode, otp, admin approval, allowlist) with `approve`/`revoke` and `senders`; push-only notification mode with `notify-filter` and `send`; `message`, `set-phone`, `set-confirm` to reach named individuals by sender id or phone number (bulk lists, preview before `--send`, `--file`); `clear-history` and `forget` for one client; files travel both ways. Group chats: opt in with `--group-chats`, then `channels groups approve`/`list`/`members`/`policy`/`allow`/`deny`/`respond`/`brakes`/`refresh`/`block`/`forget` — the agent answers when mentioned or relevant, and several of your bots can talk in one group under loop brakes. Not `cremind group` (Cremind's own multi-profile rooms)."
+description: "Connect and manage messaging channels — Telegram, WhatsApp, Discord, Slack, Messenger and Zalo (official Bot API, or a QR-paired userbot): `list`, `add` from a JSON config, `edit`, `enable`/`disable`, `delete`, `catalog`; `pair` (QR pairing, or a Telegram code) and `repair` a stuck pairing that shows no QR (saved session invalidated elsewhere); per-channel authentication (open, passcode, otp, admin approval, allowlist) with `approve`/`revoke` and `senders`; push-only notification mode with `notify-filter` and `send`; `message`, `set-phone`, `set-confirm` to reach named individuals by sender id or phone number (bulk lists, preview before `--send`, `--file`); `clear-history` and `forget` for one client; inbound files reach the agent; outbound files only via explicit `--file` or tool `attachments`, never auto-attached to replies. Group chats: opt in with `--group-chats`, then `channels groups approve`/`list`/`members`/`policy`/`allow`/`deny`/`respond`/`brakes`/`refresh`/`block`/`forget` — the agent answers when mentioned or relevant, and several of your bots can talk in one group under loop brakes. Not `cremind group` (Cremind's own multi-profile rooms)."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -139,11 +139,14 @@ A **group** on the platform is a third path: the same inbound-only rule applies
 the group's conversation from the CLI), but the group has to be switched on and
 approved first — see **Group chats on a channel** below.
 
-Files ride the same directions the text does: a platform user's attachment
-becomes a file the agent can read (see **Files on channels** below), the
-agent's reply auto-delivers the files it created, and the two outbound push
-commands take `--file`. What the inbound-only rule still forbids is composing
-into a channel conversation from the web UI or CLI — file or not.
+Files follow the same rules: a platform user's attachment becomes a file the
+agent can read (see **Files on channels** below), but the agent's reply is its
+answer and nothing else — a file it read, wrote or converted along the way is
+never attached to it. A file goes out only when it is sent on purpose: the
+agent's `send_channel_message` / `send_notification` tools take `attachments`,
+and the two outbound push commands take `--file`. What the inbound-only rule
+still forbids is composing into a channel conversation from the web UI or
+CLI — file or not.
 
 Use `cremind conv get <id>` and `cremind conv attach <id>` to inspect channel
 conversations; use the corresponding platform (Telegram, etc.) to
@@ -151,7 +154,8 @@ talk to the agent.
 
 ## Files on channels
 
-Channels carry files **both ways** on every platform that can:
+Channels carry files **both ways** on every platform that can — inbound
+automatically, outbound only when somebody sends one on purpose:
 
 **Inbound (user → agent).** A file attached on the platform — with or without
 a caption — is downloaded into the conversation's temporary upload folder
@@ -164,19 +168,34 @@ authentication, and each file is capped by the `uploads.tmp_max_bytes` server
 setting (100 MiB default). The folder is temporary — wiped on server restart
 and pruned when idle — so ask the agent to *save* anything that must persist.
 
-**Outbound (agent → user).** Files the agent **created** during a reply (a
-written report, a converted document, a browser screenshot) are delivered to
-the channel conversation automatically after its answer — at most 5 per reply,
-never from a group turn the agent chose to stay silent on. Files it merely
-*read* are never auto-sent. Set `auto_send_files: false` in a channel's config
-to turn auto-delivery off for that channel. The agent can also send files
-explicitly: `send_notification` and `send_channel_message` both take an
-`attachments` list of absolute paths, restricted to the profile's own
-directories.
+**Outbound (agent → user) — explicit only.** A reply to a platform user
+carries the agent's answer and nothing else. Files the agent reads, writes,
+edits, moves or converts while working on it — a report it wrote, a converted
+document, a browser screenshot — are **never** attached to that reply, however
+they came about: in private chats and platform groups alike, in `normal` and
+`detail` reply mode, for replies to messages and to automations. They still
+show as file chips on the conversation in the web UI, downloadable there; a
+chip is the web UI's view of the work, not a message to anyone.
 
-**Operator pushes.** `cremind channels send <id> -F <path>` and
-`cremind channels message <id> ... --file <path>` upload local files with the
-request (multipart), so they work from a remote CLI.
+To get a file to somebody, send it deliberately:
+
+- **The agent** — `send_channel_message` (named clients, under its usual
+  approval rules) and `send_notification` (a notification channel's
+  subscribers) both take an `attachments` list of absolute paths, restricted to
+  the profile's own directories. Asking the agent to *send* you a file is what
+  gets one delivered; asking it to *write* one does not. `send_channel_message`
+  addresses people, not rooms, so no tool uploads a file into a platform group
+  the agent is answering in.
+- **You** — `cremind channels message <id> ... --file <path>` and
+  `cremind channels send <id> -F <path>` upload local files with the request
+  (multipart), so they work from a remote CLI; the REST endpoints behind them
+  (`/api/channels/{id}/message`, `/api/channels/{id}/notify`) take the same
+  attachments.
+
+**`auto_send_files` is retired.** Older versions attached the files the agent
+created to its channel replies, and this config key turned that off. It is now
+ignored — `true` and `false` alike — so a channel whose config still carries it
+needs no change, and nothing turns automatic attachment back on.
 
 **Platform caveats.**
 
@@ -353,8 +372,8 @@ The boundaries are exact:
   relaying to it would conjure a pending group, and a decision for you to make,
   about a room the platform never told it about.
 - **Only what the room hears the agent say** — the interim reply and the final
-  answer. Thinking-Process steps and the files the agent sends are not relayed,
-  which is the same line the rate cap below draws.
+  answer. Thinking-Process steps are not relayed, which is the same line the
+  rate cap below draws.
 - **A third-party bot in the group stays invisible.** The relay carries
   Cremind's own posts between Cremind's own channels; a message from somebody
   else's bot is one Telegram never hands over, and nothing here can recover it.

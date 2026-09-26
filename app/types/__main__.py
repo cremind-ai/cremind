@@ -116,9 +116,10 @@ class ToolResultFile(TypedDict):
                        placed this file as an output of the call (wrote,
                        converted, captured, moved it); ``"referenced"`` (the
                        default) when the file merely passed through (was
-                       read). Channel reply forwarders auto-deliver only
-                       ``"created"`` files, so a tool that merely *reads* a
-                       file must never mark it created.
+                       read). Provenance only: it describes the artifact the
+                       chat shows and is never permission to send the file
+                       anywhere — a channel reply carries no file unless a
+                       send tool attaches it explicitly.
 
     Extra metadata fields are allowed and will be ignored by the adapter.
     """

@@ -10,17 +10,23 @@ every failure must surface as a structured observation rather than an exception.
 from __future__ import annotations
 
 import asyncio
+import os
+
+import pytest
 
 import app.channels.registry as reg
 from app.tools.builtin.send_channel_message import SendChannelMessageTool
 
 
 class _FakeAdapter:
+    supports_file_send = True
+
     def __init__(self, channel_type, channel_id, *, profile="p") -> None:
         self.channel_type = channel_type
         self.channel_id = channel_id
         self.profile = profile
         self.sent: list[tuple[str, str]] = []
+        self.files: list[tuple[str, str]] = []
         self._locks: dict = {}
 
     def _inbound_lock(self, sender_id):
@@ -28,8 +34,17 @@ class _FakeAdapter:
         return self._locks.setdefault(sender_id, _a.Lock())
 
     async def send_strict(self, sender_id, text):
+        # Like the real one: empty text sends nothing, which is what lets an
+        # attachment-only send go out without an empty bubble in front of it.
+        text = (text or "").strip()
+        if not text:
+            return 0
         self.sent.append((sender_id, text))
         return 1
+
+    async def send_file_strict(self, sender_id, path, *, name=None, mime=None,
+                               caption=None):
+        self.files.append((sender_id, path))
 
     async def resolve_phone(self, phone):
         return {"exists": True, "jid": f"{phone}@s.whatsapp.net", "lid": None}
@@ -371,3 +386,94 @@ def test_unresolvable_recipient_is_reported_not_raised():
     assert "error" not in out
     assert out["results"][0]["error"] == "ambiguous_phone"
     assert adapter.sent == []
+
+
+# ── attachments: the deliberate way a file reaches a client ────────────────
+#
+# A channel reply never carries a file on its own (see
+# tests/channels/test_reply_file_forwarding.py), so this tool's ``attachments``
+# is how a client gets one — under the same approval rules as its text.
+
+
+def _profile_file(monkeypatch, tmp_path, profile="p", name="report.pdf") -> str:
+    """A real file inside the profile's own system-dir slice."""
+    from app.config.settings import BaseConfig
+
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
+    target_dir = tmp_path / profile
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / name
+    path.write_bytes(b"%PDF-1.7 report")
+    return str(path)
+
+
+def test_a_confirmed_attachment_is_uploaded_exactly_once(monkeypatch, tmp_path):
+    path = _profile_file(monkeypatch, tmp_path)
+    jid = "84901234567@s.whatsapp.net"
+    registry, adapter, _s = _wa_registry({"c-wa": [_known(jid)]})
+    out = _run(
+        {"recipients": [{"to": jid}], "message": "The report.", "_profile": "p",
+         "attachments": [path], "confirm": True},
+        registry=registry,
+    )
+    assert out["sent"] == 1
+    assert out["results"][0]["files_sent"] == 1
+    assert adapter.sent == [(jid, "The report.")]
+    assert adapter.files == [(jid, os.path.realpath(path))]
+
+
+def test_an_attachment_needs_no_message_text(monkeypatch, tmp_path):
+    path = _profile_file(monkeypatch, tmp_path)
+    jid = "84901234567@s.whatsapp.net"
+    registry, adapter, _s = _wa_registry({"c-wa": [_known(jid)]})
+    out = _run(
+        {"recipients": [{"to": jid}], "_profile": "p", "attachments": [path],
+         "confirm": True},
+        registry=registry,
+    )
+    assert out["sent"] == 1
+    assert out["results"][0]["files_sent"] == 1
+    assert adapter.sent == []
+    assert adapter.files == [(jid, os.path.realpath(path))]
+
+
+@pytest.mark.parametrize("arguments, confirm_by_default", [
+    pytest.param({"dry_run": True}, False, id="preview"),
+    pytest.param({}, True, id="awaiting-approval"),
+])
+def test_a_preview_or_a_pending_approval_uploads_nothing(
+    monkeypatch, tmp_path, arguments, confirm_by_default,
+):
+    import app.channels.send_policy as sp
+
+    monkeypatch.setattr(
+        sp, "confirm_before_send_default", lambda profile: confirm_by_default,
+    )
+    path = _profile_file(monkeypatch, tmp_path)
+    jid = "84901234567@s.whatsapp.net"
+    registry, adapter, storage = _wa_registry({"c-wa": [_known(jid)]})
+    out = _run(
+        {"recipients": [{"to": jid}], "message": "The report.", "_profile": "p",
+         "attachments": [path], **arguments},
+        registry=registry,
+    )
+    assert out["sent"] == 0
+    assert out["attachments"] == 1        # the preview says a file would go
+    assert adapter.sent == [] and adapter.files == []
+    assert storage.messages == []
+
+
+def test_another_profiles_file_is_refused_before_anything_is_sent(monkeypatch, tmp_path):
+    """Profile p must not be able to hand profile q's files to its clients."""
+    other = _profile_file(monkeypatch, tmp_path, profile="q", name="payroll.pdf")
+    jid = "84901234567@s.whatsapp.net"
+    registry, adapter, storage = _wa_registry({"c-wa": [_known(jid)]})
+    out = _run(
+        {"recipients": [{"to": jid}], "message": "hi", "_profile": "p",
+         "attachments": [other], "confirm": True},
+        registry=registry,
+    )
+    assert out["error"] == "InvalidAttachment"
+    assert out["rejected"][0]["path"] == other
+    assert adapter.sent == [] and adapter.files == []
+    assert storage.messages == []
