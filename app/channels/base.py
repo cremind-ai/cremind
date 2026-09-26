@@ -56,9 +56,6 @@ _OTP_TTL_SECONDS = 600  # 10 minutes
 # Telegram caps a single message at 4096 chars; the other platforms have
 # similar (looser) caps. Keep some headroom for the markdown wrapper.
 _MAX_MESSAGE_CHARS = 3500
-# Cap on files auto-delivered with one reply. A runaway loop writing files
-# must become a log line, not a message flood on somebody's phone.
-_MAX_REPLY_FILES = 5
 
 
 def _file_size(path: str) -> int | None:
@@ -829,16 +826,6 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         await self._send_chunked(target.address, text)
         return True
 
-    async def _send_reply_file(
-        self, target: ReplyTarget, path: str, *,
-        name: str | None = None, mime: str | None = None,
-    ) -> None:
-        """Send one file to wherever this run is answering (never raises)."""
-        if target.is_group:
-            await self.send_file_to_chat(target.address, path, name=name, mime=mime)
-        else:
-            await self.send_file(target.address, path, name=name, mime=mime)
-
     async def _send_chunked(self, sender_id: str, text: str) -> None:
         """Send ``text`` as one or more messages, each ≤ ``_MAX_MESSAGE_CHARS``.
 
@@ -881,16 +868,6 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         if self._is_notification_mode():
             return False
         return bool((self.channel.get("config") or {}).get("group_chats_enabled"))
-
-    def _auto_send_files_enabled(self) -> bool:
-        """Whether reply forwarders auto-deliver the files a run created.
-
-        On by default — an operator turns it off per channel with
-        ``config.auto_send_files = false`` (the send tools still work; only
-        the automatic delivery stops). Only an explicit ``False`` disables.
-        """
-        value = (self.channel.get("config") or {}).get("auto_send_files")
-        return True if value is None else bool(value)
 
     def self_identity(self) -> dict:
         """The platform account this channel speaks as, as last recorded.
@@ -1765,6 +1742,16 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         earlier ones. Buffering every step to the end would fix that and defeat
         the point of streaming progress, so it isn't done.
 
+        No file is ever sent from here. A ``file`` event is a conversation
+        artifact — the web UI's chip for a file some tool read, wrote, moved or
+        converted along the way — and how a file came about says nothing about
+        whether the person on the platform asked for it. A file reaches the
+        platform only when something sends it on purpose: the ``attachments`` of
+        the ``send_channel_message`` / ``send_notification`` tools, or an
+        operator's ``--file`` (CLI) / ``attachments`` (REST API). The retired
+        ``config.auto_send_files`` is not read, so an older channel that still
+        carries it changes nothing.
+
         Each bubble is sent through :meth:`send` which already isolates
         per-message exceptions, so a transient failure on one bubble can't
         prevent later bubbles from going out.
@@ -1800,15 +1787,6 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         # empty one — and the Final-Answer fallback must not repeat what went
         # out already.
         sent_any = False
-        # Files the run created, held for delivery AFTER the final answer —
-        # identical in detail and normal modes (files are output, not steps).
-        # Deduped by uri and capped; ``absorb``'s "file" branch is the only
-        # collector and ``deliver_pending_files`` the only sender, so a file
-        # can never go out twice even though it also appears in ``result``
-        # events and persisted parts.
-        pending_files: list[dict] = []
-        seen_file_uris: set[str] = set()
-        auto_files = self._auto_send_files_enabled()
         # Documentation search citations. A platform shows plain text, so the
         # answer's "[doc:…]" tokens go out as "[1]" markers plus a "Sources:"
         # footer. One renderer per turn: an interim reply and the final
@@ -1837,10 +1815,10 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             this. Reasoning steps stay out because counting them would make
             "answer with steps" silence the room (see ``flush_step``), and they
             stay out of the relay for the matching reason: the event-trigger
-            header and the files a run produced are Cremind's own scaffolding
-            around an answer, not the answer, and a sibling agent handed them
-            would be reading our plumbing as somebody's words. What the room
-            hears the agent *say* is what a sibling needs to hear.
+            header is Cremind's own scaffolding around an answer, not the
+            answer, and a sibling agent handed it would be reading our plumbing
+            as somebody's words. What the room hears the agent *say* is what a
+            sibling needs to hear.
 
             The relay is the other half of the same fact: on a transport that
             withholds bot posts from bots, the other Cremind agents in this very
@@ -1988,41 +1966,6 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             # read Cremind's own formatting back as somebody's words.
             note_group_post(text, delivered)
 
-        async def deliver_pending_files() -> None:
-            """Send the run's created files, after the final answer.
-
-            A silent group turn sends nothing — files included: the agent
-            decided the message was not for it, and a file landing in the room
-            anyway would be the loudest possible way to be wrong about that.
-            A DM delivers even when the final text was empty — a turn whose
-            entire output is a file is a legitimate answer.
-            """
-            if not pending_files:
-                return
-            if target.is_group and not sent_any:
-                logger.info(
-                    f"channels[{self.channel_type}]: withholding "
-                    f"{len(pending_files)} file(s) from silent turn in "
-                    f"group={target.group_id} conv={conversation_id}"
-                )
-                return
-            for payload in pending_files:
-                info = payload.get("file") or {}
-                uri = str(info.get("uri") or "")
-                # Re-check existence: a write→move sequence leaves the written
-                # uri dangling, and dedupe-by-uri cannot catch a rename.
-                if not uri or not os.path.isfile(uri):
-                    continue
-                logger.info(
-                    f"channels[{self.channel_type}]: delivering reply file "
-                    f"'{info.get('name') or os.path.basename(uri)}' "
-                    f"to={target.key} conv={conversation_id}"
-                )
-                await self._send_reply_file(
-                    target, uri,
-                    name=info.get("name"), mime=info.get("mimeType"),
-                )
-
         async def absorb(event: dict) -> bool:
             nonlocal current_step, final_answer_fallback
             seq = event.get("seq")
@@ -2096,26 +2039,12 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 obs_parts = data.get("Observation") or []
                 current_step["observation"] = _format_observation_text(obs_parts)
             elif etype == "file":
-                # A tool-touched file. Only ``origin == "created"`` is held for
-                # delivery: read_file publishes these events too, and
-                # auto-forwarding a file the agent merely READ would hand out
-                # anything it looked at. This branch is the forwarder's only
-                # file collector, and ``deliver_pending_files`` its only
-                # sender — files in ``result`` events and persisted parts are
-                # never sent from here, so nothing goes out twice.
-                if auto_files:
-                    origin = str(
-                        (data.get("metadata") or {}).get("origin") or "referenced"
-                    )
-                    uri = str((data.get("file") or {}).get("uri") or "")
-                    if (
-                        origin == "created"
-                        and uri
-                        and uri not in seen_file_uris
-                        and len(pending_files) < _MAX_REPLY_FILES
-                    ):
-                        seen_file_uris.add(uri)
-                        pending_files.append(data)
+                # A conversation artifact, never an outbound attachment — see
+                # the docstring. Consumed and dropped whatever its ``origin``:
+                # "created" says how the file came about, not that anybody asked
+                # for it to be sent. Not terminal, so the run's text and its
+                # completion still arrive.
+                return False
             elif etype == "flow_break":
                 # The agent stopped to answer something that interrupted it. Send
                 # that now as its own message — not terminal, the run continues.
@@ -2140,15 +2069,11 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                         await flush_step(current_step)
                     current_step = None
                 await flush_final(final_text)
-                await deliver_pending_files()
                 return True
             elif etype == "error":
                 if current_step is not None:
                     await flush_step(current_step)
                     current_step = None
-                # A failed run delivers no files: whatever it wrote along the
-                # way is the debris of the failure, not an answer.
-                pending_files.clear()
                 err_msg = (data or {}).get("message") or "unknown error"
                 if target.is_group:
                     # Never into a room: everyone there would read an apology

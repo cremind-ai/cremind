@@ -577,9 +577,9 @@ class BuiltInToolAdapter:
                                         name=file_entry.get("name"),
                                         mime_type=file_entry.get("mime_type"),
                                     ),
-                                    # "created" = a tool output worth delivering
-                                    # outward (channel forwarders key off it);
-                                    # "referenced" = it merely passed through.
+                                    # Provenance only: "created" = an output of
+                                    # the call, "referenced" = it merely passed
+                                    # through. Neither sends the file anywhere.
                                     metadata={
                                         "origin": file_entry.get("origin") or "referenced",
                                     },

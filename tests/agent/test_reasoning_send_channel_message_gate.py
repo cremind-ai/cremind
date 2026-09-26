@@ -49,7 +49,8 @@ class _FakeRegistry:
         return list(self._tools)
 
 
-def _build_agent(monkeypatch, *, any_channel, notification_channel=False):
+def _build_agent(monkeypatch, *, any_channel, notification_channel=False,
+                 message_origin=None):
     import app.channels.registry as reg
 
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
@@ -68,7 +69,8 @@ def _build_agent(monkeypatch, *, any_channel, notification_channel=False):
              name="Send Notification"),
     ])
     return ra.ReasoningAgent(
-        llm=llm, registry=registry, profile="default", context_id="ctx"
+        llm=llm, registry=registry, profile="default", context_id="ctx",
+        message_origin=message_origin,
     )
 
 
@@ -93,3 +95,15 @@ def test_both_tools_present_with_a_notification_channel(monkeypatch):
     agent = _build_agent(monkeypatch, any_channel=True, notification_channel=True)
     assert "send_channel_message" in agent._tools_by_id
     assert "send_notification" in agent._tools_by_id
+
+
+def test_a_private_channel_conversation_keeps_the_tool(monkeypatch):
+    """A channel reply carries no file on its own, so in a private chat that
+    arrived over a channel this tool's ``attachments`` is how the person gets
+    one — it has to stay offered there."""
+    origin = {
+        "source": "channel", "channel_type": "telegram", "channel_id": "ch1",
+        "channel_name": "Telegram", "sender_id": "u1", "sender_display_name": "Lee",
+    }
+    agent = _build_agent(monkeypatch, any_channel=True, message_origin=origin)
+    assert "send_channel_message" in agent._tools_by_id
