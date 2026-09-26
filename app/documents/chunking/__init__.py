@@ -16,7 +16,7 @@ from app.documents.chunking.cards import (
     make_folder_card,
     make_ocr_chunks,
 )
-from app.documents.chunking.chunker import CHUNKER_VERSION, chunk_blocks
+from app.documents.chunking.chunker import CHUNKER_VERSION, LEGAL_ONLY_BUMPS, chunk_blocks
 from app.documents.chunking.diff import diff_chunks
 from app.documents.chunking.legal import (
     detect_legal_meta,
@@ -27,6 +27,7 @@ from app.documents.chunking.legal import (
 
 __all__ = [
     "CHUNKER_VERSION",
+    "LEGAL_ONLY_BUMPS",
     "chunk_blocks",
     "detect_legal_meta",
     "diff_chunks",

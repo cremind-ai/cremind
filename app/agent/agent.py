@@ -178,6 +178,7 @@ class CremindAgent:
         maintenance: bool = False,
         search_tools: Any = None,
         on_search_baseline: Any = None,
+        research_delivery: dict | None = None,
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         logger.debug(f"Running CremindAgent with query: {query} and profile: {profile}")
 
@@ -253,6 +254,9 @@ class CremindAgent:
             # get today's behaviour.
             search_tools=search_tools,
             on_search_baseline=on_search_baseline,
+            # A research job reporting back as its own turn: what its delivery
+            # shows (server-built; see app.agent.research_handoff).
+            research_delivery=research_delivery,
         )
 
         async for result in reasoning_agent.run(query, task_history):

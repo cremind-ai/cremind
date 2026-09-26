@@ -1498,6 +1498,12 @@ def admin_set(
 _RESEARCH_ACTIVE = frozenset({"queued", "planning", "running"})
 _RESEARCH_WAITING = frozenset({"needs_clarification", "needs_confirmation", "interrupted"})
 _RESEARCH_DONE = frozenset({"complete", "partial"})
+# Outcome reasons (the dossier's ``outcome.reason``): the documents gave no
+# evidenced answer — as opposed to a job a limit stopped (budget, time).
+_RESEARCH_INSUFFICIENT = frozenset({
+    "insufficient_evidence", "unresolved_instrument", "no_candidates", "candidates_unreadable",
+    "candidates_rejected", "empty_scope", "no_verified_findings",
+})
 # Seconds each --follow poll asks the server to hold the request open (the
 # server caps it), and the least time between polls, so a server that
 # answers at once is not hammered.
@@ -1531,7 +1537,17 @@ def research_progress_line(job: dict[str, Any]) -> str:
     used = int(job.get("tokens_in") or 0) + int(job.get("tokens_out") or 0)
     if used and job.get("budget"):
         parts.append(f"{used:,}/{int(job['budget']):,} tokens")
+    outcome = _research_outcome(job)
+    if outcome.get("reason") and (job.get("status") or "") not in _RESEARCH_ACTIVE:
+        parts.append(f"outcome: {outcome['reason']}")
     return " · ".join(parts)
+
+
+def _research_outcome(job: dict[str, Any]) -> dict[str, Any]:
+    """The dossier's outcome (reason, detail, counts), or {} for a job
+    without one (still running, or saved by an older version)."""
+    outcome = (job.get("dossier") or {}).get("outcome")
+    return outcome if isinstance(outcome, dict) else {}
 
 
 def _progress_key(job: dict[str, Any]) -> tuple[Any, ...]:
@@ -1658,9 +1674,21 @@ def _research_hint(job: dict[str, Any], pages: Any) -> None:
         sys.stderr.write(f"Answer it: cremind docs research continue {jid} {flags} --follow\n")
         for k, meaning in keys.items():
             sys.stderr.write(f"  {k}: {meaning}\n")
-    elif status in _RESEARCH_DONE and isinstance(pages, int) and pages > 1:
-        sys.stderr.write(f"The dossier has {pages} pages: cremind docs research status {jid} "
-                         f"--page N, or --all-pages\n")
+    elif status in _RESEARCH_DONE or status == "failed":
+        outcome = _research_outcome(job)
+        reason, detail = outcome.get("reason"), outcome.get("detail") or ""
+        if reason in _RESEARCH_INSUFFICIENT:
+            # Finished, but not an evidenced answer: say so plainly, whatever
+            # the exit code (0, as for any finished job).
+            sys.stderr.write(f"Insufficient evidence ({reason}): {detail}. "
+                             f"{int(outcome.get('findings') or 0)} verified finding(s); the gaps above say what "
+                             "is missing.\n")
+        elif reason in ("budget", "time"):
+            sys.stderr.write(f"Stopped early: {detail}. Continue it or raise the budget; what it covered is "
+                             "above.\n")
+        if status in _RESEARCH_DONE and isinstance(pages, int) and pages > 1:
+            sys.stderr.write(f"The dossier has {pages} pages: cremind docs research status {jid} "
+                             f"--page N, or --all-pages\n")
 
 
 def _research_emit(ctx: typer.Context, out: dict[str, Any]) -> None:
@@ -1701,13 +1729,17 @@ def research_run_cmd(
         help="general (default) | legal (chooses the edition of each law, may ask) | financial.",
     ),
     folder: Optional[list[str]] = typer.Option(
-        None, "--folder", help="Research these folders (the case, the reports; repeatable)."),
+        None, "--folder",
+        help="The primary folders (repeatable): analyze reads them in full as the case (none given: the question "
+             "is the case); compile reads every file in them (none given: every indexed file)."),
     file: Optional[list[str]] = typer.Option(
-        None, "--file", help="Research these files: file ids or citation tokens, doc:… (repeatable)."),
+        None, "--file", help="Primary files: file ids or citation tokens, doc:… (repeatable)."),
     reference_folder: Optional[list[str]] = typer.Option(
-        None, "--reference-folder", help="Where the law, policy or standard lives (analyze; repeatable)."),
+        None, "--reference-folder",
+        help="Restrict the law, policy or standard to these folders (analyze; repeatable). Without it the job "
+             "finds the governing documents across your whole index."),
     reference_file: Optional[list[str]] = typer.Option(
-        None, "--reference-file", help="A reference file id or citation token (analyze; repeatable)."),
+        None, "--reference-file", help="Restrict the references to these file ids or tokens (analyze; repeatable)."),
     follow: bool = typer.Option(
         False, "--follow", "-f", help="Wait for the result, printing progress; exits 0, 2 or 1 by outcome."),
     wait: Optional[int] = typer.Option(

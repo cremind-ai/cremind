@@ -92,7 +92,8 @@ def test_empty_and_blank_input() -> None:
     assert len(one) == 1 and one[0].text == "  Hello world."
     assert one[0].text_hash == textnorm.text_hash("", "Hello world.")
     assert one[0].ordinal == 0 and one[0].ctype == CTYPE_BODY and one[0].occ == 0
-    assert CHUNKER_VERSION == 1
+    # 2: wrapped cross-references no longer start an article (legal overlay only).
+    assert CHUNKER_VERSION == 2
 
 
 def test_deterministic() -> None:

@@ -1,5 +1,5 @@
 ---
-description: "Deep research over the user's OWN indexed files with `cremind docs research`: `run` a background job that either ANALYZES a question (legal, financial or general: reads the case files in full, searches the law or policy folder from several angles, verifies every quote; `--domain legal` picks the edition of each law in force and stops to ask when it cannot tell) or COMPILES a folder exhaustively (every file read, one table, conflicting values kept side by side — e.g. compile the business results in MKT-report). The result is a dossier: a coverage table of every file read or unread and why, findings with verified [doc:…] citations, gaps. `--follow` prints progress until done; `continue JOB --answer edition=<fid>` answers a clarification; `status --all-pages`, `cancel`, `list`. Not for Cremind's own documentation (that is cremind_documentation_search); one quick lookup is `cremind docs search`."
+description: "Deep research over the user's OWN indexed files with `cremind docs research`: `run` a background job that either ANALYZES a question (legal, financial or general: reads the case files in full, finds the governing law or policy — in the given reference folder, or across the whole index by topic and by the laws or numbers the question names — searches it from several angles, verifies every quote; `--domain legal` picks the edition of each law in force and stops to ask when it cannot tell) or COMPILES a folder exhaustively (every file read, one table, conflicting values kept side by side — e.g. compile the business results in MKT-report). The result is a dossier: an outcome (complete only when every issue has verified findings; partial says why — insufficient evidence, a named law not indexed, the budget), a coverage table of every file read or unread and why, findings with verified [doc:…] citations, gaps. `--follow` prints progress until done; `continue JOB --answer edition=<fid>` answers a clarification; `status --all-pages`, `cancel`, `list`. Not for Cremind's own documentation (that is cremind_documentation_search); one quick lookup is `cremind docs search`."
 ---
 
 # `cremind docs research` — deep research over your documents
@@ -35,12 +35,21 @@ variables `RESEARCH_TOKEN_BUDGET` (default 250000) and `RESEARCH_MODEL_GROUP`
 ## Analyze and compile modes
 
 **`--mode analyze`** (default) answers a question. It reads the primary
-scope (`--folder`, `--file`: the case) in full, works out the issues it
-raises, searches the reference scope (`--reference-folder`,
-`--reference-file`: the law, the policy, the standard) for each issue from
-several angles, including counter-evidence and exceptions, reads each cited
-provision in full and follows its cross-references. Every finding carries
+scope (`--folder`, `--file`: the case) in full — without one, the question
+itself is the case — works out the issues it raises, searches the reference
+scope (`--reference-folder`, `--reference-file`: the law, the policy, the
+standard) for each issue from several angles, including counter-evidence and
+exceptions, reads each cited provision in full (a long article in parts,
+to its end) and follows its cross-references. Every finding carries
 verified quotes.
+
+A reference scope restricts the job to those files. Without one, the job
+finds the governing documents itself across your whole index: it searches the
+issues as topics — a regulation on foreign workers governs a work-permit
+question whatever its title says — and any law or document number the
+question names; it inspects each candidate and keeps the relevant legal
+documents. A law the question names that is not indexed stays an open
+requirement: another document never stands in for it.
 
 **`--mode compile`** is exhaustive: every file in scope is read in full, the
 values the question asks for are extracted from each, and merged into one
@@ -87,6 +96,14 @@ the question, the candidates and the answer keys; `continue` takes each as
 
 ## What the dossier contains
 
+- **Outcome** — why the job ended as it did: `evidenced` (the only reason a
+  job is `complete`: every issue has verified findings), or, for `partial`,
+  `insufficient_evidence`, `unresolved_instrument` (a law the question names
+  is not indexed), `no_candidates`, `candidates_rejected`,
+  `candidates_unreadable`, `no_verified_findings`, `empty_scope`, `budget`,
+  `time`; with the searches run, candidates found and selected, files and
+  provisions read, verified findings and unresolved issues. Page 1 opens
+  with it.
 - **Coverage** — every file in scope, `read`, `partial` or `unread`, with the
   reason (`encrypted`, `legacy_format`, `awaiting_vision`, `too_large`,
   `not_indexed_yet`, `budget`, `time`, …). A conclusion is only as good as the
@@ -106,7 +123,7 @@ or `--all-pages`). Check any token with `cremind docs cite '[doc:…]'`.
 
 | Code | Meaning |
 |------|---------|
-| 0 | `complete` or `partial` — or, without `--follow`, still running |
+| 0 | `complete` or `partial` — or, without `--follow`, still running. A `partial` job without enough evidence also prints `Insufficient evidence (<reason>): …` to stderr |
 | 2 | waiting for you: `needs_clarification`, `needs_confirmation`, `interrupted` — the question is printed, answer with `continue` |
 | 1 | `failed` or `cancelled`, or an error (feature off, job not found, busy, bad filter) |
 
@@ -133,10 +150,10 @@ cremind docs research run QUESTION [--mode analyze|compile] [--domain general|le
 |------|---------|---------|
 | `--mode` | `analyze` | `analyze` a question, or `compile` every file in scope into a table. |
 | `--domain` | `general` | `legal` adds edition selection; `financial` or `general`. |
-| `--folder` | whole index | Primary scope: a folder, matched loosely (case, accents, typos), subfolders included. Repeatable. |
+| `--folder` | analyze: none; compile: whole index | Primary scope: a folder, matched loosely (case, accents, typos), subfolders included. Repeatable. |
 | `--file` | — | Primary scope: a file id or `[doc:…]` token. Repeatable. |
-| `--reference-folder` | — | Where the law, policy or standard lives (analyze). Repeatable. |
-| `--reference-file` | — | A reference file id or token (analyze). Repeatable. |
+| `--reference-folder` | found across the index | Restrict the law, policy or standard to this folder (analyze). Repeatable. |
+| `--reference-file` | — | Restrict the references to this file id or token (analyze). Repeatable. |
 | `--follow`, `-f` | off | Wait for the result, printing a progress line per change (phase, files done, current step). |
 | `--wait` | 0 | Seconds the start request may wait for the job (the server caps it, about 4 minutes). |
 
@@ -227,6 +244,13 @@ which.
 
 **`partial` with "stopped at the token budget"** — narrow the scope, or raise
 the budget: `cremind tools set-var documentation_search RESEARCH_TOKEN_BUDGET=500000`.
+
+**`partial` with insufficient evidence** — the outcome says which: with
+`no_candidates` no indexed document matched (add or name the document that
+governs the question); with `candidates_rejected` or `no_verified_findings`
+the documents found did not answer it (name the provision, narrow the
+question, or give `--reference-folder`). `--json` shows the outcome's
+`trace`: each search, the candidates it found, and why each was rejected.
 
 **Many `unread` files** — they are not indexed yet or need the vision model
 (`cremind docs caption --consent-vision`); `cremind docs files --status error`

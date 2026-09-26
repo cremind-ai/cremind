@@ -712,7 +712,8 @@ def test_unreadable_files_need_confirmation_then_become_gaps(alice):
     assert clar.candidates == [{"fid": alice.fid("Clients/DEF/scan.pdf"), "rel_path": "Clients/DEF/scan.pdf",
                                 "role": ROLE_PRIMARY, "reason": "encrypted"}]
     d = asyncio.run(run_analyze(resume(ctx, ctx.llm._llm, answers={"confirm": "true"})))
-    assert d.status == COMPLETE
+    # The model found nothing verifiable: never a complete answer.
+    assert d.status == PARTIAL and d.outcome.reason == "no_verified_findings" and d.outcome.findings == 0
     assert any("Clients/DEF/scan.pdf" in g and "encrypted" in g for g in d.gaps)
     cov = {c.rel_path: c for c in d.coverage}
     assert cov["Clients/DEF/scan.pdf"].reason == "encrypted" and cov["Clients/DEF/HopDong.txt"].read == READ_FULL

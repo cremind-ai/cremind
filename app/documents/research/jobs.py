@@ -70,6 +70,11 @@ from app.documents.research.types import (
     MODES,
     NEEDS_CLARIFICATION,
     NEEDS_CONFIRMATION,
+    OUTCOME_BUDGET,
+    OUTCOME_CANCELLED,
+    OUTCOME_FAILED,
+    OUTCOME_TEXT,
+    OUTCOME_TIME,
     PARTIAL,
     QUEUED,
     READ_FULL,
@@ -77,6 +82,7 @@ from app.documents.research.types import (
     WAITING,
     Dossier,
     JobView,
+    Outcome,
     dossier_from_dict,
 )
 from app.utils.logger import logger
@@ -262,16 +268,23 @@ def _activity_module() -> Any:
         return None
 
 
-def _render(profile: str, view: JobView) -> tuple[str, list[Any]]:
+def _render(profile: str, view: JobView) -> tuple[str, list[Any], dict[str, Any] | None]:
     """The job as the agent reads it (``render.render_job``, sized to the
-    profile's tool-result budget) and the citations it printed. Blocking."""
+    profile's tool-result budget), the citations it printed, and the record
+    of what it hands over (``handoff.ResearchDelivery``, as a dict).
+    Blocking."""
     from app.tools.builtin.documentation_search import render_context
     from app.documents.citations import profile_index
     from app.documents.research import render as R
+    from app.documents.research.handoff import build_delivery
 
     with profile_index(profile) as db:
         rendered = R.render_job(view, ctx=render_context(profile, budgeted=True), db=db)
-    return rendered.text, list(rendered.citations or [])
+    delivery = build_delivery(view, text=rendered.text, page=int(rendered.data.get("page") or 1),
+                              pages=int(rendered.data.get("pages") or 1),
+                              evidence_pages=list(rendered.data.get("evidence_pages") or []),
+                              page_tokens=rendered.data.get("page_tokens"))
+    return rendered.text, list(rendered.citations or []), delivery.to_dict()
 
 
 def _configured_variables(profile: str) -> dict[str, Any]:
@@ -300,6 +313,24 @@ def _settings(profile: str, variables: dict[str, Any] | None) -> tuple[str, int]
     except (TypeError, ValueError):
         budget = DEFAULT_BUDGET
     return group, max(1000, budget)
+
+
+def research_model_label(profile: str) -> str | None:
+    """The model ``profile``'s research jobs run on — their own calls, on the
+    ``RESEARCH_MODEL_GROUP`` model, not the chat's — labelled as the Thinking
+    Process labels models ("Openai gpt-5.6-terra"); None when it cannot be
+    resolved. Blocking: reads the profile's settings."""
+    try:
+        from app.lib.llm.base import model_label_for
+        from app.lib.llm.model_groups import ModelGroupManager
+        from app.storage import get_dynamic_config_storage
+
+        group, _budget = _settings(profile, None)
+        provider, model = ModelGroupManager(get_dynamic_config_storage()).get_provider_and_model(group, profile)
+    except Exception as exc:  # noqa: BLE001 — a label never fails a call
+        logger.debug(f"[documents] research model label unavailable for {profile}: {exc}")
+        return None
+    return model_label_for(provider, model)
 
 
 # ── views ─────────────────────────────────────────────────────────────────
@@ -762,15 +793,63 @@ def _json_copy(value: Any) -> Any:
     return json.loads(json.dumps(value))
 
 
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n:,} {one if n == 1 else many}"
+
+
 def _summary(d: Dossier) -> str:
-    read = sum(1 for r in d.coverage if r.read == READ_FULL)
-    parts = [f"{read}/{len(d.coverage)} files read"] if d.coverage else []
+    o = d.outcome
+    if d.mode == MODE_ANALYZE and o is not None:
+        # An analysis reads the provisions each issue turns on, not whole
+        # files: "files read in full" would say 0/1 of a job that read 32
+        # provisions of its one decree.
+        parts = [f"{_count(o.files_read, 'file', 'files')} and "
+                 f"{_count(o.provisions_read, 'provision', 'provisions')} read"]
+    else:
+        read = sum(1 for r in d.coverage if r.read == READ_FULL)
+        parts = [f"{read}/{len(d.coverage)} files read"] if d.coverage else []
     findings = len(d.facts) + sum(len(i.findings) for i in d.issues)
     if findings:
         parts.append(f"{findings} findings")
     if d.compiled is not None:
         parts.append(f"{len(d.compiled.rows)} rows compiled")
-    return ", ".join(parts)
+    out = ", ".join(parts)
+    if o is not None and o.detail and o.reason not in ("evidenced", "compiled", "running"):
+        out = f"{out} — {o.detail}" if out else o.detail[:1].upper() + o.detail[1:]
+    return out
+
+
+# A pipeline may end a job in one of these; anything else is its bug.
+_PIPELINE_STATUSES = frozenset({COMPLETE, PARTIAL, FAILED})
+
+
+def _settle_outcome(d: Dossier, status: str, note: str | None, error: str | None) -> None:
+    """Give the dossier an outcome that agrees with how the run ended: the
+    pipeline's own when it finished, else one for the stop (the counts the
+    last checkpoint had are kept)."""
+    o = d.outcome or Outcome()
+    if status == PARTIAL and note == _REASON_BUDGET:
+        o.reason, o.detail, o.stopped_early = OUTCOME_BUDGET, OUTCOME_TEXT[OUTCOME_BUDGET], True
+    elif status == PARTIAL and note == _REASON_TIME:
+        o.reason, o.detail, o.stopped_early = OUTCOME_TIME, OUTCOME_TEXT[OUTCOME_TIME], True
+    elif status == CANCELLED:
+        o.reason, o.detail = OUTCOME_CANCELLED, OUTCOME_TEXT[OUTCOME_CANCELLED]
+    elif status == FAILED and (d.outcome is None or d.outcome.reason in ("running", "")):
+        o.reason, o.detail = OUTCOME_FAILED, f"the job failed: {error or 'unknown error'}"[:600]
+    elif status in (COMPLETE, PARTIAL, FAILED) and o.reason == "running":
+        # A pipeline that set no reason of its own.
+        o.reason = "compiled" if d.mode == MODE_COMPILE else o.reason
+    d.outcome = o
+
+
+def _completion_log(job_id: str, profile: str, status: str, d: Dossier, elapsed: float) -> str:
+    """One line per finished run: what it searched, found and read, and why
+    it ended — counts only, never a document's name or text."""
+    o = d.outcome or Outcome()
+    return (f"[documents] research job {job_id} of {profile}: {status} reason={o.reason} "
+            f"queries={o.queries} candidates={o.candidates} selected={o.selected} files_read={o.files_read} "
+            f"provisions_read={o.provisions_read} findings={o.findings} unresolved={o.unresolved} "
+            f"stopped_early={o.stopped_early} ({d.tokens_in + d.tokens_out} tokens, {elapsed:.0f}s)")
 
 
 def _clip(value: Any, n: int) -> str | None:
@@ -919,7 +998,14 @@ async def _run_once(run: _Run, row: dict[str, Any], engine: Any) -> None:
         result = await pipeline(ctx)
         if isinstance(result, Dossier):
             ctx.dossier = result
-        status = ctx.dossier.status if ctx.dossier.status in (COMPLETE, PARTIAL) else COMPLETE
+        status = ctx.dossier.status
+        if status not in _PIPELINE_STATUSES:
+            # Never read as success: a status the pipeline had no business
+            # returning is its failure.
+            raise RuntimeError(f"the research pipeline ended with an invalid status {status!r}")
+        if status == FAILED:
+            outcome = ctx.dossier.outcome
+            error = (outcome.detail if outcome is not None and outcome.detail else "the research failed")
     except NeedsInput as ask:
         status = ask.status if ask.status in (NEEDS_CLARIFICATION, NEEDS_CONFIRMATION) else NEEDS_CLARIFICATION
         (ctx.dossier if ctx else dossier).clarification = ask.clarification
@@ -951,6 +1037,7 @@ async def _run_once(run: _Run, row: dict[str, Any], engine: Any) -> None:
     d.status = status
     if status not in WAITING:
         d.clarification = None
+        _settle_outcome(d, status, note, error)
     if note and note not in d.notes:
         d.notes.append(note)
     llm = run.llm
@@ -983,11 +1070,15 @@ async def _run_once(run: _Run, row: dict[str, Any], engine: Any) -> None:
     await flush_usage()
     if activity is not None:
         try:
-            await activity.finish(status=status, summary=_summary(d) or None, error=error)
+            await activity.finish(status=status, summary=_summary(d) or None, error=error,
+                                  outcome=d.outcome.to_dict() if d.outcome is not None and status in FINAL else None)
         except Exception:  # noqa: BLE001
             logger.debug("[documents] research activity finish failed", exc_info=True)
-    logger.info(f"[documents] research job {job_id} of {profile}: {status} "
-                f"({d.tokens_in + d.tokens_out} tokens, {elapsed():.0f}s)")
+    if status in FINAL:
+        logger.info(_completion_log(job_id, profile, status, d, elapsed()))
+    else:
+        logger.info(f"[documents] research job {job_id} of {profile}: {status} "
+                    f"({d.tokens_in + d.tokens_out} tokens, {elapsed():.0f}s)")
     if written and not quiet and conv_id:
         # The row's conversation, not the one captured at start: a
         # conversation id renamed meanwhile repointed the row, not this run.
@@ -1024,12 +1115,19 @@ async def _end_quietly(run: _Run, activity: Any, flush_usage: Callable[..., Awai
 # ── delivery ──────────────────────────────────────────────────────────────
 
 
-def _render_safe(profile: str, view: JobView) -> tuple[str, list[Any]]:
+def _render_safe(profile: str, view: JobView) -> tuple[str, list[Any], dict[str, Any] | None]:
     try:
         return _render(profile, view)
     except Exception as exc:  # noqa: BLE001 — a result must still arrive, even plain
         logger.warning(f"[documents] research job {view.job_id}: render failed ({exc}); sending a plain summary")
-        return _plain_text(view), []
+        text = _plain_text(view)
+        try:
+            from app.documents.research.handoff import build_delivery
+
+            delivery: dict[str, Any] | None = build_delivery(view, text=text, page=1, pages=1).to_dict()
+        except Exception:  # noqa: BLE001
+            delivery = None
+        return text, [], delivery
 
 
 def _plain_text(view: JobView) -> str:
@@ -1077,20 +1175,25 @@ def build_delivery_messages(view: JobView, text: str, *, room: bool = False) -> 
                 "already read. Tell the user it is resuming.")
         word = "interrupted"
     elif status in (COMPLETE, PARTIAL):
+        from app.documents.research.handoff import RESPONSE_CONTRACT
+
         header = ("[Document research result] The research job started earlier in this conversation has "
                   "finished. This turn delivers its results; the full conversation history is above.")
         tail = ("Present these research results to the user: answer their question from the findings, cite "
                 "each claim with the [doc:…] tokens exactly as printed, and say which files were not read and "
-                "what was not found. Do not add claims the results do not support.")
+                "what was not found. Do not add claims the results do not support. " + RESPONSE_CONTRACT)
         if status == PARTIAL:
-            tail += " The job is partial — say what it did not cover and why."
+            tail += " The job is partial — say what it did not cover and why (its outcome above)."
         tail += (f' Further dossier pages: documentation_search__read(file="research:{jid}", page=n).')
         word = "complete" if status == COMPLETE else "partial"
     else:
+        from app.documents.research.handoff import RESPONSE_CONTRACT
+
         header = (f"[Document research — {status}] The research job started earlier in this conversation "
                   f"did not finish ({status}).")
         tail = ("Tell the user it did not finish and why, present whatever it did establish above (with its "
-                "[doc:…] tokens exactly as printed), and offer to run it again.")
+                "[doc:…] tokens exactly as printed), and offer to run it again. Do not replace it with "
+                "conclusions of your own. " + RESPONSE_CONTRACT)
         word = status
     query = f"{header}\n\n{text}\n\n{tail}"
     if room:
@@ -1140,7 +1243,7 @@ async def _deliver(row: dict[str, Any]) -> bool:
                         f"closed out")
             return False
         view = _view(full)
-        text, citations = await asyncio.to_thread(_render_safe, profile, view)
+        text, citations, delivery = await asyncio.to_thread(_render_safe, profile, view)
         if citations:
             await asyncio.to_thread(_issue, profile, conv_id, citations)
 
@@ -1156,6 +1259,11 @@ async def _deliver(row: dict[str, Any]) -> bool:
         except Exception:  # noqa: BLE001
             logger.exception("[documents] research: channel forwarder setup failed")
         query, trigger_event = build_delivery_messages(view, text, room=room)
+        if delivery is not None:
+            # The turn's agent starts from what this delivery shows: the pages
+            # it still owes the model, and whether there is anything to answer
+            # from at all (app.agent.research_handoff).
+            trigger_event["research_delivery"] = delivery
         metadata = {"source": "research_result", "status": view.status, "job_id": job_id}
         trigger_metadata = {**metadata, "trigger": True, "label": trigger_event["label"]}
 
@@ -1277,6 +1385,6 @@ def _reset_for_tests() -> None:
 __all__ = [
     "artifacts_dir", "artifacts_root", "boot_recover", "build_delivery_messages", "cancel_job",
     "cancel_profile_jobs", "continue_job", "get_job", "has_live_run", "list_jobs", "mark_collected",
-    "on_turn_end", "purge_profile", "resolve_conversation_id", "signal_cancel", "spawn", "start_job",
-    "wait_cap", "wait_job",
+    "on_turn_end", "purge_profile", "research_model_label", "resolve_conversation_id", "signal_cancel", "spawn",
+    "start_job", "wait_cap", "wait_job",
 ]

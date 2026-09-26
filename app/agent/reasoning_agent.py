@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 from a2a.types import DataPart, Part, TextPart
 
 from app.agent import document_review as dr
+from app.agent import research_handoff as rh
 from app.agent import search_tools as st
 from app.agent.usage import UsageRecord
 from app.utils.formatting import dict_to_text
@@ -73,7 +74,7 @@ from app.tools import (
     ToolThinkingEvent,
     ToolType,
 )
-from app.tools.base import make_leaf_name
+from app.tools.base import LEAF_SEP, make_leaf_name
 from app.tools.ids import slugify
 from app.skills.scanner import generate_dir_tree
 from app.types import ReasoningStreamResponseType
@@ -1209,7 +1210,11 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
         research = (
             f"Legal, financial or compliance questions, and requests to compile everything in a "
             f"folder, MUST go through {fn('research')} — never conclude from snippets; if it "
-            "reports status 'running', call it again with continue_job before answering."
+            "reports status 'running', call it again with continue_job before answering. Leave "
+            "reference_scope out unless the user named the folder or file of the law: without it the "
+            "job finds the governing documents across their index itself. Answer only from its "
+            "verified findings, and never tell the user an indexed document is missing or ask them to "
+            "upload it again."
         )
     else:
         research = (
@@ -1651,16 +1656,21 @@ class _LeafOutcome:
     ``evidence`` is the delivery record of a Documentation Search result
     (``app.documents.delivery.DocumentEvidence``), present only when the
     trusted built-in group produced it — see ``document_review.trusted_evidence``.
+    ``research`` is the same for a research result
+    (``app.documents.research.handoff.ResearchDelivery``) — see
+    ``research_handoff.trusted_research``.
     """
 
-    __slots__ = ("call_id", "status_chunks", "tool_text", "parts", "evidence")
+    __slots__ = ("call_id", "status_chunks", "tool_text", "parts", "evidence", "research")
 
-    def __init__(self, call_id: str, status_chunks: list, tool_text: str, parts: list, evidence: Any = None):
+    def __init__(self, call_id: str, status_chunks: list, tool_text: str, parts: list, evidence: Any = None,
+                 research: Any = None):
         self.call_id = call_id
         self.status_chunks = status_chunks
         self.tool_text = tool_text
         self.parts = parts
         self.evidence = evidence
+        self.research = research
 
 
 def _coerce_args(raw: Any) -> Dict[str, Any]:
@@ -1772,6 +1782,14 @@ class ReasoningAgent:
     # skeleton agent that never ran.
     _doc_review: Optional["dr.DocumentReview"] = None
 
+    # This turn's research results (``research_handoff.ResearchHandoff``):
+    # the dossier pages still owed and the insufficiency guard. Same life
+    # cycle as ``_doc_review``. ``_research_delivery`` is the record a
+    # research job's own delivery turn arrives with (server-built, from the
+    # trigger), taken in when the run starts.
+    _research: Optional["rh.ResearchHandoff"] = None
+    _research_delivery: Optional[dict] = None
+
     def __init__(
         self,
         llm: LLMProvider,
@@ -1789,11 +1807,15 @@ class ReasoningAgent:
         maintenance: bool = False,
         search_tools: Optional["st.Snapshot"] = None,
         on_search_baseline: Optional[Callable[[dict], Any]] = None,
+        research_delivery: Optional[dict] = None,
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # A research job reporting back as its own turn: the record of what
+        # its delivery shows (built by the job runner, never by a model).
+        self._research_delivery = research_delivery if isinstance(research_delivery, dict) else None
         # The conversation's search-tool selection, frozen when the run started
         # (``None`` = the default, every source), and the hook that records the
         # cache baseline at this run's first main-model request — sync or async,
@@ -2120,12 +2142,27 @@ class ReasoningAgent:
             return getattr(inner, "provider_name", None), getattr(inner, "model_name", None)
         return None, None
 
-    def _model_label_for(self, tool) -> str | None:
+    def _model_label_for(self, tool, *, tool_name: str = "", args: Optional[Dict[str, Any]] = None,
+                         origin: Optional[str] = None) -> str | None:
+        """The model a tool call's badge names: the model the call runs on —
+        a built-in group's child LLM, or the one its function names (a
+        Documentation Search ``research`` job runs on its own group; ``read``
+        runs none) — else the reasoning model that chose the call. A call the
+        agent made itself (``origin``) that runs no model gets no badge."""
+        chooser = None if origin else self.llm.model_label
         if tool is None or tool.tool_type is ToolType.SKILL:
             return self.llm.model_label
         adapter = getattr(tool, "adapter", None)
         inner = getattr(adapter, "_llm", None)
-        return getattr(inner, "model_label", None) if inner else self.llm.model_label
+        prefix = f"{getattr(tool, 'tool_id', None) or ''}{LEAF_SEP}"
+        leaf = tool_name[len(prefix):] if tool_name.startswith(prefix) else tool_name
+        fn = (getattr(adapter, "_tools_by_name", None) or {}).get(leaf)
+        if fn is not None and hasattr(fn, "model_label"):
+            try:
+                return fn.model_label(args or {}, self.profile, inner) or chooser
+            except Exception:  # noqa: BLE001 — a badge never fails a call
+                logger.debug(f"[reasoning] model label for {tool_name} failed", exc_info=True)
+        return getattr(inner, "model_label", None) if inner else chooser
 
     def _record_reasoning_usage(self, response: dict) -> None:
         it = response.get("input_tokens") or 0
@@ -2947,6 +2984,14 @@ class ReasoningAgent:
         # What this turn's document searches and reads delivered, and the
         # automatic reads that calls for (see _run_document_review).
         self._doc_review = dr.DocumentReview()
+        # What this turn's research results handed over (see
+        # _run_research_handoff); a delivery turn starts with its job's.
+        self._research = rh.ResearchHandoff(allowance=rh.allowance_for(
+            getattr(self.llm, "provider_name", None), getattr(self.llm, "model_name", None)))
+        from app.documents.research.handoff import ResearchDelivery
+
+        if self._research.observe(ResearchDelivery.from_dict(getattr(self, "_research_delivery", None))):
+            self._doc_review.suppress(dr.REASON_RESEARCH)
         # The search cache baseline is recorded once per RUN (see ``_loop``).
         self._search_baseline_recorded = False
         # A mid-turn reply already streamed to the user, waiting to be folded
@@ -3110,6 +3155,27 @@ class ReasoningAgent:
                 else:
                     async for item in self._run_document_review(dispatch):
                         yield item
+
+            # Research results: read the dossier pages whose verified evidence
+            # the turn has not shown the model yet; and a settled legal
+            # analysis that found no usable evidence ends the turn with the
+            # server's own summary — here, before the request, because a
+            # check of the streamed answer would come too late. New user
+            # input goes first (it may change the question).
+            research = getattr(self, "_research", None)
+            if research is not None and not drained and not getattr(self, "_maintenance", False):
+                if research.pending_pages() and self._mode != "instant":
+                    async for item in self._run_research_pages(dispatch):
+                        yield item
+                ended = research.insufficient()
+                if ended is not None:
+                    research.guarded = ended.job_id
+                    logger.info(f"[research_handoff] profile={self.profile} conversation={self.context_id} "
+                                f"job={ended.job_id} status={ended.status} outcome={ended.outcome}: no usable "
+                                "evidence; the turn ends with the insufficiency summary")
+                    self._final_answer_text = ended.insufficiency or ""
+                    yield self._final_chunk(self._final_answer_text)
+                    return
 
             messages: List["ChatCompletionMessageParam"] = [
                 {"role": "system", "content": instruction},
@@ -3348,11 +3414,13 @@ class ReasoningAgent:
 
             # A batch that hands the question to a research job leaves the
             # reading to the job: no ordinary automatic review on top of it.
-            if self._doc_review is not None and any(
-                e and e[0] == "leaf" and getattr(e[1], "tool_id", None) == st.DOCUMENTATION_SEARCH
-                and e[2] == "research"
-                for (_c, _n, _a, e) in resolved
-            ):
+            # Only a real handoff counts — a research call that failed (bad
+            # arguments, busy, no such job) handed nothing over.
+            handed_over = False
+            for outcome in outcomes.values():
+                if outcome.research is not None and self._research is not None:
+                    handed_over = self._research.observe(outcome.research) or handed_over
+            if handed_over and self._doc_review is not None:
                 self._doc_review.suppress(dr.REASON_RESEARCH)
 
             # Event run parked pending: the agent called request_user_input this
@@ -3505,7 +3573,8 @@ class ReasoningAgent:
             "Call_Id": call_id,
             "Tool": tool_name,
             "Tool_Input": json.dumps(args, ensure_ascii=False),
-            "Model_Label": self._model_label_for(tool) if tool is not None else self.llm.model_label,
+            "Model_Label": (self._model_label_for(tool, tool_name=tool_name, args=args, origin=origin)
+                            if tool is not None else self.llm.model_label),
             "Token_Usage": None if origin else self._reasoning_usage_for_step(step),
         }
         if origin:
@@ -3594,7 +3663,8 @@ class ReasoningAgent:
         ]
         text = self._render_result_text(parts, result_event.observation_text or "")
         evidence = dr.trusted_evidence(tool, result_event, tool_id=st.DOCUMENTATION_SEARCH)
-        return _LeafOutcome(call_id, status_chunks, text, parts, evidence)
+        research = rh.trusted_research(tool, result_event, tool_id=st.DOCUMENTATION_SEARCH)
+        return _LeafOutcome(call_id, status_chunks, text, parts, evidence, research)
 
     def _append_tool_result(
         self, call_id: str, observation_text: str, fn_name: str | None = None,
@@ -3716,6 +3786,54 @@ class ReasoningAgent:
             f"[document_review] profile={self.profile} conversation={self.context_id} automatic reads: "
             + ", ".join(f"{a.token} {a.outcome}" + (f" ({a.reason})" if a.reason else "") for a in attempts)
         )
+
+    async def _run_research_pages(
+        self, dispatch: Dict[str, tuple],
+    ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
+        """Read the dossier pages that carry verified evidence the turn has
+        not shown the model yet (``research_handoff``), before the next
+        model response: the agent's own tool-call group, as for the automatic
+        document review — the read function from this step's dispatch table,
+        unique call ids, every call answered, ``Origin`` on the trace, no
+        model request, no step counted."""
+        research = self._research
+        fn = make_leaf_name(st.DOCUMENTATION_SEARCH, "read")
+        entry = dispatch.get(fn)
+        if (
+            research is None or not entry or entry[0] != "leaf"
+            or getattr(entry[1], "tool_id", None) != st.DOCUMENTATION_SEARCH or entry[2] != "read"
+            or self._is_plan_blocked_leaf(entry, {}) or self._is_event_blocked_leaf(entry, {})
+        ):
+            return
+        pages = research.pending_pages()
+        if not pages:
+            return
+        research.charge(pages)
+        tool = entry[1]
+        step_no = max(1, self.current_step_count - 1)
+        calls = [(f"call_research_{uuid.uuid4().hex[:16]}", {"file": f"research:{jid}", "page": page})
+                 for jid, page in pages]
+        for call_id, args in calls:
+            yield self._thinking_artifact(step_no, call_id, fn, args, tool, origin=rh.ORIGIN)
+        ack, self._pending_ack_text = getattr(self, "_pending_ack_text", "") or "", ""
+        self._turn_messages.append({
+            "role": "assistant",
+            "content": ack or None,
+            "tool_calls": [{"id": call_id, "type": "function",
+                            "function": {"name": fn, "arguments": json.dumps(args)}} for call_id, args in calls],
+        })
+        for call_id, args in calls:
+            outcome = await self._collect_leaf(tool=tool, leaf_name="read", args=args, call_id=call_id)
+            for status_chunk in outcome.status_chunks:
+                yield status_chunk
+            if outcome.research is not None:
+                research.observe(outcome.research)
+            note = (f"[Research dossier, page {args['page']} — read for you, not a call you chose: it holds "
+                    "verified findings the page you saw did not show.]")
+            self._append_tool_result(call_id, f"{note}\n{outcome.tool_text}", fn_name=fn)
+            yield self._result_artifact(step_no, call_id, outcome.parts)
+        logger.info(f"[research_handoff] profile={self.profile} conversation={self.context_id} read dossier "
+                    f"page(s): " + ", ".join(f"{jid} p.{page}" for jid, page in pages))
 
     def _drain_task_notices(self) -> List[Dict[str, Any]]:
         """Tell the agent, mid-turn, that an awaited task result has landed.

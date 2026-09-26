@@ -359,6 +359,10 @@ class ProfileRuntime:
         if root_changed or self.watcher is None and self.watch_mode != "poll":
             self._stop_watching()
             self._start_watching(opts)
+        try:
+            self.queue_stale_chunking(SOURCE)
+        except Exception:  # noqa: BLE001 — an upgrade sweep must never stop the folder from syncing
+            logger.exception(f"[documents] {self.profile}: queueing files for the new chunker failed")
         self.request_scan("configure")
 
     def _configure_drive(self, row: dict[str, Any], ok: bool) -> None:
@@ -802,6 +806,50 @@ class ProfileRuntime:
         if changed or queued:
             self.service.wake()
         return changed, queued
+
+    def queue_stale_chunking(self, source: str) -> int:
+        """Queue, once, the indexed files of ``source`` that an older chunker
+        cut differently from today's. A new chunker version alone queues
+        nothing — a file is re-chunked only when something else sends it
+        through the pipeline — so a fix to how documents are cut would never
+        reach the files already indexed. Called when a source becomes active
+        (the folder configured and running, Drive after a sync that ran), so
+        a paused, disabled or held source queues nothing until it works again.
+
+        Idempotent and conservative: only rows at rest (``indexed``) with an
+        older ``chunker_version`` are queued — a file already waiting keeps its
+        place, time and retries, a failed one keeps its backoff — images
+        (captioned, not chunked) never, and after a bump that changed only the
+        legal overlay (``LEGAL_ONLY_BUMPS``) only the files with articles. The
+        pipeline's chunk diff then keeps every file's citation id and
+        re-embeds only the chunks that changed. Returns how many were queued."""
+        from app.documents.chunking import CHUNKER_VERSION, LEGAL_ONLY_BUMPS
+
+        db = self.db
+        if db is None:
+            return 0
+        # Files chunked before the last bump that changed more than the legal
+        # overlay are stale whatever they hold; after it, only legal ones.
+        full = max((v for v in range(1, CHUNKER_VERSION + 1) if v not in LEGAL_ONLY_BUMPS), default=1)
+        rows = db.read_sql(
+            "SELECT id FROM files WHERE source = ? AND status = 'indexed' AND kind != ? "
+            "AND chunker_version IS NOT NULL AND chunker_version < ? "
+            "AND (chunker_version < ? OR EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id "
+            "AND c.section_key LIKE 'art:%')) ORDER BY id",
+            (source, t.KIND_IMAGE, CHUNKER_VERSION, full),
+        )
+        ids = [int(r["id"]) for r in rows]
+        if not ids:
+            return 0
+        db.mark_dirty(ids, priority=P_UPGRADE)
+        db.add_activity("upgrade", f"{len(ids)} document(s) queued to be re-read by the updated chunker; their "
+                        "citations stay valid.", source=source, detail={"files": len(ids),
+                                                                        "chunker_version": CHUNKER_VERSION})
+        logger.info(f"[documents] {self.profile}: {len(ids)} {source} file(s) queued for chunker "
+                    f"version {CHUNKER_VERSION}")
+        self.note_queued(len(ids), "upgrade")
+        self.service.wake()
+        return len(ids)
 
     def run_scan(self) -> None:
         """A full reconcile of the folder against the index (scan executor)."""

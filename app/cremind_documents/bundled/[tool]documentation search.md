@@ -137,22 +137,21 @@ The message records what was returned, examined and cited
 
 The agent **must** use it for legal, financial or compliance questions over
 the user's files, and for "compile everything in folder X" requests —
-`search` and `read` alone would answer from a sample. A job reads files **in
-full**, in model-sized windows, and checks every quote against the source: a
-wrong one (a swapped word, a dropped "not") is dropped and counted. It first
-brings the index up to date (new files, Drive changes, changed local files in
-scope); a file not re-indexed in time is listed as "still being indexed",
-never read from its old text, and the job asks whether to go on without it.
+`search` and `read` alone would answer from a sample. A job reads in
+model-sized windows and checks every quote against the source: a wrong one
+(a swapped word, a dropped "not") is dropped and counted. It first
+brings the index up to date; a file not re-indexed in time is listed as
+"still being indexed", never read from its old text, and the job asks whether
+to go on without it.
 
 Two modes:
 
-- `analyze` (default) — answers a question: the primary files (the case, the
-  client's folder) are read in full, the issues they raise searched in the
-  reference files from several angles (counter-evidence included), and the
-  provisions found read in full with their cross-references. With
-  `domain="legal"` the job picks the **edition** of each law explicitly
-  (number, dates, consolidated texts, what replaced what — judged from the
-  indexed documents only), says which and why, and asks when it cannot tell.
+- `analyze` (default) — answers a question: the primary files (the case) are
+  read in full, the issues searched in the reference files from several
+  angles (counter-evidence included), the provisions found read in full with
+  their cross-references. With `domain="legal"` the job picks the **edition**
+  of each law explicitly (judged from the indexed documents only), says which
+  and why, and asks when it cannot tell.
 - `compile` — reads **every** file in scope into one table, merged across
   files, conflicting values side by side with their sources; also attached as
   CSV and Markdown.
@@ -162,15 +161,18 @@ Parameters:
 - `question` — the question or compile request (starts a new job); `mode` —
   `compile` or `analyze`; `domain` — `legal`, `financial` or `general`
   (default).
-- `scope` — the primary files, a [filters](#filters) object (usually
-  `folder`; default: every indexed file); `reference_scope` — `analyze` only:
-  where the laws, policies or standards are (default: the whole index).
+- `scope` — the primary files, a [filters](#filters) object: `analyze`'s
+  case (default: none — the question is the case), `compile`'s folder
+  (default: every indexed file). `reference_scope` — `analyze` only:
+  restricts the laws or policies to these files; left out, the job finds the
+  governing documents across the whole index (by topic, and by any law or
+  number the question names).
 - `continue_job` — an earlier job's id: get its state, answer its question
   (`answers`, keyed by the keys it printed: strings, booleans or numbers),
   `cancel` it, or read a dossier `page`.
 
-One job runs per profile at a time; starting another returns `ResearchBusy`
-with the running job's id.
+One job runs per profile at a time; another start returns `ResearchBusy`
+naming the running job.
 
 ### The continue_job protocol
 
@@ -191,27 +193,27 @@ shorter tool-call timeout) and returns the job's state:
   `continue_job=<id>` and `answers` using exactly those keys, e.g.
   `{"edition": "k7m2xq9a"}`, `{"scope_folder": "Clients/ABC"}`,
   `{"reference_folder": "Law"}` or `{"confirm": true}`.
-- **complete / partial** — the dossier (`partial`: stopped at its token
-  budget or time limit; the dossier says what it covered).
+- **complete** — every issue has verified findings. **partial** — its
+  outcome says why not: insufficient evidence, a named law not indexed, or
+  the budget or time limit. Answer only from verified findings; never tell
+  the user an indexed file is missing.
 - **failed / cancelled** — says so, with what the dossier held; not a
   conclusion.
 
 ### The dossier
 
-Page 1 is the summary: **coverage** (files in scope, read in full, partly or
-not at all, and why each unread one was not — password-protected, an old
-format, a photo awaiting the vision model, still indexing, budget spent; an
-answer must tell the user which files were not read), **authorities** (each
-law or policy, its number and dates, whether in force, the edition used and
-why), **findings per issue** with verified quotes and `[doc:…]` tokens,
-cross-references and open questions, **gaps** and the count of dropped
-quotes; for `compile` the table's first rows and conflicts; for the legal
-domain a "Not legal advice" line. Long tails are on later pages:
+Page 1 opens with the status, the **outcome** (reason and counts) and the
+coverage totals, then: unread files and why (an answer must name them),
+**authorities** (number, dates, in force or not, edition used and why),
+**findings per issue** with verified quotes and `[doc:…]` tokens,
+cross-references, open questions, **gaps**; for `compile` the table's head
+and conflicts. Long tails are on later pages:
 `documentation_search__read(file='research:<id>', page=n)` or
-`continue_job=<id>` with `page=n`. Every page fits the tool-result budget and
-its tokens are registered, so the answer's citations verify like any other.
-While a job runs, the chat's **Research activity** panel shows its progress,
-with a Cancel button.
+`continue_job=<id>` with `page=n`; each fits the tool-result budget, its
+tokens verify like any citation. Unseen pages with verified findings are read
+for the agent before it answers (labelled **automatic**): per response, up to
+40,000 tokens and a quarter of the model's context window. The chat's
+**Research activity** panel tracks a running job (with Cancel).
 
 ## Filters
 
@@ -265,7 +267,7 @@ then fewer results with a page cursor — never a cut token.
 | Variable | Type | Default | Meaning |
 |----------|------|---------|---------|
 | `DEFAULT_TOP_K` | number | `8` | Results per page when the agent does not ask for a number (1–30). |
-| `RESEARCH_MODEL_GROUP` | `high` \| `low` | `high` | Model group that runs `research` jobs: `high` for the main model, `low` for the cheaper auxiliary model. |
+| `RESEARCH_MODEL_GROUP` | `high` \| `low` | `high` | Model group for a `research` job's own calls (not the chat's): `high` main model, `low` cheaper auxiliary model. |
 | `RESEARCH_TOKEN_BUDGET` | number | `250000` | Most LLM tokens one `research` job may spend; it asks first when its estimate is higher, and stops at the budget reporting what it covered (`partial`). |
 
 Thorough mode always uses the `low` model group. Research token use is

@@ -663,18 +663,42 @@ def test_an_automation_result_landing_does_not_cancel_the_review(env, bound_run)
 
 
 def test_a_research_job_in_the_same_batch_takes_over(env):
+    from app.documents.research.handoff import ResearchDelivery
+
     docs = _docs_group()
     research = docs._adapter._tools_by_name["research"]
 
     async def fake_research(arguments):
         from app.tools.builtin.base import BuiltInToolResult
-        return BuiltInToolResult(content=[{"type": "text", "text": "research job started"}])
+        return BuiltInToolResult(content=[{"type": "text", "text": "research job started"}],
+                                 evidence=ResearchDelivery(job_id="job123", status="running", mode="analyze",
+                                                           domain="general"))
 
     research.run = fake_research
     llm = _LLM([SEARCH_CALL + [("documentation_search__research", {"question": "multi-agent"})], "answer"])
     review = _run(_agent(llm, tools=[docs]))[-1]["document_review"]
     assert _no_review(llm) and env.reads == []
     assert set(review["reasons"].values()) == {dr.REASON_RESEARCH}
+
+
+def test_a_failed_research_call_does_not_take_over(env):
+    """A research call that handed nothing over (bad arguments, busy, no
+    such job) leaves the ordinary review to run."""
+    from app.documents.research.handoff import failed_delivery
+
+    docs = _docs_group()
+    research = docs._adapter._tools_by_name["research"]
+
+    async def fake_research(arguments):
+        from app.tools.builtin.base import BuiltInToolResult
+        return BuiltInToolResult(structured_content={"error": "ResearchBusy", "message": "busy"},
+                                 evidence=failed_delivery("ResearchBusy"))
+
+    research.run = fake_research
+    llm = _LLM([SEARCH_CALL + [("documentation_search__research", {"question": "multi-agent"})], "answer"])
+    done = _run(_agent(llm, tools=[docs]))[-1]
+    assert not _no_review(llm) and len(env.reads) == 2
+    assert dr.REASON_RESEARCH not in set(done["document_review"]["reasons"].values())
 
 
 def test_instant_mode_keeps_its_one_round(env):

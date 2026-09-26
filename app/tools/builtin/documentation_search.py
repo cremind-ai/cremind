@@ -216,6 +216,9 @@ class DocumentsFindFilesTool(BuiltInTool):
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         return await _tool_result(LEAF_FIND, arguments)
 
+    def model_label(self, arguments: Dict[str, Any], profile: str, group_llm: Any) -> Optional[str]:
+        return None  # an index query: no model runs
+
 
 class DocumentsSearchTool(BuiltInTool):
     name: str = LEAF_SEARCH
@@ -267,6 +270,10 @@ class DocumentsSearchTool(BuiltInTool):
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         return await _tool_result(LEAF_SEARCH, arguments)
 
+    def model_label(self, arguments: Dict[str, Any], profile: str, group_llm: Any) -> Optional[str]:
+        # Only thorough mode runs the group's model (the `low` group).
+        return getattr(group_llm, "model_label", None) if arguments.get("thorough") else None
+
 
 class DocumentsReadTool(BuiltInTool):
     name: str = LEAF_READ
@@ -304,6 +311,9 @@ class DocumentsReadTool(BuiltInTool):
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         return await _tool_result(LEAF_READ, arguments)
 
+    def model_label(self, arguments: Dict[str, Any], profile: str, group_llm: Any) -> Optional[str]:
+        return None  # the index, or a stored dossier page: no model runs
+
 
 def _scope_schema(description: str) -> Dict[str, Any]:
     return {**FILTERS_SCHEMA, "description": description}
@@ -332,11 +342,13 @@ class DocumentsResearchTool(BuiltInTool):
             "domain": {"type": "string", "enum": ["legal", "financial", "general"],
                        "description": "legal: choose law editions explicitly, cite articles/clauses. "
                                       "financial: figures and periods. general (default)."},
-            "scope": _scope_schema("The primary files: the case, the client's folder, the folder to compile. "
-                                   "Default: every indexed file."),
-            "reference_scope": _scope_schema("analyze only: where the authorities are — the laws, policies, "
-                                             "standards (e.g. {\"folder\": [\"Luat\"]}). Default: the whole "
-                                             "index."),
+            "scope": _scope_schema("The primary files. analyze: the case files, read in full (default: none — "
+                                   "the question is the case). compile: the folder to compile (default: every "
+                                   "indexed file)."),
+            "reference_scope": _scope_schema("analyze only: restrict the authorities — laws, policies, standards "
+                                             "— to these files (e.g. {\"folder\": [\"Luat\"]}). Leave it out "
+                                             "unless the user named where they are: by default the job finds "
+                                             "the governing documents across the whole index."),
             "continue_job": {"type": "string",
                              "description": "The job id of an earlier call: get its current state (waits a while "
                                             "if it is still running), answer its question, cancel it, or read a "
@@ -354,6 +366,15 @@ class DocumentsResearchTool(BuiltInTool):
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         return await _tool_result(LEAF_RESEARCH, arguments)
+
+    def model_label(self, arguments: Dict[str, Any], profile: str, group_llm: Any) -> Optional[str]:
+        # The job runs on its own group (RESEARCH_MODEL_GROUP), never on the
+        # group's `low` model; a cancel runs none.
+        if arguments.get("cancel"):
+            return None
+        from app.documents.research import jobs
+
+        return jobs.research_model_label(profile)
 
 
 # ── execution (shared with the REST query API) ─────────────────────────────
@@ -602,6 +623,7 @@ def _scope(raw: Any, name: str) -> Optional[Dict[str, Any]]:
 
 def _research_error(err: Any) -> LeafResult:
     from app.documents.query import render as R
+    from app.documents.research.handoff import failed_delivery
 
     kind = {
         "JobNotFound": "not_found",
@@ -612,7 +634,10 @@ def _research_error(err: Any) -> LeafResult:
     text = ""
     if kind == "unavailable":
         text = R.render_status(err.message, code=err.extra.get("status_code") or err.extra.get("status"))
-    return LeafResult(text=text, error=err.to_dict(), error_kind=kind)
+    # A failed call handed nothing over: the agent must not take it for a
+    # research job that took the question.
+    return LeafResult(text=text, error=err.to_dict(), error_kind=kind,
+                      evidence=failed_delivery(getattr(err, "code", "") or "ResearchError"))
 
 
 async def _research(profile: str, args: Dict[str, Any], *, context_id: Optional[str], variables: Dict[str, Any],
@@ -670,7 +695,10 @@ async def _research(profile: str, args: Dict[str, Any], *, context_id: Optional[
     except ResearchError as err:
         return _research_error(err)
     except FilterError as exc:
-        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid")
+        from app.documents.research.handoff import failed_delivery
+
+        return LeafResult(error={"error": "InvalidFilter", "message": str(exc)}, error_kind="invalid",
+                          evidence=failed_delivery("InvalidFilter"))
     return await _render_research(profile, view, page=page, budgeted=budgeted)
 
 
@@ -707,12 +735,19 @@ async def _index_db(profile: str) -> Any:
 
 async def _render_research(profile: str, view: Any, *, page: int, budgeted: bool) -> LeafResult:
     from app.documents.research import jobs
+    from app.documents.research.handoff import build_delivery
     from app.documents.research.render import render_job
     from app.documents.research.types import FINAL, WAITING
 
     db = await _index_db(profile)
     rendered = await asyncio.to_thread(
         lambda: render_job(view, ctx=render_context(profile, budgeted=budgeted), db=db, page=page))
+    # What this page handed over, for the agent's own bookkeeping (see
+    # app.documents.research.handoff); never text the model reads.
+    delivery = build_delivery(view, text=rendered.text, page=int(rendered.data.get("page") or 1),
+                              pages=int(rendered.data.get("pages") or 1),
+                              evidence_pages=list(rendered.data.get("evidence_pages") or []),
+                              page_tokens=rendered.data.get("page_tokens"))
     if view.status in FINAL or view.status in WAITING:
         # The caller is about to see this state: claim its delivery, so no
         # extra turn is injected to present it again.
@@ -721,7 +756,7 @@ async def _render_research(profile: str, view: Any, *, page: int, budgeted: bool
         except Exception as exc:  # noqa: BLE001 — delivery bookkeeping never fails the answer
             logger.warning(f"[documents] research: could not mark job {view.job_id} collected: {exc}")
     return LeafResult(text=rendered.text, data=rendered.data, citations=rendered.citations, files=rendered.files,
-                      token_usage=None)
+                      token_usage=None, evidence=delivery)
 
 
 def _budget_arg(value: Any) -> Optional[int]:
@@ -747,6 +782,7 @@ async def _tool_result(leaf: str, arguments: Dict[str, Any]) -> BuiltInToolResul
     leaf's delivery record (``evidence``) for the agent's own bookkeeping;
     it never reaches the model."""
     from app.documents.delivery import error_evidence
+    from app.documents.research.handoff import failed_delivery
 
     profile = arguments.get("_profile") or "admin"
     context_id = arguments.get("_context_id")
@@ -757,9 +793,11 @@ async def _tool_result(leaf: str, arguments: Dict[str, Any]) -> BuiltInToolResul
                                max_tokens=_budget_arg(arguments.get(BUDGET_ARG)))
     except Exception as exc:  # noqa: BLE001 — a search failure is an observation, not a crash
         logger.exception(f"[documents] {leaf} failed for {profile}")
+        research = leaf == LEAF_RESEARCH or str(args.get("file") or "").strip().lower().startswith(
+            RESEARCH_REF_PREFIX)
         return BuiltInToolResult(structured_content={
             "error": "SearchFailed", "message": f"User document {leaf} failed: {exc}"},
-            evidence=error_evidence(leaf, "SearchFailed"))
+            evidence=failed_delivery("SearchFailed") if research else error_evidence(leaf, "SearchFailed"))
     if result.error is not None:
         if result.error_kind == "unavailable":
             return BuiltInToolResult(structured_content={**result.error, "text": result.text},
