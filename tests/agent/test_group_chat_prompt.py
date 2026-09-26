@@ -57,7 +57,7 @@ def _build(monkeypatch, *, message_origin=None, profile="dog"):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_agent_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: "")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     llm = SimpleNamespace(provider_name="fake", model_name="fake-model")
     registry = _FakeRegistry([_FakeTool("reasoning"), _FakeTool("calc")])

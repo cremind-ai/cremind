@@ -64,7 +64,7 @@ class _RecordingBus:
 def _switch(tmp_path, monkeypatch, storage, *, context_id, profile, target):
     """Run the tool's ``target='custom'`` branch and return the recording bus."""
     bus = _RecordingBus()
-    monkeypatch.setattr(cwd_tool, "get_user_working_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(cwd_tool, "get_user_working_directory", lambda *a, **k: str(tmp_path))
     monkeypatch.setattr(cwd_tool, "get_event_stream_bus", lambda: bus)
     import app.events.runner as runner
     monkeypatch.setattr(runner, "get_conversation_storage", lambda: storage)
@@ -165,8 +165,16 @@ def test_hydrate_restores_a_seat_cwd_under_its_context_key(tmp_path):
         clear_context(SEAT_CONTEXT, WORKING_DIR_OVERRIDE_KEY)
 
 
-def test_hydrate_clears_a_stale_path_on_the_row_not_the_context(tmp_path):
+def test_hydrate_clears_a_stale_path_on_the_row_not_the_context(tmp_path, monkeypatch):
     """The row id addresses the DB even while the context key addresses memory."""
+    import app.utils.working_directory as wd_mod
+
+    # The fallback is the ROW's profile's own folder — asked for by name.
+    asked = []
+    monkeypatch.setattr(
+        wd_mod, "get_user_working_directory",
+        lambda profile: asked.append(profile) or str(tmp_path / profile),
+    )
     gone = tmp_path / "deleted"
     storage = _FakeStorage({SEAT_ROW: {
         "id": SEAT_ROW, "context_id": SEAT_CONTEXT, "profile": "member",
@@ -174,12 +182,13 @@ def test_hydrate_clears_a_stale_path_on_the_row_not_the_context(tmp_path):
     }})
 
     try:
-        asyncio.run(hydrate_working_directory(
+        got = asyncio.run(hydrate_working_directory(
             SEAT_ROW, storage, context_key=SEAT_CONTEXT,
         ))
 
         assert storage.updates == [(SEAT_ROW, {"working_directory": None})]
         assert get_context(SEAT_CONTEXT, WORKING_DIR_OVERRIDE_KEY) is None
+        assert got == str(tmp_path / "member") and asked == ["member"]
     finally:
         clear_context(SEAT_CONTEXT, WORKING_DIR_OVERRIDE_KEY)
 

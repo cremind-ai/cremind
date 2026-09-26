@@ -1,4 +1,4 @@
-"""API: Documentation search settings, the admin gate, and folder browsing.
+"""API: Documentation search settings and the admin gate.
 
 What these pin, in order of how much damage a regression would do:
 
@@ -11,8 +11,9 @@ What these pin, in order of how much damage a regression would do:
 - **Confirm before destroy.** A change that would remove indexed content is
   refused with a plan and a token; only the same change carrying that token is
   applied.
-- **The root boundary.** A non-admin profile cannot index outside the working
-  directory, and nobody can browse into Cremind's system folder.
+- **The folder is the working directory.** Each profile indexes its own
+  working directory; a settings save cannot name another folder, and a working
+  directory that is unsafe to index is refused.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from app.databases.sqlite import SqliteDatabaseProvider  # noqa: E402
 from app.storage.documents_storage import DocumentsStorage  # noqa: E402
 from app.documents import settings as uds  # noqa: E402
 from app.documents import state as uds_state  # noqa: E402
+from tests.documents._workspaces import install  # noqa: E402
 
 _TABLES = ("profiles", "document_sources", "document_captions", "document_vision_usage")
 
@@ -84,13 +86,12 @@ def env(tmp_path: Path, monkeypatch):
     storage = DocumentsStorage(provider)
     monkeypatch.setattr(uds_storage_module, "_instance", storage)
 
-    wd = tmp_path / "work"
     sysdir = tmp_path / "system"
     outside = tmp_path / "elsewhere"
-    for d in (wd / "Reports", wd / "Other", wd / "coding-cli", wd / ".hidden", sysdir, outside):
+    for d in (sysdir, outside):
         d.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
-    monkeypatch.setattr(uds, "get_user_working_directory", lambda: str(wd))
+    # Both profiles on their default working directories, <SYS>/workspaces/<name>.
+    working_dirs = install(monkeypatch, sysdir, {"admin": None, "dog": None})
 
     rows: dict[str, str] = {}
     monkeypatch.setattr(uds, "get_dynamic", lambda table, key, *a, **k: rows.get(key))
@@ -105,7 +106,8 @@ def env(tmp_path: Path, monkeypatch):
     purged: list[tuple[str, str]] = []
     uds_state.set_purge_handler(lambda p, k: purged.append((p, k)))
     yield SimpleNamespace(
-        storage=storage, rows=rows, wd=wd, sysdir=sysdir, outside=outside,
+        storage=storage, rows=rows, sysdir=sysdir, outside=outside, working_dirs=working_dirs,
+        wd={p: sysdir / "workspaces" / p for p in ("admin", "dog")},
         embedding=embedding, purged=purged, monkeypatch=monkeypatch,
     )
     uds_state.set_purge_handler(None)
@@ -133,12 +135,17 @@ def _allow(env):
     ("/api/documentation-search/status", "GET"),
     ("/api/documentation-search/settings", "GET"),
     ("/api/documentation-search/settings", "PUT"),
-    ("/api/documentation-search/validate-root", "POST"),
-    ("/api/documentation-search/browse", "GET"),
     ("/api/documentation-search/admin", "GET"),
 ])
 def test_everything_needs_a_token(env, path, method):
     assert _call(path, method, authenticated=False).status_code == 401
+
+
+def test_there_is_no_folder_picker_any_more():
+    """The folder is the working directory: no browse, no validate-root."""
+    paths = {r.path for r in api.get_documents_routes()}
+    assert "/api/documentation-search/browse" not in paths
+    assert "/api/documentation-search/validate-root" not in paths
 
 
 def test_the_gate_is_admin_only(env):
@@ -182,10 +189,10 @@ def test_admin_can_allow_and_set_budgets(env):
 
 def test_the_admin_overview_never_shows_other_profiles_paths(env):
     _allow(env)
-    env.storage.upsert_source("dog", "local", enabled=True, root_path=str(env.wd / "Reports"))
+    env.storage.upsert_source("dog", "local", enabled=True, root_path=str(env.wd["dog"]))
     body = _body(_call("/api/documentation-search/admin", "GET"))
     assert body["profiles"] == [{"profile": "dog", "local_enabled": True}]
-    assert str(env.wd) not in json.dumps(body["profiles"])
+    assert "workspaces" not in json.dumps(body["profiles"])
 
 
 # ── per-profile settings ───────────────────────────────────────────────────
@@ -198,68 +205,107 @@ def test_a_profile_cannot_enable_before_the_admin_allows_it(env):
     assert env.storage.get_source("dog", "local") is None
 
 
-def test_enable_stores_the_resolved_working_directory(env):
+def test_enable_stores_the_profiles_own_working_directory(env):
+    """Each profile's own — the default one lives inside the system folder,
+    and that is exactly the one folder there that may be indexed."""
     _allow(env)
-    resp = _call("/api/documentation-search/settings", "PUT", username="dog", body={"enabled": True})
-    assert resp.status_code == 200, resp.body
-    row = env.storage.get_source("dog", "local")
-    assert row["enabled"] is True
-    assert row["root_mode"] == "inherit"
-    # Stored even for "inherit", so a later change of the global working
-    # directory is noticed instead of silently re-pointing the index.
-    assert row["root_path"] == os.path.realpath(env.wd)
+    for profile in ("dog", "admin"):
+        resp = _call("/api/documentation-search/settings", "PUT", username=profile, body={"enabled": True})
+        assert resp.status_code == 200, resp.body
+        row = env.storage.get_source(profile, "local")
+        assert row["enabled"] is True
+        assert row["root_mode"] == "inherit"
+        # Stored, so a later change of the working directory is noticed
+        # instead of silently re-pointing the index.
+        assert row["root_path"] == os.path.realpath(env.wd[profile])
 
 
-def test_profiles_only_ever_see_their_own_settings(env):
+def test_the_settings_show_the_callers_own_working_directory(env):
     _allow(env)
-    _call("/api/documentation-search/settings", "PUT", username="dog",
-          body={"enabled": True, "root_path": str(env.wd / "Reports")})
+    _call("/api/documentation-search/settings", "PUT", username="dog", body={"enabled": True})
     mine = _body(_call("/api/documentation-search/settings", "GET", username="admin"))
     assert mine["local"]["enabled"] is False
     assert mine["local"]["root_path"] is None
+    assert mine["policy_view"]["working_dir"] == os.path.realpath(env.wd["admin"])
+    assert mine["policy_view"]["working_dir_editable"] is True
+    assert "root_constraint" not in mine["policy_view"]
+    assert "root_mode" not in mine["local"]
+    dogs = _body(_call("/api/documentation-search/settings", "GET", username="dog"))
+    assert dogs["policy_view"]["working_dir"] == os.path.realpath(env.wd["dog"])
+    assert dogs["policy_view"]["working_dir_editable"] is False
     status = _body(_call("/api/documentation-search/status", "GET", username="admin"))
     assert status["enabled"] is False
 
 
-def test_a_member_cannot_index_outside_the_working_directory(env):
+@pytest.mark.parametrize("field,value", [
+    ("root_path", "elsewhere"),
+    ("root_mode", "custom"),
+    ("root_mode", "inherit"),
+])
+def test_a_settings_save_cannot_choose_a_folder(env, field, value):
     _allow(env)
-    resp = _call("/api/documentation-search/settings", "PUT", username="dog",
-                 body={"enabled": True, "root_path": str(env.outside)})
+    body = {"enabled": True, field: str(env.outside) if value == "elsewhere" else value}
+    for profile in ("dog", "admin"):
+        resp = _call("/api/documentation-search/settings", "PUT", username=profile, body=body)
+        assert resp.status_code == 400
+        out = _body(resp)
+        assert out["code"] == "root_not_configurable"
+        assert "working directory" in out["message"]
+        assert env.storage.get_source(profile, "local") is None
+
+
+def test_a_working_directory_unsafe_to_index_is_refused(env):
+    """The admin pointed dog's working directory into the system folder (not
+    its own default workspace there): enabling says why and stores nothing."""
+    _allow(env)
+    (env.sysdir / "storage").mkdir()
+    env.working_dirs.rows["dog"] = str(env.sysdir / "storage")
+    resp = _call("/api/documentation-search/settings", "PUT", username="dog", body={"enabled": True})
     assert resp.status_code == 400
-    assert _body(resp)["code"] == "outside_working_dir"
+    assert _body(resp)["code"] == "inside_system_dir"
     assert env.storage.get_source("dog", "local") is None
 
 
-def test_nobody_can_index_the_system_folder(env):
-    _allow(env)
-    resp = _call("/api/documentation-search/settings", "PUT", username="admin",
-                 body={"enabled": True, "root_path": str(env.sysdir)})
-    assert resp.status_code == 400
-    assert _body(resp)["code"] == "inside_system_dir"
-
-
-def test_moving_the_folder_needs_the_matching_confirmation(env):
+def test_a_moved_working_directory_is_not_moved_by_a_settings_save(env):
+    """Later saves never re-point the stored folder: the engine notices the
+    move and asks the profile first (pending_root_change)."""
     _allow(env)
     _call("/api/documentation-search/settings", "PUT", username="dog", body={"enabled": True})
-    move = {"root_path": str(env.wd / "Reports")}
+    env.working_dirs.rows["dog"] = str(env.outside)
+    resp = _call("/api/documentation-search/settings", "PUT", username="dog",
+                 body={"options": {"caption": {"daily_cap": 5}}})
+    assert resp.status_code == 200, resp.body
+    row = env.storage.get_source("dog", "local")
+    assert row["root_path"] == os.path.realpath(env.wd["dog"])
+    view = _body(resp)["settings"]
+    assert view["policy_view"]["working_dir"] == os.path.realpath(env.outside)
+    assert view["local"]["root_path"] == os.path.realpath(env.wd["dog"])
 
-    first = _call("/api/documentation-search/settings", "PUT", username="dog", body=move)
+
+def test_new_excludes_need_the_matching_confirmation(env):
+    _allow(env)
+    _call("/api/documentation-search/settings", "PUT", username="dog", body={"enabled": True})
+    change = {"excludes": ["Archive/**"]}
+
+    first = _call("/api/documentation-search/settings", "PUT", username="dog", body=change)
     assert first.status_code == 409
     body = _body(first)
     assert body["error"] == "ConfirmationRequired"
     assert body["plan"]["destructive"] is True
     token = body["confirm"]
 
-    # The token confirms exactly that move — not a move somewhere else.
-    elsewhere = {"root_path": str(env.wd / "Other"), "confirm": token}
-    other = _call("/api/documentation-search/settings", "PUT", username="dog", body=elsewhere)
+    # The token confirms exactly that change — not another one.
+    other = _call("/api/documentation-search/settings", "PUT", username="dog",
+                  body={"excludes": ["Other/**"], "confirm": token})
     assert other.status_code == 409
     assert _body(other)["confirm"] != token
-    assert env.storage.get_source("dog", "local")["root_path"] == os.path.realpath(env.wd)
+    assert env.storage.get_source("dog", "local")["excludes"] in (None, [])
 
-    applied = _call("/api/documentation-search/settings", "PUT", username="dog", body={**move, "confirm": token})
+    applied = _call("/api/documentation-search/settings", "PUT", username="dog", body={**change, "confirm": token})
     assert applied.status_code == 200, applied.body
-    assert env.storage.get_source("dog", "local")["root_path"] == os.path.realpath(env.wd / "Reports")
+    assert env.storage.get_source("dog", "local")["excludes"] == [
+        {"pattern": "Archive/**", "type": "glob", "mode": "skip"},
+    ]
 
 
 def test_disable_keeps_the_index_unless_asked(env):
@@ -328,24 +374,3 @@ def test_status_shows_a_profile_its_own_relocation_problems_by_uuid(env):
     assert [p["step"] for p in dog] == ["index:p1"]
     admin = _body(_call("/api/documentation-search/status", "GET", username="admin"))["relocation_errors"]
     assert {p["step"] for p in admin} == {"index:p1", "index:p0", "authored:p9", "indexes"}
-
-
-# ── browse ─────────────────────────────────────────────────────────────────
-
-
-def test_browse_hides_credentials_hidden_folders_and_the_system_folder(env):
-    body = _body(_call("/api/documentation-search/browse", "GET", username="dog"))
-    names = {e["name"] for e in body["entries"]}
-    assert "Reports" in names
-    assert "coding-cli" not in names
-    assert ".hidden" not in names
-
-
-def test_a_member_cannot_browse_outside_the_working_directory(env):
-    resp = _call("/api/documentation-search/browse", "GET", username="dog",
-                 query=f"path={env.outside}")
-    assert resp.status_code == 403
-    assert _call("/api/documentation-search/browse", "GET", username="admin",
-                 query=f"path={env.outside}").status_code == 200
-    assert _call("/api/documentation-search/browse", "GET", username="admin",
-                 query=f"path={env.sysdir}").status_code == 403

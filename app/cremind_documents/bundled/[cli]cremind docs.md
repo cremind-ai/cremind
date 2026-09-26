@@ -1,13 +1,18 @@
 ---
-description: "Search the user's OWN files with Documentation search via `cremind docs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind docs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind docs research`. Formerly `cremind userdocs`. Not for Cremind's own documentation (that is cremind_documentation_search)."
+description: "Search the user's OWN files with Documentation search via `cremind docs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`) — it always indexes the profile's own working directory (the admin changes that with `cremind profile working-dir`; accept a moved one with `confirm-root-change`), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind docs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind docs research`. Formerly `cremind userdocs`. Not for Cremind's own documentation (that is cremind_documentation_search)."
 ---
 
 # `cremind docs` — Documentation search
 
 `cremind docs` controls **Documentation search** for the current profile:
-an index of your own files (a folder you choose, and optionally Google Drive)
-that the agent can search by meaning, by keyword, by date and by folder, and
-cite back to the exact page or lines. It mirrors **Settings → My Documents**.
+an index of your own files (your working directory, and optionally Google
+Drive) that the agent can search by meaning, by keyword, by date and by
+folder, and cite back to the exact page or lines. It mirrors **Settings → My
+Documents**.
+
+**The folder is always your own working directory** (default
+`~/.cremind/workspaces/<profile>`); only the admin changes it (`cremind
+profile working-dir`). Other profiles' working directories are never indexed.
 
 It is separate from `cremind_documentation_search`, which only covers Cremind's own
 manual. Before the rename this group was `cremind userdocs` (REST
@@ -29,14 +34,14 @@ Two levels of switch:
 
 ## Finding this in the web UI
 
-> **Sidebar → Settings → My Documents** (every profile)
-> **Sidebar → Settings → Embedding → Documentation search** (admin: the gate)
+> **Sidebar → Settings → My Documents** (every profile; shown only while
+> Vector Embedding is on) — the gate is its admin-only **Administrator settings** section
 
 ## Changes that remove indexed content
 
-Moving the folder, adding exclude rules that drop indexed files, and
-`disable --delete-index` would remove content from the index. The server
-refuses them at first and prints what would go:
+`confirm-root-change`, adding exclude rules that drop indexed files, and
+`disable --delete-index` would remove content from the index. They are
+refused at first, with what would go:
 
 ```text
 This change would:
@@ -67,8 +72,9 @@ cremind docs status [--follow/-f]
 **Behavior.** Prints one line: the state (`disabled`, `idle`, `scanning`,
 `indexing`, `paused(...)`, `suspended(...)`, …), progress, the file being
 processed, and how search behaves right now (`search: lexical_only` when
-Vector Embedding is off). With `--follow`, prints one line per update until
-Ctrl-C; with `--json`, one JSON snapshot per line.
+Vector Embedding is off); then `folder: … (your working directory)`. With
+`--follow`, prints one line per update until Ctrl-C; with `--json`, one JSON
+snapshot per line.
 
 After an upgrade that moved the index to its new folder, anything that could
 not be moved safely (the destination already held something different) is kept
@@ -81,7 +87,8 @@ $ cremind docs status
 indexing · 3120/12840 files · 12 failed · ~30 min left · now: MKT-report/q3.xlsx (embed)
 ```
 
-`suspended(admin_gate)` means the admin has not allowed the feature;
+`hold(pending_root_change)`: your working directory moved; see
+`confirm-root-change`. `suspended(admin_gate)` means the admin has not allowed the feature;
 `suspended(embedding_off)` means Vector Embedding is off — the index is kept
 and still searchable by keyword, but nothing syncs. With Google Drive indexing
 on, the line also shows `drive: <state>` (e.g. `drive: hold(auth_revoked)`;
@@ -89,9 +96,8 @@ see `cremind docs drive`).
 
 ### `cremind docs settings`
 
-**Purpose.** Print this profile's folder, Google Drive and option settings,
-plus what the server allows (working directory, whether non-admin folders must
-sit inside it).
+**Purpose.** Print this profile's folder (`policy_view.working_dir`), Google
+Drive and option settings as JSON.
 
 ```bash
 cremind docs settings
@@ -102,18 +108,12 @@ cremind docs settings
 **Purpose.** Turn on Documentation search for this profile.
 
 ```bash
-cremind docs enable [--root PATH] [--yes]
+cremind docs enable [--yes]
 ```
 
-| Flag     | Default                 | Meaning                                                   |
-|----------|-------------------------|-----------------------------------------------------------|
-| `--root` | the working directory   | Folder to index. Non-admin profiles: must be inside the working directory. |
-| `--yes`  | off                     | Apply even if the change removes indexed content.         |
-
 **Errors.** `FeatureDisabledByAdmin` (ask the admin to run `admin set --allow`),
-`EmbeddingDisabled` (Vector Embedding is off), `root_path: …` (the folder was
-refused — inside Cremind's system folder, an OS location, or outside the
-working directory).
+`EmbeddingDisabled` (Vector Embedding is off), `root_path: …` (your working
+directory cannot be indexed; see below).
 
 ### `cremind docs disable`
 
@@ -128,17 +128,19 @@ cremind docs disable [--delete-index] [--yes]
 | `--delete-index` | off     | Also delete the index (needs `--yes`). Without it the index is kept. |
 | `--yes`          | off     | Confirm deleting the index.                              |
 
-### `cremind docs set-root`
+### `cremind docs confirm-root-change`
 
-**Purpose.** Change the indexed folder.
+**Purpose.** Index your working directory where it is now, after the admin
+moved it (until then: `hold(pending_root_change)`, nothing syncs or leaves
+the index).
 
 ```bash
-cremind docs set-root PATH [--yes]
-cremind docs set-root --inherit [--yes]
+cremind docs confirm-root-change [--yes]
 ```
 
-`--inherit` goes back to the working directory. Files that stay in scope keep
-their index entries; files outside the new folder are removed (after `--yes`).
+Prints the old and new folder and how many indexed files would leave the
+index, then exits 2; `--yes` applies it (files still inside keep their
+entries; your files are never touched). Exits 1 when no move is waiting.
 
 ### `cremind docs excludes`
 
@@ -316,9 +318,9 @@ Vector Embedding first (`cremind embedding set`).
 **`suspended(admin_gate)`** — The admin has not allowed the feature:
 `cremind docs admin set --allow` (admin).
 
-**`root_path: That folder is inside Cremind's system folder`** — The working
-directory is set to Cremind's own system folder (`~/.cremind`). Pick another
-folder with `set-root PATH`, or ask the admin to change the working directory.
+**`hold(root_invalid)` / `root_path: Your working directory … is inside
+Cremind's system folder`** — Inside `~/.cremind` only your own default
+workspace is indexed; the admin changes it with `cremind profile working-dir`.
 
 **Exit code 2** — The change needs confirmation; the printed plan says what
 would be removed. Re-run with `--yes`.

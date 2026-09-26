@@ -22,6 +22,7 @@ tokens.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 from pathlib import Path
@@ -30,12 +31,17 @@ from types import SimpleNamespace
 import pytest
 
 from app.api import files as files_api
+from app.config import working_dirs
 
 
 @pytest.fixture
 def system_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(files_api.BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path), raising=False)
-    monkeypatch.setattr(files_api, "get_user_working_directory", lambda: str(tmp_path / "work"))
+    monkeypatch.setattr(files_api, "get_user_working_directory", lambda profile: str(tmp_path / "work"))
+    # Working-directory ownership is not what this suite is about (see
+    # test_files_working_dirs.py): no profile rows, so no path is owned.
+    monkeypatch.setattr(importlib.import_module("app.config.settings"), "_dynamic_config_storage", None)
+    working_dirs.invalidate()
     (tmp_path / "admin" / "exports").mkdir(parents=True)
     (tmp_path / "admin" / "exports" / "cremind-javis-config.md").write_text("token", encoding="utf-8")
     (tmp_path / "admin" / "uploads_tmp").mkdir(parents=True)

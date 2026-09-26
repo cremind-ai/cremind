@@ -330,12 +330,15 @@ def test_the_shell_cannot_shadow_what_the_env_file_says() -> None:
     """Compose prefers the invoking shell's value to the .env's."""
     sh = _sh()
     branch = _between(sh, 'step "Docker install"', "docker compose pull")
+    # CREMIND_DOCKER_WORKSPACES_DIR: written with a read-only mount (the
+    # profiles' working directories then live in the cremind-data volume).
     assert ("for _doc_key in CREMIND_HOST_DOCUMENTS CREMIND_DOCUMENTS_READ_ONLY "
-            "CREMIND_COMPOSE_HOST_DIR; do") in branch
+            "CREMIND_COMPOSE_HOST_DIR CREMIND_DOCKER_WORKSPACES_DIR; do") in branch
     assert 'unset "$_doc_key"' in branch
     ps1 = _ps1()
     branch = _between(ps1, 'Write-Step "Docker install"', "Invoke-NativeLogged { & docker compose")
-    assert "@('CREMIND_HOST_DOCUMENTS', 'CREMIND_DOCUMENTS_READ_ONLY', 'CREMIND_COMPOSE_HOST_DIR')" in branch
+    assert ("@('CREMIND_HOST_DOCUMENTS', 'CREMIND_DOCUMENTS_READ_ONLY', 'CREMIND_COMPOSE_HOST_DIR', "
+            "'CREMIND_DOCKER_WORKSPACES_DIR')") in branch
     assert 'Remove-Item -LiteralPath "Env:$docKey"' in branch
 
 
@@ -569,10 +572,15 @@ def _sandbox_env(tmp_path: Path, **extra: str) -> dict[str, str]:
     the refusal lands outside the test's directory."""
     env = {
         k: v for k, v in os.environ.items()
-        if not k.upper().startswith("CREMIND_") and k.upper() != "INSTALL_MODE"
+        if not k.upper().startswith("CREMIND_")
+        and k.upper() not in ("INSTALL_MODE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "HOMEDRIVE", "HOMEPATH")
     }
     env.update({
         "HOME": str(tmp_path / "home"),
+        # install.ps1's defaults (and PowerShell's $HOME) come from these.
+        "USERPROFILE": str(tmp_path / "home"),
+        "LOCALAPPDATA": str(tmp_path / "home" / "AppData" / "Local"),
+        "APPDATA": str(tmp_path / "home" / "AppData" / "Roaming"),
         "CREMIND_INSTALL_DIR": str(tmp_path / "install"),
         "CREMIND_SYSTEM_DIR": str(tmp_path / "system"),
         # Unreachable: if validation ever moves below the catalog fetch, the

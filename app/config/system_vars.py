@@ -90,6 +90,15 @@ def _resolve_skill_dir(profile: Optional[str]) -> Optional[str]:
     return str(profile_skills_dir(profile))
 
 
+def _resolve_user_working_dir(profile: Optional[str]) -> Optional[str]:
+    """The profile's OWN working directory. There is no server-wide folder any
+    more, so without a profile the variable is omitted rather than pointed at
+    somebody else's."""
+    if not profile:
+        return None
+    return get_user_working_directory(profile)
+
+
 def _resolve_agent_name(profile: Optional[str]) -> Optional[str]:
     if not profile:
         return None
@@ -144,8 +153,11 @@ SYSTEM_VARS: list[SystemVarSpec] = [
     ),
     SystemVarSpec(
         name="CREMIND_USER_WORKING_DIR",
-        resolve=lambda _profile: get_user_working_directory(),
-        description="User-facing default working directory.",
+        resolve=_resolve_user_working_dir,
+        description=(
+            "This profile's own User Working Directory (each profile has its "
+            "own); omitted when no profile."
+        ),
     ),
     SystemVarSpec(
         name="CREMIND_SKILL_DIR",

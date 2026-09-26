@@ -20,7 +20,7 @@ const {
 } = view
 
 const ACTIONS = new Set([
-  'enable', 'open_admin', 'choose_folder', 'rescan', 'confirm_root_change', 'review_first_sync',
+  'enable', 'open_admin', 'change_working_dir', 'rescan', 'confirm_root_change', 'review_first_sync',
   'review_deletions', 'resume', 'pause', 'adjust_excludes', 'retry_failed', 'relink_google',
 ])
 
@@ -49,7 +49,7 @@ function drive(overrides = {}) {
 function snap(driveOverrides = {}, overrides = {}) {
   return {
     v: 1, boot: 'b', seq: 1, enabled: true, state: 'idle', reason: null,
-    sources: { local: { enabled: true, root_mode: 'custom', root: '/home/ann/Documents', first_sync_confirmed: true }, drive: { enabled: true } },
+    sources: { local: { enabled: true, root: '/home/ann/Documents', first_sync_confirmed: true }, drive: { enabled: true } },
     stages: { indexed: 10 },
     drive: drive(driveOverrides),
     ...overrides,
@@ -143,7 +143,7 @@ test('the new hold reasons also word a top-level hold', () => {
 test('a Drive-only profile is not "document search is off"', () => {
   const driveOnly = snap({}, {
     state: 'disabled',
-    sources: { local: { enabled: false, root_mode: 'inherit', root: null, first_sync_confirmed: false }, drive: { enabled: true } },
+    sources: { local: { enabled: false, root: null, first_sync_confirmed: false }, drive: { enabled: true } },
   })
   const b = check(stateBanner(driveOnly))
   assert.equal(b.title, 'Searching Google Drive only')

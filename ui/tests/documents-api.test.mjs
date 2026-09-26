@@ -122,15 +122,15 @@ test('rebuild goes through the same round trip on /control', async () => {
 test('any other error is thrown with the server structure kept', async () => {
   env = installBrowser()
   env.route('/api/documentation-search/settings', () => json({
-    error: 'ValidationFailed', details: { root_path: 'That folder does not exist.' }, code: 'not_found',
+    error: 'ValidationFailed', details: { root_path: 'Your working directory does not exist.' }, code: 'not_found',
   }, 400))
-  const err = await api.saveDocumentsSettings(URL_, TOKEN, { kind: 'local', root_mode: 'custom', root_path: '/x' })
+  const err = await api.saveDocumentsSettings(URL_, TOKEN, { kind: 'local', enabled: true })
     .then(() => null, e => e)
   assert.ok(err instanceof api.DocumentsApiError)
   assert.equal(err.status, 400)
   assert.equal(err.code, 'ValidationFailed')
-  assert.deepEqual(err.details, { root_path: 'That folder does not exist.' })
-  assert.equal(err.message, 'That folder does not exist.')
+  assert.deepEqual(err.details, { root_path: 'Your working directory does not exist.' })
+  assert.equal(err.message, 'Your working directory does not exist.')
 })
 
 test('FeatureNotInstalled from the admin gate carries what to install', async () => {
@@ -167,15 +167,18 @@ test('file listing sends the keyset cursor and filters as query parameters', asy
   assert.equal(url.searchParams.get('limit'), '100')
 })
 
-test('validate-root asks about the inherited root without a path', async () => {
+test('there is no folder to choose: no validate-root or browse client', () => {
+  // The folder is the profile's working directory; only the admin changes it.
+  assert.equal(api.validateDocumentsRoot, undefined)
+  assert.equal(api.browseDocumentsFolders, undefined)
+})
+
+test('confirm_root_change is a plain control action', async () => {
   env = installBrowser()
-  env.route('/api/documentation-search/validate-root', () => json({ ok: true, path: '/home/ann', code: null, message: null, locked_excludes: [] }))
-  await api.validateDocumentsRoot(URL_, TOKEN, null)
-  await api.validateDocumentsRoot(URL_, TOKEN, '/home/ann/Docs')
-  assert.deepEqual(
-    env.callsTo('/api/documentation-search/validate-root').map(bodyOf),
-    [{ root_mode: 'inherit' }, { path: '/home/ann/Docs' }],
-  )
+  env.route('/api/documentation-search/control', () => json({ accepted: true, snapshot: { v: 1, state: 'idle' } }, 202))
+  const out = await api.runDocumentsControl(URL_, TOKEN, { action: 'confirm_root_change' })
+  assert.equal(out.kind, 'done')
+  assert.deepEqual(env.callsTo('/api/documentation-search/control').map(bodyOf), [{ action: 'confirm_root_change' }])
 })
 
 test('isStaleSnapshot orders by boot and seq only', () => {

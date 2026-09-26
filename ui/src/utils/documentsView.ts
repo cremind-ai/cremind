@@ -214,8 +214,10 @@ export type BannerTone = 'info' | 'warning' | 'error' | 'success';
 
 export type BannerActionId =
   | 'enable'
+  /** Admins only: the Administrator settings section on the same page. */
   | 'open_admin'
-  | 'choose_folder'
+  /** Admins only: Settings → Profiles, where working directories are set. */
+  | 'change_working_dir'
   | 'rescan'
   | 'confirm_root_change'
   | 'review_first_sync'
@@ -244,9 +246,6 @@ export interface StateBanner {
 }
 
 export interface BannerContext {
-  /** When the kept index was last brought up to date (epoch ms), for the
-   *  "keyword search over the index as of <time>" line. */
-  asOf?: number | null;
   /** Size of an index kept while the feature is off. */
   keptIndexBytes?: number | null;
   /** Google Drive is on for the profile (the saved setting). Defaults to the
@@ -277,7 +276,17 @@ function rootOf(snap: DocumentsSnapshot, settings: DocumentsSettings | null | un
   return snap.sources?.local?.root
     || settings?.local.root_path
     || settings?.policy_view.working_dir
-    || 'your documents folder';
+    || 'your working directory';
+}
+
+/** The folder is always the profile's working directory, and only the admin
+ *  changes one (Settings → Profiles): admins get a button there, everyone
+ *  else is told whom to ask. */
+function workingDirFix(settings: DocumentsSettings | null | undefined): { note: string; actions: BannerAction[] } {
+  const policy = settings?.policy_view;
+  return (policy?.working_dir_editable ?? policy?.is_admin)
+    ? { note: 'Change it under Settings → Profiles.', actions: [{ id: 'change_working_dir', label: 'Open Profiles settings' }] }
+    : { note: 'Ask your admin to change it.', actions: [] };
 }
 
 function holdBanner(
@@ -286,29 +295,35 @@ function holdBanner(
 ): StateBanner {
   const detail = snap.detail ?? {};
   const root = detail.root || rootOf(snap, settings);
+  const fix = workingDirFix(settings);
   switch (snap.reason) {
     case 'root_invalid':
       return banner(
         'error',
-        "This folder can't be indexed",
-        `${detail.message || `${root} is not a folder Cremind can index.`} Nothing has been deleted — `
-          + 'choose another folder to carry on.',
-        [{ id: 'choose_folder', label: 'Choose a folder', primary: true }],
+        "Your working directory can't be indexed",
+        `${sentence(detail.message) || `${root} is not a folder Cremind can index. `}Nothing has been `
+          + `deleted. ${detail.message ? '' : fix.note}`.trimEnd(),
+        fix.actions.map(a => ({ ...a, primary: true })),
       );
 
     case 'pending_root_change':
     case 'root_change': {
-      const from = detail.from ?? (snap.confirmation?.kind === 'root_change' ? snap.confirmation.from : null);
-      const to = detail.to ?? (snap.confirmation?.kind === 'root_change' ? snap.confirmation.to : null);
+      const conf = snap.confirmation?.kind === 'root_change' ? snap.confirmation : null;
+      const from = detail.from ?? conf?.from ?? null;
+      const to = detail.to ?? conf?.to ?? null;
+      const leaving = typeof conf?.leaving === 'number' ? conf.leaving : null;
+      const scope = leaving !== null && conf?.files
+        ? `${formatCount(leaving)} of the ${plural(conf.files, 'indexed file')} are outside the new folder and `
+          + 'are removed from the index; the rest keep theirs.'
+        : 'files that are still inside the new folder keep their index, and the rest are removed from it.';
       return banner(
         'warning',
-        'Your documents folder moved',
-        `The working directory changed${from ? ` from ${from}` : ''}${to ? ` to ${to}` : ''}. `
-          + 'Syncing is on hold until you confirm: files that are still inside the new folder keep '
-          + 'their index, and the rest are removed from it. Your files themselves are never touched.',
+        'Your working directory changed',
+        `Your working directory changed${from ? ` from ${from}` : ''}${to ? ` to ${to}` : ''}. `
+          + `Syncing is on hold until you confirm: ${scope} Your files themselves are never touched.`,
         [
-          { id: 'confirm_root_change', label: 'Use the new folder', primary: true },
-          { id: 'choose_folder', label: 'Choose a different folder' },
+          { id: 'confirm_root_change', label: 'Index the new folder', primary: true },
+          ...fix.actions,
         ],
       );
     }
@@ -343,10 +358,7 @@ function holdBanner(
         'warning',
         "Your documents folder isn't available right now",
         body,
-        [
-          { id: 'rescan', label: 'Check again', primary: true },
-          { id: 'choose_folder', label: 'Choose a different folder' },
-        ],
+        [{ id: 'rescan', label: 'Check again', primary: true }],
         { snippet },
       );
     }
@@ -406,7 +418,11 @@ function holdBanner(
 /**
  * The banner for a snapshot — one per `state(reason)` of the design's state
  * table. `settings` supplies the folder names and whether the viewer is the
- * admin (who is offered the admin page where others are told to ask).
+ * admin (who is sent to the Administrator settings further down the same page
+ * where others are told to ask).
+ *
+ * No row for `suspended(embedding_off)`: My Documents exists only while
+ * Vector Embedding is on (utils/myDocumentsAccess.ts), so nobody reads it.
  */
 export function stateBanner(
   snap: DocumentsSnapshot,
@@ -415,7 +431,7 @@ export function stateBanner(
 ): StateBanner {
   const isAdmin = !!settings?.policy_view.is_admin;
   const adminLink: BannerAction[] = isAdmin
-    ? [{ id: 'open_admin', label: 'Open Vector Embedding settings' }]
+    ? [{ id: 'open_admin', label: 'Go to Administrator settings' }]
     : [];
   const progress = syncProgress(snap);
   const failed = failedCount(snap);
@@ -457,7 +473,7 @@ export function stateBanner(
           'info',
           'Not available on this server yet',
           isAdmin
-            ? 'Allow Documentation search on the Vector Embedding page, then turn it on here.'
+            ? 'Allow Documentation search under Administrator settings below, then turn it on here.'
             : 'An administrator has to allow Documentation search before you can turn it on.',
           adminLink,
         );
@@ -469,17 +485,6 @@ export function stateBanner(
           'The agent cannot search your documents until an administrator allows Documentation search '
             + 'again. Nothing has been deleted, and syncing picks up where it left off.'
             + (isAdmin ? '' : ' Ask your administrator if you need it back.'),
-          adminLink,
-        );
-      }
-      if (snap.reason === 'embedding_off') {
-        const when = formatWhen(ctx.asOf);
-        return banner(
-          'warning',
-          `Vector Embedding is off — keyword search over the index as of ${when || 'when it was turned off'}`,
-          'Syncing is paused and new changes are not picked up. The agent can still find your '
-            + 'documents by keyword; search by meaning returns when Vector Embedding is back on.'
-            + (isAdmin ? '' : ' Your administrator controls Vector Embedding.'),
           adminLink,
         );
       }
@@ -499,8 +504,8 @@ export function stateBanner(
         'warning',
         'PDF and Office files are waiting for a document reader',
         isAdmin
-          ? 'Plain-text files are indexed normally. Install the document readers from the Vector '
-            + 'Embedding page and the waiting files are picked up on their own.'
+          ? 'Plain-text files are indexed normally. Install the document readers under Administrator '
+            + 'settings below and the waiting files are picked up on their own.'
           : 'Plain-text files are indexed normally. Ask your administrator to install the document '
             + 'readers; the waiting files are picked up on their own.',
         adminLink,
@@ -576,7 +581,7 @@ export function stateBanner(
             'The storage budget for document search is full',
             `${storage.message || 'New and growing files wait; deletes, moves and search keep working.'} `
               + 'Exclude folders you do not need searched'
-              + (isAdmin ? ', or raise the budget on the Vector Embedding page.' : ', or ask your administrator for more space.'),
+              + (isAdmin ? ', or raise the budget under Administrator settings below.' : ', or ask your administrator for more space.'),
             [{ id: 'adjust_excludes', label: 'Adjust exclusions', primary: true }, ...adminLink],
           );
         case 'disk_low':

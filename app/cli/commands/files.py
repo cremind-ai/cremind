@@ -1,8 +1,9 @@
 """`cremind files ...` — browse and manage files in the Cremind workspace.
 
 Talks to the file-serving API (`/api/files/*`), which is sandboxed to the
-Cremind system dir + the user working dir (plus a conversation's custom cwd
-when `--conversation` is passed). Paths are absolute server-side paths — start
+Cremind system dir + the calling profile's own working dir (plus a
+conversation's custom cwd when `--conversation` is passed); another profile's
+working dir is always refused. Paths are absolute server-side paths — start
 from `cremind files cwd`.
 """
 
@@ -35,7 +36,7 @@ def _fmt_mtime(value: Any) -> str:
 @files_app.command("cwd")
 @graceful_errors
 def files_cwd(ctx: typer.Context) -> None:
-    """Print the workspace working directory (the file-tree seed path)."""
+    """Print your profile's working directory (the file-tree seed path)."""
     import asyncio
 
     from app.cli.client._base import Client

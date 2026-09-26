@@ -109,7 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # 2. Safety backup of the current system (server still running — same live
-    #    snapshot posture the upgrader uses before migrating).
+    #    snapshot posture the upgrader uses before migrating). It carries the
+    #    profiles' working directories only when the incoming archive does:
+    #    only then can the restore overwrite files there, and copying a large
+    #    workspaces folder for nothing would double its footprint on disk.
     from app.backup.manifest import ARCHIVE_SUFFIX
     from app.backup.store import backups_root
 
@@ -117,7 +120,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         restore_status.update_phase("safety_backup", "Backing up the current system before restoring...")
         safety_path = backups_root() / f"pre-restore-{restore_id}{ARCHIVE_SUFFIX}"
-        engine.create_backup(engine.BackupOptions(dest=safety_path))
+        engine.create_backup(engine.BackupOptions(
+            dest=safety_path, include_workspaces=manifest.workspaces_included,
+        ))
     except Exception as e:  # noqa: BLE001
         logger.exception("[backup:restore] safety backup failed")
         restore_status.finish(ok=False, error=f"Could not take a safety backup: {e}")

@@ -113,7 +113,10 @@ cremind profile wizard start <profile name> [--adopt]
 (use `cremind setup complete` for that), if the profile exists and `--adopt` was
 not given, if `--adopt` was given and the profile does not exist, or if a draft
 for that profile is already open. `admin` is never accepted — it is created by
-first-run setup and reconfigured with `cremind setup reconfigure`.
+first-run setup and reconfigured with `cremind setup reconfigure` — and a new
+profile may not take a reserved name (`shared`, `cli`, `workspaces`). The new
+profile gets its own working directory, `<workspaces>/<name>`; `admin` can
+move it afterwards with `cremind profile working-dir`.
 
 Adoption applies the configuration on top of the existing profile and mints a
 new token; **tokens issued to it earlier stay valid** (revoking those is

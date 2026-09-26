@@ -47,7 +47,7 @@ def _fake_cfg() -> SimpleNamespace:
 def _build(monkeypatch, provider_name, model_name):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
     llm = SimpleNamespace(provider_name=provider_name, model_name=model_name)
@@ -270,7 +270,7 @@ def test_agent_wires_search_guidance_into_prompt(monkeypatch):
     # REASONING STEP block is absent and only the search block is present.
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
     llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")

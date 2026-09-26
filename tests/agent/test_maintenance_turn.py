@@ -79,7 +79,7 @@ def _build(monkeypatch, *, maintenance: bool):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: "")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     # The profile that makes all three tools reachable: in a group, with a
     # notification channel and a live channel of some mode.
@@ -121,7 +121,7 @@ def test_maintenance_is_off_unless_asked_for(monkeypatch):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: "")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     agent = ra.ReasoningAgent(
         llm=llm, registry=_FakeRegistry([]), profile="dog", context_id="ctx",

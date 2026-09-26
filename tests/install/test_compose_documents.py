@@ -153,6 +153,86 @@ def test_the_template_tells_the_app_what_it_mounted() -> None:
             "CREMIND_COMPOSE_HOST_DIR"} <= interpolated
 
 
+def test_every_profiles_working_directory_lives_in_the_documents_mount() -> None:
+    """``CREMIND_WORKSPACES_DIR`` puts each profile's folder at
+    ``/root/Documents/cremind-workspaces/<profile>`` — on the host, inside the
+    bind — unless a read-only mount made the installer name the data volume.
+    Not ``workspaces/``: a user's own folder of that name would become an
+    unowned entry nobody may open. The compose-side name differs from the
+    app's so a native install's host path in the invoking shell can never
+    reach the container."""
+    environment = _template()["services"]["cremind"]["environment"]
+    assert environment["CREMIND_WORKSPACES_DIR"] == (
+        "${CREMIND_DOCKER_WORKSPACES_DIR:-/root/Documents/cremind-workspaces}"
+    )
+    interpolated = set(_INTERPOLATED.findall(COMPOSE_TEMPLATE.read_text(encoding="utf-8")))
+    assert "CREMIND_WORKSPACES_DIR" not in interpolated
+    assert "CREMIND_DOCKER_WORKSPACES_DIR" in interpolated
+    # Inside the mount's target, which is unchanged.
+    assert _documents_volume(_template()["services"]["cremind"])["target"] == "/root/Documents"
+    # The basic flavor keeps it.
+    basic = yaml.safe_load(strip_desktop(COMPOSE_TEMPLATE.read_text(encoding="utf-8")))
+    assert "CREMIND_WORKSPACES_DIR" in basic["services"]["cremind"]["environment"]
+
+
+class _Store:
+    """The three DynamicConfigStorage methods working_dirs uses."""
+
+    def __init__(self, rows: dict[str, str | None]):
+        self.rows = dict(rows)
+
+    def get_profile_working_dir(self, profile):
+        return self.rows.get(profile)
+
+    def set_profile_working_dir(self, profile, value):
+        self.rows[profile] = value
+        return True
+
+    def profile_working_dirs(self):
+        return dict(self.rows)
+
+
+def test_a_users_own_workspaces_folder_in_the_documents_mount_stays_theirs(tmp_path, monkeypatch) -> None:
+    """``workspaces`` is a common folder name (VS Code and friends). With the
+    compose default mapped onto tmp_path — the admin kept the whole documents
+    folder (an upgraded install), bob has his default folder — the user's own
+    ``<Documents>/workspaces/client-x`` is the admin's like any other folder,
+    not an unowned workspaces entry nobody may open; bob's folder stays his."""
+    import importlib
+
+    from app.config import working_dirs as wd
+
+    cfg = importlib.import_module("app.config.settings")
+    default = _template()["services"]["cremind"]["environment"]["CREMIND_WORKSPACES_DIR"]
+    container_root = default.split(":-", 1)[1].rstrip("}")
+    assert container_root.startswith("/root/Documents/")
+    docs = tmp_path / "Documents"
+    client = docs / "workspaces" / "client-x"
+    client.mkdir(parents=True)
+    (client / "main.py").write_text("the user's code", encoding="utf-8")
+
+    monkeypatch.setattr(cfg.BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path / "sys"))
+    monkeypatch.setattr(cfg, "_dynamic_config_storage", _Store({"admin": str(docs), "bob": None}))
+    monkeypatch.setenv(wd.WORKSPACES_ENV, str(docs / container_root[len("/root/Documents/"):]))
+    wd.invalidate()
+    try:
+        bob = cfg.get_user_working_directory("bob")
+        assert Path(bob).parent.name == "cremind-workspaces"
+        mine = str(client / "main.py")
+        assert wd.owners_of(mine) == frozenset({"admin"})
+        assert not wd.is_foreign(mine, "admin")
+        assert wd.is_foreign(mine, "bob")
+        assert wd.is_foreign(os.path.join(bob, "report.md"), "admin"), "admin is not exempt"
+        assert wd.foreign_dirs_inside(str(docs), "admin") == [os.path.normcase(os.path.realpath(bob))]
+
+        # What the old name did: the same folder became an unowned entry.
+        monkeypatch.setenv(wd.WORKSPACES_ENV, str(docs / "workspaces"))
+        wd.invalidate()
+        assert wd.owners_of(mine) == frozenset()
+    finally:
+        wd.invalidate()
+
+
 def test_the_app_reads_the_names_the_template_sets() -> None:
     """``app.documents.deploy_env.docker_root_status`` is the reader."""
     source = DEPLOY_ENV.read_text(encoding="utf-8")
@@ -309,6 +389,20 @@ def test_an_env_from_an_older_installer_falls_back_to_the_bundle_folder(
     assert not (tmp_path / "documents").exists()
     assert cremind["environment"]["CREMIND_HOST_DOCUMENTS_HINT"] == ""
     assert cremind["environment"]["CREMIND_COMPOSE_HOST_DIR"] == ""
+
+
+@pytest.mark.parametrize(("extra", "expected"), [
+    ([], "/root/Documents/cremind-workspaces"),
+    (["CREMIND_DOCKER_WORKSPACES_DIR=/root/.cremind/workspaces"], "/root/.cremind/workspaces"),
+])
+def test_compose_resolves_the_workspaces_root(docker: str, tmp_path: Path, extra: list[str], expected: str) -> None:
+    """Read-write: inside the documents mount. Read-only: the installer appends
+    the data-volume path, and compose passes that instead."""
+    bundle = render_bundle(tmp_path, read_only="true" if extra else "false")
+    with open(bundle / ".env", "a", encoding="utf-8") as env:
+        env.write("".join(line + "\n" for line in extra))
+    config = _config(docker, bundle)
+    assert config["services"]["cremind"]["environment"]["CREMIND_WORKSPACES_DIR"] == expected
 
 
 def test_a_read_only_value_compose_cannot_parse_fails_loudly(docker: str, tmp_path: Path) -> None:

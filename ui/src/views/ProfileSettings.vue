@@ -1,21 +1,45 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElPopconfirm, ElAlert, ElDialog, ElCheckbox, ElCheckboxGroup } from 'element-plus';
+import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElAlert, ElDialog, ElCheckbox, ElCheckboxGroup, ElRadioGroup, ElRadio } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
+import { useTerminalPanelStore } from '../stores/terminalPanel';
 import ConfigExportCard from '../components/profile/ConfigExportCard.vue';
-import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getInstructions, updateInstructions, getAgentName, setAgentName } from '../services/configApi';
+import {
+  listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getInstructions, updateInstructions,
+  getAgentName, setAgentName, getProfileWorkingDir, setProfileWorkingDir, type RetiredWorkingDir,
+} from '../services/configApi';
 import { cleanProfileData, CLEAN_GROUPS, type CleanScope } from '../services/cleanApi';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const settingsStore = useSettingsStore();
+const terminalPanel = useTerminalPanelStore();
 
 const profiles = ref<string[]>([]);
 const loading = ref(false);
 const newProfileName = ref('');
+// Optional: the new profile's working directory, handed to its setup wizard.
+const newProfileWorkingDir = ref('');
 const nameError = ref('');
+
+// Each profile's own working directory. Admin edits any row (blank = the
+// default, shown as the placeholder); everyone else sees their own, read-only.
+interface WorkingDirRow {
+  path: string;
+  defaultPath: string;
+  isDefault: boolean;
+  draft: string;
+  saving: boolean;
+  error: string;
+}
+const workingDirs = ref<Record<string, WorkingDirRow>>({});
+
+// Delete dialog: which profile, and what happens to its working directory.
+const deleteTarget = ref<string | null>(null);
+const deleteWorkingDirMode = ref<'keep' | 'delete'>('keep');
+const deleting = ref(false);
 const showReconfigureConfirm = ref(false);
 const reconfiguring = ref(false);
 
@@ -129,6 +153,10 @@ async function saveInstructions() {
 
 // Profile name validation regex: lowercase, numbers, hyphens, underscores
 const PROFILE_NAME_RE = /^[a-z0-9_-]+$/;
+// Names a new profile may not take (the server's RESERVED_PROFILE_NAMES, in
+// app/cremind_documents/paths.py): the manual's ``shared``/``cli`` scopes and
+// ``workspaces``, the folder that holds every profile's working directory.
+const RESERVED_PROFILE_NAMES = ['shared', 'cli', 'workspaces'];
 
 onMounted(async () => {
   await Promise.all([loadProfiles(), loadAgentName(), loadPersona(), loadInstructions()]);
@@ -141,6 +169,64 @@ async function loadProfiles() {
     profiles.value = res.profiles;
   } catch { ElMessage.error('Failed to load profiles'); }
   finally { loading.value = false; }
+  void loadWorkingDirs();
+}
+
+function toRow(wd: { path: string; default_path: string; is_default: boolean }): WorkingDirRow {
+  return {
+    path: wd.path,
+    defaultPath: wd.default_path,
+    isDefault: wd.is_default,
+    draft: wd.is_default ? '' : wd.path,
+    saving: false,
+    error: '',
+  };
+}
+
+async function loadWorkingDirs() {
+  // The list is already scoped by the server: every profile for admin, the
+  // caller's own otherwise — exactly the folders the caller may read.
+  const rows: Record<string, WorkingDirRow> = {};
+  await Promise.all(profiles.value.map(async (name) => {
+    try {
+      rows[name] = toRow(await getProfileWorkingDir(settingsStore.agentUrl, settingsStore.authToken, name));
+    } catch { /* leave the row blank; the rest of the page still works */ }
+  }));
+  workingDirs.value = rows;
+}
+
+const ownWorkingDir = computed(
+  () => workingDirs.value[settingsStore.profileId]?.path || settingsStore.workingDir,
+);
+
+async function saveWorkingDir(name: string) {
+  const row = workingDirs.value[name];
+  if (!row) return;
+  row.saving = true;
+  row.error = '';
+  try {
+    const wd = await setProfileWorkingDir(settingsStore.agentUrl, settingsStore.authToken, name, row.draft);
+    workingDirs.value[name] = toRow(wd);
+    ElMessage.success(`Working directory of '${name}': ${wd.path}`);
+    // The admin moved its own folder: this session's file panel (and the
+    // settings copy) still point at the old one. A no-op for any other profile.
+    void terminalPanel.workingDirChanged(name);
+  } catch (e) {
+    row.error = e instanceof Error ? e.message : 'Failed to save the working directory';
+  } finally {
+    row.saving = false;
+  }
+}
+
+function describeRetired(wd: RetiredWorkingDir | null | undefined): string {
+  if (!wd) return '';
+  switch (wd.action) {
+    case 'archived': return ` Its folder was kept, moved to ${wd.archived_to}.`;
+    case 'deleted': return ' Its folder was deleted.';
+    case 'untouched': return ` Its folder ${wd.path} was left in place.`;
+    case 'failed': return ` Its folder ${wd.path} could not be ${deleteWorkingDirMode.value === 'delete' ? 'deleted' : 'moved'}: ${wd.error}`;
+    default: return '';
+  }
 }
 
 function validateName(): boolean {
@@ -151,6 +237,7 @@ function validateName(): boolean {
     return false;
   }
   if (name.length > 64) { nameError.value = 'Max 64 characters'; return false; }
+  if (RESERVED_PROFILE_NAMES.includes(name)) { nameError.value = `'${name}' is reserved — choose another name`; return false; }
   if (profiles.value.includes(name)) { nameError.value = 'Profile already exists'; return false; }
   nameError.value = '';
   return true;
@@ -161,21 +248,47 @@ function handleCreateProfile() {
   const name = newProfileName.value.trim();
 
   // Open a new tab with the setup page for this profile
-  // The actual profile creation happens during the setup flow in the new tab
-  const setupUrl = `${window.location.origin}${window.location.pathname}#/setup/${encodeURIComponent(name)}`;
+  // The actual profile creation happens during the setup flow in the new tab.
+  // A chosen working directory rides along; the setup call checks it.
+  const dir = newProfileWorkingDir.value.trim();
+  const query = dir ? `?working_dir=${encodeURIComponent(dir)}` : '';
+  const setupUrl = `${window.location.origin}${window.location.pathname}#/setup/${encodeURIComponent(name)}${query}`;
   window.open(setupUrl, '_blank');
 
   newProfileName.value = '';
+  newProfileWorkingDir.value = '';
 }
 
-async function handleDeleteProfile(name: string) {
+function askDeleteProfile(name: string) {
+  deleteWorkingDirMode.value = 'keep';
+  deleteTarget.value = name;
+}
+
+async function confirmDeleteProfile() {
+  const name = deleteTarget.value;
+  if (!name) return;
+  deleting.value = true;
   try {
-    await deleteProfile(settingsStore.agentUrl, settingsStore.authToken, name);
+    await handleDeleteProfile(name, deleteWorkingDirMode.value);
+  } finally {
+    deleting.value = false;
+    deleteTarget.value = null;
+  }
+}
+
+async function handleDeleteProfile(name: string, workingDir: 'keep' | 'delete') {
+  try {
+    const res = await deleteProfile(settingsStore.agentUrl, settingsStore.authToken, name, workingDir);
     // Drop the deleted profile's cached token + saved-profile entry so it
     // stops appearing on the profile selector in this browser. Other browsers
     // reconcile against the live list on the selector (ProfileSelector.vue).
     settingsStore.removeTokenForProfile(name);
-    ElMessage.success(`Profile '${name}' deleted`);
+    const note = describeRetired(res.working_dir);
+    if (res.working_dir?.action === 'failed') {
+      ElMessage.warning(`Profile '${name}' deleted.${note}`);
+    } else {
+      ElMessage.success(`Profile '${name}' deleted.${note}`);
+    }
     if (name === settingsStore.profileId) {
       // We just deleted the profile we are signed in as, so the token this
       // page holds is dead — reloading the list would only 401. Send the user
@@ -293,7 +406,7 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         </h2>
         <p class="section-desc">
           Define the AI assistant's persona and user context. This file is stored on the server at
-          <code>&lt;working_dir&gt;/{{ profile }}/PERSONA.md</code>.
+          <code>&lt;CREMIND_SYSTEM_DIR&gt;/{{ profile }}/PERSONA.md</code>.
         </p>
         <div v-if="loadingPersona" class="loading-state">Loading...</div>
         <ElInput
@@ -318,7 +431,7 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           Standing directives the agent follows in every conversation — while the persona above says
           <em>who</em> the agent is, this says <em>what it must do</em> (for example: "when a new user
           messages a channel, check the Active-User sheet and register them"). Leave it empty for none.
-          Stored on the server at <code>&lt;working_dir&gt;/{{ profile }}/INSTRUCTIONS.md</code>.
+          Stored on the server at <code>&lt;CREMIND_SYSTEM_DIR&gt;/{{ profile }}/INSTRUCTIONS.md</code>.
         </p>
         <div v-if="loadingInstructions" class="loading-state">Loading...</div>
         <ElInput
@@ -370,6 +483,12 @@ function goBack() { router.push(`/${props.profile}/settings`); }
               @input="nameError = ''"
             />
             <p v-if="nameError" class="name-error">{{ nameError }}</p>
+            <ElInput
+              v-model="newProfileWorkingDir"
+              placeholder="Working directory (optional — default: its own folder in workspaces)"
+              class="profile-input"
+              style="margin-top: 8px;"
+            />
           </div>
           <ElButton type="primary" @click="handleCreateProfile" :disabled="!newProfileName.trim()">
             <Icon icon="mdi:open-in-new" /> Create & Open Setup
@@ -396,23 +515,48 @@ function goBack() { router.push(`/${props.profile}/settings`); }
             you out.
           </template>
         </p>
+        <p v-if="isAdmin" class="section-desc">
+          Each profile has its own <strong>working directory</strong> — its file panel, the default
+          folder of its tools and terminals, and what its Documentation search indexes. Only that
+          profile can see its files. Leave a row blank for its default folder.
+        </p>
+        <p v-else-if="ownWorkingDir" class="section-desc">
+          Your working directory: <code>{{ ownWorkingDir }}</code> — only you can see its files;
+          the <code>admin</code> profile can move it.
+        </p>
         <div v-if="loading" class="loading-state">Loading...</div>
         <ElTable v-else :data="profiles.map(p => ({ name: p }))" stripe size="default">
-          <ElTableColumn prop="name" label="Profile Name" />
+          <ElTableColumn prop="name" label="Profile Name" width="160" />
+          <ElTableColumn v-if="isAdmin" label="Working directory">
+            <template #default="{ row }">
+              <div v-if="workingDirs[row.name]" class="working-dir-cell">
+                <div class="working-dir-edit">
+                  <ElInput
+                    v-model="workingDirs[row.name].draft"
+                    size="small"
+                    :placeholder="workingDirs[row.name].defaultPath"
+                    @input="workingDirs[row.name].error = ''"
+                    @keyup.enter="saveWorkingDir(row.name)"
+                  />
+                  <ElButton
+                    size="small"
+                    :loading="workingDirs[row.name].saving"
+                    :disabled="workingDirs[row.name].draft.trim() === (workingDirs[row.name].isDefault ? '' : workingDirs[row.name].path)"
+                    @click="saveWorkingDir(row.name)"
+                  >
+                    Save
+                  </ElButton>
+                </div>
+                <p v-if="workingDirs[row.name].error" class="name-error">{{ workingDirs[row.name].error }}</p>
+              </div>
+              <span v-else class="muted">—</span>
+            </template>
+          </ElTableColumn>
           <ElTableColumn label="Actions" width="120" align="right">
             <template #default="{ row }">
-              <ElPopconfirm
-                :title="`Delete profile '${row.name}'? This cannot be undone.`"
-                confirm-button-text="Delete"
-                cancel-button-text="Cancel"
-                @confirm="handleDeleteProfile(row.name)"
-              >
-                <template #reference>
-                  <ElButton type="danger" size="small" :disabled="row.name === 'admin'">
-                    <Icon icon="mdi:delete" /> Delete
-                  </ElButton>
-                </template>
-              </ElPopconfirm>
+              <ElButton type="danger" size="small" :disabled="row.name === 'admin'" @click="askDeleteProfile(row.name)">
+                <Icon icon="mdi:delete" /> Delete
+              </ElButton>
             </template>
           </ElTableColumn>
         </ElTable>
@@ -486,6 +630,37 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         </template>
       </div>
     </div>
+
+    <!-- Delete profile: what happens to its working directory. Only a folder
+         Cremind made for it is moved or removed; one chosen elsewhere stays. -->
+    <ElDialog
+      :model-value="deleteTarget !== null"
+      :title="`Delete profile '${deleteTarget}'`"
+      width="480px"
+      @update:model-value="(open: boolean) => { if (!open && !deleting) deleteTarget = null; }"
+    >
+      <ElAlert type="warning" :closable="false" show-icon>
+        Its conversations, tool overrides and skill registrations are removed.
+        This cannot be undone.
+      </ElAlert>
+      <p class="section-desc" style="margin-top: 14px;">
+        Its working directory<template v-if="deleteTarget && workingDirs[deleteTarget]">
+          (<code>{{ workingDirs[deleteTarget].path }}</code>)</template>:
+      </p>
+      <ElRadioGroup v-model="deleteWorkingDirMode" class="delete-choice">
+        <ElRadio value="keep">Keep its folder (moved to the workspaces folder's .deleted)</ElRadio>
+        <ElRadio value="delete">Delete its folder and files</ElRadio>
+      </ElRadioGroup>
+      <p class="section-desc" style="margin-top: 8px;">
+        A folder chosen outside the workspaces is never moved or deleted.
+      </p>
+      <template #footer>
+        <ElButton :disabled="deleting" @click="deleteTarget = null">Cancel</ElButton>
+        <ElButton type="danger" :loading="deleting" @click="confirmDeleteProfile">
+          Delete profile
+        </ElButton>
+      </template>
+    </ElDialog>
 
     <!-- Reconfigure Confirmation -->
     <ElDialog v-model="showReconfigureConfirm" title="Confirm Reconfigure" width="400px">
@@ -572,6 +747,10 @@ function goBack() { router.push(`/${props.profile}/settings`); }
 .input-group { flex: 1; }
 .profile-input { width: 100%; }
 .name-error { color: var(--el-color-danger); font-size: 0.75rem; margin: 4px 0 0 0; }
+.working-dir-cell { min-width: 0; }
+.working-dir-edit { display: flex; gap: 6px; align-items: center; }
+.muted { color: var(--text-secondary); }
+.delete-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 
 /* Danger Zone */
 .danger-zone {

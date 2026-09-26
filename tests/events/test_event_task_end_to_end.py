@@ -336,3 +336,10 @@ def test_a_result_landing_mid_turn_waits_and_then_arrives_when_the_turn_ends(
     assert _ANSWER in new_messages[0]["content"]
     assert _ANSWER in agent.queries[1]
     assert sub["task_status"] == "completed"
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

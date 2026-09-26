@@ -859,7 +859,7 @@ def test_member_rows_carry_the_working_directory_the_viewer_may_see(
     """
     cs, _gcs = _setup(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        settings_module, "get_user_working_directory", lambda: "/default",
+        settings_module, "get_user_working_directory", lambda *a, **k: "/default",
     )
     from app.utils.context_storage import clear_context, set_context
     from app.utils.working_directory import WORKING_DIR_OVERRIDE_KEY
@@ -901,6 +901,86 @@ def test_member_rows_carry_the_working_directory_the_viewer_may_see(
     assert "working_directory" not in dog_rows["cat"]
     assert "working_directory" not in dog_rows["chicken"]
     assert "/persisted/cat" not in json.dumps(as_dog)
+
+
+class _WorkingDirStore:
+    """The three DynamicConfigStorage methods ``app.config.working_dirs`` reads."""
+
+    def __init__(self, rows):
+        self.rows = dict(rows)
+
+    def get_profile_working_dir(self, profile):
+        return self.rows.get(profile)
+
+    def set_profile_working_dir(self, profile, value):
+        self.rows[profile] = value
+        return True
+
+    def profile_working_dirs(self):
+        return dict(self.rows)
+
+
+def test_a_seat_folder_the_viewer_does_not_own_comes_back_private(tmp_path, monkeypatch):
+    """The admin may watch every seat work, but each member's working directory
+    is that member's alone — the admin is not exempt. Its row then carries no
+    path, just a flag the room renders as "private"; the member itself still
+    gets its own folder, resolved for ITS profile rather than the viewer's."""
+    from app.config import working_dirs as wd
+
+    cs, _gcs = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        settings_module, "_dynamic_config_storage",
+        _WorkingDirStore({p: None for p in _PROFILES}),
+    )
+    wd.invalidate()
+    try:
+        async def _run():
+            group = await _create_group(cs, members=("dog", "cat"))
+            params = {"group_id": group["id"]}
+            return (
+                _body(await _call(cs, _DETAIL, "GET", params=params)),
+                _body(await _call(cs, _DETAIL, "GET", username="dog", params=params)),
+            )
+
+        as_admin, as_dog = asyncio.run(_run())
+        dog_dir = settings_module.get_user_working_directory("dog")
+    finally:
+        wd.invalidate()
+
+    admin_rows = {r["profile"]: r for r in as_admin["group"]["member_rows"]}
+    for member in ("dog", "cat"):
+        assert admin_rows[member]["working_directory"] is None
+        assert admin_rows[member]["working_directory_private"] is True
+    assert json.dumps(dog_dir)[1:-1] not in json.dumps(as_admin)
+
+    dog_rows = {r["profile"]: r for r in as_dog["group"]["member_rows"]}
+    assert dog_rows["dog"]["working_directory"] == dog_dir
+    assert "working_directory_private" not in dog_rows["dog"]
+
+
+def test_a_seat_cwd_frame_into_a_private_folder_is_dropped_for_other_viewers(
+    tmp_path, monkeypatch,
+):
+    from app.api.group_chats import _private_seat_cwd
+    from app.config import working_dirs as wd
+
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        settings_module, "_dynamic_config_storage",
+        _WorkingDirStore({p: None for p in _PROFILES}),
+    )
+    wd.invalidate()
+    try:
+        cat_dir = settings_module.get_user_working_directory("cat")
+        frame = {"type": "cwd", "profile": "cat", "data": {"working_directory": cat_dir}}
+        assert _private_seat_cwd(frame, "admin") is True
+        assert _private_seat_cwd(frame, "cat") is False
+        # An ordinary folder is nobody's; other frames are not cwd frames.
+        ordinary = {**frame, "data": {"working_directory": str(tmp_path / "shared")}}
+        assert _private_seat_cwd(ordinary, "admin") is False
+        assert _private_seat_cwd({**frame, "type": "thinking"}, "admin") is False
+    finally:
+        wd.invalidate()
 
 
 # ── the timeline carries its reasoning ─────────────────────────────────────
@@ -1148,3 +1228,10 @@ def test_a_post_with_no_turn_behind_it_reports_no_usage(tmp_path, monkeypatch):
 
     row = _body(asyncio.run(_run()))["messages"][0]
     assert row["source_token_usage"] is None
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

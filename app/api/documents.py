@@ -1,34 +1,38 @@
 """Documentation search — settings, admin gate and progress API.
 
-Backs Settings → My Documents, the admin card on the Vector Embedding page,
+Backs Settings → My Documents (its Administrator settings section is the
+admin's view of the gate; the page shows only while Vector Embedding is on)
 and the ``cremind docs`` CLI:
 
 - ``GET/PUT /api/documentation-search/admin``      — the server-wide gate (admin only).
 - ``GET     /api/documentation-search/status``     — this profile's progress snapshot.
 - ``GET     /api/documentation-search/stream``     — the same snapshot as SSE, live.
 - ``GET/PUT /api/documentation-search/settings``   — this profile's sources (folder, Drive).
-- ``POST    /api/documentation-search/validate-root`` — would this folder be accepted?
-- ``GET     /api/documentation-search/browse``     — directory picker for the root.
 - ``GET     /api/documentation-search/drive/folders`` — Drive folder picker (``include_folders``).
 
 The profile is always the caller's own (``request.user.username``), never a
 body or query field, so no route can read or change another profile's index.
 
+The local folder is always the profile's own working directory, which only
+the admin changes (Settings → Profiles); a settings PUT naming a folder is
+refused (``400 root_not_configurable``). When the working directory moves,
+the engine holds the folder (``pending_root_change``) until the profile
+confirms with the ``confirm_root_change`` control action.
+
 Destructive saves are two-step. A ``PUT /settings`` that would remove indexed
-content (turning Drive off, moving the folder, deleting the index) answers
-``409 ConfirmationRequired`` with a plan of what would go and a ``confirm``
-token; repeating the request with that token applies it. The token is bound to
-the exact change and the row's version, so a stale dialog cannot confirm a
-different change. Turning Drive off always deletes the Drive index once
-applied: a Drive index outliving its switch would keep serving files the user
-chose to stop sharing.
+content (turning Drive off, adding excludes that drop files, deleting the
+index) answers ``409 ConfirmationRequired`` with a plan of what would go and a
+``confirm`` token; repeating the request with that token applies it. The token
+is bound to the exact change and the row's version, so a stale dialog cannot
+confirm a different change. Turning Drive off always deletes the Drive index
+once applied: a Drive index outliving its switch would keep serving files the
+user chose to stop sharing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -40,12 +44,7 @@ from starlette.routing import Route
 from app.api._auth import is_admin, require_admin, require_auth
 from app.documents import settings as uds
 from app.documents import state as uds_state
-from app.utils.credential_paths import CREDENTIAL_DIR_NAMES
 from app.utils.logger import logger
-
-# The directory picker never lists more than this many subfolders; a folder
-# with more is shown truncated rather than stalling the dialog.
-_BROWSE_LIMIT = 2000
 
 # A Drive file/folder id: what Google hands out, and all the Drive client will
 # splice into a query ("'<id>' in parents").
@@ -118,7 +117,8 @@ def _source_payload(row: Optional[Dict[str, Any]], kind: str) -> Dict[str, Any]:
     return {
         "kind": kind,
         "enabled": bool(row.get("enabled")),
-        "root_mode": row.get("root_mode") or uds.ROOT_INHERIT,
+        # The folder the index was built from (see _settings_view's
+        # working_dir for the folder it follows).
         "root_path": row.get("root_path"),
         "excludes": uds.normalize_excludes(row.get("excludes")),
         "options": uds.normalize_options(row.get("options")),
@@ -234,6 +234,13 @@ def _admin_view() -> Dict[str, Any]:
 # ── settings ───────────────────────────────────────────────────────────────
 
 
+def _own_working_dir(profile: str) -> Optional[str]:
+    try:
+        return uds.working_dir(profile)
+    except ValueError:  # not a profile that has a working directory
+        return None
+
+
 def _settings_view(profile: str, admin: bool) -> Dict[str, Any]:
     storage = _storage()
     policy = uds.read_admin_policy()
@@ -246,9 +253,11 @@ def _settings_view(profile: str, admin: bool) -> Dict[str, Any]:
             "effective": effective,
             "reason": reason,
             "is_admin": admin,
-            "working_dir": uds.working_dir(),
-            # Non-admin profiles may only index inside the working directory.
-            "root_constraint": "any" if admin else "working_dir",
+            # The folder Documentation search indexes: the caller's own
+            # working directory. Only the admin changes it (Settings →
+            # Profiles), for any profile.
+            "working_dir": _own_working_dir(profile),
+            "working_dir_editable": admin,
             "vision_daily_cap_default": policy.vision_daily_cap_default,
             "max_file_mb": policy.max_file_mb,
         },
@@ -292,6 +301,12 @@ class _BadRequest(Exception):
         self.response = response
 
 
+_ROOT_NOT_CONFIGURABLE = (
+    "Documentation search indexes your working directory; the admin changes it under "
+    "Settings → Profiles."
+)
+
+
 def _validation_failed(details: Dict[str, str], code: Optional[str] = None) -> _BadRequest:
     body: Dict[str, Any] = {"error": "ValidationFailed", "details": details}
     if code:
@@ -304,16 +319,27 @@ def _build_patch(
     kind: str,
     body: Dict[str, Any],
     current: Optional[Dict[str, Any]],
-    admin: bool,
 ) -> Dict[str, Any]:
     """Turn a request body into validated column values for ``kind``.
 
     Raises :class:`_BadRequest` with the response to send on any problem.
-    Only fields present in the body are touched, so a save that changes one
-    option cannot reset the folder.
+    Only fields present in the body are touched. The folder is not one of
+    them: it is the profile's working directory, recorded here only on the
+    first enable (the tool gate and the engine's move detection read it).
     """
     patch: Dict[str, Any] = {}
     cur = current or {}
+
+    if "root_mode" in body or "root_path" in body:
+        raise _BadRequest(JSONResponse(
+            {
+                "error": "ValidationFailed",
+                "code": "root_not_configurable",
+                "message": _ROOT_NOT_CONFIGURABLE,
+                "details": {"root_path": _ROOT_NOT_CONFIGURABLE},
+            },
+            status_code=400,
+        ))
 
     if "enabled" in body:
         enabled = bool(body.get("enabled"))
@@ -325,23 +351,14 @@ def _build_patch(
                 raise _BadRequest(_drive_not_linked())
         patch["enabled"] = enabled
 
-    if kind == uds.SOURCE_LOCAL:
-        wants_root = "root_mode" in body or "root_path" in body
-        first_enable = patch.get("enabled") and not cur.get("root_path")
-        if wants_root or first_enable:
-            mode = body.get("root_mode") or (
-                uds.ROOT_CUSTOM if body.get("root_path") else cur.get("root_mode") or uds.ROOT_INHERIT
-            )
-            if mode not in (uds.ROOT_INHERIT, uds.ROOT_CUSTOM):
-                raise _validation_failed({"root_mode": "must be 'inherit' or 'custom'"})
-            raw = None if mode == uds.ROOT_INHERIT else body.get("root_path") or cur.get("root_path")
-            if mode == uds.ROOT_CUSTOM and not raw:
-                raise _validation_failed({"root_path": "choose a folder"})
-            check = uds.validate_root(raw, is_admin=admin)
-            if not check.ok:
-                raise _validation_failed({"root_path": check.message or "invalid folder"}, check.code)
-            patch["root_mode"] = mode
-            patch["root_path"] = check.path
+    if kind == uds.SOURCE_LOCAL and patch.get("enabled") and not cur.get("root_path"):
+        # First enable: record the working directory the index starts from.
+        # Later moves go through the engine's pending_root_change hold.
+        check = uds.validate_root(profile)
+        if not check.ok:
+            raise _validation_failed({"root_path": check.message or "invalid folder"}, check.code)
+        patch["root_mode"] = uds.ROOT_INHERIT
+        patch["root_path"] = check.path
 
     if "excludes" in body:
         patch["excludes"] = uds.normalize_excludes(body.get("excludes"))
@@ -410,7 +427,7 @@ def _apply_settings(profile: str, admin: bool, body: Dict[str, Any]) -> JSONResp
     storage = _storage()
     current = storage.get_source(profile, kind)
     try:
-        patch = _build_patch(profile, kind, body, current, admin)
+        patch = _build_patch(profile, kind, body, current)
     except _BadRequest as bad:
         return bad.response
 
@@ -452,66 +469,6 @@ def _apply_settings(profile: str, admin: bool, body: Dict[str, Any]) -> JSONResp
     return JSONResponse({
         "settings": _settings_view(profile, admin),
         "snapshot": uds_state.build_snapshot(profile),
-    })
-
-
-# ── browse ─────────────────────────────────────────────────────────────────
-
-
-def _browse(profile: str, admin: bool, raw: Optional[str], hidden: bool) -> JSONResponse:
-    wd = uds.working_dir()
-    sysdir = uds.system_dir()
-    target = uds.real_path(raw) if raw else wd
-    if not admin and not uds.is_inside(target, wd):
-        return JSONResponse(
-            {"error": "Forbidden", "message": "Only folders inside the working directory can be browsed."},
-            status_code=403,
-        )
-    if uds.is_inside(target, sysdir):
-        return JSONResponse(
-            {"error": "Forbidden", "message": "Cremind's system folder cannot be indexed."},
-            status_code=403,
-        )
-    if not os.path.isdir(target):
-        return JSONResponse({"error": "NotFound", "message": "No such folder."}, status_code=404)
-
-    entries: List[Dict[str, Any]] = []
-    truncated = False
-    try:
-        with os.scandir(target) as it:
-            for de in it:
-                try:
-                    if not de.is_dir(follow_symlinks=False):
-                        continue
-                except OSError:
-                    continue
-                if not hidden and de.name.startswith("."):
-                    continue
-                if de.name in CREDENTIAL_DIR_NAMES:
-                    continue
-                path = os.path.join(target, de.name)
-                if uds.is_inside(path, sysdir):
-                    continue
-                if len(entries) >= _BROWSE_LIMIT:
-                    truncated = True
-                    break
-                entries.append({"name": de.name, "path": path})
-    except PermissionError:
-        return JSONResponse({"error": "Forbidden", "message": "Permission denied."}, status_code=403)
-    except OSError as exc:
-        return JSONResponse({"error": "ReadFailed", "message": str(exc)}, status_code=400)
-
-    entries.sort(key=lambda e: e["name"].lower())
-    parent = os.path.dirname(target.rstrip("\\/")) or None
-    if parent and (parent == target or (not admin and not uds.is_inside(parent, wd))):
-        parent = None
-    roots = [wd] + ([os.path.expanduser("~")] if admin else [])
-    return JSONResponse({
-        "path": target,
-        "parent": parent,
-        "entries": entries,
-        "truncated": truncated,
-        "roots": roots,
     })
 
 
@@ -754,23 +711,6 @@ def get_documents_routes() -> List[Route]:
         body = await _json_body(request)
         return await asyncio.to_thread(_apply_settings, _profile(request), is_admin(request), body)
 
-    async def handle_validate_root(request: Request) -> JSONResponse:
-        denied = require_auth(request)
-        if denied is not None:
-            return denied
-        body = await _json_body(request)
-        raw = None if body.get("root_mode") == uds.ROOT_INHERIT else body.get("path")
-        check = await asyncio.to_thread(uds.validate_root, raw, is_admin=is_admin(request))
-        return JSONResponse(check.to_dict())
-
-    async def handle_browse(request: Request) -> JSONResponse:
-        denied = require_auth(request)
-        if denied is not None:
-            return denied
-        raw = request.query_params.get("path") or None
-        hidden = request.query_params.get("hidden") in ("1", "true")
-        return await asyncio.to_thread(_browse, _profile(request), is_admin(request), raw, hidden)
-
     # ── engine-backed routes ───────────────────────────────────────────────
 
     async def handle_control(request: Request) -> JSONResponse:
@@ -888,6 +828,4 @@ def get_documents_routes() -> List[Route]:
         Route("/api/documentation-search/stream", handle_stream, methods=["GET"]),
         Route("/api/documentation-search/settings", handle_settings_get, methods=["GET"]),
         Route("/api/documentation-search/settings", handle_settings_put, methods=["PUT"]),
-        Route("/api/documentation-search/validate-root", handle_validate_root, methods=["POST"]),
-        Route("/api/documentation-search/browse", handle_browse, methods=["GET"]),
     ]

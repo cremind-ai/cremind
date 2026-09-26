@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  28faaec7462b498f919c09f65cf2b66fcfc8b421b142b07dec275d577347002d
+# Source SHA-256:  2a4a0f3a9f726e7b0e74ba10ab15ace8d2f5916e9fe1a3ea2f9f8768f14121df
 
 $script:CatalogSchema = 1
 
@@ -114,12 +114,12 @@ $script:VncPasswordPrompt = [ordered]@{
 # ── Docker documents folder ──
 $script:DockerDocuments = [ordered]@{
     Prompt           = 'Which folder should Cremind use as your Documents folder?'
-    Hint             = 'The container sees it as /root/Documents: document search indexes it, and the agent reads and saves files there by default. It is created if it does not exist. The path cannot contain $, # or double quotes.'
+    Hint             = 'The container sees it as /root/Documents. Each profile works in its own folder inside it, cremind-workspaces/<profile>: the agent reads and saves files there by default, and document search indexes it. It is created if it does not exist. The path cannot contain $, # or double quotes.'
     AccessPrompt     = 'Can Cremind change files in this folder?'
     RwLabel          = 'Read-write'
     RwDisclosure     = 'The agent''s file tools write to your real folder: files it creates, edits or deletes there change on this machine.'
     RoLabel          = 'Read-only'
-    RoDisclosure     = 'Cremind can read and search the folder, but the agent cannot save files there, and its default working folder is read-only.'
+    RoDisclosure     = 'Cremind can read the folder, but the agent cannot save files there. The profiles'' own working folders then live inside Cremind''s data volume instead, where you cannot see them from this computer.'
     LinuxOwnerNote   = 'On Linux the container runs as root, so files the agent creates in this folder are owned by root on the host (sudo chown -R $USER <folder> takes them back).'
     MacosPrivacyNote = 'macOS will ask whether Docker may access your Documents folder. Allow it: if you deny it, the folder looks empty inside the container and nothing is indexed.'
     WslNote          = 'Inside WSL, ~/Documents is your Linux home, not your Windows Documents folder. For the Windows one, use /mnt/c/Users/<you>/Documents.'

@@ -197,7 +197,8 @@ def _unavailable_message(snapshot: dict[str, Any]) -> tuple[str, str]:
     state, reason = snapshot.get("state"), snapshot.get("reason")
     if state == "suspended" and reason == "admin_gate":
         return "admin_gate", ("Documentation search is disabled by the administrator, so the user's files "
-                              "cannot be searched. An admin can allow it in Settings → Embedding.")
+                              "cannot be searched. An admin can allow it under Settings → My Documents → "
+                              "Administrator settings (or `cremind docs admin set --allow`).")
     if not snapshot.get("enabled"):
         return "disabled", ("Documentation search is off for this profile. The user can turn it on in "
                             "Settings → My Documents (or `cremind docs enable`).")

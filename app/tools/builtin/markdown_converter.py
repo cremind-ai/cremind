@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict
 
+from app.config.settings import get_user_working_directory
 from app.tools.builtin.base import (
     BuiltInTool,
     BuiltInToolResult,
@@ -72,14 +73,25 @@ def _get_markitdown():
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _safe_resolve(data_dir: str, relative_path: str) -> str:
-    """Resolve *relative_path* inside data_dir.  Raises ValueError on traversal."""
+def _safe_resolve(data_dir: str, relative_path: str, *, profile: str | None = None) -> str:
+    """Resolve *relative_path* inside data_dir.  Raises ValueError on traversal,
+    and on a path inside ANOTHER profile's working directory — ``profile`` is
+    the caller, judged exactly as the ``system_file`` tools judge it (an admin
+    whose folder contains the workspaces root is not exempt)."""
+    from app.tools.builtin.system_file import _foreign_to_caller
+
     base = os.path.realpath(data_dir)
     os.makedirs(base, exist_ok=True)
     relative_path = relative_path.lstrip("/\\")
     target = os.path.realpath(os.path.join(base, relative_path))
     if target != base and not target.startswith(base + os.sep):
         raise ValueError(f"Path traversal detected: {relative_path}")
+    if _foreign_to_caller(target, profile, base):
+        raise ValueError(
+            f"Access denied: '{relative_path}' is inside another profile's working "
+            "directory. That folder belongs to another profile; each profile's "
+            "working directory is private to it."
+        )
     return target
 
 
@@ -147,7 +159,12 @@ class ConvertToMarkdownTool(BuiltInTool):
         self._data_dir = data_dir
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        data_dir = arguments.pop("_working_directory", None) or self._data_dir
+        # The calling profile (adapter-injected), not the ``profile`` argument
+        # the model fills in: it decides whose working directory is reachable.
+        caller = arguments.get("_profile") or None
+        data_dir = arguments.pop("_working_directory", None) or (
+            get_user_working_directory(caller) if caller else self._data_dir
+        )
         source_path = arguments.get("source_path", "").strip()
         profile = arguments.get("profile", "").strip()
         output_path = arguments.get("output_path", "").strip()
@@ -175,7 +192,7 @@ class ConvertToMarkdownTool(BuiltInTool):
 
         # -- Resolve and validate source --
         try:
-            source_abs = _safe_resolve(data_dir, source_path)
+            source_abs = _safe_resolve(data_dir, source_path, profile=caller)
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -239,7 +256,7 @@ class ConvertToMarkdownTool(BuiltInTool):
 
         if output_path:
             try:
-                resolved_output = _safe_resolve(data_dir, output_path)
+                resolved_output = _safe_resolve(data_dir, output_path, profile=caller)
             except ValueError as e:
                 return BuiltInToolResult(structured_content={
                     "error": "Access denied",

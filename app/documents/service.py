@@ -114,6 +114,7 @@ class DocumentsService:
     # ── lifecycle ──────────────────────────────────────────────────────────
 
     def start(self) -> None:
+        from app.config import working_dirs
         from app.config.embedding_state import add_listener
         from app.documents.extract.pool import wipe_stale_tmp
 
@@ -128,6 +129,7 @@ class DocumentsService:
         uds_state.set_drive_suspend_handler(self._on_suspend_drive)
         uds.set_effect_counter(self.count_effect)
         add_listener(self._on_embedding)
+        working_dirs.add_change_listener(self._on_working_dir_changed)
 
         workers = max(1, min(8, uds.read_admin_policy().workers))
         specs = [("documents-maint", self._maintenance), ("documents-embed", self._embedder)]
@@ -151,6 +153,7 @@ class DocumentsService:
         return run
 
     def stop(self, budget_s: float = 1.5) -> None:
+        from app.config import working_dirs
         from app.config.embedding_state import remove_listener
 
         deadline = time.monotonic() + budget_s
@@ -161,6 +164,7 @@ class DocumentsService:
             remove_listener(self._on_embedding)
         except Exception:  # noqa: BLE001
             pass
+        working_dirs.remove_change_listener(self._on_working_dir_changed)
         with self._lock:
             runtimes = list(self._runtimes.values())
         for rt in runtimes:
@@ -197,6 +201,11 @@ class DocumentsService:
 
     def _on_settings_changed(self, profile: str, kind: str) -> None:
         self.command("configure", profile)
+
+    def _on_working_dir_changed(self, profile: str) -> None:
+        # A profile's working directory was set, reset, created or deleted.
+        # May run on the event loop: queue and return.
+        self.command("working_dir_changed", profile)
 
     def _on_purge(self, profile: str, kind: str) -> None:
         self.command("purge", profile, kind)
@@ -340,6 +349,8 @@ class DocumentsService:
                 if rt is not None:
                     rt.configure()
                 _stop_research_if_off(p)
+        elif name == "working_dir_changed":
+            self._working_dir_changed(cmd[1])
         elif name == "purge":
             self._purge(cmd[1], cmd[2])
         elif name == "suspend_drive":
@@ -350,6 +361,35 @@ class DocumentsService:
             rt = self.runtime(cmd[1])
             if rt is not None:
                 rt.configure()
+
+    def _working_dir_changed(self, profile: str) -> None:
+        """``profile``'s working directory was set, reset, created or deleted.
+
+        Its folder is its index root, so it is re-checked now rather than at
+        the next restart — the same configure a settings save runs; a moved
+        folder puts the profile on the pending_root_change hold until it
+        confirms. Every other profile indexing a folder that holds the
+        changed one (an upgraded admin's legacy folder may hold the
+        workspaces root) is re-checked too when what its walker must lock out
+        changed: a profile created since must not be indexed by it, and one
+        deleted since is no longer anyone's to lock."""
+        self._run_command(("configure", profile))
+        with self._lock:
+            others = [rt for p, rt in self._runtimes.items() if p != profile]
+        for rt in others:
+            if not rt.active or not rt.root:
+                continue  # not indexing: its next configure checks afresh
+            try:
+                check = uds.validate_root(rt.profile)
+                same = (
+                    check.ok and os.path.normcase(check.path or "") == os.path.normcase(rt.root)
+                    and sorted(check.locked_excludes) == sorted(rt.locked_excludes)
+                )
+                if not same:
+                    rt.configure()
+            except Exception:  # noqa: BLE001 — one profile must not stop the others
+                logger.exception(f"[documents] {rt.profile}: re-checking the folder after a working "
+                                 f"directory change of {profile!r} failed")
 
     def _boot(self) -> None:
         from app.storage.documents_storage import get_documents_storage
@@ -783,8 +823,10 @@ class DocumentsService:
         elif action == "confirm_root_change":
             hold = rt.hold or {}
             if hold.get("reason") != "pending_root_change":
-                raise EngineError("There is no folder change waiting for confirmation.")
-            storage.upsert_source(profile, SOURCE, root_path=(hold.get("detail") or {}).get("to"))
+                raise EngineError("There is no working directory change waiting for confirmation.")
+            # root_mode too: a row from an earlier build may still say "custom".
+            storage.upsert_source(profile, SOURCE, root_path=(hold.get("detail") or {}).get("to"),
+                                  root_mode=uds.ROOT_INHERIT)
             rt.hold = None
             rt._set_confirmation(None)
             self.command("configure", profile)
@@ -1036,6 +1078,8 @@ class DocumentsService:
             manifest = db.load_manifest(SOURCE)
             old_root = rt.root or (ctx.get("current") or {}).get("root_path")
             if "root_path" in patch and patch.get("root_path") and old_root:
+                # A moved working directory (the pending_root_change
+                # confirmation): files outside the new folder leave the index.
                 new_root = patch["root_path"]
                 out = sum(
                     1 for r in manifest.values()
@@ -1044,7 +1088,8 @@ class DocumentsService:
                 return uds.Effect(what, files=out, detail={"to": new_root})
             if "excludes" in patch and old_root:
                 matcher = IgnoreMatcher(old_root, excludes=uds.normalize_excludes(patch["excludes"]),
-                                        system_dir=uds.system_dir())
+                                        system_dir=uds.system_dir(),
+                                        root_sanctioned=uds.system_dir_exempt(old_root))
                 out = sum(
                     1 for r in manifest.values()
                     if matcher.classify(r.rel_path, os.path.join(old_root, *r.rel_path.split("/"))) == SKIP

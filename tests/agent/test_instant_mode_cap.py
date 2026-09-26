@@ -94,7 +94,7 @@ class _ScriptedLLM:
 
 def _build_agent(monkeypatch, llm, tools, *, mode: str) -> ra.ReasoningAgent:
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "generate_dir_tree", lambda p: "")
 
     async def _no_ltm(self):

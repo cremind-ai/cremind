@@ -27,7 +27,7 @@ def _make_agent(monkeypatch):
     monkeypatched to fixed values.
     """
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
 
     agent = ra.ReasoningAgent.__new__(ra.ReasoningAgent)
     agent.profile = "default"

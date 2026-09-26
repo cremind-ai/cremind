@@ -184,13 +184,19 @@ The user's own documents (pre-release scripts):
 # Before                                         # After
 pip install "cremind[userdocs]"                  pip install "cremind[documentation-search]"
 cremind features install userdocs                cremind features install documentation_search
-cremind userdocs enable --root ~/Documents       cremind docs enable --root ~/Documents
+cremind userdocs enable --root ~/Documents       cremind docs enable
 cremind userdocs search "Q3 budget"              cremind docs search "Q3 budget"
 cremind userdocs research run "…" --follow       cremind docs research run "…" --follow
 cremind tools set-var user_documents \           cremind tools set-var documentation_search \
   RESEARCH_TOKEN_BUDGET=500000                     RESEARCH_TOKEN_BUDGET=500000
 cremind clean components --user-documents        cremind clean components --documentation-search
 ```
+
+`--root` is gone: Documentation search always indexes the profile's own working
+directory, which each profile now has to itself — see
+[upgrade-per-profile-working-dir.md](upgrade-per-profile-working-dir.md). To
+index another folder, the admin points the profile's working directory there
+(`cremind profile working-dir <profile> <path>`).
 
 Direct REST calls:
 

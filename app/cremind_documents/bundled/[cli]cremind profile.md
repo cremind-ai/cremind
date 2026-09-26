@@ -1,5 +1,5 @@
 ---
-description: "List, inspect and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — an interactive type-to-filter pick on first use, the root `--profile` flag, or `cremind profile use`, remembered per terminal. Reads and edits a profile's **persona** (who the agent is), its **standing instructions** (directives followed in every conversation) and its **agent name**. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `persona get/set`, `instructions get/set`, `agent-name get/set`; there is **no rename**. To set up a NEW profile properly — with an LLM model, tools, channels and a login token — use `cremind profile wizard start`; plain `create` only registers an empty shell that cannot answer anything and has no token. Creating is **admin-only**; deleting is **self-only**, except that **admin** may delete any other profile and can never itself be deleted. `--profile` only picks an identity when no `CREMIND_TOKEN` / `--token` is set, so inside `exec_shell` pass the other profile's token with `--token` instead."
+description: "List, inspect and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — an interactive type-to-filter pick on first use, the root `--profile` flag, or `cremind profile use`, remembered per terminal. Reads and edits a profile's **persona** (who the agent is), its **standing instructions** (directives followed in every conversation) and its **agent name**, and shows or (admin only) changes a profile's private **working directory**. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `working-dir`, `persona get/set`, `instructions get/set`, `agent-name get/set`; there is **no rename**. To set up a NEW profile properly — with an LLM model, tools, channels and a login token — use `cremind profile wizard start`; plain `create` only registers an empty shell that cannot answer anything and has no token. Creating is **admin-only**; deleting is **self-only**, except that **admin** may delete any other profile and can never itself be deleted. `--profile` only picks an identity when no `CREMIND_TOKEN` / `--token` is set, so inside `exec_shell` pass the other profile's token with `--token` instead."
 ---
 
 # `cremind profile` — Profile Management & Selection
@@ -23,7 +23,7 @@ use`. An explicit `CREMIND_TOKEN` in the environment (as injected into
 cannot change who you are acting as. See *Acting as another profile*
 below for what does.
 
-The command groups together six concerns:
+The command groups together seven concerns:
 
 - **Profile setup** — `wizard start/status/set/skip/finish/cancel`. The
   step-by-step way to create a profile that actually works: an LLM model,
@@ -51,10 +51,21 @@ The command groups together six concerns:
 - **Agent name** — `agent-name get`, `agent-name set`. The display name
   the assistant goes by for that profile — shown in the chat header and
   in the `@`-mention menu when more than one profile is reachable.
+- **Working directory** — `working-dir`. Every profile has its **own**
+  folder: the root of its file panel, the default directory of its tools
+  and terminals, `$CREMIND_USER_WORKING_DIR` in its shells, and the folder
+  its Documentation search indexes. By default it is
+  `<workspaces>/<profile name>` (`<workspaces>` is
+  `<CREMIND_SYSTEM_DIR>/workspaces`, or `$CREMIND_WORKSPACES_DIR` when set —
+  the container images point it at `/root/Documents/cremind-workspaces`). It is
+  private: no other profile's file tools, terminals, watchers or searches
+  may reach into it — `admin` included. Only `admin` may change a
+  profile's folder.
 
 Deleting a profile cascades: its conversations, tool overrides, and
 skill registrations are removed in the same transaction. There is no
-confirmation prompt, so be careful.
+confirmation prompt, so be careful. Its working directory is **kept** by
+default (see `delete` below).
 
 ## Who may do what
 
@@ -79,6 +90,12 @@ grants (`cremind me` prints it), not against the name you typed:
   everyone**. The `admin` exception is about administering profiles, not
   about reading them: `admin` cannot get or set another profile's persona,
   instructions, or agent name either.
+- **`working-dir`** is the other way round, because a profile's folder is
+  what keeps the other profiles' files away from it: any profile may
+  *show* its own (and `admin` any profile's), but only **`admin`** may
+  *change* one — every profile's, its own included. A non-admin is refused
+  with `403 Only the admin profile can change a profile's working
+  directory.`
 
 ## Finding this in the web UI
 
@@ -107,6 +124,15 @@ visible to `cremind profile get`.
 
 Deleting the profile you are signed in as logs you out on the spot — its
 token dies with it, so the UI drops you back on the profile selector.
+
+Signed in as `admin`, each row also has a **Working directory** field
+(empty = the default, shown as the placeholder; **Save** runs the same
+check as `cremind profile working-dir` and shows its refusal), and the
+delete dialog asks whether to **keep the profile's folder** (the default —
+moved to `<workspaces>/.deleted/`) or **delete it with its files**, like
+`--delete-working-dir`. Everyone else sees their own folder, read-only,
+above their row. The **Create New Profile** form takes an optional
+working directory too, which the setup wizard it opens applies.
 
 ## Global flags
 
@@ -369,21 +395,32 @@ road — it opens the setup wizard, which completes through `POST
 **Syntax.**
 
 ```bash
-cremind profile create <profile name>
+cremind profile create <profile name> [--working-dir <absolute path>]
 ```
 
 **Arguments** (required):
 
 - `<profile name>` — Profile name. Must not already exist. Lowercase
   letters, numbers, `-` and `_` only. `shared` and
-  `cli` are **reserved** (Cremind's own manual uses them as scope names) and
-  are refused with `400 The profile name '<name>' is reserved …` — here, in
-  the setup wizard and in a blueprint import alike.
+  `cli` are **reserved** (Cremind's own manual uses them as scope names), and
+  so is `workspaces` (the folder that holds every profile's working
+  directory); all three are refused with `400 The profile name '<name>' is
+  reserved …` — here, in the setup wizard, `cremind profile wizard` and a
+  blueprint import alike.
+
+**Options:**
+
+- `--working-dir <absolute path>` — The new profile's working directory,
+  created if missing. Checked the same way as `cremind profile working-dir`
+  (see the refusals there). Omitted, the profile gets its default,
+  `<workspaces>/<name>` — or `<workspaces>/<name>-2` when a folder of that
+  name already holds files (say, from an earlier profile of the same
+  name): a new profile never inherits someone else's files.
 
 **Behavior.** Calls the server's create endpoint and, on success, prints
-the new profile name on stdout (so the command is pipe-friendly). The
-admin check runs *before* the name is validated, so a non-admin caller
-gets the same 403 whatever name it passes.
+the new profile name on stdout (so the command is pipe-friendly) and its
+working directory on stderr. The admin check runs *before* the name is
+validated, so a non-admin caller gets the same 403 whatever name it passes.
 
 `create` makes the profile, not its credential: no
 `<CREMIND_SYSTEM_DIR>/tokens/<name>.token` file appears until the setup
@@ -432,7 +469,7 @@ reaches it by naming `admin` itself, which the server never allows.
 **Syntax.**
 
 ```bash
-cremind profile delete <profile name>
+cremind profile delete <profile name> [--delete-working-dir]
 ```
 
 **Arguments** (required):
@@ -440,10 +477,33 @@ cremind profile delete <profile name>
 - `<profile name>` — Profile to remove. Your own, or any non-`admin`
   profile when you are `admin`.
 
+**Options:**
+
+- `--delete-working-dir` — Also delete the profile's working directory
+  **and every file in it**. Without it the folder is kept: moved to
+  `<workspaces>/.deleted/<name>-<date>-<time>`, so a later profile of the
+  same name starts with an empty folder while the files stay recoverable.
+  Either way only a folder Cremind made for the profile (its default, or a
+  `<name>-2`-style sibling) is moved or deleted — **a folder `admin` chose
+  elsewhere is never touched**.
+
 **Behavior.** Cascades to the profile's conversations, tool overrides,
 agent OAuth tokens, and skill registrations. **There is no confirmation
 prompt** — pair with a manual `cremind profile list` first if you need a
-sanity check. Silent on success.
+sanity check. Prints one line on what happened to the working directory:
+
+```
+Working directory kept: moved to /home/li/.cremind/workspaces/.deleted/alice-20260926-101500
+Working directory deleted: /home/li/.cremind/workspaces/alice
+Working directory /home/li/.cremind/workspaces/alice was empty or missing; nothing to keep.
+Working directory left in place: /srv/alice (not a folder Cremind made for it)
+```
+
+With `--json` it prints the server's response, whose `working_dir` object
+carries `action` (`archived` / `deleted` / `none` / `untouched` /
+`failed`), `path`, and `archived_to` or `error`. A move or removal that
+fails (say, a file held open on Windows) does not undo the delete: the
+line starts with `Warning:` on stderr and the folder stays where it was.
 
 Deleting **your own** profile also invalidates the token you just used:
 subsequent commands as that profile fail, and its
@@ -454,11 +514,80 @@ carrying on.
 **Example.**
 
 ```bash
-# admin tearing down someone else's profile
+# admin tearing down someone else's profile (its folder is kept)
 $ cremind --token "$(cremind auth show --profile admin)" profile delete alice
+Working directory kept: moved to /home/li/.cremind/workspaces/.deleted/alice-20260926-101500
+
+# ...and this time its files too
+$ cremind --token "$(cremind auth show --profile admin)" profile delete bob --delete-working-dir
+Working directory deleted: /home/li/.cremind/workspaces/bob
 
 # a profile removing itself — the last command it can run
 $ cremind --token "$(cremind auth show --profile alice)" profile delete alice
+```
+
+### `cremind profile working-dir`
+
+**Purpose.** Show a profile's working directory, or — `admin` only —
+change it.
+
+**Syntax.**
+
+```bash
+cremind profile working-dir                          # your own
+cremind profile working-dir <profile name>           # admin: any profile
+cremind profile working-dir [<profile name>] <absolute path>   # admin: set it
+cremind profile working-dir [<profile name>] --default         # admin: back to the default
+```
+
+**Arguments** (all optional):
+
+- `<profile name>` — Whose folder. Omitted, your own (the profile your
+  token grants). A lone argument that is not a profile name — it has a
+  `/`, `\`, `:` or `~` — is taken as the `<absolute path>` for your own
+  profile.
+- `<absolute path>` — The new folder. Created if missing. `~` expands on
+  the **server**.
+
+**Options:**
+
+- `--default` — Reset to `<workspaces>/<profile name>`. Mutually exclusive
+  with a path.
+
+**Behavior.** Prints `profile`, `path`, `default` (`yes` when the folder is
+the default), `default_path` and `exists`; `--json` prints the same as an
+object (`is_default`, `exists` as booleans). Setting takes effect at once
+for the file panel, new terminals and tool calls; Documentation search
+follows it, asking before the old folder's documents leave its index.
+**Nothing is moved**: the old folder and its files stay where they were.
+
+Two profiles may share a folder — set both to the *same* path — but a
+folder is refused (`400 InvalidWorkingDir: <why>`, `code` in `--json`
+errors) when it is:
+
+| code | meaning |
+|---|---|
+| `not_absolute` | a relative path |
+| `not_directory` | an existing file |
+| `inside_system_dir` | inside `<CREMIND_SYSTEM_DIR>` (credentials, every profile's data) |
+| `forbidden_system_path` | an operating-system location or a bare drive root |
+| `inside_workspaces` | inside `<workspaces>` — each folder there is its own profile's |
+| `inside_other_working_dir` | *inside* another profile's folder (the same folder is fine) |
+| `not_creatable` / `not_writable` | Cremind cannot create it, or cannot read and write it |
+
+**Examples.**
+
+```bash
+$ cremind profile working-dir
+profile:       alice
+path:          /home/li/.cremind/workspaces/alice
+default:       yes
+default_path:  /home/li/.cremind/workspaces/alice
+exists:        yes
+
+# admin moves alice onto the team share, then back
+$ cremind --token "$(cremind auth show --profile admin)" profile working-dir alice /srv/team
+$ cremind --token "$(cremind auth show --profile admin)" profile working-dir alice --default
 ```
 
 ### `cremind profile persona get`
@@ -813,7 +942,17 @@ profile name`.
 **`agent-name set` rejected** — The name must be non-empty and at most
 128 characters. Trim it (or quote a name with spaces) and retry.
 
+**`working-dir` returns `403` / `Only the admin profile can change a
+profile's working directory`** — Showing a folder is open to its owner;
+changing one is `admin`'s alone, for every profile. Ask `admin`, or re-run
+with `admin`'s token.
+
+**`working-dir` returns `400 InvalidWorkingDir`** — The folder failed one
+of the checks in the table under `cremind profile working-dir`; the
+message after the colon says which. Pick a folder outside
+`<CREMIND_SYSTEM_DIR>` and `<workspaces>`, or `--default`.
+
 **Override of "the" profile vs the current profile** — Every subcommand
-takes an explicit `<profile name>`; nothing in `cremind profile` implicitly targets
-the active profile. To find out which profile the current token grants,
-run `cremind me`.
+but `working-dir` takes an explicit `<profile name>`; nothing else in
+`cremind profile` implicitly targets the active profile. To find out which
+profile the current token grants, run `cremind me`.

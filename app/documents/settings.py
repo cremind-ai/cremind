@@ -14,6 +14,14 @@ publishes nothing, so a folder path written there would skip the checks in
 :func:`validate_root`. Blueprints also export ``user_config`` verbatim, which
 would carry a machine-specific path to another install.
 
+**The folder** is always the profile's own User Working Directory
+(:mod:`app.config.working_dirs`); there is no separate choice. Only the admin
+changes a profile's working directory (Settings → Profiles), and the engine
+then asks the profile before anything leaves its index. ``root_path`` records
+the folder the index was last built from, so a moved working directory is
+noticed; ``root_mode`` is always ``inherit`` (a row saved as ``custom`` by an
+earlier build is read as ``inherit``, so its folder counts as moved).
+
 Every per-profile read here names its profile explicitly. ``get_dynamic(...,
 profile=None)`` falls back to the admin's row without saying so.
 """
@@ -26,12 +34,21 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable
 
+from app.config import working_dirs
 from app.config.settings import BaseConfig, _bool, _dynaconf_get, get_dynamic, get_user_working_directory
+from app.utils.credential_paths import (
+    authored_docs_root,
+    holds_documents_index,
+    is_documents_index_path,
+    within,
+)
 
 SOURCE_LOCAL = "local"
 SOURCE_DRIVE = "drive"
 SOURCE_KINDS = (SOURCE_LOCAL, SOURCE_DRIVE)
 
+# ``document_sources.root_mode``: always ``inherit`` now. ``custom`` is only
+# ever read, from a row an earlier build saved with a folder of its own.
 ROOT_INHERIT = "inherit"
 ROOT_CUSTOM = "custom"
 
@@ -304,8 +321,9 @@ class RootCheck:
     path: str | None = None
     code: str | None = None
     message: str | None = None
-    # Paths under the root that must never be indexed (the system directory,
-    # when it happens to sit inside the chosen folder).
+    # Paths under the root that must never be indexed: the system directory
+    # when it sits inside the folder, and every other profile's working
+    # directory (or unowned workspaces entry) inside it.
     locked_excludes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -313,7 +331,9 @@ class RootCheck:
 
 
 def real_path(path: str) -> str:
-    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    # The working-directory rules' spelling (no ``\\?\`` prefix), so a root
+    # compares with the zones it is judged against.
+    return working_dirs.real_path(path)
 
 
 def _norm(path: str) -> str:
@@ -348,50 +368,97 @@ def system_dir() -> str:
     return real_path(BaseConfig.CREMIND_SYSTEM_DIR)
 
 
-def working_dir() -> str:
-    """The server-wide User Working Directory, resolved. Note that
+def working_dir(profile: str) -> str:
+    """``profile``'s User Working Directory, resolved. Note that
     :func:`get_user_working_directory` creates it, so "it exists" never
     proves a folder is mounted — the sync engine's root guard knows that."""
-    return real_path(get_user_working_directory())
+    return real_path(get_user_working_directory(profile))
 
 
-def validate_root(raw: str | None, *, is_admin: bool) -> RootCheck:
-    """Decide whether ``raw`` may be indexed by this profile.
+_CHANGE_IT = "The admin can choose a different one under Settings → Profiles."
 
-    ``raw=None`` means "inherit the working directory". Checked in order:
-    resolves (symlinks included, so a link cannot escape); exists and is a
-    readable directory; is not inside the Cremind system directory (tokens,
-    every profile's data); is not an OS location; and, for non-admin profiles,
-    sits inside the working directory. When the system directory is *inside*
-    the root it is returned in ``locked_excludes`` so the walker prunes it.
+
+def _sanctioned_in_system_dir(profile: str, real: str, sysdir: str) -> bool:
+    """Is ``real`` — a working directory inside the system folder — one that
+    may be indexed: a folder under the workspaces root that is ``profile``'s
+    alone (its default ``<SYS>/workspaces/<profile>``, or the ``<profile>-2``
+    sibling it was given when a folder of its name held someone's files — not
+    another live profile's workspace, even one it was pointed at), and
+    neither Documentation search's index store nor Cremind's manual pages nor
+    anything holding them (an odd ``CREMIND_WORKSPACES_DIR`` could otherwise
+    name one)? With ownership unknown (no storage) only the default is."""
+    ws = real_path(working_dirs.workspaces_root())
+    if _norm(real) == _norm(ws) or not is_inside(real, ws):
+        return False
+    owners = working_dirs.owners_of(real)
+    if owners is None:
+        if not working_dirs.is_default_location(profile, real):
+            return False
+    elif owners != frozenset({profile}):
+        return False
+    if is_documents_index_path(real, sysdir) or holds_documents_index(real, sysdir):
+        return False
+    manual = authored_docs_root(sysdir)
+    return not (within(real, manual) or within(manual, real))
+
+
+def validate_root(profile: str) -> RootCheck:
+    """Decide whether ``profile``'s working directory may be indexed.
+
+    Checked in order: resolves (symlinks included, so a link cannot escape);
+    who owns which folder is known (storage failing with no earlier reading
+    refuses, ``ownership_unavailable`` — the locked excludes below would be
+    incomplete); exists and is a readable directory; is not inside the Cremind
+    system directory (tokens, every profile's data) — except that a workspace
+    of the profile's own under ``<SYS>/workspaces`` is the one kind of folder
+    there that may be; is not an OS location; and is not another profile's
+    folder. When the system directory, or another profile's working
+    directory, sits *inside* the folder it is returned in ``locked_excludes``
+    so the walker prunes it (an admin whose legacy folder holds the workspaces
+    root never indexes the workspaces in it).
     """
-    inherited = raw is None or not str(raw).strip()
-    real = working_dir() if inherited else real_path(str(raw).strip())
+    try:
+        real = working_dir(profile)
+    except ValueError as exc:  # no profile, or a name that is no directory name
+        return RootCheck(False, None, "invalid_profile", str(exc))
+    if working_dirs.ownership_unavailable():
+        return RootCheck(False, real, "ownership_unavailable",
+                         "Cremind could not read which working directory belongs to which profile "
+                         "just now, so it cannot tell what to keep out of your index. Try again in "
+                         "a moment.")
     sysdir = system_dir()
 
     if not os.path.exists(real):
-        return RootCheck(False, real, "not_found", "That folder does not exist.")
+        return RootCheck(False, real, "not_found", "Your working directory does not exist.")
     if not os.path.isdir(real):
-        return RootCheck(False, real, "not_directory", "That path is a file, not a folder.")
+        return RootCheck(False, real, "not_directory", "Your working directory is a file, not a folder.")
     if not os.access(real, os.R_OK | os.X_OK):
-        return RootCheck(False, real, "not_readable", "Cremind cannot read that folder.")
-    if is_inside(real, sysdir):
-        msg = (
-            "The working directory is Cremind's own system folder, which holds "
-            "credentials and every profile's data — choose a different folder."
-            if inherited else
-            "That folder is inside Cremind's system folder, which holds credentials "
-            "and every profile's data. Choose a different folder."
-        )
-        return RootCheck(False, real, "inside_system_dir", msg)
+        return RootCheck(False, real, "not_readable", "Cremind cannot read your working directory.")
+    if is_inside(real, sysdir) and not _sanctioned_in_system_dir(profile, real, sysdir):
+        return RootCheck(False, real, "inside_system_dir",
+                         f"Your working directory ({real}) is inside Cremind's system folder, which "
+                         f"holds credentials and every profile's data, so it cannot be indexed. {_CHANGE_IT}")
     if _is_forbidden(real):
         return RootCheck(False, real, "forbidden_system_path",
-                         "That is an operating-system location, not a documents folder.")
-    if not is_admin and not inherited and not is_inside(real, working_dir()):
-        return RootCheck(False, real, "outside_working_dir",
-                         f"Choose a folder inside the working directory ({working_dir()}).")
-    locked = [sysdir] if is_inside(sysdir, real) else []
+                         f"Your working directory ({real}) is an operating-system location, not a "
+                         f"documents folder. {_CHANGE_IT}")
+    if working_dirs.is_foreign(real, profile):
+        return RootCheck(False, real, "inside_other_working_dir",
+                         f"Your working directory ({real}) is inside another profile's working "
+                         f"directory, which only that profile may search. {_CHANGE_IT}")
+    locked = [sysdir] if is_inside(sysdir, real) and not is_inside(real, sysdir) else []
+    locked += [p for p in working_dirs.foreign_dirs_inside(real, profile) if p not in locked]
     return RootCheck(True, real, None, None, locked)
+
+
+def system_dir_exempt(root: str) -> bool:
+    """Whether an APPROVED root (``validate_root(...).ok``) lies inside the
+    system folder — a workspace of the profile's own under
+    ``<SYS>/workspaces``, the only such root :func:`validate_root` approves.
+    The walker's matcher is told so
+    (``IgnoreMatcher(root_sanctioned=True)``); otherwise its backstop would
+    index nothing under a root inside a locked directory."""
+    return bool(root) and is_inside(real_path(root), system_dir())
 
 
 # ── Confirm-before-destroy change plans ────────────────────────────────────
@@ -498,11 +565,12 @@ def plan_source_change(
     """What saving ``patch`` over ``current`` would do, before doing it.
 
     Destructive effects: turning the source off *and* deleting its index,
-    moving the root (files outside the new folder leave the index), adding
-    excludes that drop indexed files, turning Drive off (its index goes),
-    and narrowing Drive's ``include_folders`` (files outside the folders
-    now chosen leave the index). Turning a source off while keeping the
-    index is not destructive.
+    adding excludes that drop indexed files, turning Drive off (its index
+    goes), and narrowing Drive's ``include_folders`` (files outside the
+    folders now chosen leave the index). Turning a source off while keeping
+    the index is not destructive. The folder itself never moves through a
+    settings save: it is the profile's working directory, and a moved one is
+    confirmed through the engine's ``pending_root_change`` hold instead.
     """
     effects: list[Effect] = []
     cur = current or {}
@@ -516,9 +584,6 @@ def plan_source_change(
         purging = True
     if kind == SOURCE_DRIVE and cur.get("enabled") and not purging and _narrows_folders(cur, patch):
         effects.append(_count(profile, kind, "purge_out_of_scope", ctx))
-    if kind == SOURCE_LOCAL and cur.get("root_path") and "root_path" in patch:
-        if _norm(str(patch.get("root_path") or "")) != _norm(str(cur.get("root_path") or "")):
-            effects.append(_count(profile, kind, "purge_out_of_scope", ctx))
     if "excludes" in patch and cur.get("enabled"):
         new_rules = {(r["type"], r["pattern"]) for r in normalize_excludes(patch["excludes"])}
         old_rules = {(r["type"], r["pattern"]) for r in normalize_excludes(cur.get("excludes"))}

@@ -1,8 +1,9 @@
 """Documentation search endpoints — `/api/documentation-search/*`.
 
 Everything is scoped to the caller's own profile except `admin`, which is the
-server-wide gate and needs the admin profile. Two error bodies callers should
-recognise:
+server-wide gate and needs the admin profile. The indexed folder is always the
+profile's working directory: a settings PUT naming one is refused (400
+`root_not_configurable`). Error bodies callers should recognise:
 
 - **409 ConfirmationRequired** — the change would remove indexed content; the
   body carries `plan` (what would go) and `confirm` (a token). Repeat the same
@@ -45,12 +46,6 @@ async def put_settings(client: Client, body: dict[str, Any]) -> dict[str, Any]:
     return resp if isinstance(resp, dict) else {}
 
 
-async def validate_root(client: Client, path: Optional[str]) -> dict[str, Any]:
-    body: dict[str, Any] = {"path": path} if path else {"root_mode": "inherit"}
-    resp = await client.post_json("/api/documentation-search/validate-root", body)
-    return resp if isinstance(resp, dict) else {}
-
-
 async def get_admin(client: Client) -> dict[str, Any]:
     resp = await client.get_json("/api/documentation-search/admin")
     return resp if isinstance(resp, dict) else {}
@@ -64,6 +59,13 @@ async def put_admin(client: Client, policy: dict[str, Any]) -> dict[str, Any]:
 async def control(client: Client, action: str, **params: Any) -> dict[str, Any]:
     resp = await client.post_json("/api/documentation-search/control", {"action": action, **params})
     return resp if isinstance(resp, dict) else {}
+
+
+async def confirm_root_change(client: Client) -> dict[str, Any]:
+    """Index the profile's working directory where it is now, after the admin
+    moved it (the ``hold(pending_root_change)`` state). Files still inside the
+    new folder keep their index; the rest leave it."""
+    return await control(client, "confirm_root_change")
 
 
 async def list_files(client: Client, **params: Any) -> dict[str, Any]:

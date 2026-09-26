@@ -20,7 +20,7 @@ const {
 function snap(overrides = {}) {
   return {
     v: 1, boot: 'b', seq: 1, enabled: true, state: 'idle', reason: null,
-    sources: { local: { enabled: true, root_mode: 'custom', root: '/home/ann/Documents', first_sync_confirmed: true }, drive: null },
+    sources: { local: { enabled: true, root: '/home/ann/Documents', first_sync_confirmed: true }, drive: null },
     ...overrides,
   }
 }
@@ -28,12 +28,15 @@ function snap(overrides = {}) {
 function settings({ admin = false } = {}) {
   return {
     local: { root_path: '/home/ann/Documents' },
-    policy_view: { is_admin: admin, working_dir: '/home/ann', allowed: true, effective: true, reason: null },
+    policy_view: {
+      is_admin: admin, working_dir: '/home/ann', working_dir_editable: admin,
+      allowed: true, effective: true, reason: null,
+    },
   }
 }
 
 const ACTIONS = new Set([
-  'enable', 'open_admin', 'choose_folder', 'rescan', 'confirm_root_change', 'review_first_sync',
+  'enable', 'open_admin', 'change_working_dir', 'rescan', 'confirm_root_change', 'review_first_sync',
   'review_deletions', 'resume', 'pause', 'adjust_excludes', 'retry_failed', 'relink_google',
 ])
 
@@ -67,9 +70,31 @@ test('suspended(admin_gate): disabled by the administrator, index kept', () => {
   assert.equal(b.title, 'Disabled by your administrator — your index is kept')
   assert.deepEqual(ids(b), [])
   assert.match(b.body, /Ask your administrator/)
-  // The admin is offered the page where the gate lives instead.
+  // The admin is offered the Administrator settings on the same page instead.
   const admin = check(stateBanner(snap({ state: 'suspended', reason: 'admin_gate' }), settings({ admin: true })))
   assert.deepEqual(ids(admin), ['open_admin'])
+  assert.equal(admin.actions[0].label, 'Go to Administrator settings')
+  assert.doesNotMatch(admin.body, /Ask your administrator/)
+})
+
+// The gate moved from the Vector Embedding page to My Documents' own
+// Administrator settings: no banner may send anyone back there.
+test('no banner points at the Vector Embedding page', () => {
+  const rows = [
+    snap({ state: 'suspended', reason: 'admin_gate', enabled: false }),
+    snap({ state: 'suspended', reason: 'admin_gate' }),
+    snap({ state: 'blocked', reason: 'feature_missing' }),
+    snap({ state: 'paused', reason: 'budget' }),
+  ]
+  for (const row of rows) {
+    for (const who of [settings({ admin: true }), settings()]) {
+      const b = check(stateBanner(row, who))
+      const text = [b.title, b.body, ...b.actions.map(a => a.label)].join(' ')
+      assert.doesNotMatch(text, /Vector Embedding/, `${row.state}(${row.reason})`)
+    }
+  }
+  const admin = check(stateBanner(rows[0], settings({ admin: true })))
+  assert.match(admin.body, /under Administrator settings below/)
 })
 
 test('suspended(admin_gate) for a profile that never turned it on promises no kept index', () => {
@@ -78,15 +103,14 @@ test('suspended(admin_gate) for a profile that never turned it on promises no ke
   assert.match(b.body, /administrator has to allow/)
 })
 
-test('suspended(embedding_off): keyword search over the index as of a time', () => {
-  const asOf = new Date(2026, 8, 20, 14, 30).getTime()
-  const b = check(stateBanner(snap({ state: 'suspended', reason: 'embedding_off' }), settings(), { asOf }))
-  assert.equal(b.tone, 'warning')
-  assert.match(b.title, /^Vector Embedding is off — keyword search over the index as of /)
-  assert.doesNotMatch(b.title, /when it was turned off/)
-  // Without a time it still says what it means.
-  const noTime = check(stateBanner(snap({ state: 'suspended', reason: 'embedding_off' }), settings()))
-  assert.match(noTime.title, /as of when it was turned off$/)
+test('suspended(embedding_off) has no row of its own: My Documents is closed then', () => {
+  // The page (and the chip) exist only while Vector Embedding is on, so the
+  // state falls through to the generic suspended wording — which still
+  // promises nothing destructive.
+  const b = check(stateBanner(snap({ state: 'suspended', reason: 'embedding_off' }), settings({ admin: true })))
+  assert.equal(b.title, 'Document search is suspended')
+  assert.match(b.body, /Nothing has been deleted/)
+  assert.deepEqual(ids(b), [])
 })
 
 test('suspended(allow_in): explains the origin limit', () => {
@@ -106,15 +130,21 @@ test('blocked(feature_missing): admins install, others ask', () => {
 
 // ── hold ────────────────────────────────────────────────────────────────────
 
-test('hold(root_invalid): the server message, and a way to pick another folder', () => {
-  const b = check(stateBanner(snap({
+test('hold(root_invalid): the server message; only the admin is offered Profiles settings', () => {
+  const held = snap({
     state: 'hold', reason: 'root_invalid',
-    detail: { code: 'not_found', message: 'That folder does not exist.', root: '/gone' },
-  })))
-  assert.equal(b.tone, 'error')
-  assert.match(b.body, /That folder does not exist\./)
-  assert.match(b.body, /Nothing has been deleted/)
-  assert.deepEqual(ids(b), ['choose_folder'])
+    detail: { code: 'inside_system_dir', message: "Your working directory (/x) is inside Cremind's system folder", root: '/x' },
+  })
+  const admin = check(stateBanner(held, settings({ admin: true })))
+  assert.equal(admin.tone, 'error')
+  assert.equal(admin.title, "Your working directory can't be indexed")
+  assert.match(admin.body, /inside Cremind's system folder\. Nothing has been deleted\.$/)
+  assert.deepEqual(ids(admin), ['change_working_dir'])
+  const member = check(stateBanner(held, settings()))
+  assert.deepEqual(ids(member), [])
+  // No server message: the fallback says whom to ask.
+  const bare = check(stateBanner(snap({ state: 'hold', reason: 'root_invalid', detail: { root: '/gone' } }), settings()))
+  assert.match(bare.body, /\/gone is not a folder Cremind can index\. Nothing has been deleted\. Ask your admin to change it\./)
 })
 
 test('hold(root_unavailable): missing folder, nothing deleted, resumes on its own', () => {
@@ -122,7 +152,7 @@ test('hold(root_unavailable): missing folder, nothing deleted, resumes on its ow
   assert.equal(b.tone, 'warning')
   assert.match(b.body, /\/home\/ann\/Documents is missing/)
   assert.match(b.body, /Nothing has been deleted/)
-  assert.deepEqual(ids(b), ['rescan', 'choose_folder'])
+  assert.deepEqual(ids(b), ['rescan'])
   assert.equal(b.snippet, null)
 })
 
@@ -156,15 +186,27 @@ test('hold(root_unavailable) inside a container adds the Docker hint to other ca
   assert.ok(b.snippet)
 })
 
-test('hold(pending_root_change): confirm the new folder, or choose one', () => {
-  const b = check(stateBanner(snap({
+test('hold(pending_root_change): your working directory changed — confirm to index the new one', () => {
+  const held = snap({
     state: 'hold', reason: 'pending_root_change',
     detail: { from: '/old/docs', to: '/new/docs' },
-    confirmation: { kind: 'root_change', from: '/old/docs', to: '/new/docs', files: 420 },
-  })))
+    confirmation: { kind: 'root_change', from: '/old/docs', to: '/new/docs', files: 420, leaving: 17 },
+  })
+  const b = check(stateBanner(held, settings()))
   assert.equal(b.tone, 'warning')
-  assert.match(b.body, /from \/old\/docs to \/new\/docs/)
-  assert.deepEqual(ids(b), ['confirm_root_change', 'choose_folder'])
+  assert.equal(b.title, 'Your working directory changed')
+  assert.match(b.body, /^Your working directory changed from \/old\/docs to \/new\/docs\./)
+  assert.match(b.body, /17 of the 420 indexed files are outside the new folder/)
+  assert.match(b.body, /never touched/)
+  assert.deepEqual(ids(b), ['confirm_root_change'])
+  // The admin may also move it again, on the Profiles page.
+  assert.deepEqual(ids(check(stateBanner(held, settings({ admin: true })))), ['confirm_root_change', 'change_working_dir'])
+  // Without a count, the rule itself.
+  const uncounted = check(stateBanner(snap({
+    state: 'hold', reason: 'pending_root_change', detail: { from: '/a', to: '/b' },
+    confirmation: { kind: 'root_change', from: '/a', to: '/b', files: 3 },
+  })))
+  assert.match(uncounted.body, /files that are still inside the new folder keep their index/)
 })
 
 test('Drive holds: re-link Google, or wait for it to answer', () => {
@@ -262,7 +304,7 @@ test('awaiting_confirmation(root_change) reads like the root-change hold', () =>
     state: 'awaiting_confirmation', reason: 'root_change',
     confirmation: { kind: 'root_change', from: '/a', to: '/b', files: 3 },
   })))
-  assert.deepEqual(ids(b), ['confirm_root_change', 'choose_folder'])
+  assert.deepEqual(ids(b), ['confirm_root_change'])
   assert.match(b.body, /from \/a to \/b/)
 })
 

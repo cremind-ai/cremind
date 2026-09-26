@@ -2,11 +2,13 @@
 /**
  * Settings → My Documents: Documentation search for this profile.
  *
- * The profile turns the feature on, picks the folder the agent may search,
- * says what to leave out, and watches the index being built and kept current.
- * Everything here is the caller's own — the server scopes every route to the
- * token's profile, so this page can neither see nor change another profile's
- * folder or index.
+ * The profile turns the feature on, says what to leave out, and watches the
+ * index being built and kept current. The folder is always the profile's own
+ * working directory, shown read-only here: only the admin changes a working
+ * directory (Settings → Profiles), and a moved one waits for this profile to
+ * confirm it. Everything here is the caller's own — the server scopes every
+ * route to the token's profile, so this page can neither see nor change
+ * another profile's folder or index.
  *
  * What the page shows is driven by the live snapshot in the documents store,
  * which streams while this page is mounted (`attachPage`). The page adds the
@@ -18,9 +20,18 @@
  * - the engine's own confirmations (first sync, a held mass deletion, a moved
  *   working directory) arrive in the snapshot and open their dialogs once.
  *
- * An admin-disabled gate replaces the page with an explanation (admins get a
- * link to the gate); an engine that failed to start (503) replaces only the
- * live panels, since settings can still be saved.
+ * An admin-disabled gate replaces the page with an explanation; an engine that
+ * failed to start (503) replaces only the live panels, since settings can
+ * still be saved.
+ *
+ * The admin also finds the server-wide gate here, as its own "Administrator
+ * settings" section (DocumentsAdminGate): allowing the feature, budgets,
+ * workers, which profiles use it. Other profiles never see it. Allowing it can
+ * need the document readers installed first, which the install dialog does.
+ *
+ * The page exists only while Vector Embedding is on (utils/myDocumentsAccess.ts):
+ * the route guard keeps people out while it is off, and an open page leaves
+ * when it is turned off — so nothing here explains an embedding that is off.
  *
  * Google Drive is a second source with its own switch (DriveIndexingSection).
  * A profile may use either or both, so "on" for the live panels means the
@@ -35,20 +46,20 @@ import {
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useDocumentsStore } from '../stores/documents';
+import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
 import {
   getDocumentsSettings,
   getDocumentsStorage,
-  listDocumentsActivity,
   runDocumentsControl,
   saveDocumentsSettings,
   DocumentsApiError,
   type ChangePlan,
   type ConfirmOutcome,
   type ExcludeRule,
-  type RootMode,
   type DocumentsControlAction,
   type DocumentsControlRequest,
   type DocumentsControlResult,
+  type DocumentsFeatureMissing,
   type DocumentsOptions,
   type DocumentsSettings,
   type DocumentsSettingsPatch,
@@ -57,9 +68,11 @@ import {
   type DocumentsStorageInfo,
 } from '../services/documentsApi';
 import { dockerWarning, formatBytes, formatCount, stateBanner, type BannerActionId } from '../utils/documentsView';
+import { myDocumentsClosedMessage, myDocumentsOpen, settingsListPath } from '../utils/myDocumentsAccess';
+import DocumentsAdminGate from '../components/documents/DocumentsAdminGate.vue';
+import FeatureInstallDialog from '../components/shared/FeatureInstallDialog.vue';
 import DriveIndexingSection from '../components/documents/DriveIndexingSection.vue';
 import DocumentsStatePanel from '../components/documents/DocumentsStatePanel.vue';
-import RootFolderPicker from '../components/documents/RootFolderPicker.vue';
 import ExcludeRulesEditor from '../components/documents/ExcludeRulesEditor.vue';
 import StorageUsageBar from '../components/documents/StorageUsageBar.vue';
 import SyncActivityPanel from '../components/documents/SyncActivityPanel.vue';
@@ -75,6 +88,7 @@ const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const settingsStore = useSettingsStore();
 const store = useDocumentsStore();
+const embeddingStatus = useEmbeddingStatusStore();
 
 const settings = ref<DocumentsSettings | null>(null);
 const loading = ref(true);
@@ -82,12 +96,9 @@ const loadError = ref('');
 /** The engine failed to start on this server (503 from an engine route). */
 const engineDown = ref(false);
 const storageDetail = ref<DocumentsStorageInfo | null>(null);
-/** When the kept index was last updated — for the embedding-off banner. */
-const asOf = ref<number | null>(null);
 
 /** One action at a time: every button that sends something disables meanwhile. */
 const acting = ref(false);
-const savingRoot = ref(false);
 const savingExcludes = ref(false);
 const savingOptions = ref(false);
 const togglingEnabled = ref(false);
@@ -101,12 +112,15 @@ const driveEnabled = computed(() => !!drive.value?.enabled);
 /** Either source is on: the live panels (sync, storage, files) apply. */
 const enabled = computed(() => localEnabled.value || driveEnabled.value);
 const isAdmin = computed(() => !!policy.value?.is_admin);
+/** Only the admin changes a working directory (the server says so). */
+const canChangeWorkingDir = computed(() => !!(policy.value?.working_dir_editable ?? policy.value?.is_admin));
+/** The indexed folder: the working directory, as the settings report it. */
+const workingDir = computed(() => policy.value?.working_dir || local.value?.root_path || null);
 
 const banner = computed(() => {
   const snap = snapshot.value;
   if (!snap) return null;
   return stateBanner(snap, settings.value, {
-    asOf: asOf.value,
     keptIndexBytes: snap.state === 'disabled' ? storageDetail.value?.total_bytes ?? null : null,
     driveEnabled: driveEnabled.value,
   });
@@ -172,18 +186,21 @@ onBeforeUnmount(() => {
   detachPage = null;
 });
 
-// "Keyword search over the index as of <time>": the newest activity entry is
-// the last time the index changed.
+// My Documents needs Vector Embedding. The route guard keeps people out while
+// it is off; this covers it being turned off while the page is open (here or
+// in another tab), and a fresh load the guard let through before the state
+// was known.
+let embeddingWasOn = false;
 watch(
-  () => (snapshot.value?.state === 'suspended' && snapshot.value.reason === 'embedding_off'),
-  async (frozen) => {
-    if (!frozen || asOf.value !== null) return;
-    try {
-      const res = await listDocumentsActivity(settingsStore.agentUrl, settingsStore.authToken, { limit: 1 });
-      asOf.value = res.events[0]?.ts ?? null;
-    } catch {
-      // The banner falls back to "as of when it was turned off".
+  () => myDocumentsOpen({ known: embeddingStatus.known, enabled: embeddingStatus.enabled }),
+  (open) => {
+    if (open === null) return;
+    if (open) {
+      embeddingWasOn = true;
+      return;
     }
+    ElMessage.info(myDocumentsClosedMessage(embeddingWasOn));
+    void router.replace(settingsListPath(props.profile));
   },
   { immediate: true },
 );
@@ -199,9 +216,6 @@ function describeError(e: unknown): string {
       case 'FeatureDisabledByAdmin':
         void loadSettings();
         return 'An administrator has not allowed Documentation search on this server.';
-      case 'EmbeddingDisabled':
-        void loadSettings();
-        return 'Vector Embedding is off, so document search cannot be turned on right now.';
       case 'NotEnabled':
         return 'Turn document search on first.';
       case 'DriveNotLinked':
@@ -373,20 +387,6 @@ async function confirmDisable() {
     }
   } finally {
     togglingEnabled.value = false;
-  }
-}
-
-async function onSaveRoot(choice: { root_mode: RootMode; root_path: string | null }) {
-  savingRoot.value = true;
-  try {
-    const ok = await saveLocal(
-      choice.root_mode === 'inherit' ? { root_mode: 'inherit' } : choice,
-      'Change the indexed folder?',
-      'Change folder',
-    );
-    if (ok) ElMessage.success('Folder saved.');
-  } finally {
-    savingRoot.value = false;
   }
 }
 
@@ -605,18 +605,23 @@ async function confirmRootChange() {
   const from = conf?.kind === 'root_change' ? conf.from : detail.from;
   const to = conf?.kind === 'root_change' ? conf.to : detail.to;
   const files = conf?.kind === 'root_change' ? conf.files : 0;
+  const leaving = conf?.kind === 'root_change' && typeof conf.leaving === 'number' ? conf.leaving : null;
+  const scope = !files
+    ? ''
+    : leaving !== null
+      ? `${formatCount(leaving)} of the ${formatCount(files)} indexed files are outside it and are removed from the index; the rest keep theirs. `
+      : `Of the ${formatCount(files)} indexed files, those inside the new folder keep their index; the rest are removed from it. `;
   try {
     await ElMessageBox.confirm(
-      `Index ${to ?? 'the new working directory'} instead of ${from ?? 'the previous folder'}? `
-        + (files ? `Of the ${formatCount(files)} indexed files, those inside the new folder keep their index; the rest are removed from it. ` : '')
-        + 'Your files themselves are not touched.',
-      'Use the new folder?',
-      { confirmButtonText: 'Use the new folder', cancelButtonText: 'Not now' },
+      `Your working directory changed from ${from ?? 'the previous folder'} to ${to ?? 'a new folder'}. `
+        + `Index the new folder? ${scope}Your files themselves are not touched.`,
+      'Index your new working directory?',
+      { confirmButtonText: 'Index the new folder', cancelButtonText: 'Not now' },
     );
   } catch {
     return;
   }
-  if (await control('confirm_root_change')) ElMessage.success('Now indexing the new folder.');
+  if (await control('confirm_root_change')) ElMessage.success('Now indexing your new working directory.');
 }
 
 // ── the engine's confirmations ────────────────────────────────────────────
@@ -695,22 +700,69 @@ async function keepDeletions() {
 
 // ── banner actions ────────────────────────────────────────────────────────
 
-const folderSection = ref<HTMLElement | null>(null);
 const excludesSection = ref<HTMLElement | null>(null);
 
 function scrollTo(el: HTMLElement | null) {
   el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-function goToEmbeddingSettings() {
-  void router.push({ name: 'embedding-settings', params: { profile: props.profile } });
+/** Settings → Profiles, where the admin sets each profile's working directory. */
+function goToProfiles() {
+  void router.push({ name: 'profile-settings', params: { profile: props.profile } });
+}
+
+// ── administrator settings (the admin only) ───────────────────────────────
+
+const adminSection = ref<HTMLElement | null>(null);
+const adminGate = ref<InstanceType<typeof DocumentsAdminGate> | null>(null);
+const installDialog = ref<InstanceType<typeof FeatureInstallDialog> | null>(null);
+
+/** Restart prompt after installing the document readers. */
+const READERS_RESTART = 'Install complete. Restart the Cremind server so the new components load.';
+
+/** The admin changed the gate: this page's own view of it (allowed, budgets)
+ *  is read again, and the storage numbers once it is allowed. */
+async function onAdminSaved() {
+  await loadSettings();
+  if (settings.value?.policy_view.allowed) void loadStorage();
+}
+
+/** Saving "allowed" needs the document readers first: install them, then
+ *  save again — the section kept the unsaved switch, so the retry completes
+ *  what the admin asked for. */
+function onAdminFeatureMissing(detail: { missing: DocumentsFeatureMissing[]; message: string }) {
+  installDialog.value?.open({
+    detail,
+    title: 'Install document readers?',
+    purpose: 'Allowing Documentation search',
+    onInstalled: async (restartRequired) => {
+      await adminGate.value?.save();
+      return { restart: restartRequired ? READERS_RESTART : null };
+    },
+  });
+}
+
+/** Already allowed, readers missing: install them, then show the section
+ *  (and the waiting files) as they are now. */
+function onAdminInstallReaders(detail: { missing: DocumentsFeatureMissing[]; message: string }) {
+  installDialog.value?.open({
+    detail,
+    title: 'Install document readers?',
+    purpose: 'Reading PDF, Office and photo files',
+    onInstalled: async (restartRequired) => {
+      await adminGate.value?.reload();
+      void store.refresh();
+      return { restart: restartRequired ? READERS_RESTART : null };
+    },
+  });
 }
 
 function onBannerAction(id: BannerActionId) {
   switch (id) {
     case 'enable': void onToggleEnabled(true); break;
-    case 'open_admin': goToEmbeddingSettings(); break;
-    case 'choose_folder': scrollTo(folderSection.value); break;
+    // Offered to the admin only, whose page carries the section.
+    case 'open_admin': scrollTo(adminSection.value); break;
+    case 'change_working_dir': goToProfiles(); break;
     case 'adjust_excludes': scrollTo(excludesSection.value); break;
     case 'rescan': void rescan(); break;
     case 'confirm_root_change': void confirmRootChange(); break;
@@ -752,8 +804,8 @@ function goBack() {
         <h1 class="doc-title">My Documents</h1>
         <p class="doc-subtitle">
           Let the agent search your own files and answer with citations you can open. Cremind keeps
-          a private index of the folder you choose (and of your Google Drive, if you turn it on) and
-          updates it as files change — only this profile can search it, and your files are never
+          a private index of your working directory (and of your Google Drive, if you turn it on)
+          and updates it as files change — only this profile can search it, and your files are never
           modified.
         </p>
       </div>
@@ -770,14 +822,16 @@ function goBack() {
       </section>
 
       <template v-else-if="settings && local && policy">
-        <!-- The admin has not allowed the feature: nothing here can be used. -->
+        <!-- The admin has not allowed the feature: nothing here can be used —
+             except, for the admin, the Administrator settings right below,
+             where it is allowed. -->
         <section v-if="!policy.allowed" class="doc-card doc-problem">
           <Icon icon="mdi:shield-lock-outline" class="doc-problem-icon" />
           <div>
-            <h2>Not available on this server</h2>
+            <h2>{{ isAdmin ? 'Not allowed on this server yet' : 'Not available on this server' }}</h2>
             <p v-if="isAdmin">
-              Documentation search is turned off for every profile. Allow it on the Vector
-              Embedding page, then come back here to choose a folder.
+              Documentation search is off for every profile. Allow it under Administrator settings
+              below, then turn it on here for this profile.
             </p>
             <p v-else>
               An administrator has to allow Documentation search before you can use it. Ask your
@@ -786,9 +840,6 @@ function goBack() {
             <p v-if="enabled">
               Your index is kept, and syncing picks up where it left off once it is allowed again.
             </p>
-            <ElButton v-if="isAdmin" size="small" type="primary" @click="goToEmbeddingSettings">
-              Open Vector Embedding settings
-            </ElButton>
           </div>
         </section>
 
@@ -813,32 +864,27 @@ function goBack() {
                 @update:model-value="onToggleEnabled"
               />
             </div>
-            <p v-if="!localEnabled && policy.reason === 'embedding_disabled'" class="doc-note">
-              <Icon icon="mdi:information-outline" />
-              <span>
-                Vector Embedding is off on this server, so document search can't be turned on right now.
-                <template v-if="isAdmin">
-                  <a href="#" @click.prevent="goToEmbeddingSettings">Turn Vector Embedding on</a>.
-                </template>
-                <template v-else>Ask your administrator.</template>
-              </span>
-            </p>
           </section>
 
-          <!-- Folder -->
-          <section ref="folderSection" class="doc-card">
+          <!-- Folder: always the working directory, read-only here -->
+          <section class="doc-card">
             <h2>Folder</h2>
             <p class="doc-muted">
               Everything inside it is indexed, subfolders included, except what you exclude below.
-              <template v-if="!localEnabled">Choose it before turning search on, if you like.</template>
             </p>
-            <RootFolderPicker
-              :source="local"
-              :policy="policy"
-              :saving="savingRoot"
-              :disabled="savingRoot"
-              @save="onSaveRoot"
-            />
+            <p class="doc-folder">
+              <Icon icon="mdi:folder-outline" class="doc-folder-icon" />
+              <span>
+                Folder: <span class="doc-mono">{{ workingDir || 'not available' }}</span>
+                — your working directory
+              </span>
+            </p>
+            <p class="doc-folder-hint">
+              <template v-if="canChangeWorkingDir">
+                Change it under <a href="#" @click.prevent="goToProfiles">Settings → Profiles</a>.
+              </template>
+              <template v-else>Ask your admin to change it.</template>
+            </p>
           </section>
 
           <!-- Exclusions -->
@@ -969,6 +1015,20 @@ function goBack() {
             </template>
           </template>
         </template>
+
+        <!-- The server-wide gate, for the admin only (the server says who that
+             is). One place in the template whatever the gate's state, so it
+             stays mounted — unsaved edits included — when allowing it brings
+             the sections above in: right under the "not allowed" card before,
+             at the end of the page after. -->
+        <div v-if="isAdmin" ref="adminSection" class="doc-admin">
+          <DocumentsAdminGate
+            ref="adminGate"
+            @saved="onAdminSaved"
+            @feature-missing="onAdminFeatureMissing"
+            @install-readers="onAdminInstallReaders"
+          />
+        </div>
       </template>
     </div>
 
@@ -1046,6 +1106,9 @@ function goBack() {
       @remove="removeDeletions"
       @keep="keepDeletions"
     />
+
+    <!-- The document readers, installed from the Administrator settings. -->
+    <FeatureInstallDialog v-if="isAdmin" ref="installDialog" />
   </div>
 </template>
 
@@ -1079,12 +1142,18 @@ function goBack() {
 .doc-actions :deep(.el-button + .el-button) { margin-left: 0; }
 .btn-icon { margin-right: 4px; }
 
-.doc-note {
-  display: flex; gap: 8px; align-items: flex-start; margin: 12px 0 0;
-  font-size: 0.82rem; color: var(--text-secondary); line-height: 1.45;
+/* The page's flex gap spaces it; the offset keeps a jump to it clear of the
+   top edge. */
+.doc-admin { scroll-margin-top: 16px; }
+
+.doc-folder {
+  display: flex; gap: 8px; align-items: flex-start; margin: 0;
+  font-size: 0.875rem; color: var(--text-primary); line-height: 1.5;
 }
-.doc-note :deep(svg) { flex: none; margin-top: 2px; color: var(--warning-color); }
-.doc-note a { color: var(--primary-color); }
+.doc-folder-icon { flex: none; margin-top: 3px; color: var(--primary-color); }
+.doc-mono { font-family: var(--font-mono, monospace); font-size: 0.82rem; word-break: break-all; }
+.doc-folder-hint { margin: 6px 0 0 24px; font-size: 0.8rem; color: var(--text-secondary); line-height: 1.45; }
+.doc-folder-hint a { color: var(--primary-color); }
 
 .doc-problem { display: flex; gap: 14px; align-items: flex-start; }
 .doc-problem-icon { font-size: 26px; color: var(--warning-color); flex: none; margin-top: 2px; }

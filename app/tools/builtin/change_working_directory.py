@@ -7,14 +7,18 @@ the reasoning agent's prompt) on every subsequent step.
 
 Allowed targets:
 
-- ``user_working`` -- the profile-global default (``get_user_working_directory()``).
+- ``user_working`` -- the calling profile's OWN working directory
+  (``get_user_working_directory(profile)``; each profile has its own).
   Selecting this clears any prior override so the conversation tracks the live
-  default again.
+  folder again.
 - ``skills``       -- ``<CREMIND_SYSTEM_DIR>/<profile>/skills``.
-- ``documents``    -- the profile's own Cremind manual pages,
+- ``documents``    -- the profile's own Cremind manual pages (Cremind's
+  documentation, not the user's files),
   ``<CREMIND_SYSTEM_DIR>/storage/cremind_documents/profiles/<profile uuid>``
   (created on first use). Keyed by the profile's uuid, resolved from its row;
   see :mod:`app.cremind_documents.paths`.
+- ``custom``       -- an existing absolute directory the user names. Never one
+  inside ANOTHER profile's working directory (the admin is not exempt).
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config.settings import BaseConfig, get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.events import get_event_stream_bus
 from app.skills.sync import profile_skills_dir
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
@@ -89,7 +94,7 @@ def _resolve_target(
 
         return doc_paths.profile_dir(profile, Path(BaseConfig.CREMIND_SYSTEM_DIR))
     if target == "user_working":
-        return Path(get_user_working_directory())
+        return Path(get_user_working_directory(profile))
     if target == "custom":
         if not custom_path:
             return None
@@ -111,11 +116,14 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
     description: str = (
         "Switch the conversation's active working directory so subsequent "
         "exec_shell and system_file calls operate in the right place. Use "
-        "target='user_working' (the profile default; also clears any override), "
-        "'documents', 'skills', or the name of a loaded skill to use that "
-        "skill's source directory. For an arbitrary directory the user names, "
-        "use target='custom' with `path` set to an existing absolute path "
-        "(it is not auto-created)."
+        "target='user_working' (your own working directory — the user's files; "
+        "also clears any override), 'documents' (your Cremind manual pages "
+        "folder — Cremind's own documentation, not the user's files), "
+        "'skills', or the name of a loaded skill to use that skill's source "
+        "directory. For an arbitrary directory the user names, use "
+        "target='custom' with `path` set to an existing absolute path (it is "
+        "not auto-created). Another profile's working directory is never "
+        "reachable."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -124,16 +132,20 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
                 "type": "string",
                 "enum": list(_TARGETS),
                 "description": (
-                    "Which directory to switch to: 'user_working' (profile "
-                    "default; clears any override), 'documents', 'skills', "
-                    "or 'custom' for an arbitrary user-supplied directory."
+                    "Which directory to switch to: 'user_working' (your own "
+                    "working directory; clears any override), 'documents' "
+                    "(your Cremind manual pages, not the user's files), "
+                    "'skills', or 'custom' for an arbitrary user-supplied "
+                    "directory."
                 ),
             },
             "path": {
                 "type": "string",
                 "description": (
                     "Required when target='custom'. Absolute directory "
-                    "path the agent should operate in. Must already exist."
+                    "path the agent should operate in. Must already exist "
+                    "and must not be inside another profile's working "
+                    "directory."
                 ),
             },
         },
@@ -158,7 +170,15 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
                 )}]
             )
 
-        profile = arguments.get("_profile") or "default"
+        # The caller's profile decides which working directory is "its own" —
+        # without one there is nothing safe to fall back to.
+        profile = arguments.get("_profile") or ""
+        if not profile:
+            return BuiltInToolResult(
+                content=[{"type": "text", "text": (
+                    "Cannot change working directory: missing profile."
+                )}]
+            )
         custom_path = arguments.get("path")
 
         # Reject unknown skill IDs (defense in depth — even if the inner LLM
@@ -195,7 +215,7 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
 
         previous = (
             get_context(context_id, OVERRIDE_KEY)
-            or get_user_working_directory()
+            or get_user_working_directory(profile)
         )
         # Off the event loop: 'documents' and a skill id both resolve through
         # a DB row.
@@ -218,6 +238,16 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
             clear_context(context_id, OVERRIDE_KEY)
             persist_path = None
         elif target == "custom":
+            # Before the existence check, so the answer never reveals what
+            # another profile keeps in its folder.
+            if is_foreign(str(new_path), profile):
+                return BuiltInToolResult(
+                    content=[{"type": "text", "text": (
+                        f"Cannot switch to '{new_path}': That folder belongs to "
+                        "another profile. Each profile's working directory is "
+                        "private to it; use target='user_working' for your own."
+                    )}]
+                )
             if not new_path.exists() or not new_path.is_dir():
                 return BuiltInToolResult(
                     content=[{"type": "text", "text": (

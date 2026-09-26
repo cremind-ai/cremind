@@ -67,7 +67,7 @@ here — run the command for the values your profile actually gets.
 |-----------------------------|-----------------------------------------------------------------------------------------------------------|
 | `CREMIND_SYSTEM_DIR`        | The Cremind System Directory (`~/.cremind`) — runtime state and user-content root.                        |
 | `CREMIND_INSTALL_DIR`       | The Install Directory — install-time scratch (compose bundle, `install.log`, caches).                     |
-| `CREMIND_USER_WORKING_DIR`  | The user-facing default working directory.                                                                |
+| `CREMIND_USER_WORKING_DIR`  | **The calling profile's own** working directory (each profile has its own; `<workspaces>/<profile>` unless admin chose another); omitted when there is no profile. Other profiles' folders are off-limits to every file tool. |
 | `CREMIND_SKILL_DIR`         | This profile's skills directory; omitted when there is no profile.                                        |
 | `CREMIND_SERVER`            | Loopback URL of this server, so a `cremind` CLI call in the shell needs no `--server`.                    |
 | `CREMIND_PROFILE`           | The active profile name; omitted when none is set.                                                        |
@@ -136,7 +136,7 @@ $ cremind system-vars
 │ NAME                     │ VALUE                                     │ DESCRIPTION                                                                │
 ├──────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
 │ CREMIND_SYSTEM_DIR       │ /home/li/.cremind                         │ Cremind System Directory (~/.cremind) - runtime state + user content root. │
-│ CREMIND_USER_WORKING_DIR │ /home/li/Documents                        │ User-facing default working directory.                                     │
+│ CREMIND_USER_WORKING_DIR │ /home/li/.cremind/workspaces/admin        │ This profile's own User Working Directory (each profile has its own); o... │
 │ CREMIND_SKILL_DIR        │ /home/li/.cremind/admin/skills            │ Per-profile skills directory; omitted when no profile.                     │
 │ CREMIND_SERVER           │ http://127.0.0.1:1112                     │ Loopback URL of this server for the `cremind` CLI.                         │
 │ CREMIND_PROFILE          │ admin                                     │ Active profile name; omitted when no profile is set.                       │

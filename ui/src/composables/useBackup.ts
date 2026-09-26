@@ -98,13 +98,13 @@ function startCreatePoll(): void {
   void tick()
 }
 
-async function create(passphrase?: string): Promise<void> {
+async function create(passphrase?: string, includeWorkspaces = true): Promise<void> {
   const c = creds()
   if (!c) return
   createError.value = null
   createPhase.value = 'queued'
   try {
-    await createBackup(c.url, c.token, passphrase)
+    await createBackup(c.url, c.token, passphrase, includeWorkspaces)
   } catch (e) {
     createPhase.value = 'failed'
     createError.value = e instanceof Error ? e.message : String(e)

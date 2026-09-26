@@ -48,6 +48,7 @@ from app.databases.sqlite import SqliteDatabaseProvider  # noqa: E402
 from app.storage.documents_storage import DocumentsStorage  # noqa: E402
 from app.documents import settings as uds  # noqa: E402
 from app.documents import state as uds_state  # noqa: E402
+from tests.documents._workspaces import install as install_working_dirs  # noqa: E402
 
 WHOLE = "https://www.googleapis.com/auth/drive"
 READONLY = "https://www.googleapis.com/auth/drive.readonly"
@@ -107,10 +108,7 @@ def env(tmp_path: Path, monkeypatch):
     storage = DocumentsStorage(provider)
     monkeypatch.setattr(uds_storage_module, "_instance", storage)
 
-    wd = tmp_path / "work"
-    wd.mkdir()
-    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path / "system"))
-    monkeypatch.setattr(uds, "get_user_working_directory", lambda: str(wd))
+    install_working_dirs(monkeypatch, tmp_path / "system", {"admin": None, "dog": None, "cat": None})
     rows: dict[str, str] = {"documentation_search.allowed": "true"}
     monkeypatch.setattr(uds, "get_dynamic", lambda table, key, *a, **k: rows.get(key))
     monkeypatch.setattr(storage_pkg, "get_dynamic_config_storage", lambda *a, **k: None)

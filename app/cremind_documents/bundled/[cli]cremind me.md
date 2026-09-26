@@ -1,5 +1,5 @@
 ---
-description: "Show the **identity** of the current CLI session: decode the active `CREMIND_TOKEN` JWT and print the profile, subject, issued-at and expires-at times, and the server-side and user working directories. Use this to confirm which profile you are acting as, check whether the token has expired, or find the working directory the agent will use — a read-only probe that changes nothing."
+description: "Show the **identity** of the current CLI session: decode the active `CREMIND_TOKEN` JWT and print the profile, subject, issued-at and expires-at times, the server's system directory, and this profile's own working directory (each profile has its own). Use this to confirm which profile you are acting as, check whether the token has expired, or find the working directory your files and tools use — a read-only probe that changes nothing."
 ---
 
 # `cremind me` — Identity Info for the Current Token
@@ -50,11 +50,15 @@ list with these rows:
 | `subject`          | JWT `sub` claim — the principal id (typically the same as the profile, but server-controlled).|
 | `issued_at`        | RFC 3339 timestamp + Unix seconds, e.g. `2026-05-02T14:00:00Z (1746201600)`.                  |
 | `expires_at`       | RFC 3339 timestamp + Unix seconds. After this moment, every authenticated command will fail.  |
-| `working_dir`      | Server-side working directory used by built-in tools and the agent's filesystem operations.   |
-| `user_working_dir` | The profile's preferred user working directory (mirrors the value set during setup).          |
+| `system_dir`       | Cremind's system directory on the server (`CREMIND_SYSTEM_DIR`): database, tokens, per-profile state. |
+| `user_working_dir` | **This profile's own working directory** — its file panel, the default directory of its tools and terminals, `$CREMIND_USER_WORKING_DIR` in its shells, what its Documentation search indexes. Every profile has its own; no other profile can reach it. |
+| `user_working_dir_default` | Whether that folder is the profile's default, `<workspaces>/<profile>` (`yes`/`no`). Omitted by a server that does not report it. |
 
-With `--json`, the output is the full JSON object emitted by the
-identity endpoint, suitable for piping into `jq`.
+With `--json`, the output is the same rows as a JSON object (keys
+`subject`, `profile`, `issued_at`, `expires_at`, `system_dir`,
+`user_working_dir`, and `user_working_dir_default` when reported),
+suitable for piping into `jq`. Only `admin` can change a profile's working
+directory — see `cremind profile working-dir`.
 
 ## Examples
 
@@ -62,12 +66,20 @@ identity endpoint, suitable for piping into `jq`.
 
 ```bash
 $ cremind me
-profile           admin
-subject           admin
-issued_at         2026-05-02T14:00:00Z (1746201600)
-expires_at        2026-06-01T14:00:00Z (1748793600)
-working_dir       /var/lib/cremind
-user_working_dir  /home/li/work
+profile:                   li
+subject:                   li
+issued_at:                 2026-05-02T14:00:00+00:00 (1746201600)
+expires_at:                2026-06-01T14:00:00+00:00 (1748793600)
+system_dir:                /home/li/.cremind
+user_working_dir:          /home/li/.cremind/workspaces/li
+user_working_dir_default:  yes
+```
+
+### Find your working directory in a script
+
+```bash
+$ cremind --json me | jq -r .user_working_dir
+/home/li/.cremind/workspaces/li
 ```
 
 ### Read just the profile name in a script

@@ -40,12 +40,23 @@ const STUBS = {
       ;(subs[conversationId] ||= []).push(onEvent)
       return { close() {} }
     }
+    // The embedding status store's source once a token exists: tests deliver
+    // snapshots with globalThis.__embeddingSubscribers[i](snapshot).
+    export function subscribeEmbeddingState(agentUrl, token, onState) {
+      const subs = (globalThis.__embeddingSubscribers ||= [])
+      subs.push(onState)
+      return {
+        close() {
+          const i = subs.indexOf(onState)
+          if (i >= 0) subs.splice(i, 1)
+        },
+      }
+    }
     const idle = () => ({ close() {} })
     export const subscribeConversationsList = idle
     export const subscribeNotifications = idle
     export const subscribeSettingsState = idle
     export const subscribeProcesses = idle
-    export const subscribeEmbeddingState = idle
   `,
   // The real router imports every view (.vue files esbuild cannot load); the
   // stores only ever call push() on it.
@@ -206,6 +217,7 @@ export function installBrowser({ href = 'http://localhost:1515/#/alice/c/42' } =
   globalThis.BroadcastChannel = SilentBroadcastChannel
   globalThis.__transportSubscribers = []
   globalThis.__documentsSubscribers = []
+  globalThis.__embeddingSubscribers = []
   globalThis.fetch = async (input, init = {}) => {
     const requested = String(input)
     calls.push({ url: requested, init })

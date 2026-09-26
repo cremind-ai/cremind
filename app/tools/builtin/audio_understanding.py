@@ -16,7 +16,11 @@ Anthropic model, which has no audio input).
 
 Audio bytes are read from within the same allowed roots as ``system_file``
 (reusing its ``_safe_resolve`` / ``_allowed_roots`` helpers), so this works on
-uploaded temp files and on existing working/system files alike. Audio is sent as
+uploaded temp files and on existing working/system files alike. The path is
+judged for the CALLING profile, exactly as ``system_file`` judges it: relative
+paths resolve under the conversation's directory (else the profile's own
+working directory), and a path inside another profile's working directory is
+refused — the admin is not exempt. Audio is sent as
 an OpenAI-style ``input_audio`` content part (base64 payload + a ``format`` hint);
 OpenAI-compatible providers (OpenAI, Google Gemini, xAI, Qwen, vLLM, …) accept it
 directly.
@@ -29,6 +33,7 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 from app.config import model_supports_audio
+from app.config.settings import get_user_working_directory
 from app.constants import ChatCompletionTypeEnum
 from app.lib.llm.base import done_chunk_token_usage
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
@@ -200,7 +205,12 @@ class AnalyzeAudioTool(BuiltInTool):
         self._data_dir = data_dir
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        data_dir = arguments.pop("_working_directory", None) or self._data_dir
+        profile = arguments.get("_profile") or None
+        # The adapter injects the conversation's directory; without one the
+        # caller's own working directory is the base, never the system folder.
+        data_dir = arguments.pop("_working_directory", None) or (
+            get_user_working_directory(profile) if profile else self._data_dir
+        )
         path = (arguments.get("path") or "").strip()
         query = (arguments.get("query") or "").strip()
         llm = arguments.get("_llm")
@@ -218,9 +228,12 @@ class AnalyzeAudioTool(BuiltInTool):
                 "message": "No audio model is configured. Choose a Specialized Audio Model in Settings → LLM Providers.",
             })
 
-        # Resolve the audio path within the same trust boundary as system_file.
+        # Resolve the audio path within the same trust boundary as system_file,
+        # for the calling profile (its manual pages yes, another's folder no).
         try:
-            target = _safe_resolve(data_dir, path, _allowed_roots(arguments, data_dir))
+            target = _safe_resolve(
+                data_dir, path, _allowed_roots(arguments, data_dir), profile=profile,
+            )
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied", "message": str(e)})

@@ -32,11 +32,41 @@ function authHeaders(token: string): Record<string, string> {
 
 export class DirectoryAccessError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // The server's machine-readable reason, when it gives one (e.g.
+  // ``foreign_working_directory``).
+  code?: string;
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
     this.name = 'DirectoryAccessError';
   }
+}
+
+// The 403 ``code`` app/api/files.py sends for a path inside another profile's
+// working directory. Each profile's working directory is private to it — the
+// admin's included — so this is a rule, not a transient failure.
+export const FOREIGN_WORKSPACE_CODE = 'foreign_working_directory';
+export const FOREIGN_WORKSPACE_MESSAGE =
+  "This folder belongs to another profile — each profile's working directory is private to it.";
+
+export function isForeignWorkspaceError(e: unknown): boolean {
+  return (
+    e instanceof DirectoryAccessError &&
+    e.status === 403 &&
+    e.code === FOREIGN_WORKSPACE_CODE
+  );
+}
+
+// Build the error for a failed response from its JSON body (``error`` and
+// ``code``), falling back to ``fallback`` when the body has no message.
+async function accessError(res: Response, fallback: string): Promise<DirectoryAccessError> {
+  const data = await res.json().catch(() => ({}));
+  return new DirectoryAccessError(
+    res.status,
+    data.error || fallback,
+    typeof data.code === 'string' ? data.code : undefined,
+  );
 }
 
 export async function listDirectory(
@@ -56,15 +86,13 @@ export async function listDirectory(
   }
   const res = await fetch(url, { headers: authHeaders(token), signal });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Failed to list directory: ${res.statusText}`,
-    );
+    throw await accessError(res, `Failed to list directory: ${res.statusText}`);
   }
   return res.json();
 }
 
+// The caller's own working directory — the file panel's root. Per profile, so
+// it must be fetched again after a profile switch.
 export async function getInitialCwd(agentUrl: string, token: string): Promise<string> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/files/cwd`, { headers: authHeaders(token) });
@@ -139,11 +167,7 @@ export async function uploadFiles(
       body: form,
     });
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new DirectoryAccessError(
-        res.status,
-        data.error || `Upload failed: ${res.statusText}`,
-      );
+      throw await accessError(res, `Upload failed: ${res.statusText}`);
     }
     const data = await res.json();
     return (data.results || []) as UploadResult[];
@@ -179,11 +203,7 @@ export async function uploadTempFiles(
       body: form,
     });
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new DirectoryAccessError(
-        res.status,
-        data.error || `Upload failed: ${res.statusText}`,
-      );
+      throw await accessError(res, `Upload failed: ${res.statusText}`);
     }
     const data = await res.json();
     return (data.results || []) as TempUploadResult[];
@@ -203,11 +223,7 @@ export async function deleteEntry(
     body: JSON.stringify({ path, conversation_id: conversationId }),
   });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Delete failed: ${res.statusText}`,
-    );
+    throw await accessError(res, `Delete failed: ${res.statusText}`);
   }
 }
 
@@ -225,11 +241,7 @@ export async function moveEntry(
     body: JSON.stringify({ src, dest, conversation_id: conversationId }),
   });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Move failed: ${res.statusText}`,
-    );
+    throw await accessError(res, `Move failed: ${res.statusText}`);
   }
 }
 
@@ -246,11 +258,7 @@ export async function mkdir(
     body: JSON.stringify({ path, conversation_id: conversationId }),
   });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `mkdir failed: ${res.statusText}`,
-    );
+    throw await accessError(res, `mkdir failed: ${res.statusText}`);
   }
 }
 
@@ -267,11 +275,7 @@ export async function setConversationCwd(
     body: JSON.stringify({ conversation_id: conversationId, path }),
   });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Set cwd failed: ${res.statusText}`,
-    );
+    throw await accessError(res, `Set cwd failed: ${res.statusText}`);
   }
   const data = await res.json();
   return (data.working_directory as string) || path;
@@ -290,11 +294,7 @@ export async function downloadFile(
   const url = fileOpenUrl(agentUrl, path, conversationId);
   const res = await fetch(url, { headers: authHeaders(token) });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Download failed: ${res.statusText}`,
-    );
+    throw await accessError(res, `Download failed: ${res.statusText}`);
   }
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);

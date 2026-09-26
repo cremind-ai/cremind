@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List
 
+import pytest
+
 from app.constants import ChatCompletionTypeEnum
 from app.tools.builtin.adapter import BuiltInToolAdapter
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
@@ -215,3 +217,10 @@ def test_adapter_emits_zero_usage_when_tool_reports_none():
         "input_tokens": 0, "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0, "output_tokens": 0,
     }
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

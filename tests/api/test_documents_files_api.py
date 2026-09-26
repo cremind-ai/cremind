@@ -7,8 +7,9 @@ What these pin, in order of how much damage a regression would do:
   existed, on every route. A conversation id must be the caller's too.
 - **The root boundary for raw bytes.** A file is served only when its real
   path is inside the indexed folder *now* — a path that escapes it (a
-  rewritten row, a symlink planted since indexing) is refused, and so is
-  Cremind's own system folder.
+  rewritten row, a symlink planted since indexing) is refused, and so are
+  Cremind's own system folder (but for the profile's own default workspace
+  in it) and another profile's working directory inside the folder.
 - **Thumbnails leave nothing behind.** They are made in memory; generating
   one writes no file anywhere.
 - **Executable formats are never served inline** from the app's origin.
@@ -250,19 +251,70 @@ def test_raw_drive_and_missing_files(env):
     assert resp.status_code == 404 and _json(resp)["error"] == "FileMissing"
 
 
-def test_raw_rechecks_the_saved_root_when_the_engine_has_none(env, tmp_path, monkeypatch):
-    from app.documents import settings as uds
+def test_raw_rechecks_the_working_directory_when_the_engine_has_none(env):
+    from tests.documents._workspaces import move
 
-    monkeypatch.setattr(uds, "get_user_working_directory", lambda: str(tmp_path))
     env.svc.runtimes["alice"].root = None  # e.g. the feature is switched off, index kept
     resp = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": env.law["cite_id"]})
     assert resp.status_code == 200
-    # A saved root that no longer validates is not served from.
+    # A saved root that is no longer the working directory is a pending
+    # change, not a folder to serve from.
     env.storage.upsert_source("alice", "local", root_path=str(env.sysdir))
+    resp = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": env.law["cite_id"]})
+    assert resp.status_code == 409 and _json(resp)["error"] == "RootUnavailable"
+    # Nor after the admin moved the working directory away from the index.
+    env.storage.upsert_source("alice", "local", root_path=str(env.root))
+    move(env.working_dirs, "alice", env.sysdir.parent / "moved")
     resp = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": env.law["cite_id"]})
     assert resp.status_code == 409 and _json(resp)["error"] == "RootUnavailable"
 
 
+def _index_local(env, rel: str, content: str = "hello"):
+    return env.db.insert_file("local", rel, f"h-{rel}", name=rel.rsplit("/", 1)[-1], kind="markdown",
+                              status="indexed", mime="text/markdown")
+
+
+def test_raw_serves_the_own_default_workspace_inside_the_system_dir(env):
+    """The profile's default working directory lives in the system folder
+    (``<SYS>/workspaces/alice``): the one place there its files are served
+    from — never a path elsewhere in the system folder."""
+    from app.documents import settings as uds
+    from tests.documents._workspaces import move
+
+    move(env.working_dirs, "alice", None)
+    check = uds.validate_root("alice")
+    assert check.ok and uds.system_dir_exempt(check.path)
+    ws = env.sysdir / "workspaces" / "alice"
+    (ws / "Notes").mkdir(parents=True)
+    (ws / "Notes" / "mine.md").write_text("in my workspace", encoding="utf-8")
+    env.svc.runtimes["alice"].root = check.path
+    rec = _index_local(env, "Notes/mine.md")
+    resp = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": rec["cite_id"]})
+    assert resp.status_code == 200, resp.body
+    assert _body_bytes(resp) == b"in my workspace"
+    # Out of the workspace, into the rest of the system folder: refused.
+    (env.sysdir / "storage").mkdir(exist_ok=True)
+    (env.sysdir / "storage" / "x.md").write_text("system", encoding="utf-8")
+    env.db.update_file(rec["id"], rel_path="../../storage/x.md")
+    resp = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": rec["cite_id"]})
+    assert resp.status_code == 403 and _json(resp)["error"] == "OutsideRoot"
+
+
+def test_raw_never_serves_another_profiles_folder_inside_the_root(env):
+    """bob's working directory sits inside alice's folder (the admin chose
+    it there): a row naming a file in it is refused."""
+    from tests.documents._workspaces import move
+
+    bob = env.root / "Bob"
+    bob.mkdir()
+    (bob / "private.md").write_text("bob's", encoding="utf-8")
+    move(env.working_dirs, "bob", bob)
+    rec = _index_local(env, "Bob/private.md")
+    resp = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": rec["cite_id"]})
+    assert resp.status_code == 403 and _json(resp)["error"] == "OutsideRoot"
+    # alice's own files beside it are still served.
+    ok = _call("/api/documentation-search/files/{fid}/raw", "GET", path_params={"fid": env.law["cite_id"]})
+    assert ok.status_code == 200
 # ── thumbnail ──────────────────────────────────────────────────────────────
 
 

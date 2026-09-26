@@ -1,6 +1,8 @@
-"""File serving API for CREMIND_SYSTEM_DIR.
+"""File serving API for CREMIND_SYSTEM_DIR and the caller's working directory.
 
-Serves files from the configured data directory with path-traversal prevention.
+Serves files from the configured data directory and the calling profile's own
+User Working Directory, with path-traversal prevention. Another profile's
+working directory is never served (see :mod:`app.config.working_dirs`).
 Protected by the application's existing JWT authentication middleware.
 """
 
@@ -17,6 +19,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from app.api._auth import is_admin
+from app.config import working_dirs
 from app.config.coding_cli_homes import shared_claude_config_dir, shared_codex_home
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.events import get_event_stream_bus
@@ -77,6 +80,30 @@ from app.utils.credential_paths import (  # noqa: E402
 _PRIVATE_PROFILE_DIR_NAMES = frozenset({"exports"})
 
 
+def _private_path_matcher(profile: str | None):
+    """Predicate over *resolved* paths: is it inside some other profile's
+    private directory? :func:`_is_other_profiles_private_path` without the
+    ``realpath``, for the per-entry listing filter and the per-event watch
+    filter, whose paths are built from a root resolved before the route
+    accepted it."""
+    base = os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)
+    own = profile or ""
+
+    def _matches(resolved: str) -> bool:
+        try:
+            relative = os.path.relpath(resolved, base)
+        except ValueError:
+            return False  # different drive on Windows: not under the System Directory
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            return False
+        segments = relative.replace("\\", "/").split("/")
+        if len(segments) < 2 or segments[1] not in _PRIVATE_PROFILE_DIR_NAMES:
+            return False
+        return segments[0] != own
+
+    return _matches
+
+
 def _is_other_profiles_private_path(target: str, profile: str | None) -> bool:
     """Is ``target`` inside some *other* profile's private directory?
 
@@ -88,17 +115,94 @@ def _is_other_profiles_private_path(target: str, profile: str | None) -> bool:
     would buy nothing and would hand the one profile most likely to be
     prompt-injected a reader for everyone else's tokens.
     """
-    base = os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)
-    try:
-        relative = os.path.relpath(os.path.realpath(target), base)
-    except ValueError:
-        return False  # different drive on Windows: not under the System Directory
-    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+    return _private_path_matcher(profile)(os.path.realpath(target))
+
+
+# Each profile's User Working Directory is its own (see
+# :mod:`app.config.working_dirs`). A path inside another profile's folder -- or
+# inside an entry of the workspaces root that no live profile owns, such as a
+# deleted profile's archive under ``.deleted`` -- is off limits to every route
+# here, however the caller arrived at it: a conversation override never widens
+# it. Admin is not exempt, for the reason given for ``exports`` above. The rule
+# matters twice over because the default workspaces root sits inside the System
+# Directory, which every profile may otherwise browse.
+_FOREIGN_WORKSPACE_ERROR = "That location belongs to another profile's working directory"
+_FOREIGN_WORKSPACE_CODE = "foreign_working_directory"
+
+
+def _is_foreign_workspace(target: str, profile: str | None) -> bool:
+    """Is ``target`` inside a working directory that is not the caller's?
+
+    ``None`` (no caller known) denies every owned path -- failing closed, like
+    the private-directory rule."""
+    return working_dirs.is_foreign(target, profile)
+
+
+def _foreign_matcher(root: str, profile: str | None):
+    """Predicate over *resolved* paths below the resolved ``root``: does the
+    path lie in another profile's working directory (or an unowned workspaces
+    entry)? For the per-entry listing filter and the per-event watch filter.
+
+    Built once per request. The working directories inside ``root`` are asked
+    for up front, so an ordinary path costs a prefix comparison; only a path
+    under the workspaces root -- where a new profile's folder may appear while
+    a watch is open -- is resolved and asked about individually."""
+    foreign = tuple(
+        d for d in working_dirs.foreign_dirs_inside(root, profile or "")
+        # ``foreign_dirs_inside`` judges a workspaces entry by its name alone;
+        # an explicit ``<name>-2`` folder belongs to its profile all the same.
+        if working_dirs.is_foreign(d, profile)
+    )
+    ws = os.path.normcase(os.path.realpath(working_dirs.workspaces_root()))
+    ws_below = working_dirs.is_inside(ws, root)
+
+    def _matches(resolved: str) -> bool:
+        p = os.path.normcase(resolved)
+        if any(p == d or p.startswith(d + os.sep) for d in foreign):
+            return True
+        if ws_below and p.startswith(ws + os.sep):
+            return working_dirs.is_foreign(resolved, profile)
         return False
-    segments = relative.replace("\\", "/").split("/")
-    if len(segments) < 2 or segments[1] not in _PRIVATE_PROFILE_DIR_NAMES:
-        return False
-    return segments[0] != (profile or "")
+
+    return _matches
+
+
+def _holds_foreign_workspace(target: str, profile: str | None) -> bool:
+    """Does the resolved ``target`` contain the workspaces root, or another
+    profile's working directory? Deleting or moving such a parent would take
+    other profiles' files with it -- or carry them out from under the rule
+    that keeps them to their owners -- so neither route accepts it."""
+    if working_dirs.is_inside(os.path.realpath(working_dirs.workspaces_root()), target):
+        return True
+    return any(
+        working_dirs.is_foreign(d, profile)
+        for d in working_dirs.foreign_dirs_inside(target, profile or "")
+    )
+
+
+def _is_workspaces_container(target: str) -> bool:
+    """Is the resolved ``target`` the workspaces root or its ``.deleted``
+    folder? Both hold nothing but profiles' folders: an entry created there
+    belongs to no profile, so nobody -- its creator included -- could reach it
+    again, and one wearing a future profile's name would be that profile's."""
+    norm = os.path.normcase(target)
+    return any(
+        norm == os.path.normcase(os.path.realpath(root))
+        for root in (working_dirs.workspaces_root(), working_dirs.deleted_root())
+    )
+
+
+def _access_denied(path: str | None, profile: str | None, suffix: str = "") -> JSONResponse:
+    """The 403 for a path a route refused. One inside another profile's
+    working directory says so (with a ``code`` the file panel keys on), so the
+    panel can explain the refusal instead of showing a bare "Access denied";
+    every other refusal keeps the generic message, which names no rule."""
+    if path and _is_foreign_workspace(os.path.realpath(path), profile):
+        return JSONResponse(
+            {"error": _FOREIGN_WORKSPACE_ERROR + suffix, "code": _FOREIGN_WORKSPACE_CODE},
+            status_code=403,
+        )
+    return JSONResponse({"error": "Access denied" + suffix}, status_code=403)
 
 
 def _is_documents_index_path(target: str) -> bool:
@@ -302,20 +406,29 @@ def _creates_credential_name(path: str) -> bool:
     return os.path.basename(path.rstrip("\\/")) in _CREDENTIAL_DIR_NAMES
 
 
-def _allowed_bases() -> list[str]:
-    """Directories the file-serving routes are allowed to read from.
+def _allowed_bases(profile: str | None) -> list[str]:
+    """Directories the file-serving routes let ``profile`` read from.
 
-    Includes both the internal Cremind working dir and the user's
-    working dir (where the agent operates and produces files).
+    The internal Cremind System Directory and the caller's *own* working
+    directory (where its agent operates and produces files) -- never another
+    profile's. No caller known means no working directory at all.
     """
     bases = [os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)]
-    user_dir = os.path.realpath(get_user_working_directory())
+    if not profile:
+        return bases
+    try:
+        user_dir = os.path.realpath(get_user_working_directory(profile))
+    except ValueError:
+        # A name that is no directory name has no working directory.
+        return bases
     if user_dir not in bases:
         bases.append(user_dir)
     return bases
 
 
-def _allowed_bases_for_conversation(context_key: str | None) -> list[str]:
+def _allowed_bases_for_conversation(
+    context_key: str | None, profile: str | None,
+) -> list[str]:
     """Same as ``_allowed_bases`` plus the active conversation's cwd override.
 
     The ``change_working_directory`` tool may switch a conversation into an
@@ -329,8 +442,13 @@ def _allowed_bases_for_conversation(context_key: str | None) -> list[str]:
     :func:`_conversation_scope`. Looking it up by the client-supplied row id
     instead finds nothing for a group-chat seat, whose context_id is
     ``group:<gid>:<profile>``.
+
+    ``profile`` is the caller, whose own working directory is the other base:
+    an admin reading a member seat's tree gets the seat's override, not the
+    member's working directory (and the foreign-workspace rule, checked before
+    any of this, still refuses the member's folder).
     """
-    bases = _allowed_bases()
+    bases = _allowed_bases(profile)
     if not context_key:
         return bases
     override = get_context(context_key, _WORKING_DIR_OVERRIDE_KEY)
@@ -347,16 +465,18 @@ def _is_inside_allowed(
 ) -> bool:
     # Checked before the bases, and never widened by a conversation override:
     # a credential store is off limits however the caller arrived at it, and so
-    # is another profile's private directory.
+    # are another profile's private directory and its working directory.
     if _is_credential_path(target):
         return False
     if _is_other_profiles_private_path(target, profile):
+        return False
+    if _is_foreign_workspace(target, profile):
         return False
     if _is_documents_index_path(target):
         return False
     if _is_other_profiles_authored_docs(target, profile):
         return False
-    for base in _allowed_bases_for_conversation(context_key):
+    for base in _allowed_bases_for_conversation(context_key, profile):
         if target == base or target.startswith(base + os.sep):
             return True
     return False
@@ -426,6 +546,10 @@ def _safe_resolve(relative_path: str, profile: str | None = None) -> str | None:
         return None
     if _is_other_profiles_private_path(target, profile):
         return None
+    # The default workspaces root is ``<system dir>/workspaces``, so this
+    # route reaches every profile's working directory by a relative path.
+    if _is_foreign_workspace(target, profile):
+        return None
     if _is_documents_index_path(target):
         return None
     if _is_other_profiles_authored_docs(target, profile):
@@ -453,9 +577,12 @@ async def _serve_file(request: Request):
         return JSONResponse({"error": "No path specified"}, status_code=400)
 
     logger.debug(f"File request: relative_path={relative_path}, CREMIND_SYSTEM_DIR={BaseConfig.CREMIND_SYSTEM_DIR}")
-    target = _safe_resolve(relative_path, _profile_of(request))
+    profile = _profile_of(request)
+    target = _safe_resolve(relative_path, profile)
     if target is None:
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+        return _access_denied(
+            os.path.join(BaseConfig.CREMIND_SYSTEM_DIR, relative_path), profile,
+        )
 
     logger.debug(f"Resolved file path: {target}, exists={os.path.isfile(target)}")
     if not os.path.isfile(target):
@@ -486,13 +613,14 @@ async def _serve_file_by_path(request: Request):
     if denied is not None:
         return denied
 
+    profile = _profile_of(request)
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key, _profile_of(request)):
+    if not _is_inside_allowed(target, context_key, profile):
         logger.debug(
             f"File access denied: target={target}, "
-            f"allowed_bases={_allowed_bases_for_conversation(context_key)}"
+            f"allowed_bases={_allowed_bases_for_conversation(context_key, profile)}"
         )
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+        return _access_denied(target, profile)
 
     if not os.path.isfile(target):
         return JSONResponse({"error": "File not found"}, status_code=404)
@@ -548,15 +676,18 @@ async def _list_directory(request: Request):
     if denied is not None:
         return denied
 
+    profile = _profile_of(request)
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key, _profile_of(request)):
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+    if not _is_inside_allowed(target, context_key, profile):
+        return _access_denied(target, profile)
     if not os.path.isdir(target):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
 
     entries: list[dict] = []
     is_credential = _credential_matcher()
-    is_protected_doc_tree = _document_trees_matcher(_profile_of(request))
+    is_protected_doc_tree = _document_trees_matcher(profile)
+    is_private = _private_path_matcher(profile)
+    is_foreign = _foreign_matcher(target, profile)
     try:
         with os.scandir(target) as it:
             for de in it:
@@ -575,13 +706,21 @@ async def _list_directory(request: Request):
                 # name covers the per-profile stores; the path check covers the
                 # shared home, which wears an ordinary name and, on a native
                 # install browsing the user's home, is an ordinary entry here.
-                if de.name in _CREDENTIAL_DIR_NAMES or is_credential(
-                    os.path.join(target, de.name)
-                ) or is_protected_doc_tree(os.path.join(target, de.name)):
+                # Likewise another profile's working directory (listing
+                # ``<system dir>/workspaces`` shows the caller its own folder
+                # only) and its private ``exports``.
+                entry_path = os.path.join(target, de.name)
+                if (
+                    de.name in _CREDENTIAL_DIR_NAMES
+                    or is_credential(entry_path)
+                    or is_protected_doc_tree(entry_path)
+                    or is_private(entry_path)
+                    or is_foreign(entry_path)
+                ):
                     continue
                 entries.append({
                     "name": de.name,
-                    "path": os.path.join(target, de.name),
+                    "path": entry_path,
                     "is_dir": is_dir,
                     "size": st.st_size if is_file else None,
                     "modified": st.st_mtime,
@@ -597,7 +736,8 @@ async def _list_directory(request: Request):
 
 
 async def _get_cwd(request: Request):
-    """Return the seed working directory for the file tree.
+    """Return the seed working directory for the file tree: the caller's own
+    working directory.
 
     The live cwd flows in via terminal WebSocket ``status`` messages once a
     terminal is open; this endpoint just provides the initial value before
@@ -606,7 +746,11 @@ async def _get_cwd(request: Request):
     unauth = _require_auth(request)
     if unauth is not None:
         return unauth
-    return JSONResponse({"cwd": get_user_working_directory()})
+    try:
+        cwd = get_user_working_directory(_profile_of(request))
+    except ValueError:
+        return JSONResponse({"error": "No working directory for this caller"}, status_code=400)
+    return JSONResponse({"cwd": cwd})
 
 
 _WATCH_QUEUE_SIZE = 2048
@@ -636,16 +780,27 @@ async def _watch_directory(request: Request):
     )
     if denied is not None:
         return denied
+    profile = _profile_of(request)
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key, _profile_of(request)):
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+    if not _is_inside_allowed(target, context_key, profile):
+        return _access_denied(target, profile)
     if not os.path.isdir(target):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=_WATCH_QUEUE_SIZE)
     is_credential = _credential_matcher()
-    is_protected_doc_tree = _document_trees_matcher(_profile_of(request))
+    is_protected_doc_tree = _document_trees_matcher(profile)
+    is_private = _private_path_matcher(profile)
+    is_foreign = _foreign_matcher(target, profile)
+
+    def _withheld(path: str) -> bool:
+        return (
+            is_credential(path)
+            or is_protected_doc_tree(path)
+            or is_private(path)
+            or is_foreign(path)
+        )
 
     def _enqueue(payload: dict) -> None:
         # The observer is recursive, so a watch on the System Directory (or on
@@ -653,13 +808,15 @@ async def _watch_directory(request: Request):
         # and a change frame naming ``.../coding-cli/codex/auth.json`` hands
         # back exactly what the listing filter is there to withhold. Filtered
         # at the single choke point all four handlers go through, and on both
-        # ends of a move. No ``realpath``: watchdog builds these paths from the
+        # ends of a move. No ``realpath`` (bar a path under the workspaces
+        # root, see ``_foreign_matcher``): watchdog builds these paths from the
         # already-resolved watch root, and this runs once per event. The same
-        # goes for the index store and other profiles' manual pages, whose
-        # file names the listing withholds too.
+        # goes for the index store, other profiles' manual pages and
+        # ``exports``, and other profiles' working directories (a watch on the
+        # System Directory spans ``workspaces/``), whose file names the listing
+        # withholds too.
         if any(
-            is_credential(os.path.normpath(payload[key]))
-            or is_protected_doc_tree(os.path.normpath(payload[key]))
+            _withheld(os.path.normpath(payload[key]))
             for key in ("path", "dest_path")
             if payload.get(key)
         ):
@@ -769,13 +926,28 @@ def _resolve_safe(
     return target
 
 
-def _is_allowed_base(path: str) -> bool:
-    """``True`` iff ``path`` (already realpath'd) is exactly an allowed base.
+def _is_protected_root(path: str, profile: str | None) -> bool:
+    """``True`` iff ``path`` (already realpath'd) is a root no delete or move
+    may take.
 
-    Used to refuse delete/move operations that would clobber a configured
-    root (CREMIND_SYSTEM_DIR or the user working dir).
+    The caller's allowed bases (CREMIND_SYSTEM_DIR, its own working
+    directory), the workspaces root and its ``.deleted`` folder, and any
+    profile's working directory -- the point where one owner's zone begins,
+    i.e. where :func:`working_dirs.owners_of` answers differently than for the
+    parent. The caller can only reach its own (or one the admin pointed it at
+    together with another profile), but deleting or moving that would pull the
+    folder out from under every profile using it.
     """
-    return path in _allowed_bases()
+    norm = os.path.normcase(path)
+    roots = [
+        *_allowed_bases(profile),
+        working_dirs.workspaces_root(),
+        working_dirs.deleted_root(),
+    ]
+    if any(norm == os.path.normcase(os.path.realpath(root)) for root in roots):
+        return True
+    owners = working_dirs.owners_of(path)
+    return owners is not None and owners != working_dirs.owners_of(os.path.dirname(path))
 
 
 def _unique_dest(target_dir: str, basename: str) -> str:
@@ -861,9 +1033,13 @@ async def _upload_files(request: Request):
     if denied is not None:
         return denied
 
-    resolved = _resolve_safe(target_dir, context_key, _profile_of(request))
+    profile = _profile_of(request)
+    resolved = _resolve_safe(target_dir, context_key, profile)
     if resolved is None:
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+        return _access_denied(target_dir, profile)
+    if _is_workspaces_container(resolved):
+        return JSONResponse({"error": "The workspaces folder holds only profiles' own folders"},
+                            status_code=403)
     if not os.path.isdir(resolved):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
 
@@ -957,11 +1133,16 @@ async def _delete_entry(request: Request):
     if denied is not None:
         return denied
 
-    resolved = _resolve_safe(path, context_key, _profile_of(request))
+    profile = _profile_of(request)
+    resolved = _resolve_safe(path, context_key, profile)
     if resolved is None:
-        return JSONResponse({"error": "Access denied"}, status_code=403)
-    if _is_allowed_base(resolved):
-        return JSONResponse({"error": "Refusing to delete an allowed base"}, status_code=400)
+        return _access_denied(path, profile)
+    if _is_protected_root(resolved, profile):
+        return JSONResponse(
+            {"error": "Refusing to delete a root folder (a working directory, the workspaces "
+                      "folder or the system folder)"},
+            status_code=400,
+        )
     if not os.path.exists(resolved):
         return JSONResponse({"error": "Not found"}, status_code=404)
     # Unlike a credential store's parent, this parent holds OTHER profiles'
@@ -969,6 +1150,12 @@ async def _delete_entry(request: Request):
     if _holds_protected_document_tree(resolved):
         return JSONResponse(
             {"error": "Refusing to delete a directory that holds other profiles' documents"},
+            status_code=403,
+        )
+    # ...or their working directories.
+    if _holds_foreign_workspace(resolved, profile):
+        return JSONResponse(
+            {"error": "Refusing to delete a directory that holds other profiles' working directories"},
             status_code=403,
         )
 
@@ -1010,11 +1197,16 @@ async def _move_entry(request: Request):
     _row_id, context_key, denied = await _conversation_scope(request, cid, write=True)
     if denied is not None:
         return denied
-    src_resolved = _resolve_safe(src, context_key, _profile_of(request))
+    profile = _profile_of(request)
+    src_resolved = _resolve_safe(src, context_key, profile)
     if src_resolved is None:
-        return JSONResponse({"error": "Access denied (src)"}, status_code=403)
-    if _is_allowed_base(src_resolved):
-        return JSONResponse({"error": "Refusing to move an allowed base"}, status_code=400)
+        return _access_denied(src, profile, " (src)")
+    if _is_protected_root(src_resolved, profile):
+        return JSONResponse(
+            {"error": "Refusing to move a root folder (a working directory, the workspaces "
+                      "folder or the system folder)"},
+            status_code=400,
+        )
     if not os.path.exists(src_resolved):
         return JSONResponse({"error": "src not found"}, status_code=404)
     # ``_resolve_safe`` refuses a store as the source; the subtree is the other
@@ -1034,15 +1226,25 @@ async def _move_entry(request: Request):
             {"error": "Refusing to move a directory that holds other profiles' documents"},
             status_code=403,
         )
+    # And for other profiles' working directories: carried elsewhere, their
+    # files would no longer sit in a folder the ownership rule knows.
+    if _holds_foreign_workspace(src_resolved, profile):
+        return JSONResponse(
+            {"error": "Refusing to move a directory that holds other profiles' working directories"},
+            status_code=403,
+        )
 
     # Resolve the dest's *parent* against the allowlist (the dest itself
     # doesn't exist yet — realpath would resolve through the missing leaf).
     dest_parent = os.path.dirname(dest)
     if not dest_parent:
         return JSONResponse({"error": "dest must include a parent directory"}, status_code=400)
-    dest_parent_resolved = _resolve_safe(dest_parent, context_key, _profile_of(request))
+    dest_parent_resolved = _resolve_safe(dest_parent, context_key, profile)
     if dest_parent_resolved is None:
-        return JSONResponse({"error": "Access denied (dest)"}, status_code=403)
+        return _access_denied(dest_parent, profile, " (dest)")
+    if _is_workspaces_container(dest_parent_resolved):
+        return JSONResponse({"error": "The workspaces folder holds only profiles' own folders"},
+                            status_code=403)
     if not os.path.isdir(dest_parent_resolved):
         return JSONResponse({"error": "dest parent is not a directory"}, status_code=404)
 
@@ -1094,9 +1296,13 @@ async def _mkdir(request: Request):
     parent = os.path.dirname(path)
     if not parent:
         return JSONResponse({"error": "path must include a parent"}, status_code=400)
-    parent_resolved = _resolve_safe(parent, context_key, _profile_of(request))
+    profile = _profile_of(request)
+    parent_resolved = _resolve_safe(parent, context_key, profile)
     if parent_resolved is None:
-        return JSONResponse({"error": "Access denied"}, status_code=403)
+        return _access_denied(parent, profile)
+    if _is_workspaces_container(parent_resolved):
+        return JSONResponse({"error": "The workspaces folder holds only profiles' own folders"},
+                            status_code=403)
     if not os.path.isdir(parent_resolved):
         return JSONResponse({"error": "Parent is not a directory"}, status_code=404)
 
@@ -1125,7 +1331,7 @@ async def _set_cwd(request: Request):
     JSON body: ``{conversation_id, path}``.
 
     The path must be an existing absolute directory; we deliberately do **not**
-    require it to be inside ``_allowed_bases()`` because the tool's
+    require it to be inside ``_allowed_bases(profile)`` because the tool's
     ``target='custom'`` branch likewise allows arbitrary user-supplied dirs,
     and once the override is set, ``_allowed_bases_for_conversation`` widens
     the allowlist for subsequent reads from the same conversation.
@@ -1170,10 +1376,18 @@ async def _set_cwd(request: Request):
         return JSONResponse({"error": "Access denied"}, status_code=403)
     # ...and for the same reason the document rules: the agent's shell must
     # not be aimed at the index store or another profile's manual pages.
+    profile = _profile_of(request)
     if _is_documents_index_path(new_path) or _is_other_profiles_authored_docs(
-        new_path, _profile_of(request)
+        new_path, profile
     ):
         return JSONResponse({"error": "Access denied"}, status_code=403)
+    # ...nor at another profile's exports or working directory. The file
+    # routes would refuse to serve either however the override pointed, but
+    # the agent's own tools and terminals follow the cwd.
+    if _is_other_profiles_private_path(new_path, profile):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+    if _is_foreign_workspace(new_path, profile):
+        return _access_denied(new_path, profile)
 
     # The agent reads the override back under the conversation's context_id,
     # while the durable column and the SSE channel belong to the row — one and
@@ -1226,15 +1440,31 @@ def get_file_routes() -> list[Route]:
     ``/delete`` and ``/move`` refuse any directory that *contains* them, and
     ``POST /cwd`` restates both.
 
+    And they carry the working-directory rule (``_is_foreign_workspace``):
+    each profile's User Working Directory is its own, admin included, and the
+    only working directory among a caller's allowed bases is its own. Checked
+    before the bases, so a conversation override never widens it -- an admin
+    reading a group-room seat's tree is refused the member's folder. ``/list``
+    and ``/watch`` hide other profiles' folders (``_foreign_matcher``),
+    ``/delete`` and ``/move`` refuse any working-directory root, the
+    workspaces root and ``.deleted`` (``_is_protected_root``) and any
+    directory containing another profile's folder
+    (``_holds_foreign_workspace``), ``/upload``, ``/mkdir`` and ``/move`` never
+    create an entry directly in the workspaces root
+    (``_is_workspaces_container``), and ``POST /cwd`` restates the rule. A
+    refusal under it is a 403 whose ``code`` is ``foreign_working_directory``
+    (``_access_denied``), which the file panel shows as such.
+
     ``GET  /list``
         ``_is_inside_allowed`` on the directory, plus the per-entry filter that
         drops a store from the listing (name, and location for shared homes).
     ``GET  /cwd``
-        No caller-supplied path: returns the configured working directory.
+        No caller-supplied path: returns the caller's own working directory.
     ``POST /cwd``
         ``_is_credential_path`` **directly**. This route takes paths outside
         the allowlist on purpose, so it is the one place the rule is restated
-        rather than inherited.
+        rather than inherited -- along with the document, private-directory
+        and working-directory rules.
     ``GET  /watch``
         ``_is_inside_allowed`` on the directory, plus the per-event filter in
         ``_enqueue`` -- the observer is recursive, so the gate on the root is

@@ -11,8 +11,16 @@ this with the server stopped):
 - :func:`restore_backup` — stage+apply in one call (offline / setup-mode path)
 
 Archive layout (tar+gzip, optionally wrapped in the encryption envelope):
-``manifest.json`` (first), ``db/dump.jsonl.gz``, ``files/**``, ``inventory.json``
-(last). See :mod:`app.backup.manifest`.
+``manifest.json`` (first), ``db/dump.jsonl.gz``, ``files/**``, ``workspaces/**``
+(the profiles' working directories, unless ``include_workspaces=False``),
+``inventory.json`` (last). See :mod:`app.backup.manifest`.
+
+``files/**`` restores into the target's system dir and ``workspaces/**`` into
+the target's workspaces root (:func:`_target_workspaces_root`) — the same
+folder only when neither side sets ``CREMIND_WORKSPACES_DIR``. Both merge:
+a restore overwrites files the archive carries and deletes nothing, so an
+archive without the working directories leaves the ones on disk as they are.
+Folders an admin chose outside the workspaces root are never archived.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -39,6 +48,7 @@ from app.backup.manifest import (
     FILES_PREFIX,
     INVENTORY_MEMBER,
     MANIFEST_MEMBER,
+    WORKSPACES_PREFIX,
     BackupError,
     BackupPassphraseError,
     Manifest,
@@ -47,7 +57,7 @@ from app.backup.manifest import (
     now_iso,
 )
 from app.backup.paths import RelocationReport, build_path_map, transform_row
-from app.backup.rules import iter_backup_files, long_path
+from app.backup.rules import iter_backup_files, iter_workspace_files, long_path
 from app.utils import logger
 
 ProgressFn = Callable[[str, int, int], None]
@@ -58,6 +68,9 @@ class BackupOptions:
     dest: Path | None = None
     passphrase: str | None = None
     include_browser_profiles: bool = True
+    # Every profile's default-location working directory (the workspaces
+    # root, deleted profiles' kept folders included). ``--no-workspaces``.
+    include_workspaces: bool = True
 
 
 @dataclass
@@ -67,6 +80,8 @@ class BackupResult:
     bytes_written: int
     file_count: int = 0
     skipped: list[str] = field(default_factory=list)
+    # Of ``file_count``, how many came from the workspaces root.
+    workspaces_file_count: int = 0
 
 
 @dataclass
@@ -159,19 +174,94 @@ def _query_profile_rows(engine: Any = None) -> list[tuple[str, str]]:
         return []
 
 
-def _source_paths() -> SourcePaths:
-    from app.config.settings import get_user_working_directory
+def _workspaces_root() -> str:
+    from app.config.working_dirs import workspaces_root
+
+    return workspaces_root()
+
+
+def _target_workspaces_root(target_system_dir: str) -> str:
+    """Where a restore puts the archived working directories: the configured
+    ``CREMIND_WORKSPACES_DIR``, else ``<target system dir>/workspaces`` —
+    what :func:`app.config.working_dirs.workspaces_root` answers once the
+    target runs, spelled against ``target_system_dir`` so a restore into a
+    directory other than the live one stays self-consistent."""
+    from app.config.working_dirs import WORKSPACES_DIRNAME, WORKSPACES_ENV
+
+    if (os.environ.get(WORKSPACES_ENV) or "").strip():
+        return _workspaces_root()
+    return os.path.normpath(os.path.join(target_system_dir, WORKSPACES_DIRNAME))
+
+
+def _stored_working_dirs(engine: Any = None) -> dict[str, str]:
+    """``{profile: folder an admin chose}``, read from the DB so the offline
+    CLI sees it too; a profile on its default folder is absent. Empty when
+    the column does not exist yet (a DB not at head) or there is no table."""
+    from sqlalchemy import text
 
     try:
-        uwd = get_user_working_directory()
+        if engine is None:
+            from app.databases import get_database_provider
+
+            engine = get_database_provider().sync_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT name, working_dir FROM profiles WHERE working_dir IS NOT NULL")
+            ).all()
+    except Exception:  # noqa: BLE001 — no column yet, no table
+        return {}
+    return {str(n): str(v).strip() for n, v in rows if n and isinstance(v, str) and v.strip()}
+
+
+def _working_dirs_record(
+    profiles: list[str], workspaces_root: str, included: bool
+) -> dict[str, dict[str, Any]]:
+    """Each profile's working directory for the manifest (see
+    :attr:`Manifest.working_dirs`). Nothing is created."""
+    from app.config.working_dirs import default_working_dir, is_inside, real_path
+
+    stored = _stored_working_dirs()
+    root = real_path(workspaces_root) if workspaces_root else ""
+    record: dict[str, dict[str, Any]] = {}
+    for name in profiles:
+        chosen = stored.get(name)
+        try:
+            path = (
+                os.path.normpath(os.path.abspath(os.path.expanduser(chosen)))
+                if chosen else default_working_dir(name)
+            )
+        except ValueError:  # a pseudo profile: no working directory
+            continue
+        inside = bool(root) and is_inside(real_path(path), root)
+        record[name] = {
+            "path": path,
+            "default": not chosen,
+            "in_workspaces": inside,
+            "archived": inside and included,
+        }
+    return record
+
+
+def _source_paths() -> SourcePaths:
+    """``user_working_dir`` starts as the admin's default folder; the caller
+    replaces it with the admin's actual folder once the profiles are read."""
+    from app.config.working_dirs import default_working_dir
+
+    try:
+        ws = _workspaces_root()
     except Exception:  # noqa: BLE001
-        uwd = ""
+        ws = ""
+    try:
+        admin_default = default_working_dir("admin")
+    except Exception:  # noqa: BLE001
+        admin_default = ""
     return SourcePaths(
         system_dir=_system_dir(),
         home_dir=os.path.expanduser("~"),
-        user_working_dir=uwd,
+        user_working_dir=admin_default,
         sep=os.sep,
         case_insensitive=(sys.platform == "win32"),
+        workspaces_root=ws,
     )
 
 
@@ -203,6 +293,12 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
     profile_rows = _query_profile_rows()
     profiles = [name for name, _uid in profile_rows]
     profile_uids = [uid for _name, uid in profile_rows]
+    source_paths = _source_paths()
+    include_workspaces = bool(options.include_workspaces and source_paths.workspaces_root)
+    working_dirs = _working_dirs_record(profiles, source_paths.workspaces_root, include_workspaces)
+    if "admin" in working_dirs:
+        # Informational (see SourcePaths): where the admin's files are.
+        source_paths.user_working_dir = working_dirs["admin"]["path"]
 
     dest = Path(options.dest) if options.dest else _default_dest()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -225,10 +321,12 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
             db_provider=provider.name,
             platform=sys.platform,
             hostname=socket.gethostname(),
-            source_paths=_source_paths(),
+            source_paths=source_paths,
             profiles=profiles,
             db_row_counts=stats.row_counts,
             browser_profiles_included=options.include_browser_profiles,
+            workspaces_included=include_workspaces,
+            working_dirs=working_dirs,
             encrypted=bool(options.passphrase),
             created_at=now_iso(),
         )
@@ -237,7 +335,26 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
         dest_part = dest.with_suffix(dest.suffix + ".part")
         skipped: list[str] = []
         inventory_files: dict[str, dict[str, Any]] = {}
+        inventory_workspaces: dict[str, dict[str, Any]] = {}
         file_count = 0
+
+        def _add_file(abs_path: str, member: str, rel: str, inventory: dict[str, dict[str, Any]]) -> bool:
+            try:
+                tinfo = tf.gettarinfo(name=long_path(abs_path), arcname=member)
+            except OSError as e:
+                skipped.append(f"{member}: {e}")
+                return False
+            if tinfo is None or not tinfo.isreg():
+                return False
+            hasher = hashlib.sha256()
+            try:
+                with open(long_path(abs_path), "rb") as fh:
+                    tf.addfile(tinfo, _HashingReader(fh, hasher))
+            except OSError as e:
+                skipped.append(f"{member}: {e}")
+                return False
+            inventory[rel] = {"sha256": hasher.hexdigest(), "size": tinfo.size}
+            return True
 
         raw = None
         enc = None
@@ -269,28 +386,27 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
                     include_browser_profiles=options.include_browser_profiles,
                     profile_uids=profile_uids,
                 ):
-                    member = FILES_PREFIX + arc
-                    try:
-                        tinfo = tf.gettarinfo(name=long_path(abs_path), arcname=member)
-                    except OSError as e:
-                        skipped.append(f"{arc}: {e}")
-                        continue
-                    if tinfo is None or not tinfo.isreg():
-                        continue
-                    hasher = hashlib.sha256()
-                    try:
-                        with open(long_path(abs_path), "rb") as fh:
-                            tf.addfile(tinfo, _HashingReader(fh, hasher))
-                    except OSError as e:
-                        skipped.append(f"{arc}: {e}")
-                        continue
-                    inventory_files[arc] = {"sha256": hasher.hexdigest(), "size": tinfo.size}
-                    file_count += 1
+                    if _add_file(abs_path, FILES_PREFIX + arc, arc, inventory_files):
+                        file_count += 1
+
+                # workspaces/** — every profile's default working directory.
+                # The system dir is pruned in case the root contains it, and
+                # the archive's own spool/part files in case it was pointed
+                # into the root.
+                if manifest.workspaces_included:
+                    for abs_path, rel in iter_workspace_files(
+                        source_paths.workspaces_root,
+                        exclude_dirs=(system_dir,),
+                        exclude_files=(str(dest_part), str(spool)),
+                    ):
+                        if _add_file(abs_path, WORKSPACES_PREFIX + rel, rel, inventory_workspaces):
+                            file_count += 1
 
                 # inventory.json — last member.
                 inventory = {
                     "db": {"sha256": db_sha.hexdigest(), "size": db_size},
                     "files": inventory_files,
+                    "workspaces": inventory_workspaces,
                 }
                 _add_bytes(tf, INVENTORY_MEMBER, json.dumps(inventory).encode("utf-8"))
 
@@ -312,16 +428,20 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
         except OSError:
             pass
 
-    manifest.files_approx_bytes = sum(f["size"] for f in inventory_files.values())
+    manifest.files_approx_bytes = sum(
+        f["size"] for f in (*inventory_files.values(), *inventory_workspaces.values())
+    )
     bytes_written = dest.stat().st_size if dest.exists() else 0
     _p("done")
     logger.info(
         f"[backup] created {dest.name} files={file_count} bytes={bytes_written} "
-        f"encrypted={bool(options.passphrase)} skipped={len(skipped)}"
+        f"encrypted={bool(options.passphrase)} skipped={len(skipped)} "
+        f"workspaces={'%d file(s)' % len(inventory_workspaces) if manifest.workspaces_included else 'excluded'}"
     )
     return BackupResult(
         path=dest, manifest=manifest, bytes_written=bytes_written,
         file_count=file_count, skipped=skipped,
+        workspaces_file_count=len(inventory_workspaces),
     )
 
 
@@ -380,10 +500,17 @@ def _open_read_tar(archive: Path, passphrase: str | None):
 
 
 def _safe_members(tf: tarfile.TarFile):
+    """Members that stay inside the staging dir. A backup only ever holds
+    regular files (and the directories tar implies), so links and devices are
+    refused too: a crafted ``workspaces/x -> /etc`` link would otherwise let
+    a later member, or the copy into the target, write outside it."""
     for member in tf:
         name = member.name.replace("\\", "/")
-        if name.startswith("/") or ".." in name.split("/"):
+        if name.startswith("/") or ".." in name.split("/") or re.match(r"^[A-Za-z]:", name):
             logger.warning(f"[backup:restore] refusing unsafe archive member {member.name!r}")
+            continue
+        if not (member.isfile() or member.isdir()):
+            logger.warning(f"[backup:restore] refusing non-file archive member {member.name!r}")
             continue
         yield member
 
@@ -432,14 +559,16 @@ def _verify_inventory(staged_dir: Path) -> list[str]:
             raise BackupError("Database dump failed integrity check (sha256 mismatch).")
 
     # File integrity is best-effort — warn and continue.
-    for arc, meta in (inv.get("files") or {}).items():
-        fp = staged_dir / FILES_PREFIX / arc
-        if not fp.is_file():
-            warnings.append(f"missing file: {arc}")
-            continue
-        exp = meta.get("sha256")
-        if exp and _sha256_file(fp) != exp:
-            warnings.append(f"checksum mismatch: {arc}")
+    for section, prefix in (("files", FILES_PREFIX), ("workspaces", WORKSPACES_PREFIX)):
+        for arc, meta in (inv.get(section) or {}).items():
+            fp = staged_dir / prefix / arc
+            label = arc if section == "files" else f"{WORKSPACES_PREFIX}{arc}"
+            if not fp.is_file():
+                warnings.append(f"missing file: {label}")
+                continue
+            exp = meta.get("sha256")
+            if exp and _sha256_file(fp) != exp:
+                warnings.append(f"checksum mismatch: {label}")
     return warnings
 
 
@@ -526,7 +655,10 @@ def apply_staged_restore(
     provider = get_database_provider()
     engine = provider.sync_engine()
     target_home = os.path.expanduser("~")
-    pm = build_path_map(manifest, target_system_dir, target_home)
+    target_workspaces = _target_workspaces_root(target_system_dir)
+    pm = build_path_map(
+        manifest, target_system_dir, target_home, target_workspaces_root=target_workspaces,
+    )
 
     # The JWT signing secret is local to this installation, not part of the
     # backup: capture it before the DB is wiped (generate one if this is a
@@ -577,12 +709,17 @@ def apply_staged_restore(
 
     # Replace file trees (merge-overwrite into the target system dir).
     file_count = _restore_file_trees(staged_dir, target_system_dir)
+    # The profiles' working directories, into THIS install's workspaces root
+    # (merge-overwrite too: nothing already there is deleted).
+    workspace_count = _restore_workspaces(staged_dir, target_workspaces)
+    file_count += workspace_count
 
     warnings: list[str] = [
         "JWT signing secret and session tokens were kept local to this "
         "installation (not restored from the backup); token files were "
         "re-issued for each restored profile."
     ]
+    warnings.extend(_workspace_notes(manifest, target_workspaces, workspace_count))
 
     # An archive from before the Cremind manual moved puts each profile's
     # pages back at ``<profile>/documents``: move them to the uuid-keyed
@@ -603,12 +740,22 @@ def apply_staged_restore(
     except Exception as e:  # noqa: BLE001 — the boot relocation is the backstop
         logger.warning(f"[backup:restore] post-restore document relocation failed: {e}")
         warnings.append(f"Document folders were not relocated after the restore ({e}); the next start retries.")
-    if report.unmapped:
+    reset = [u for u in report.unmapped if u.get("reset_to_default")]
+    unmapped = [u for u in report.unmapped if not u.get("reset_to_default")]
+    if reset:
+        chosen = ", ".join(f"'{u.get('profile') or '?'}' ({u.get('value')})" for u in reset)
         warnings.append(
-            f"{len(report.unmapped)} stored path(s) point outside the backed-up "
+            f"The working directory an admin chose for {chosen} belongs to another "
+            f"operating system and could not be mapped here; those profiles now use "
+            f"their default folder in {target_workspaces}. An admin can choose another."
+        )
+    if unmapped:
+        warnings.append(
+            f"{len(unmapped)} stored path(s) point outside the backed-up "
             f"home/system directories and were left unchanged; processes that use "
             f"them may fail until fixed."
         )
+    warnings.extend(_chosen_dir_notes(report, target_workspaces))
     if closed_out > 0:
         warnings.append(
             f"{closed_out} automation result(s) that had not yet reached their "
@@ -725,6 +872,77 @@ def _restore_file_trees(staged_dir: Path, target_system_dir: str) -> int:
             except OSError as e:
                 logger.warning(f"[backup:restore] could not restore file {rel}: {e}")
     return count
+
+
+def _restore_workspaces(staged_dir: Path, target_root: str) -> int:
+    """Copy ``workspaces/**`` into ``target_root``, overwriting files the
+    archive carries and deleting nothing — an archive made without the
+    working directories has no such member and leaves them untouched."""
+    src_root = Path(staged_dir) / WORKSPACES_PREFIX.rstrip("/")
+    if not src_root.is_dir() or not target_root:
+        return 0
+    target = Path(target_root)
+    count = 0
+    for dirpath, _dirs, filenames in os.walk(str(src_root)):
+        for fn in filenames:
+            src = os.path.join(dirpath, fn)
+            rel = os.path.relpath(src, str(src_root))
+            dst = target / rel
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(long_path(src), long_path(str(dst)))
+                count += 1
+            except OSError as e:
+                logger.warning(f"[backup:restore] could not restore working-directory file {rel}: {e}")
+    return count
+
+
+def _workspace_notes(manifest: Manifest, target_root: str, restored: int) -> list[str]:
+    """What the restore did with the profiles' working directories, for the
+    report: nothing (not in the archive), or where they went when that is not
+    where the backup found them."""
+    if not manifest.workspaces_included:
+        return [
+            "This backup does not include the profiles' working directories; "
+            f"the ones in {target_root} were left as they are."
+        ]
+    source = manifest.source_paths.workspaces_root
+    if restored and source and os.path.normcase(os.path.normpath(source)) != os.path.normcase(
+        os.path.normpath(target_root)
+    ):
+        return [
+            f"The profiles' working directories ({restored} file(s)) were restored into "
+            f"{target_root}; on the machine the backup came from they were in {source}."
+        ]
+    return []
+
+
+def _chosen_dir_notes(report: RelocationReport, target_root: str) -> list[str]:
+    """Folders an admin chose for a profile outside the workspaces root are
+    never archived. After a restore onto another machine the (relocated)
+    folder is usually not there: say which profiles that affects, rather
+    than let their file panel open on an empty folder unexplained."""
+    from app.config.working_dirs import is_inside, real_path
+
+    root = real_path(target_root) if target_root else ""
+    missing: list[str] = []
+    for entry in (*report.relocated, *report.unmapped):
+        if "profile" not in entry or entry.get("reset_to_default"):
+            continue
+        path = entry.get("new") or entry.get("value")
+        if not isinstance(path, str) or not path:
+            continue
+        if root and is_inside(real_path(path), root):
+            continue  # in the workspaces root: restored with it (or not included at all)
+        if not os.path.isdir(path):
+            missing.append(f"'{entry['profile']}' ({path})")
+    if not missing:
+        return []
+    return [
+        f"The working directory an admin chose for {', '.join(missing)} does not exist on "
+        f"this machine: a backup never carries a folder chosen outside the workspaces "
+        f"folder. Copy those files there, or have an admin choose another folder."
+    ]
 
 
 def restore_backup(

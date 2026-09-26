@@ -334,7 +334,7 @@ def test_consent_names_the_current_model_and_never_rides_a_settings_save(env, vi
     patch = _build_patch("alice", "local", {"options": {
         "caption_consent": {"provider": "openai", "model": "gpt-4o", "at": 1},
         "caption": {"daily_cap": 5},
-    }}, cur, False)
+    }}, cur)
     assert patch["options"]["caption"]["daily_cap"] == 5
     assert patch["options"].get("caption_consent") is None
 

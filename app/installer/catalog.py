@@ -87,17 +87,18 @@ class DockerDocuments:
 
     prompt: str = "Which folder on this computer should Cremind use as its Documents folder?"
     hint: str = (
-        "It is mounted into the container at /root/Documents, the agent's "
-        "default working folder and the folder Documentation search indexes. "
-        "It is created if it does not exist."
+        "It is mounted into the container at /root/Documents. Each profile "
+        "works in its own folder inside it, cremind-workspaces/<profile>: the "
+        "agent's default working folder and the folder Documentation search "
+        "indexes. It is created if it does not exist."
     )
     access_prompt: str = "Should Cremind be able to change files in that folder?"
     rw_label: str = "Read-write"
     ro_label: str = "Read-only"
     rw_disclosure: str = "The agent's file tools write to your real folder."
     ro_disclosure: str = (
-        "The agent cannot save files there, and its default working folder "
-        "is read-only."
+        "The agent cannot save files there; the profiles' own working folders "
+        "live in Cremind's data volume instead."
     )
     linux_owner_note: str = (
         "On Linux, files the agent creates in the folder are owned by root."

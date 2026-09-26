@@ -49,7 +49,7 @@ def test_the_documents_working_directory_is_the_profiles_own_uuid_directory(sysd
             published.append(a)
 
     monkeypatch.setattr(cwd_tool, "get_event_stream_bus", lambda: _Bus())
-    monkeypatch.setattr(cwd_tool, "get_user_working_directory", lambda: str(sysdir))
+    monkeypatch.setattr(cwd_tool, "get_user_working_directory", lambda *a, **k: str(sysdir))
     import app.events.runner as runner
 
     monkeypatch.setattr(runner, "get_conversation_storage", lambda: SimpleNamespace())

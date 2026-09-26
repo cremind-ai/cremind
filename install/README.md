@@ -94,7 +94,20 @@ shows no radio (it's local-only).
 
 ### The Documents folder
 
-The container sees one folder of yours as `/root/Documents`: Documentation search indexes it, and the agent reads and saves files there by default.
+The container sees one folder of yours as `/root/Documents`. Every profile has
+its own working directory inside it, `cremind-workspaces/<profile>`
+(`/root/Documents/cremind-workspaces/<profile>` in the container,
+`<your folder>/cremind-workspaces/<profile>` on this machine): where that
+profile's agent reads and saves files by default, and what its Documentation
+search indexes. The compose file sets
+`CREMIND_WORKSPACES_DIR=/root/Documents/cremind-workspaces` to put them there.
+Every entry in `cremind-workspaces/` is taken to be a profile's folder (one
+that belongs to no profile is off-limits to all of them) and
+`--purge-workspaces` deletes it, so keep your own files elsewhere; a
+`workspaces/` folder of yours is just one of your folders.
+An install made before profiles had their own folders keeps
+the admin on `/root/Documents` itself; the admin can point any profile at
+another folder with `cremind profile working-dir <profile> <path>`.
 Without a bind mount that folder would live on the container's own layer and
 disappear whenever the container is recreated (an image upgrade, a
 `docker compose down && up`), so the installer asks for a real one:
@@ -105,8 +118,12 @@ disappear whenever the container is recreated (an image upgrade, a
   A leading `~` is expanded and a relative path is made absolute; `install.ps1`
   writes it with forward slashes (`C:/Users/you/Documents`).
 - **Read-write or read-only.** Read-write (default) means the agent's file
-  tools change your real files. Read-only means the agent cannot save there,
-  and its default working folder is read-only.
+  tools change your real files. Read-only means the agent cannot save there —
+  and since the profiles' own folders cannot live in a read-only folder, the
+  installer then also writes `CREMIND_DOCKER_WORKSPACES_DIR=/root/.cremind/workspaces`,
+  which keeps them in the `cremind-data` volume (writable, not visible on this
+  machine). To have a profile work in (and search) the read-only folder,
+  point it there: `cremind profile working-dir admin /root/Documents`.
 
 Precedence for each: `--documents-dir` / `--documents-access` (PowerShell:
 `-DocumentsDir` / `-DocumentsAccess`) → `$CREMIND_DOCUMENTS_DIR` /
@@ -135,9 +152,17 @@ Platform notes the installer prints:
   created inside that container); Docker creates it on the Docker host.
 
 To move it later, edit `CREMIND_HOST_DOCUMENTS` in `docker/.env` and run
-`docker compose up -d`, or re-run the installer with `--documents-dir`.
-Native installs use your real `~/Documents` directly; Kubernetes mounts the
-chart's `persistence.work` volume there instead.
+`docker compose up -d`, or re-run the installer with `--documents-dir`. Files
+already in the old folder (its `cremind-workspaces/` included) stay where they are;
+copy them across yourself. A bundle written by an older installer has no
+`CREMIND_WORKSPACES_DIR` line, so its profiles' folders land in the
+`cremind-data` volume until you re-run the installer.
+
+Native installs keep every profile's folder in `~/.cremind/workspaces/<profile>`
+(or `$CREMIND_WORKSPACES_DIR/<profile>`); an upgraded install's admin keeps
+the folder it had (by default your real `~/Documents`). Kubernetes mounts the
+chart's `persistence.work` volume at `/root/Documents` and keeps the profiles'
+folders in its `cremind-workspaces/`.
 
 The bundle defines four services. Only `cremind` is started at install
 time; the others are activated by the wizard:
@@ -315,7 +340,10 @@ ChromaDB volumes and — only if the installer created it — the namespace.
 
 The chart's own PVCs (`system`, `venv`, `work`) are removed by
 `helm uninstall` itself, in both modes; only the StatefulSet subcharts' data
-volumes survive it.
+volumes survive it. `work` holds every profile's working directory, so take a
+backup first (`cremind backup create` includes them), or annotate the claim
+`helm.sh/resource-policy: keep` (see the chart README's *Uninstalling and
+removing data*).
 
 ### The production channel needs the desktop image
 
@@ -375,13 +403,15 @@ container-friendly defaults) for one release; new scripts should use
 | `--no-port-forward`                  | (kubernetes) Don't start the background port-forward; just print the command. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
 | `--vnc-password PW`                  | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
-| `--documents-dir PATH`               | (docker) The folder mounted at `/root/Documents`, created if missing. Falls back to `$CREMIND_DOCUMENTS_DIR`, the previous install's folder, then `~/Documents`. `$`, `#`, `"` and leading/trailing whitespace are refused. See [The Documents folder](#the-documents-folder). |
-| `--documents-access rw\|ro`          | (docker) Mount it read-write (default) or read-only. Falls back to `$CREMIND_DOCUMENTS_ACCESS`, then the previous install's choice. |
+| `--documents-dir PATH`               | (docker) The folder mounted at `/root/Documents`, created if missing; each profile's working directory is its `cremind-workspaces/<profile>` subfolder. Falls back to `$CREMIND_DOCUMENTS_DIR`, the previous install's folder, then `~/Documents`. `$`, `#`, `"` and leading/trailing whitespace are refused. See [The Documents folder](#the-documents-folder). |
+| `--documents-access rw\|ro`          | (docker) Mount it read-write (default) or read-only (the profiles' working directories then live in the `cremind-data` volume). Falls back to `$CREMIND_DOCUMENTS_ACCESS`, then the previous install's choice. |
 | `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
 | `--boot-service` / `--no-boot-service` | (native) Register a login/boot service that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker (the daemon supervises the container) and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `--no-launch`                        | Don't open the wizard at the end. |
 | `--unattended`                       | Use defaults; never prompt. Implies `--mode docker` if Docker is present. |
 | `--reinstall`                        | Wipe the existing venv (native) or regenerate compose+.env (docker). |
+| `--uninstall [--keep\|--purge]`      | Uninstall. `--keep` removes the binaries and install scratch and keeps your data; `--purge` deletes everything Cremind installed **except the profiles' working directories** (see [Uninstalling](#uninstalling)). Neither: asks. |
+| `--purge-workspaces`                 | (with `--uninstall`; implies `--purge`) Delete the profiles' working directories too. Asks you to type `delete` on a terminal; without one the flag is the confirmation. |
 
 ## Flags (ps1)
 
@@ -407,13 +437,15 @@ container-friendly defaults) for one release; new scripts should use
 | `-NoPortForward`                    | (kubernetes) Don't start the background port-forward; just print the command. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
 | `-VncPassword PW`                   | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
-| `-DocumentsDir PATH`                | (docker) The folder mounted at `/root/Documents`, created if missing and written with forward slashes. Falls back to `$env:CREMIND_DOCUMENTS_DIR`, the previous install's folder, then your Documents folder (OneDrive-aware). `$`, `#`, `"` and leading/trailing whitespace are refused. |
-| `-DocumentsAccess rw\|ro`           | (docker) Mount it read-write (default) or read-only. Falls back to `$env:CREMIND_DOCUMENTS_ACCESS`, then the previous install's choice. |
+| `-DocumentsDir PATH`                | (docker) The folder mounted at `/root/Documents`, created if missing and written with forward slashes; each profile's working directory is its `cremind-workspaces\<profile>` subfolder. Falls back to `$env:CREMIND_DOCUMENTS_DIR`, the previous install's folder, then your Documents folder (OneDrive-aware). `$`, `#`, `"` and leading/trailing whitespace are refused. |
+| `-DocumentsAccess rw\|ro`           | (docker) Mount it read-write (default) or read-only (the profiles' working directories then live in the `cremind-data` volume). Falls back to `$env:CREMIND_DOCUMENTS_ACCESS`, then the previous install's choice. |
 | `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
 | `-BootService` / `-NoBootService`   | (native) Register a logon Scheduled Task that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |
 | `-Unattended`                       | Use defaults; never prompt. |
 | `-Reinstall`                        | Wipe the existing venv or regenerate compose+.env. |
+| `-Uninstall [-Keep\|-Purge]`        | Uninstall. `-Keep` keeps your data; `-Purge` deletes everything Cremind installed **except the profiles' working directories** (see [Uninstalling](#uninstalling)). Neither: asks. |
+| `-PurgeWorkspaces`                  | (with `-Uninstall`; implies `-Purge`) Delete the profiles' working directories too. Asks you to type `delete` in an interactive console; without one the switch is the confirmation. |
 
 ## Shared catalog
 
@@ -447,7 +479,7 @@ the wizard, not by the installer, so they survive re-runs as well.
 |---|---|
 | `~/.cremind/docker/docker-compose.yml` | Compose orchestration for cremind, postgres, qdrant. |
 | `~/.cremind/docker/.env`               | Secrets and config that Compose substitutes (chmod 600), including the Documents folder. |
-| Your Documents folder                 | Bind-mounted at `/root/Documents`; created if missing. Uninstalling never deletes it (only the `docker/documents` fallback, used when no folder could be recorded, lives inside the bundle and goes with it). |
+| Your Documents folder                 | Bind-mounted at `/root/Documents`; created if missing. Holds every profile's working directory in `cremind-workspaces/`. Uninstalling never deletes it — only `--purge-workspaces` deletes its `cremind-workspaces/` subfolder. The `docker/documents` fallback, used when no folder could be recorded, lives inside the bundle and goes with it, all but its `cremind-workspaces/`. |
 | `~/.cremind/install.log`               | Output of `compose pull` / `compose up`. |
 | Docker named volumes                  | `cremind-data`, `pg-data`, `qdrant-data`. Persisted across restarts. |
 
@@ -548,6 +580,41 @@ kill $(cat ~/.cremind/install.pid)
 ```powershell
 Stop-Process -Id (Get-Content ~/.cremind/install.pid)
 ```
+
+## Uninstalling
+
+```bash
+bash install.sh --uninstall --keep               # binaries go, data stays
+bash install.sh --uninstall --purge              # everything but the working directories
+bash install.sh --uninstall --purge-workspaces   # everything
+```
+
+```powershell
+.\install.ps1 -Uninstall -Keep
+.\install.ps1 -Uninstall -Purge
+.\install.ps1 -Uninstall -PurgeWorkspaces
+```
+
+A purge deletes the System Dir and the Install Dir (and, for Docker, the named
+volumes) but **keeps the profiles' working directories** — they are your
+files, not Cremind's — and prints where they are:
+
+- native: `~/.cremind/workspaces` (or `$CREMIND_WORKSPACES_DIR`); everything
+  else in `~/.cremind` goes around it;
+- Docker: `<your Documents folder>/cremind-workspaces` is never touched (the rest of
+  that folder never is either); with a read-only Documents folder they lived in
+  the `cremind-data` volume, and are copied out to `~/cremind-workspaces-<time>`
+  before the volume is removed;
+- the deleted profiles' folders in the workspaces folder's `.deleted/` are
+  kept with them.
+
+`--purge-workspaces` / `-PurgeWorkspaces` deletes them too; on a terminal it
+asks you to type `delete` first, and the interactive k/p/c prompt asks after a
+purge whether to delete them. Folders an admin chose for a profile outside the
+workspaces folder (the admin's `~/Documents` on an upgraded install, say) are
+never touched by any uninstall; a purge names them. A Kubernetes release is
+different: `helm uninstall` removes the `work` claim that holds every profile's
+folder, whatever the flag — see the chart README.
 
 ## Building the SPA into the wheel
 

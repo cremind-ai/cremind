@@ -3,7 +3,8 @@
 A ``.cremind-backup`` archive captures the entire Cremind system in an
 environment-independent form: a portable logical database dump plus the file
 trees under ``CREMIND_SYSTEM_DIR`` (skills, OAuth token files, personas,
-per-profile documents, JWT tokens, channel sessions, browser login state).
+per-profile documents, JWT tokens, channel sessions, browser login state) and,
+unless opted out, the profiles' working directories (the workspaces root).
 It restores across environments — Windows-native→Docker/K8s, SQLite→PostgreSQL,
 a new home directory — by relocating stored absolute paths to the target's
 equivalents. Optional passphrase encryption protects the secrets a backup

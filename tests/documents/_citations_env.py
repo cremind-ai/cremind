@@ -28,6 +28,7 @@ from app.documents.cite import IssuedCitation, locator_label, make_token
 from app.documents.index import IndexDB, index_path
 from app.documents.textnorm import text_hash
 from app.documents.types import Chunk, ChunkDiff
+from tests.documents._workspaces import install as install_working_dirs
 
 TABLES = (
     "profiles", "channels", "conversations", "messages",
@@ -84,6 +85,9 @@ def build(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     (root / "Luat" / "luat-dat-dai.pdf").write_bytes(b"%PDF-1.4 fake")
     (root / "Notes" / "q3.md").write_text(NOTE, encoding="utf-8")
     monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
+    # alice's working directory is the folder her index covers; bob keeps
+    # his default one.
+    working_dirs = install_working_dirs(monkeypatch, sysdir, {"alice": root, "bob": None})
 
     provider = SqliteDatabaseProvider(str(tmp_path / "main.db"))
     eng = provider.sync_engine()
@@ -112,7 +116,7 @@ def build(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(uds_module, "_instance", storage)
     cit = DocumentCitationsStorage(provider)
     monkeypatch.setattr(cit_module, "_instance", cit)
-    storage.upsert_source("alice", "local", enabled=True, root_mode="custom", root_path=str(root))
+    storage.upsert_source("alice", "local", enabled=True, root_path=str(root))
 
     db = IndexDB.open(index_path("uid-alice"), profile_uid="uid-alice")
     law = db.insert_file(
@@ -151,7 +155,7 @@ def build(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     return SimpleNamespace(
         provider=provider, storage=storage, cit=cit, db=db, svc=svc, root=root, sysdir=sysdir,
         law=law, law_chunks=law_chunks, note=note, note_chunks=note_chunks, folder=folder,
-        token=token, issued=issued,
+        token=token, issued=issued, working_dirs=working_dirs,
     )
 
 

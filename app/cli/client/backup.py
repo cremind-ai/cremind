@@ -13,10 +13,16 @@ from typing import Any
 from app.cli.client._base import Client
 
 
-async def create(client: Client, passphrase: str | None = None) -> Any:
+async def create(
+    client: Client, passphrase: str | None = None, *, include_workspaces: bool = True,
+) -> Any:
     body: dict[str, Any] = {}
     if passphrase:
         body["passphrase"] = passphrase
+    if not include_workspaces:
+        # Only the opt-out is sent: the server includes the profiles' working
+        # directories unless told otherwise.
+        body["include_workspaces"] = False
     return await client.post_json("/api/backup/create", body or None)
 
 

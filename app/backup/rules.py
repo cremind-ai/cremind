@@ -25,6 +25,12 @@ An archive made before the manual moved carries a profile's pages at
 ``<profile>/documents``; the restore copies them back there and the relocation
 that follows (app/documents/relocate.py) moves them to the uuid directory.
 
+The profiles' working directories are walked separately
+(:func:`iter_workspace_files`): the workspaces root holds user files, not
+Cremind state, so only the dependency/virtualenv directory prunes apply there —
+never the suffix prunes, which would silently drop a ``poetry.lock`` or a
+``notes.tmp`` the user wrote.
+
 Pure functions only — no ``app.*`` imports — so this is trivially unit-testable
 and safe to import from the offline CLI.
 """
@@ -252,11 +258,66 @@ def iter_backup_files(
                 yield full, child_rel
 
 
+def _norm_abs(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path)).rstrip("\\/")
+
+
+def iter_workspace_files(
+    workspaces_root: str,
+    *,
+    exclude_dirs: list[str] | tuple[str, ...] = (),
+    exclude_files: list[str] | tuple[str, ...] = (),
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(absolute_source_path, relative_posix_name)`` for every file
+    under the workspaces root — each profile's default working directory and
+    the ``.deleted`` folders of deleted profiles, all of it user content.
+
+    ``relative_posix_name`` is relative to ``workspaces_root`` (the engine
+    prepends the ``workspaces/`` member prefix). Only the dependency and
+    virtualenv directories are pruned (``node_modules``, ``.venv``, ``venv``,
+    ``__pycache__``); file suffixes are never — a ``poetry.lock`` is the
+    user's. Symlinks are skipped, as in :func:`iter_backup_files`.
+
+    ``exclude_dirs`` are absolute directories never descended into: the
+    engine passes the system dir, so a workspaces root that happens to
+    contain it never archives the database, the tokens or the backups folder
+    through the back door. ``exclude_files`` are absolute files skipped (the
+    archive being written, should it land inside the root).
+    """
+    root = os.path.abspath(workspaces_root)
+    if not os.path.isdir(root):
+        return
+    pruned = {_norm_abs(d) for d in exclude_dirs if d}
+    skipped = {_norm_abs(f) for f in exclude_files if f}
+    if _norm_abs(root) in pruned:
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        kept = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            if d in _GLOBAL_EXCLUDE_DIRS or os.path.islink(full):
+                continue
+            if _norm_abs(full) in pruned:
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+        for f in filenames:
+            full = os.path.join(dirpath, f)
+            if os.path.islink(full) or _norm_abs(full) in skipped:
+                continue
+            try:
+                rel = os.path.relpath(full, root)
+            except ValueError:
+                continue
+            yield full, rel.replace(os.sep, "/")
+
+
 __all__ = [
     "AUTHORED_DOCS_PARTS",
     "authored_docs_root",
     "include_roots",
     "is_excluded",
     "iter_backup_files",
+    "iter_workspace_files",
     "long_path",
 ]

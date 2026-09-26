@@ -1,10 +1,10 @@
 /**
  * Typed client for Documentation search (`/api/documentation-search/*`).
  *
- * Backs Settings → My Documents, the NavRail sync chip and the admin gate card
- * on the Vector Embedding page. Every route acts on the caller's own profile —
- * the server takes it from the Bearer token, never from a body or query field —
- * so nothing here names a profile.
+ * Backs Settings → My Documents (the admin's server-wide gate included, as that
+ * page's Administrator settings section) and the NavRail sync chip. Every route
+ * acts on the caller's own profile — the server takes it from the Bearer token,
+ * never from a body or query field — so nothing here names a profile.
  *
  * Errors keep the server's machine-readable shape (`DocumentsApiError.code`,
  * `.details`, `.plan`, `.confirm`, `.missing`) instead of flattening it into a
@@ -52,8 +52,6 @@ export type DocumentsState =
 /** How the agent tool behaves right now. */
 export type DocumentsToolMode = 'hidden' | 'normal' | 'lexical_only' | 'partial';
 
-export type RootMode = 'inherit' | 'custom';
-
 export type StorageLevel = 'ok' | 'warn' | 'budget' | 'disk_low' | 'disk_critical';
 
 /** Per-file index status (the `files.status` column of the index). */
@@ -69,7 +67,8 @@ export type DocumentsFileStatus =
 
 export interface DocumentsSourceState {
   enabled: boolean;
-  root_mode: RootMode | null;
+  /** The folder the index was built from: the profile's working directory,
+   *  or its previous one while a move waits for `confirm_root_change`. */
   root: string | null;
   first_sync_confirmed: boolean;
 }
@@ -143,7 +142,17 @@ export interface DocumentsEstimate {
 export type DocumentsConfirmation =
   | { kind: 'first_sync'; estimate: DocumentsEstimate }
   | { kind: 'mass_delete'; missing: number; total: number }
-  | { kind: 'root_change'; from: string | null; to: string | null; files: number };
+  | {
+    kind: 'root_change';
+    from: string | null;
+    to: string | null;
+    /** Indexed files now. */
+    files: number;
+    /** How many of them are outside the new folder and would leave the
+     *  index; null when the engine could not count. */
+    leaving?: number | null;
+    message?: string;
+  };
 
 /** Where an indexed file comes from. */
 export type DocumentsSourceKind = 'local' | 'drive';
@@ -230,7 +239,7 @@ export interface DocumentsSnapshot {
   tool_mode?: DocumentsToolMode;
   sources?: { local: DocumentsSourceState | null; drive: DocumentsSourceState | null };
   /** Hold details: root_invalid {code, message, root}, root_unavailable
-   *  {why, …docker status}, pending_root_change {from, to}. */
+   *  {why, …docker status}, pending_root_change {from, to, message}. */
   detail?: Record<string, any> | null;
   phase?: string | null;
   batch?: DocumentsBatch;
@@ -299,7 +308,8 @@ export interface DocumentsOptions {
 export interface DocumentsSource {
   kind: 'local' | 'drive';
   enabled: boolean;
-  root_mode: RootMode;
+  /** The folder the index was built from (see `DocumentsPolicyView.working_dir`
+   *  for the folder it follows). */
   root_path: string | null;
   excludes: ExcludeRule[];
   options: DocumentsOptions;
@@ -312,9 +322,10 @@ export interface DocumentsPolicyView {
   effective: boolean;
   reason: 'admin_gate_off' | 'embedding_disabled' | null;
   is_admin: boolean;
-  working_dir: string;
-  /** Non-admin profiles may only index inside the working directory. */
-  root_constraint: 'any' | 'working_dir';
+  /** The folder that is indexed: the caller's own working directory. */
+  working_dir: string | null;
+  /** Only the admin changes a working directory (Settings → Profiles). */
+  working_dir_editable: boolean;
   vision_daily_cap_default: number;
   max_file_mb: number;
 }
@@ -380,12 +391,12 @@ export interface DocumentsOptionsPatch {
   include_folders?: string[];
 }
 
-/** The fields a settings PUT may carry; only those present are changed. */
+/** The fields a settings PUT may carry; only those present are changed.
+ *  There is no folder: it is always the profile's working directory (the
+ *  server refuses `root_path` / `root_mode` with `root_not_configurable`). */
 export interface DocumentsSettingsPatch {
   kind: 'local' | 'drive';
   enabled?: boolean;
-  root_mode?: RootMode;
-  root_path?: string | null;
   excludes?: ExcludeRule[];
   options?: DocumentsOptionsPatch;
   /** Only valid while turning the source off. */
@@ -395,26 +406,6 @@ export interface DocumentsSettingsPatch {
 export interface DocumentsSettingsSaved {
   settings: DocumentsSettings;
   snapshot: DocumentsSnapshot;
-}
-
-export interface RootCheck {
-  ok: boolean;
-  path: string | null;
-  /** not_found | not_directory | not_readable | inside_system_dir |
-   *  forbidden_system_path | outside_working_dir */
-  code: string | null;
-  message: string | null;
-  /** Paths under the root that are never indexed (Cremind's system folder). */
-  locked_excludes: string[];
-}
-
-export interface BrowseResult {
-  path: string;
-  parent: string | null;
-  entries: { name: string; path: string }[];
-  truncated: boolean;
-  /** Quick-jump roots: the working directory, plus home for the admin. */
-  roots: string[];
 }
 
 // ── change plans ───────────────────────────────────────────────────────────
@@ -716,29 +707,6 @@ export function saveDocumentsSettings(
   return sendWithConfirm(confirm => putDocumentsSettings(
     agentUrl, token, confirm ? { ...patch, confirm } : patch,
   ));
-}
-
-/** Would this folder be accepted? `path: null` asks about the inherited root. */
-export function validateDocumentsRoot(
-  agentUrl: string,
-  token: string,
-  path: string | null,
-): Promise<RootCheck> {
-  const body = path === null ? { root_mode: 'inherit' } : { path };
-  return request(agentUrl, token, '/api/documentation-search/validate-root', { method: 'POST', body });
-}
-
-export function browseDocumentsFolders(
-  agentUrl: string,
-  token: string,
-  path: string | null,
-  hidden = false,
-): Promise<BrowseResult> {
-  const params = new URLSearchParams();
-  if (path) params.set('path', path);
-  if (hidden) params.set('hidden', '1');
-  const qs = params.toString();
-  return request(agentUrl, token, `/api/documentation-search/browse${qs ? `?${qs}` : ''}`);
 }
 
 export interface DriveFolder {

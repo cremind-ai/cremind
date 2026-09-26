@@ -74,7 +74,7 @@ The app runs `upgrade head` automatically on boot (`ensure_at_head()` in
 migration will break existing installs on upgrade.
 
 - Migrations live in `app/alembic/versions/` (current head:
-  `20260928c_search_tools`). Revision ids must be **≤ 32 chars** —
+  `20260929_profile_working_dir`). Revision ids must be **≤ 32 chars** —
   `alembic_version.version_num` is `VARCHAR(32)`, which Postgres enforces and
   SQLite silently truncates (`tests/storage/test_migrations_graph.py` guards it).
 - Generate and **hand-review** the migration following the checklist in
@@ -99,3 +99,10 @@ keyed by `profile` everywhere — DB rows, on-disk dirs, in-memory registries),
 system-wide, or an admin-set default that profiles inherit. State that ends up
 process-global works on a single-profile dev box and cross-contaminates as soon
 as a second profile exists, so test with two profiles, not just `admin`.
+
+Each profile has its own User Working Directory
+(`get_user_working_directory(profile)` — the profile is required; default
+`<SYS>/workspaces/<name>`, see [app/config/working_dirs.py](app/config/working_dirs.py)).
+Any feature that reads, lists, watches or indexes a path a profile supplied must
+refuse another profile's folder with `working_dirs.is_foreign(path, profile)` —
+the admin is not exempt.

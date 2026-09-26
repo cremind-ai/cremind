@@ -172,7 +172,7 @@ def env(monkeypatch):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: "")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
     async def _no_ltm(self):

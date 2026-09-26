@@ -266,3 +266,10 @@ def test_only_an_actual_adoption_is_announced(tmp_path, monkeypatch):
     conv = asyncio.run(scenario())
     adopted = [f[2] for f in frames if f[0] == conv["id"] and f[1] == "search_tools"]
     assert adopted == [{"version": 0, "adopted": True}, {"version": 1, "adopted": True}]
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

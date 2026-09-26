@@ -47,7 +47,7 @@ def _build(monkeypatch, *, instructions="", profile="default"):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_agent_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: instructions)
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     llm = SimpleNamespace(provider_name="fake", model_name="fake-model")
     registry = _FakeRegistry([_FakeTool("reasoning"), _FakeTool("calc")])
@@ -105,7 +105,7 @@ def test_instructions_are_reread_per_call(monkeypatch):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_agent_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: current["text"])
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     agent = ra.ReasoningAgent(
         llm=SimpleNamespace(provider_name="fake", model_name="fake-model"),

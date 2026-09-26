@@ -87,6 +87,33 @@ def test_a_custom_system_dir_takes_the_model_cache_along() -> None:
     assert env["SENTENCE_TRANSFORMERS_HOME"] == "/srv/state/.cache/sentence-transformers"
 
 
+# ── the profiles' working directories ────────────────────────────────────
+
+
+def test_every_profiles_folder_lives_on_the_work_volume() -> None:
+    """``CREMIND_WORKSPACES_DIR`` = ``<work mountPath>/cremind-workspaces``:
+    each profile's own folder survives a rollout. The mount itself is
+    unchanged, so an upgraded release's admin keeps ``/root/Documents`` — and a
+    ``workspaces/`` folder of its own there stays an ordinary folder, not an
+    unowned entry of the workspaces root that nobody may open."""
+    env = _render()["env"]
+    values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    assert values["persistence"]["work"]["mountPath"] == "/root/Documents"
+    assert env["CREMIND_WORKSPACES_DIR"] == "/root/Documents/cremind-workspaces"
+
+
+def test_a_custom_work_mount_takes_the_workspaces_along() -> None:
+    env = _render(set_strings=("persistence.work.mountPath=/srv/work/",))["env"]
+    assert env["CREMIND_WORKSPACES_DIR"] == "/srv/work/cremind-workspaces"
+
+
+def test_without_the_work_volume_the_workspaces_stay_on_the_system_volume() -> None:
+    """Unset → the app's default, ``<systemDir>/workspaces`` — on the system
+    PVC, never the pod filesystem a rollout discards."""
+    env = _render("persistence.work.enabled=false")["env"]
+    assert "CREMIND_WORKSPACES_DIR" not in env
+
+
 # ── volume sizes for the governor ─────────────────────────────────────────
 
 

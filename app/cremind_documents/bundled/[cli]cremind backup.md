@@ -1,5 +1,5 @@
 ---
-description: "Create, list, download, upload, delete, and restore **full-system backups** of Cremind — one portable `.cremind-backup` archive holding the entire database (conversations, LLM providers and API keys, custom providers, channels, events/schedules, memories) plus the on-disk trees (skills, Google/OAuth token files, personas, per-profile documents, channel sessions, browser login state). The JWT sign-in secret and session tokens are kept local to each install (re-issued on restore), not carried in the archive. Restores across environments — Windows↔Docker/K8s, SQLite↔PostgreSQL, a new home directory — by relocating stored absolute paths automatically. Use this to move Cremind to another machine, reinstall without losing data, or recover from failure. Distinct from `cremind db backup`, which snapshots only the database. Optional passphrase encryption."
+description: "Create, list, download, upload, delete, and restore **full-system backups** of Cremind — one portable `.cremind-backup` archive holding the entire database (conversations, LLM providers and API keys, custom providers, channels, events/schedules, memories) plus the on-disk trees (skills, Google/OAuth token files, personas, per-profile documents, channel sessions, browser login state) and, by default, every profile's working directory (the workspaces folder with the users' own files; leave it out with `--no-workspaces`). The JWT sign-in secret and session tokens are kept local to each install (re-issued on restore), not carried in the archive. Restores across environments — Windows↔Docker/K8s, SQLite↔PostgreSQL, a new home directory — by relocating stored absolute paths automatically. Use this to move Cremind to another machine, reinstall without losing data, or recover from failure. Distinct from `cremind db backup`, which snapshots only the database. Optional passphrase encryption."
 ---
 
 # `cremind backup` — Full-System Backup & Restore
@@ -13,7 +13,8 @@ Unlike `cremind db backup` (which snapshots only the relational database), a
 full backup also includes everything Cremind keeps on disk: per-profile skills
 (and their Google/OAuth token files), personas, the Cremind documentation
 pages each profile wrote (`storage/cremind_documents/profiles/<profile uuid>/`),
-channel session files, and browser login state.
+channel session files, and browser login state — and, unless you pass
+`--no-workspaces`, every profile's working directory (see below).
 
 The JWT sign-in secret and the per-profile session tokens are **not** backed
 up — they are local to each installation. Carrying them across a restore would
@@ -36,6 +37,8 @@ A `.cremind-backup` archive is a gzipped tar with three parts:
   profiles). An archive made before the manual moved carries a profile's pages
   at `<profile>/documents/`; after a restore they are moved to the new place
   at boot.
+- **The profiles' working directories** (`workspaces/`), unless
+  `--no-workspaces`.
 
 Rebuildable/transient and installation-local content is intentionally excluded:
 the raw database files (dumped logically instead), the embeddings vector store
@@ -48,16 +51,46 @@ restored), temporary chat uploads, derived skill `.env` files (regenerated from 
 database), and the JWT sign-in secret and session tokens (kept per-install;
 re-issued on restore).
 
+## The profiles' working directories
+
+Each profile's default working directory lives in the **workspaces folder**:
+`~/.cremind/workspaces/<profile>` on a native install,
+`/root/Documents/cremind-workspaces/<profile>` in the Docker bundle and on Kubernetes
+(or wherever `CREMIND_WORKSPACES_DIR` points). A backup archives that whole
+folder by default — the folders kept from deleted profiles (`.deleted/`)
+included. Everything in it is the users' own, so `*.lock`, `*.tmp` and the like
+are kept; only `node_modules/`, `.venv/`, `venv/` and `__pycache__/` are
+skipped.
+
+- **Not archived:** a folder an admin chose for a profile *outside* the
+  workspaces folder — e.g. the admin's `~/Documents` on an install upgraded
+  from before per-profile folders. Back those up yourself. `backup create`
+  names each one (`not included: profile '<name>' works in <path>`), and a
+  restore onto a machine where that folder is missing says so in its report.
+- **`--no-workspaces`** (web UI: untick *Include the profiles' working
+  directories*) leaves the folder out, for a small backup. `cremind backup
+  list` shows which archives have it (WORKING DIRS).
+- **On restore** the folder goes into the *target's* workspaces folder, even
+  when that is somewhere else (a native backup restored into Docker lands in
+  `/root/Documents/cremind-workspaces`). Files in the archive overwrite files of the
+  same name; nothing else is deleted — an archive without the working
+  directories leaves the ones on disk exactly as they are. The safety backup a
+  restore takes includes them only when the incoming archive does.
+
 ## Environment independence
 
 Absolute paths stored in the database (a conversation's working directory, an
 autostart process's command and working directory, a skill's source directory,
-a file-watcher root, the configured user working directory) are **relocated**
-on restore: the source machine's `CREMIND_SYSTEM_DIR` and home directory are
-rewritten to the target's, converting separators between Windows and POSIX.
+a file-watcher root, a folder an admin chose as a profile's working directory)
+are **relocated** on restore: the source machine's `CREMIND_SYSTEM_DIR`, home
+directory and workspaces folder are rewritten to the target's, converting
+separators between Windows and POSIX. An archive made before per-profile
+working directories carries one server-wide folder; it becomes the admin's.
 Paths that live outside those roots (e.g. a `D:\projects\...` working
 directory) are left unchanged and reported as warnings, since the process that
-uses them may not run in the new environment.
+uses them may not run in the new environment — except a profile's chosen
+working directory from the other OS family (`D:\work` restored onto Linux):
+that profile goes back to its default folder, and the report names it.
 
 After a restore, the normal boot re-arms everything from the restored data:
 previously-activated events, schedules (fired forward from their next
@@ -77,7 +110,8 @@ fire again normally.
 
 > **Settings → Backup & Restore**
 
-The page lists backups, creates new ones (with an optional passphrase),
+The page lists backups, creates new ones (with an optional passphrase, and a
+checkbox for the profiles' working directories, on by default),
 uploads/downloads archives, and drives a restore with live progress. The Setup
 Wizard also offers "restore from a backup" as an alternative to configuring a
 fresh install.
@@ -85,7 +119,7 @@ fresh install.
 ## Syntax
 
 ```bash
-cremind backup create   [--offline] [--to <path>] [--passphrase <text> | --passphrase-prompt]
+cremind backup create   [--offline] [--to <path>] [--passphrase <text> | --passphrase-prompt] [--no-workspaces]
 cremind backup list
 cremind backup download <name> [--to <path>]
 cremind backup upload   <path>
@@ -114,6 +148,7 @@ cremind backup report   [--ack]
 | `--to <path>`          | create, download  | Output path. Offline create / any download.                            |
 | `--passphrase <text>`  | create, restore   | Encrypt (create) or decrypt (restore) with this passphrase.             |
 | `--passphrase-prompt`  | create, restore   | Prompt for the passphrase interactively (hidden input).                 |
+| `--no-workspaces`      | create            | Leave out the profiles' working directories (included by default).      |
 | `--yes` / `-y`         | restore, delete   | Skip the confirmation prompt.                                           |
 | `--ack`                | report            | Mark the restore report as acknowledged.                                |
 

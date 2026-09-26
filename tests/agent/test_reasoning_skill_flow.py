@@ -107,7 +107,7 @@ class _SkillCallLLM:
 
 def _build_agent(monkeypatch, llm, tools: List[Tool]) -> ra.ReasoningAgent:
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     # generate_dir_tree would hit the filesystem for the fake dir; stub it out.
     monkeypatch.setattr(ra, "generate_dir_tree", lambda p: "")
 

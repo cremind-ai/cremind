@@ -37,6 +37,7 @@ import {
 import { matchesCaTrustHint, resolveTrustEvidence } from '../services/caTrustHint';
 import { tunnelCommand } from '../services/httpsReadiness';
 import { downloadTextFile, type ExportFormat } from '../utils/configExport';
+import { chosenWorkingDir } from '../utils/setupWorkingDir';
 import {
   openSetupProgressStream,
   type SetupLogEntry,
@@ -477,6 +478,22 @@ const pivotPortForward = computed(
 // ``serverConfig`` may carry a nested ``postgres`` object when the admin
 // picks PostgreSQL during first setup; everything else is a flat string map.
 const serverConfig = ref<Record<string, any>>({});
+// The profile's own working directory. First setup: the admin's, editable on
+// the Server step with the server's suggestion as its placeholder, and sent as
+// the payload's top-level ``working_dir`` only when the admin typed another
+// folder (chosenWorkingDir). Any other profile never picks it here:
+// it is the folder the admin chose on Settings → Profiles (``?working_dir=``)
+// or the suggested default, shown read-only on the Complete step.
+const workingDir = ref('');
+const suggestedWorkingDir = ref<string | null>(null);
+const requestedWorkingDir = ref(
+  typeof route.query.working_dir === 'string' ? route.query.working_dir.trim() : '',
+);
+// What the server actually made (the setup response's ``working_dir``).
+const createdWorkingDir = ref<string | null>(null);
+const profileWorkingDirLine = computed(
+  () => createdWorkingDir.value || requestedWorkingDir.value || suggestedWorkingDir.value || '',
+);
 const embeddingConfig = ref<EmbeddingConfigPayload | null>(null);
 const llmConfig = ref<Record<string, string>>({});
 // What the LLM step says about its own record. Emitted alongside every
@@ -916,17 +933,26 @@ async function runPostInstallSetupChecks() {
     // while our own submit is in flight, we are the ones who created it.
     profileWasAbsentAtMount.value = true;
 
-    if (isFirstSetup.value) {
-      try {
-        const resp = await fetchSetupProfiles(settingsStore.agentUrl);
+    try {
+      // After first setup the catalogue only matters for the working
+      // directory the new profile will get, which the server tells the
+      // admin token alone.
+      const resp = await fetchSetupProfiles(
+        settingsStore.agentUrl,
+        isFirstSetup.value ? {} : { profile: profileName.value, token: adminToken.value },
+      );
+      // A placeholder, never copied into the field: the admin may still move
+      // the System Directory it lives under (see chosenWorkingDir).
+      suggestedWorkingDir.value = resp.suggested_working_dir ?? null;
+      if (isFirstSetup.value) {
         if (resp.selected) {
           const preset = (resp.profiles ?? []).find((p) => p.id === resp.selected);
           if (preset) applyProfileDefaults(preset);
         }
-      } catch {
-        // Server unreachable or endpoint missing — leave the wizard
-        // unconfigured; component-level fallbacks take over.
       }
+    } catch {
+      // Server unreachable or endpoint missing — leave the wizard
+      // unconfigured; component-level fallbacks take over.
     }
 
     try {
@@ -1311,6 +1337,15 @@ async function handleCompleteSetup() {
       if (embeddingConfig.value) {
         config.embedding_config = embeddingConfig.value;
       }
+      // Top level, not server_config: it is the admin's own folder, not a
+      // server-wide setting. Blank or the suggestion → the server's default,
+      // settled after any System Directory change.
+      const chosen = chosenWorkingDir(workingDir.value, suggestedWorkingDir.value);
+      if (chosen) {
+        config.working_dir = chosen;
+      }
+    } else if (requestedWorkingDir.value) {
+      config.working_dir = requestedWorkingDir.value;
     }
     // Always send LLM and tool configs (both first setup and profile setup)
     config.llm_config = llmConfig.value;
@@ -1344,6 +1379,7 @@ async function handleCompleteSetup() {
       result = recovered;
     }
     generatedToken.value = result.token;
+    createdWorkingDir.value = result.working_dir ?? null;
     restartRequired.value = Boolean(result.restart_required);
     createdChannels.value = result.channels || [];
     channelErrors.value = result.channel_errors || [];
@@ -1393,7 +1429,18 @@ async function handleCompleteSetup() {
       ElMessage.success('Setup completed! Copy your token below.');
     }
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : 'Setup failed');
+    // The folder the admin picked on Settings → Profiles was refused. It is
+    // not editable here, so fall back to the default for the next attempt —
+    // the admin can move it later from the same page.
+    if ((e as SetupError)?.code === 'invalid_working_dir' && !isFirstSetup.value && requestedWorkingDir.value) {
+      requestedWorkingDir.value = '';
+      ElMessage.error(
+        `${e instanceof Error ? e.message : 'Working directory rejected'} — `
+        + `click "Create Profile" again to use the default folder, and change it later in Settings → Profiles.`,
+      );
+    } else {
+      ElMessage.error(e instanceof Error ? e.message : 'Setup failed');
+    }
   } finally {
     submitting.value = false;
     if (setupProgressHandle) {
@@ -2060,8 +2107,10 @@ async function downloadConfigFile(format: ExportFormat) {
         <!-- ── Existing setup steps ───────────────────────────── -->
         <StepServerConfig
           v-else-if="currentStepKey === 'server'"
+          v-model:working-dir="workingDir"
           :config="serverConfig"
           :first-setup="isFirstSetup"
+          :suggested-working-dir="suggestedWorkingDir"
           :service-capabilities="serviceCapabilities"
           :install-catalog="installCatalog"
           @update="handleServerConfigUpdate"
@@ -2120,6 +2169,13 @@ async function downloadConfigFile(format: ExportFormat) {
           @generate="handleCompleteSetup"
           @download="downloadConfigFile"
         />
+        <p
+          v-if="currentStepKey === 'complete' && !isFirstSetup && profileWorkingDirLine"
+          class="working-dir-line"
+        >
+          Working directory: <code>{{ profileWorkingDirLine }}</code> — only this profile can
+          see its files; the admin can change it in Settings → Profiles.
+        </p>
 
         <div
           v-if="generatedToken && channelErrors.length > 0"
@@ -2670,6 +2726,20 @@ async function downloadConfigFile(format: ExportFormat) {
 }
 
 .embedding-status-box.is-failed strong { color: #b03030; }
+
+.working-dir-line {
+  margin: 12px 0 0;
+  font-size: 0.825rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.working-dir-line code {
+  background: var(--hover-bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
 
 .channel-errors-box {
   margin-top: 16px;

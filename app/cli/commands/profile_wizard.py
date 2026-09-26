@@ -191,6 +191,10 @@ def wizard_start(
             "the admin profile is created by first-run setup, not by this wizard. "
             "To reconfigure it: cremind setup reconfigure"
         )
+    # A new profile only: one made before its name was reserved stays adoptable.
+    reserved = None if adopt else wizard_draft.reserved_profile_name_error(name)
+    if reserved:
+        _fail(reserved)
 
     cfg, acting = _require_admin_client(ctx)
 

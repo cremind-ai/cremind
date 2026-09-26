@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List
 
+import pytest
+
 from app.tools.builtin.adapter import BuiltInToolAdapter
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.tools.builtin.tool import BuiltInToolGroup
@@ -138,3 +140,10 @@ def test_the_execute_log_names_variables_without_their_values() -> None:
     assert tool.calls[0]["_variables"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-supersecret"
     # And the line still says which variables were in play.
     assert "CLAUDE_CODE_OAUTH_TOKEN" in logged
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

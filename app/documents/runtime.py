@@ -158,6 +158,9 @@ class ProfileRuntime:
         self.settings: dict[str, Any] = {}      # the local row (per-profile options live here)
         self.drive_settings: dict[str, Any] = {}
         self.root: str | None = None
+        # What validate_root locked out of the root when the matcher was built
+        # (the system folder, other profiles' working directories inside it).
+        self.locked_excludes: list[str] = []
         self.matcher: Any = None
         self.watcher: Any = None
         self.watch_mode: str | None = None
@@ -289,18 +292,23 @@ class ProfileRuntime:
         self.suspended = None
         self.paused_user = bool(db.get_source_state(SOURCE).get("paused_user"))
 
-        custom = row.get("root_mode") == uds.ROOT_CUSTOM
-        check = uds.validate_root(row.get("root_path") if custom else None, is_admin=self.profile == "admin")
+        # Always the profile's working directory. A row an earlier build saved
+        # with a folder of its own (root_mode "custom") reads the same way, so
+        # its stored folder differs and the hold below asks first.
+        check = uds.validate_root(self.profile)
         if not check.ok:
             self._set_hold("root_invalid", {"code": check.code, "message": check.message, "root": check.path})
             return
         stored = row.get("root_path")
-        if not custom and stored and _norm(check.path) != _norm(stored):
-            # The server-wide working directory moved under an inherited root.
-            # Nobody asked this profile, so nothing moves until it confirms.
-            self._set_hold("pending_root_change", {"from": stored, "to": check.path})
+        if stored and _norm(check.path) != _norm(stored):
+            # The working directory moved (the admin changed it). Nobody asked
+            # this profile, so nothing leaves the index until it confirms.
+            message = f"Your working directory changed from {stored} to {check.path}."
+            self._set_hold("pending_root_change", {"from": stored, "to": check.path, "message": message})
             self._set_confirmation({"kind": "root_change", "from": stored, "to": check.path,
-                                    "files": db.count_by_status(SOURCE).get("indexed", 0)})
+                                    "files": db.count_by_status(SOURCE).get("indexed", 0),
+                                    "leaving": self._count_leaving(row, check.path),
+                                    "message": message})
             return
 
         new_root = check.path
@@ -315,11 +323,13 @@ class ProfileRuntime:
         with self.lock:
             root_changed = _norm(self.root) != _norm(new_root)
             self.root = new_root
+            self.locked_excludes = list(check.locked_excludes)
             self.matcher = IgnoreMatcher(
                 new_root,
                 excludes=uds.normalize_excludes(row.get("excludes")),
                 locked_excludes=check.locked_excludes,
                 system_dir=uds.system_dir(),
+                root_sanctioned=uds.system_dir_exempt(new_root),
             )
             self.hold = None
             if self.confirmation and self.confirmation.get("kind") in ("root_change",):
@@ -411,6 +421,20 @@ class ProfileRuntime:
             and int(est.get("bytes") or 0) <= FIRST_SYNC_AUTO["bytes"]
             and int(est.get("images_to_caption") or 0) <= FIRST_SYNC_AUTO["images"]
         )
+
+    def _count_leaving(self, row: dict[str, Any], new_root: str) -> int | None:
+        """How many indexed files lie outside ``new_root`` and would leave the
+        index once a moved working directory is confirmed (the settings
+        plan's own count, :meth:`DocumentsService.count_effect`). None when
+        it cannot be counted — the confirmation then shows the total only."""
+        try:
+            eff = self.service.count_effect(
+                self.profile, SOURCE, "purge_out_of_scope",
+                {"current": row, "patch": {"root_path": new_root}},
+            )
+            return int(eff.files) if eff is not None else None
+        except Exception:  # noqa: BLE001 — a failed count must not block the hold
+            return None
 
     def _rebase(self, old_root: str, new_root: str) -> None:
         """The user moved the folder (already confirmed). Rows whose file is
@@ -1580,8 +1604,7 @@ class ProfileRuntime:
         from app.documents.kinds import guess_kind
 
         row = self.settings or {}
-        custom = row.get("root_mode") == uds.ROOT_CUSTOM
-        check = uds.validate_root(row.get("root_path") if custom else None, is_admin=self.profile == "admin")
+        check = uds.validate_root(self.profile)
         est: dict[str, Any] = {"state": "running", "root": check.path, "started_at": _now() * 1000}
         with self.lock:
             self.estimate = est
@@ -1594,6 +1617,7 @@ class ProfileRuntime:
             matcher = IgnoreMatcher(
                 check.path, excludes=uds.normalize_excludes(row.get("excludes")),
                 locked_excludes=check.locked_excludes, system_dir=uds.system_dir(),
+                root_sanctioned=uds.system_dir_exempt(check.path),
             )
             by_kind: dict[str, int] = {}
             files = dirs = total_bytes = chunks = images = placeholders = 0

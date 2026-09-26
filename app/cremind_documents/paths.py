@@ -48,14 +48,24 @@ PROFILES_PARTS: tuple[str, ...] = ROOT_PARTS + ("profiles",)
 # shared scope.
 SHARED_SCOPE = "shared"
 LEGACY_CLI_SCOPE = "cli"
-RESERVED_PROFILE_NAMES: frozenset[str] = frozenset({SHARED_SCOPE, LEGACY_CLI_SCOPE})
+# ``<SYS>/workspaces`` holds every profile's working directory
+# (app/config/working_dirs.py), so a profile of that name would have its own
+# system folder — persona, skills, exports — inside the other profiles' space.
+WORKSPACES_NAME = "workspaces"
+RESERVED_PROFILE_NAMES: frozenset[str] = frozenset({SHARED_SCOPE, LEGACY_CLI_SCOPE, WORKSPACES_NAME})
 
 
 def reserved_profile_name_error(name: object) -> Optional[str]:
-    """The refusal for a profile name the manual reserves, or None."""
-    if str(name or "").strip() in RESERVED_PROFILE_NAMES:
+    """The refusal for a profile name Cremind reserves, or None."""
+    clean = str(name or "").strip()
+    if clean == WORKSPACES_NAME:
         return (
-            f"The profile name '{str(name).strip()}' is reserved (Cremind's manual uses it "
+            f"The profile name '{clean}' is reserved (Cremind keeps every profile's working "
+            "directory in a folder of that name); choose another name."
+        )
+    if clean in RESERVED_PROFILE_NAMES:
+        return (
+            f"The profile name '{clean}' is reserved (Cremind's manual uses it "
             "internally); choose another name."
         )
     return None

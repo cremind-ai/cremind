@@ -85,6 +85,9 @@ class ProfileModel(Base):
     token_serial: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    # The profile's User Working Directory when the admin chose one; NULL is
+    # the default ``<workspaces root>/<name>`` (see app/config/working_dirs.py).
+    working_dir: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
 
 class ChannelModel(Base):

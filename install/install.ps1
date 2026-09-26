@@ -138,9 +138,12 @@
 
 .PARAMETER DocumentsDir
     (Docker mode) The folder on this machine the container sees as
-    /root/Documents: document search indexes it and the agent works there.
-    Created if missing. A leading ~ is expanded, a relative path is made
-    absolute, and the path is written with forward slashes; $, #, double
+    /root/Documents. Each profile's working directory (where its agent works
+    and what its document search indexes) is
+    <folder>\cremind-workspaces\<profile>; an install that predates
+    per-profile folders keeps the admin on the
+    folder itself. Created if missing. A leading ~ is expanded, a relative
+    path is made absolute, and the path is written with forward slashes; $, #, double
     quotes and leading/trailing whitespace are refused (compose's .env would
     mangle them). Default: $env:CREMIND_DOCUMENTS_DIR, else the previous
     install's folder, else your Documents folder as Windows reports it (which
@@ -149,8 +152,9 @@
 .PARAMETER DocumentsAccess
     (Docker mode) 'rw' or 'ro'. Mount that folder read-write (default; the
     agent's file tools change your real files) or read-only (the agent cannot
-    save there, and its default working folder is read-only). Default:
-    $env:CREMIND_DOCUMENTS_ACCESS, else the previous install's choice, else rw.
+    save there; the profiles' working directories then live in the
+    cremind-data volume instead). Default: $env:CREMIND_DOCUMENTS_ACCESS,
+    else the previous install's choice, else rw.
 
 .PARAMETER BootService
     Register a Scheduled Task that starts Cremind at logon and restarts it if
@@ -215,7 +219,16 @@
 
 .PARAMETER Purge
     (with -Uninstall) Wipe both System Dir and Install Dir. For docker
-    installs, also runs ``docker compose down -v`` to drop volumes.
+    installs, also runs ``docker compose down -v`` to drop volumes. Keeps the
+    profiles' working directories (the workspaces folder: <System Dir>\
+    workspaces or $env:CREMIND_WORKSPACES_DIR, and a Docker install's
+    <documents>\cremind-workspaces) and says where; folders an admin chose
+    elsewhere are never touched.
+
+.PARAMETER PurgeWorkspaces
+    (with -Uninstall; implies -Purge) Delete the workspaces folder too. Asks
+    to confirm in an interactive console; without one (or with -Unattended)
+    the switch is the confirmation.
 
 .NOTES
     Service selection (database backend, vector store backend, …) is no
@@ -290,6 +303,8 @@ param(
     [switch] $Uninstall,
     [switch] $Keep,
     [switch] $Purge,
+    # With -Purge: delete the profiles' working directories too (kept by default).
+    [switch] $PurgeWorkspaces,
     # Skip the prompt_toolkit TUI bootstrap and fall back to the legacy
     # numbered prompts. CI/debugging only — interactive users benefit
     # from the TUI's keyboard navigation and version picker.
@@ -404,13 +419,23 @@ function Write-Utf8NoBomFile {
 # Detection: $InstallDir\docker\docker-compose.yml -> Docker; else
 #            $SystemDir\venv -> Native; else partial-install -> Native.
 #
-# The User Working Directory (server_config.user_working_dir, picked in
-# the Setup Wizard) is NEVER touched directly. When it resolves inside
-# the System Dir (typical default), it goes with -Purge along with the
-# rest of the System Dir.
+# The profiles' working directories. Each profile's default folder lives in
+# the workspaces folder - $env:CREMIND_WORKSPACES_DIR, else
+# <System Dir>\workspaces (native), and <documents folder>\cremind-workspaces
+# for a Docker install - which -Purge KEEPS (everything else goes) unless
+# -PurgeWorkspaces. The Docker name is not plain "workspaces": the user's own
+# <documents folder>\workspaces is theirs, and -PurgeWorkspaces must never
+# delete it. A folder an admin chose for a profile elsewhere
+# (profiles.working_dir; before per-profile folders,
+# server_config.user_working_dir) is NEVER touched; when it resolves inside
+# the System Dir, -Purge takes it along with the rest of the System Dir.
 if ($Uninstall) {
     if ($Keep -and $Purge) {
         Write-Host "Pass at most one of -Keep / -Purge." -ForegroundColor Red
+        exit 2
+    }
+    if ($Keep -and $PurgeWorkspaces) {
+        Write-Host "-PurgeWorkspaces deletes the profiles' working directories; it cannot be combined with -Keep." -ForegroundColor Red
         exit 2
     }
     # ErrorActionPreference is 'Stop' from the install path; the uninstall
@@ -479,11 +504,103 @@ if ($Uninstall) {
         exit 1
     }
 
-    # Resolve mode (flag or interactive).
+    # Resolve mode (flag or interactive). -PurgeWorkspaces is a purge that
+    # deletes the working directories too.
     $UninstallMode = ''
-    if ($Purge) { $UninstallMode = 'purge' }
+    if ($Purge -or $PurgeWorkspaces) { $UninstallMode = 'purge' }
     elseif ($Keep) { $UninstallMode = 'keep' }
+    $DeleteWorkspaces = [bool]$PurgeWorkspaces
 
+    # An absolute, separator-trimmed spelling of a stored or configured path
+    # (~ expanded); '' for ''.
+    function Get-UninstallFullPath([string]$Path) {
+        if (-not $Path) { return '' }
+        $p = $Path.Trim()
+        if ($p -eq '~') { $p = $env:USERPROFILE }
+        elseif ($p.StartsWith('~/') -or $p.StartsWith('~\')) { $p = Join-Path $env:USERPROFILE $p.Substring(2) }
+        try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+        $trimmed = $p.TrimEnd('\', '/')
+        if ($trimmed -match '^[A-Za-z]:$') { return $trimmed + '\' }
+        return $trimmed
+    }
+    # $Child equals $Parent or lies inside it (case-insensitive, no resolving).
+    function Test-UninstallPathInside([string]$Child, [string]$Parent) {
+        $c = Get-UninstallFullPath $Child
+        $p = Get-UninstallFullPath $Parent
+        if (-not $c -or -not $p) { return $false }
+        if ($c -ieq $p) { return $true }
+        $prefix = $p.TrimEnd('\') + '\'
+        return $c.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    }
+    # Remove $Dir except $Keep, a path inside it that stays where it is with
+    # its parent folders; every sibling on the way down to $Keep goes. A $Keep
+    # that is empty, missing or outside $Dir removes $Dir whole; $Keep = $Dir
+    # keeps it all. A junction or symlink is removed as a link (never
+    # followed), and one on the way down to $Keep is kept whole.
+    function Remove-TreeExcept([string]$Dir, [string]$Keep) {
+        if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return }
+        $dirFull = Get-UninstallFullPath $Dir
+        $keepFull = Get-UninstallFullPath $Keep
+        if (-not $keepFull -or -not (Test-Path -LiteralPath $keepFull) -or -not (Test-UninstallPathInside $keepFull $dirFull)) {
+            Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction Continue
+            return
+        }
+        if ($keepFull -ieq $dirFull) { return }
+        $cur = $dirFull
+        foreach ($next in ($keepFull.Substring($dirFull.Length) -split '[\\/]')) {
+            if (-not $next) { continue }
+            if ($cur -ne $dirFull) {
+                $curItem = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+                if ($curItem -and ($curItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { break }
+            }
+            foreach ($entry in @(Get-ChildItem -LiteralPath $cur -Force -ErrorAction SilentlyContinue)) {
+                if ($entry.Name -ieq $next) { continue }
+                if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    try { $entry.Delete() } catch { }
+                } else {
+                    Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction Continue
+                }
+            }
+            $cur = Join-Path $cur $next
+        }
+    }
+
+    # Where the working directories are. The native root is a candidate for
+    # every kind (this machine may have run a native install before).
+    $wsNativeRaw = if ($env:CREMIND_WORKSPACES_DIR) { $env:CREMIND_WORKSPACES_DIR } else { Join-Path $UninstallSystemDir 'workspaces' }
+    $UninstallWsNative = Get-UninstallFullPath $wsNativeRaw
+    $UninstallWsDocker = ''
+    $UninstallWsInVolume = $false
+    if ($Kind -eq 'docker') {
+        $wsEnvFile = Join-Path $UninstallInstallDir 'docker\.env'
+        $wsDocs = ''
+        if (Test-Path -LiteralPath $wsEnvFile) {
+            foreach ($line in (Get-Content -LiteralPath $wsEnvFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                $line = $line.TrimStart([char]0xFEFF)
+                if (-not $wsDocs -and $line -like 'CREMIND_HOST_DOCUMENTS=*') {
+                    $wsDocs = $line.Substring('CREMIND_HOST_DOCUMENTS='.Length).Trim()
+                } elseif ($line -like 'CREMIND_DOCKER_WORKSPACES_DIR=?*') {
+                    # A read-only documents mount puts them in the cremind-data volume.
+                    $UninstallWsInVolume = $true
+                }
+            }
+        }
+        if (-not $wsDocs) { $wsDocs = Join-Path $UninstallInstallDir 'docker\documents' }
+        $UninstallWsDocker = Get-UninstallFullPath (Join-Path $wsDocs 'cremind-workspaces')
+    }
+    function Test-UninstallWsPresent {
+        return ((Test-Path -LiteralPath $UninstallWsNative -PathType Container) -or
+                ($UninstallWsDocker -and (Test-Path -LiteralPath $UninstallWsDocker -PathType Container)) -or
+                $UninstallWsInVolume)
+    }
+    function Write-UninstallWsList {
+        foreach ($ws in @($UninstallWsNative, $UninstallWsDocker)) {
+            if ($ws -and (Test-Path -LiteralPath $ws -PathType Container)) { Write-Host "  $ws" }
+        }
+        if ($UninstallWsInVolume) { Write-Host '  (the ones in the cremind-data volume)' }
+    }
+
+    $UninstallAskedWs = $false
     if (-not $UninstallMode) {
         Write-Host ''
         Write-Host "Uninstall Cremind ($Kind):"
@@ -503,6 +620,7 @@ if ($Uninstall) {
                       elseif ($K8sPresent) { ' (incl. the cluster volumes)' }
                       else { '' }
         Write-Host "  [p] Purge all    - delete everything Cremind installed$purgeExtra"
+        Write-Host "                     except the profiles' working directories (asked next)"
         Write-Host '  [c] Cancel'
         Write-Host ''
         $ans = Read-Host -Prompt 'Choose'
@@ -511,22 +629,49 @@ if ($Uninstall) {
             '^[pP]' { $UninstallMode = 'purge' }
             default { Write-Host 'Cancelled.'; exit 0 }
         }
+        if ($UninstallMode -eq 'purge' -and (Test-UninstallWsPresent)) {
+            Write-Host ''
+            Write-Host "The profiles' working directories are kept unless you delete them too:"
+            Write-UninstallWsList
+            $ans = Read-Host -Prompt 'Delete them as well? This cannot be undone. [y/N]'
+            $DeleteWorkspaces = ($ans -match '^(y|yes)$')
+            $UninstallAskedWs = $true
+        }
     }
 
-    # Probe the User Working Directory (best-effort; only when sqlite3.exe
-    # is on PATH). Used only for the post-purge "preserved at..." message.
-    $UserDir = $null
+    # -PurgeWorkspaces asks once more in an interactive console; with no
+    # console (the desktop app, CI) or -Unattended the switch is the
+    # confirmation.
+    $wsCanAsk = (-not $Unattended) -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    if ($UninstallMode -eq 'purge' -and $DeleteWorkspaces -and -not $UninstallAskedWs -and $wsCanAsk -and (Test-UninstallWsPresent)) {
+        Write-Host ''
+        Write-Host "-PurgeWorkspaces deletes every profile's working directory:"
+        Write-UninstallWsList
+        $ans = Read-Host -Prompt 'Type "delete" to confirm; anything else keeps them'
+        if ($ans -ne 'delete') {
+            $DeleteWorkspaces = $false
+            Write-Host 'Keeping the working directories.'
+        }
+    }
+
+    # Folders an admin chose for a profile outside the workspaces folder:
+    # never touched, and named after a purge so nobody wonders where they
+    # went. Best-effort - a native SQLite install, sqlite3.exe on PATH. An
+    # install from before per-profile folders kept its one folder in
+    # server_config.
+    $UninstallChosenDirs = @()
     if ($UninstallMode -eq 'purge') {
         $sqlite = Get-Command sqlite3.exe -ErrorAction SilentlyContinue
-        if ($sqlite) {
-            $dbPath = Join-Path $UninstallSystemDir 'storage\cremind.db'
-            if (Test-Path -LiteralPath $dbPath) {
-                try {
-                    $UserDir = & $sqlite.Source $dbPath "select value from server_config where key='user_working_dir'" 2>$null
-                    $UserDir = ($UserDir | Select-Object -First 1)
-                } catch {
-                    $UserDir = $null
+        $dbPath = Join-Path $UninstallSystemDir 'storage\cremind.db'
+        if ($sqlite -and (Test-Path -LiteralPath $dbPath)) {
+            try {
+                $rows = & $sqlite.Source -separator '|' $dbPath "select name, working_dir from profiles where working_dir is not null and working_dir <> ''" 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    $rows = & $sqlite.Source $dbPath "select 'admin|' || value from server_config where key='user_working_dir'" 2>$null
                 }
+                $UninstallChosenDirs = @($rows | Where-Object { $_ -and $_.Contains('|') })
+            } catch {
+                $UninstallChosenDirs = @()
             }
         }
     }
@@ -669,6 +814,7 @@ if ($Uninstall) {
 
     # Docker container/volume cleanup. Only runs when the daemon is reachable
     # AND the user didn't pick force-remove at the pre-check above.
+    $UninstallWsCopied = ''
     if ($Kind -eq 'docker' -and $dockerInstalled -and -not $forceRemove) {
         $docker = Get-Command docker.exe -ErrorAction SilentlyContinue
         if ($docker -and (Test-Path -LiteralPath (Join-Path $UninstallInstallDir 'docker'))) {
@@ -676,6 +822,18 @@ if ($Uninstall) {
             Push-Location -LiteralPath $DockerDir
             try {
                 if ($UninstallMode -eq 'purge') {
+                    # With a read-only documents folder the working directories
+                    # live in the cremind-data volume, which `down -v` deletes:
+                    # copy them out first so a purge keeps them there too.
+                    if ($UninstallWsInVolume -and -not $DeleteWorkspaces) {
+                        $wsCopy = Join-Path $env:USERPROFILE ('cremind-workspaces-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+                        & $docker.Source compose -p cremind cp 'cremind:/root/.cremind/workspaces' $wsCopy 2>$null | Out-Null
+                        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $wsCopy -PathType Container)) {
+                            $UninstallWsCopied = $wsCopy
+                        } else {
+                            Write-Host 'Could not copy the working directories out of the cremind-data volume; they are removed with it.' -ForegroundColor Yellow
+                        }
+                    }
                     Write-Host 'Stopping containers and removing volumes...'
                     & $docker.Source compose -p cremind down -v --remove-orphans
                 } else {
@@ -820,16 +978,59 @@ if ($Uninstall) {
             Write-Host "Refusing to purge a root-like Install Dir: '$UninstallInstallDir'" -ForegroundColor Red
             exit 1
         }
+        # The workspaces folders survive a purge unless -PurgeWorkspaces:
+        # inside the System / Install Dir everything else there goes around
+        # them; outside, they are simply not touched (or deleted with it).
+        $keepSys = ''
+        $keepInst = ''
+        if (-not $DeleteWorkspaces) {
+            if (Test-UninstallPathInside $UninstallWsNative $UninstallSystemDir) { $keepSys = $UninstallWsNative }
+            if ($UninstallWsDocker -and (Test-UninstallPathInside $UninstallWsDocker $UninstallInstallDir)) { $keepInst = $UninstallWsDocker }
+        }
         if (Test-Path -LiteralPath $UninstallSystemDir) {
-            Remove-Item -LiteralPath $UninstallSystemDir -Recurse -Force -ErrorAction Continue
-            Write-Host "Removed $UninstallSystemDir."
+            Remove-TreeExcept $UninstallSystemDir $keepSys
+            if ($keepSys -and (Test-Path -LiteralPath $keepSys)) {
+                Write-Host "Removed $UninstallSystemDir, except the profiles' working directories."
+            } else {
+                Write-Host "Removed $UninstallSystemDir."
+            }
         }
         if (Test-Path -LiteralPath $UninstallInstallDir) {
-            Remove-Item -LiteralPath $UninstallInstallDir -Recurse -Force -ErrorAction Continue
+            Remove-TreeExcept $UninstallInstallDir $keepInst
             Write-Host "Removed $UninstallInstallDir."
         }
-        if ($UserDir -and ($UserDir -notlike "$UninstallSystemDir*")) {
-            Write-Host "User Working Directory preserved at: $UserDir"
+        foreach ($ws in @($UninstallWsNative, $UninstallWsDocker)) {
+            if (-not $ws -or -not (Test-Path -LiteralPath $ws -PathType Container)) { continue }
+            if ($DeleteWorkspaces) {
+                # Only ever a folder of its own: never a drive root or one that
+                # holds the home folder (a stray CREMIND_WORKSPACES_DIR=~).
+                if (($ws -match '^[A-Za-z]:\\$') -or (Test-UninstallPathInside $env:USERPROFILE $ws)) {
+                    Write-Host "Not deleting ${ws}: it contains your home folder. Delete the working directories in it by hand." -ForegroundColor Yellow
+                    continue
+                }
+                Remove-Item -LiteralPath $ws -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $ws) {
+                    Write-Host "Could not delete everything in $ws; remove what is left by hand." -ForegroundColor Yellow
+                } else {
+                    Write-Host "Removed the profiles' working directories at $ws."
+                }
+            } else {
+                Write-Host "Kept the profiles' working directories at: $ws"
+                Write-Host '  (delete them with -Uninstall -PurgeWorkspaces, or by hand)'
+            }
+        }
+        if ($UninstallWsCopied) {
+            Write-Host "Kept the profiles' working directories (copied out of the cremind-data volume) at: $UninstallWsCopied"
+        }
+        # Folders an admin chose elsewhere, one "name|path" per row.
+        foreach ($row in $UninstallChosenDirs) {
+            $parts = $row.Split([char]'|', 2)
+            $chosen = Get-UninstallFullPath $parts[1]
+            if (-not $chosen) { continue }
+            if (Test-UninstallPathInside $chosen $UninstallSystemDir) { continue }
+            if (Test-UninstallPathInside $chosen $UninstallWsNative) { continue }
+            if ($UninstallWsDocker -and (Test-UninstallPathInside $chosen $UninstallWsDocker)) { continue }
+            Write-Host "Working directory of profile '$($parts[0])' preserved at: $chosen"
         }
     } else {
         # Keep mode: remove venv + bin + install scratch; preserve runtime state.
@@ -852,10 +1053,17 @@ if ($Uninstall) {
         if ($K8sPresent -and (Test-Path -LiteralPath $UninstallK8sEnv)) {
             $K8sKeepText = Get-Content -LiteralPath $UninstallK8sEnv -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         }
-        # Wipe the Install Dir wholesale - it's all install scratch.
+        # Wipe the Install Dir wholesale - it's all install scratch, but for
+        # the working directories a Docker install without a recorded
+        # documents folder keeps in its .\documents fallback.
+        $keepInst = ''
+        if ($UninstallWsDocker -and (Test-UninstallPathInside $UninstallWsDocker $UninstallInstallDir)) { $keepInst = $UninstallWsDocker }
         if (Test-Path -LiteralPath $UninstallInstallDir) {
-            Remove-Item -LiteralPath $UninstallInstallDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-TreeExcept $UninstallInstallDir $keepInst
             Write-Host "Removed install scratch at $UninstallInstallDir."
+        }
+        if ($keepInst -and (Test-Path -LiteralPath $keepInst)) {
+            Write-Host "Kept the profiles' working directories at: $keepInst"
         }
         if ($K8sKeepText) {
             $keepDir = Split-Path -Parent $UninstallK8sEnv
@@ -2383,6 +2591,11 @@ if ($Mode -eq 'docker') {
         }
         $docsHow = if ($DocumentsReadOnly -eq 'true') { 'read-only' } else { 'read-write' }
         Write-Ok "Documents folder: $DocumentsHostDir ($docsHow)"
+        if ($DocumentsReadOnly -eq 'true') {
+            Write-Info "Each profile's working directory lives in the cremind-data volume: a read-only folder cannot hold them."
+        } else {
+            Write-Info "Each profile's working directory: $DocumentsHostDir/cremind-workspaces/<profile>"
+        }
     }
 } elseif ($DocumentsDir -or $DocumentsAccess) {
     # Only the Docker bundle mounts a documents folder: native installs use
@@ -4099,6 +4312,13 @@ if ($Mode -eq 'docker') {
         Add-Content -Path $EnvDocker -Value "CREMIND_HOST_DOCUMENTS=$DocumentsHostDir" -Encoding utf8
     }
     Add-Content -Path $EnvDocker -Value "CREMIND_DOCUMENTS_READ_ONLY=$DocumentsReadOnly" -Encoding utf8
+    # Every profile's working directory lives in
+    # /root/Documents/cremind-workspaces - which a read-only mount cannot hold.
+    # Then they go to the cremind-data volume instead (writable, not visible on
+    # the host); see the compose file.
+    if ($DocumentsReadOnly -eq 'true') {
+        Add-Content -Path $EnvDocker -Value "CREMIND_DOCKER_WORKSPACES_DIR=/root/.cremind/workspaces" -Encoding utf8
+    }
     $composeHostDir = Resolve-DocumentsDir $DockerDir
     if (-not $composeHostDir.Problem) {
         Add-Content -Path $EnvDocker -Value "CREMIND_COMPOSE_HOST_DIR=$($composeHostDir.Path)" -Encoding utf8
@@ -4150,7 +4370,7 @@ if ($Mode -eq 'docker') {
     # session would mount one folder now and the .env's another on the next
     # plain ``docker compose up -d``. The installer's own inputs are
     # CREMIND_DOCUMENTS_DIR / CREMIND_DOCUMENTS_ACCESS, already folded in.
-    foreach ($docKey in @('CREMIND_HOST_DOCUMENTS', 'CREMIND_DOCUMENTS_READ_ONLY', 'CREMIND_COMPOSE_HOST_DIR')) {
+    foreach ($docKey in @('CREMIND_HOST_DOCUMENTS', 'CREMIND_DOCUMENTS_READ_ONLY', 'CREMIND_COMPOSE_HOST_DIR', 'CREMIND_DOCKER_WORKSPACES_DIR')) {
         if (Test-Path -LiteralPath "Env:$docKey") {
             Write-Warn2 "Ignoring $docKey from the environment: $EnvDocker holds the installer's value."
             Remove-Item -LiteralPath "Env:$docKey" -ErrorAction SilentlyContinue

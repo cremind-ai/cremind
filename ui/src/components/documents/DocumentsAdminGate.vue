@@ -1,29 +1,30 @@
 <script setup lang="ts">
 /**
- * The admin gate for Documentation search, on the Vector Embedding page.
+ * The admin gate for Documentation search: the "Administrator settings"
+ * section of Settings → My Documents, rendered for the admin only (both
+ * `/api/documentation-search/admin` routes are admin-only).
  *
- * The feature rides the server-wide embedding model and vector store, so the
- * admin allows it here; each profile then turns it on for itself under
- * Settings → My Documents. The card saves on its own (`PUT /api/documentation-search/admin`)
- * — never through the embedding form's Apply, which always rebuilds every
- * embedding cache and refuses chat while it runs.
- *
- * It renders even while Vector Embedding is off, read-only, so the admin can
- * see that profiles' indexes are kept (searchable by keyword only) rather than
- * wonder where the setting went.
+ * Server-wide, unlike the rest of that page: whether profiles may use the
+ * feature at all, the storage budgets, the indexing workers, and which
+ * profiles use it. Each profile then turns it on for itself on its own My
+ * Documents page. The page itself only exists while Vector Embedding is on —
+ * the feature rides the server-wide embedding model and vector store — so
+ * this section never has to explain an embedding that is off. It saves on its
+ * own (`PUT /api/documentation-search/admin`), apart from the page's
+ * per-profile settings.
  *
  * Allowing it when the document readers (PDF, Office, images) are not
  * installed answers `409 FeatureNotInstalled`; that is handed to the page's
  * install dialog (`feature-missing`), which calls `save()` again once the
- * install is done.
+ * install is done. Once allowed, missing readers can be installed on their
+ * own (`install-readers`), after which the page calls `reload()`.
  */
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import {
   ElButton, ElInputNumber, ElMessage, ElSwitch, ElTable, ElTableColumn,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../../stores/settings';
-import { useEmbeddingStatusStore } from '../../stores/embeddingStatus';
 import {
   getDocumentsAdmin,
   putDocumentsAdmin,
@@ -33,12 +34,19 @@ import {
   type DocumentsFeatureMissing,
 } from '../../services/documentsApi';
 
+/** What is missing, in the shape of the server's 409 body. */
+type MissingReaders = { missing: DocumentsFeatureMissing[]; message: string };
+
 const emit = defineEmits<{
-  'feature-missing': [detail: { missing: DocumentsFeatureMissing[]; message: string }];
+  /** A save needs the document readers first; the page installs them and calls `save()` again. */
+  'feature-missing': [detail: MissingReaders];
+  /** The admin asked to install the missing readers (nothing to save); the page calls `reload()` after. */
+  'install-readers': [detail: MissingReaders];
+  /** Saved: the policy every profile's page reads has changed. */
+  saved: [view: DocumentsAdminView];
 }>();
 
 const settingsStore = useSettingsStore();
-const embeddingStatus = useEmbeddingStatusStore();
 
 const view = ref<DocumentsAdminView | null>(null);
 const loadError = ref('');
@@ -122,17 +130,24 @@ const patch = computed<Partial<DocumentsAdminPolicy>>(() => {
 });
 const dirty = computed(() => Object.keys(patch.value).length > 0);
 
-const readOnly = computed(() => !view.value?.embedding_enabled);
-
 const statusLine = computed(() => {
   const v = view.value;
   if (!v) return '';
   if (!v.policy.allowed) return 'Not allowed — no profile can turn it on.';
-  if (v.reason === 'embedding_disabled') {
-    return 'Allowed, but paused while Vector Embedding is off. Indexes are kept and searchable by keyword.';
-  }
-  return 'Allowed — each profile turns it on for itself under Settings → My Documents.';
+  return 'Allowed — each profile turns it on for itself on its own My Documents page.';
 });
+
+/** Allowed already, but PDF, Office and photo files wait for their readers. */
+const readersMissing = computed(() => !!view.value?.policy.allowed && !!view.value.feature.missing.length);
+
+function installReaders() {
+  const missing = view.value?.feature.missing ?? [];
+  if (!missing.length) return;
+  emit('install-readers', {
+    missing,
+    message: 'Documentation search reads PDF, Office and photo files with optional document readers.',
+  });
+}
 
 async function reload() {
   loadError.value = '';
@@ -157,6 +172,7 @@ async function save(): Promise<boolean> {
     view.value = v;
     form.value = toForm(v.policy);
     ElMessage.success('Documentation search settings saved.');
+    emit('saved', v);
     return true;
   } catch (e) {
     if (e instanceof DocumentsApiError) {
@@ -181,20 +197,22 @@ function discard() {
 }
 
 onMounted(reload);
-// The read-only state follows Vector Embedding being switched on or off.
-watch(() => embeddingStatus.enabled, () => { void reload(); });
 
 defineExpose({ save, reload });
 </script>
 
 <template>
-  <section class="gate">
+  <section class="gate" aria-labelledby="documents-admin-title">
     <header class="gate-head">
-      <Icon icon="mdi:file-search-outline" class="gate-icon" />
+      <Icon icon="mdi:shield-account-outline" class="gate-icon" />
       <div>
-        <h4 class="gate-title">Documentation search</h4>
+        <h2 id="documents-admin-title" class="gate-title">
+          Administrator settings
+          <span class="gate-badge">Whole server</span>
+        </h2>
         <p class="gate-sub">
-          Lets each profile index a folder of its own files so the agent can search them and cite them.
+          Whether profiles may use Documentation search, and the limits they all share. It applies
+          to every profile on this server; only the admin sees it.
         </p>
       </div>
     </header>
@@ -202,25 +220,24 @@ defineExpose({ save, reload });
     <p v-if="loadError" class="gate-note bad">{{ loadError }}</p>
 
     <template v-else-if="view && form">
-      <p v-if="readOnly" class="gate-note">
-        <Icon icon="mdi:information-outline" />
-        <span>
-          Vector Embedding is off, so Documentation search cannot run and these settings are
-          read-only. Profiles that had it on keep their indexes, searchable by keyword only.
-        </span>
-      </p>
-      <p v-else class="gate-status">{{ statusLine }}</p>
+      <p class="gate-status">{{ statusLine }}</p>
 
-      <!-- Plain fields rather than an ElForm: this card sits inside the
-           embedding page's own ElForm (the ``after-enable`` slot), and a form
-           nested in a form is invalid HTML. The outer form's ``disabled``
-           (an embedding apply in flight) still reaches these controls. -->
+      <!-- Plain fields rather than an ElForm: the numbers lay themselves out
+           in the grid below, and the server's field errors are shown under
+           each field by hand — nothing here needs ElForm's own validation. -->
       <div class="gate-form">
         <div class="gate-field">
           <label class="gate-label">Allow Documentation search</label>
-          <ElSwitch v-model="form.allowed" :disabled="readOnly || saving" />
+          <ElSwitch v-model="form.allowed" :disabled="saving" aria-label="Allow Documentation search" />
           <p v-if="fieldErrors.allowed" class="field-error">{{ fieldErrors.allowed }}</p>
-          <p v-if="form.allowed && view.feature.missing.length" class="field-hint">
+          <p v-if="readersMissing && form.allowed" class="field-hint">
+            The document readers (PDF, Office, photos) are not installed, so those files wait;
+            plain-text files index normally.
+            <ElButton link type="primary" size="small" :disabled="saving" @click="installReaders">
+              Install them
+            </ElButton>
+          </p>
+          <p v-else-if="form.allowed && view.feature.missing.length" class="field-hint">
             The document readers (PDF, Office, photos) are not installed yet — saving offers to
             install them. Plain-text files index without them.
           </p>
@@ -235,7 +252,7 @@ defineExpose({ save, reload });
               :max="f.max"
               :step="f.step"
               :precision="f.precision"
-              :disabled="readOnly || saving"
+              :disabled="saving"
               controls-position="right"
             />
             <p v-if="fieldErrors[f.policyKey]" class="field-error">{{ fieldErrors[f.policyKey] }}</p>
@@ -248,9 +265,9 @@ defineExpose({ save, reload });
         </p>
       </div>
 
-      <div v-if="!readOnly" class="gate-actions">
+      <div class="gate-actions">
         <ElButton type="primary" :loading="saving" :disabled="!dirty" @click="save">
-          Save document search settings
+          Save administrator settings
         </ElButton>
         <ElButton v-if="dirty" :disabled="saving" @click="discard">Discard</ElButton>
       </div>
@@ -259,7 +276,7 @@ defineExpose({ save, reload });
         <h5>Profiles using it</h5>
         <ElTable :data="view.profiles" size="small" class="gate-table">
           <ElTableColumn prop="profile" label="Profile" />
-          <ElTableColumn label="My Documents" width="140">
+          <ElTableColumn label="Working directory" width="160">
             <template #default="{ row }">{{ row.local_enabled ? 'On' : 'Off' }}</template>
           </ElTableColumn>
           <ElTableColumn label="Google Drive" width="140">
@@ -274,13 +291,24 @@ defineExpose({ save, reload });
 </template>
 
 <style scoped>
+/* A page card like its neighbours on My Documents, set apart by an accent
+   edge: it is the one section that acts on every profile. */
 .gate {
-  margin: 4px 0 18px; padding: 14px 16px; border-radius: 10px;
-  border: 1px solid var(--border-color); background: var(--surface-color);
+  padding: 16px 18px; border-radius: 10px;
+  border: 1px solid var(--border-color); border-left: 3px solid var(--primary-color);
+  background: var(--surface-color);
 }
-.gate-head { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px; }
+.gate-head { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 10px; }
 .gate-icon { font-size: 22px; color: var(--primary-color); flex: none; margin-top: 1px; }
-.gate-title { margin: 0; font-size: 0.95rem; font-weight: 600; color: var(--text-primary); }
+.gate-title {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 0; font-size: 1rem; font-weight: 600; color: var(--text-primary);
+}
+.gate-badge {
+  padding: 1px 8px; border-radius: 999px; font-size: 0.7rem; font-weight: 600;
+  letter-spacing: 0.02em; color: var(--primary-color);
+  background: color-mix(in srgb, var(--primary-color) 12%, var(--surface-color));
+}
 .gate-sub { margin: 2px 0 0; font-size: 0.8rem; color: var(--text-secondary); line-height: 1.45; }
 .gate-status { margin: 0 0 8px; font-size: 0.82rem; color: var(--text-secondary); }
 .gate-note {

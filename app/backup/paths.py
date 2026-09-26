@@ -2,19 +2,23 @@
 
 Absolute paths stored in DB rows (a conversation's working directory, an
 autostart process's cwd/command, a skill tool's source dir, a file-watcher
-root, the configured user working dir) are meaningful only on the machine that
+root, a profile's working directory) are meaningful only on the machine that
 wrote them. When restoring onto a different machine — Windows→Linux, a new
 home directory, a Docker ``/root`` — those prefixes must be rewritten to the
 target's equivalents:
 
     C:\\Users\\alice\\.cremind\\admin\\skills\\x   →   /root/.cremind/admin/skills/x
     C:\\Users\\alice\\Documents\\notes             →   /home/bob/Documents/notes
+    C:\\Users\\alice\\.cremind\\workspaces\\bob    →   /root/Documents/cremind-workspaces/bob
 
-The rule is prefix substitution: the source ``system_dir`` and ``home_dir``
-(from the manifest) map to the target's, longest-prefix first. Anything not
-under a known prefix (e.g. ``D:\\projects\\x``) is left untouched and recorded
-so the restore can warn the user that a process may fail in the new
-environment (matching the user's "warn, don't silently break" requirement).
+The rule is prefix substitution: the source ``system_dir``, ``home_dir`` and
+``workspaces_root`` (from the manifest) map to the target's, longest-prefix
+first — so a path in a profile's default working directory follows the
+workspaces root even when the target keeps it somewhere else (a container's
+``CREMIND_WORKSPACES_DIR``). Anything not under a known prefix (e.g.
+``D:\\projects\\x``) is left untouched and recorded so the restore can warn the
+user that a process may fail in the new environment (matching the user's
+"warn, don't silently break" requirement).
 
 Pure functions — no ``app.*`` imports.
 """
@@ -43,9 +47,17 @@ _PATH_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "file_watcher_subscriptions": [("root_path", "path")],
     "document_sources": [("root_path", "path")],
     "userdoc_sources": [("root_path", "path")],
+    # A folder the admin chose for the profile (NULL = the default, which
+    # follows the target's workspaces root on its own). Absent from archives
+    # made before the per-profile working directories; nothing to relocate
+    # there. "working_dir" mode: see :func:`_apply_working_dir`.
+    "profiles": [("working_dir", "working_dir")],
 }
 
 # server_config is a key/value table; only this key holds a filesystem path.
+# Kept for archives made before the per-profile working directories: their
+# server-wide folder is relocated here, and the ``20260929_profile_working_dir``
+# migration hands it to the admin on the upgrade that follows the load.
 _SERVER_CONFIG_PATH_KEYS = frozenset({"user_working_dir"})
 
 
@@ -88,8 +100,15 @@ def _fold(parts: tuple[str, ...], case_insensitive: bool) -> tuple[str, ...]:
 
 
 def build_path_map(
-    manifest: Manifest, target_system_dir: str, target_home: str
+    manifest: Manifest,
+    target_system_dir: str,
+    target_home: str,
+    *,
+    target_workspaces_root: str | None = None,
 ) -> PathMap:
+    """``target_workspaces_root`` adds the source workspaces root → target
+    rule; without it (a blueprint, an archive that predates the workspaces)
+    such paths relocate through the system/home rules like any other."""
     sp = manifest.source_paths
     windows_source = sp.sep == "\\"
     flavor = PureWindowsPath if windows_source else PurePosixPath
@@ -99,9 +118,12 @@ def build_path_map(
         raw_rules.append((flavor(sp.system_dir).parts, target_system_dir))
     if sp.home_dir:
         raw_rules.append((flavor(sp.home_dir).parts, target_home))
+    if sp.workspaces_root and target_workspaces_root:
+        raw_rules.append((flavor(sp.workspaces_root).parts, target_workspaces_root))
 
     # Longest source prefix first so ``~/.cremind`` (system dir) wins over
-    # ``~`` (home) for a path that sits under both.
+    # ``~`` (home) for a path that sits under both — and the workspaces root
+    # (``~/.cremind/workspaces``, ``/root/Documents/cremind-workspaces``) over both.
     raw_rules.sort(key=lambda r: len(r[0]), reverse=True)
 
     return PathMap(
@@ -196,7 +218,10 @@ def transform_row(
     """
     if table == "server_config":
         if row.get("key") in _SERVER_CONFIG_PATH_KEYS:
-            _apply_path(pm, table, "value", row, report)
+            # The server-wide folder of an older archive: the admin's once the
+            # migration runs, so the same cross-OS rule (an empty value there
+            # leaves the admin on its default).
+            _apply_working_dir(pm, table, "value", row, report, empty="", profile="admin")
         return row
 
     for column, mode in _PATH_COLUMNS.get(table, ()):  # type: ignore[arg-type]
@@ -208,9 +233,43 @@ def transform_row(
                 report.relocated.append(
                     {"table": table, "column": column, "old": old, "new": new}
                 )
+        elif mode == "working_dir":
+            _apply_working_dir(pm, table, column, row, report)
         else:
             _apply_path(pm, table, column, row, report)
     return row
+
+
+def _apply_working_dir(
+    pm: PathMap,
+    table: str,
+    column: str,
+    row: dict[str, Any],
+    report: RelocationReport,
+    *,
+    empty: str | None = None,
+    profile: str | None = None,
+) -> None:
+    """A profile's chosen working directory relocates like any path, but one
+    that matches no known prefix AND comes from the other OS family (``D:\\work``
+    restored onto Linux) is not a folder there at all: the profile falls back
+    to its default folder instead of resolving that string relative to the
+    server's cwd. Recorded as unmapped with ``reset_to_default`` so the
+    restore can say which profiles moved. Same OS family: kept as it is (the
+    folder may well exist on the new machine) and reported as unmapped."""
+    who = profile or row.get("name")
+    n_relocated, n_unmapped = len(report.relocated), len(report.unmapped)
+    _apply_path(pm, table, column, row, report)
+    if len(report.relocated) > n_relocated:
+        report.relocated[-1]["profile"] = who
+        return
+    if len(report.unmapped) == n_unmapped:  # empty, or not an absolute path
+        return
+    report.unmapped[-1]["profile"] = who
+    if pm.windows_source == (pm.target_sep == "\\"):
+        return
+    row[column] = empty
+    report.unmapped[-1]["reset_to_default"] = True
 
 
 def _apply_path(

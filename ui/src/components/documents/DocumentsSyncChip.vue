@@ -4,7 +4,8 @@
  * something to see: a spinning sync icon while indexing is under way, an
  * alert when the user has to act (a held deletion, an unavailable folder, a
  * full disk, files that failed). The tooltip says what, and a click opens
- * Settings → My Documents.
+ * Settings → My Documents — so it is hidden while Vector Embedding is off,
+ * when that page is too (utils/myDocumentsAccess.ts).
  *
  * Deliberately a chip and never the App.vue full-screen embedding overlay:
  * indexing runs in the background and blocks nothing — chat included.
@@ -14,13 +15,19 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElTooltip } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useDocumentsStore } from '../../stores/documents';
+import { useEmbeddingStatusStore } from '../../stores/embeddingStatus';
 import { chipTooltip } from '../../utils/documentsView';
+import { documentsChipVisible } from '../../utils/myDocumentsAccess';
 
 const route = useRoute();
 const router = useRouter();
 const store = useDocumentsStore();
+const embeddingStatus = useEmbeddingStatusStore();
 
-const visible = computed(() => store.isActive || store.needsAttention);
+const visible = computed(() => documentsChipVisible(
+  { known: embeddingStatus.known, enabled: embeddingStatus.enabled },
+  { isActive: store.isActive, needsAttention: store.needsAttention },
+));
 // Failures during a run tint the spinner rather than replacing it: work is
 // still under way, and that is the more useful thing to show.
 const mode = computed(() => (store.isActive ? 'active' : 'attention'));

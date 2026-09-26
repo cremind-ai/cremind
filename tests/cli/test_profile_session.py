@@ -167,7 +167,7 @@ def _patch_get_me(monkeypatch, captured: dict) -> None:
         captured["token"] = client.token
         return SimpleNamespace(
             profile="solo", subject="solo", issued_at=0, expires_at=0,
-            system_dir="", user_working_dir="",
+            system_dir="", user_working_dir="", user_working_dir_default=None,
         )
 
     monkeypatch.setattr(me_client, "get_me", fake_get_me)

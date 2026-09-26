@@ -285,7 +285,12 @@ def server_config_set(
         metavar="KEY=VALUE",
     ),
 ) -> None:
-    """Write one or more server config keys."""
+    """Write one or more server config keys.
+
+    `user_working_dir` is not one any more — each profile has its own working
+    directory; the server refuses it (and the whole request) with a pointer to
+    `cremind profile working-dir`.
+    """
     import asyncio
 
     from app.cli.client._base import Client

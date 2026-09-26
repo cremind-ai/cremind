@@ -185,6 +185,25 @@ def _document_tree_guard(profile: Optional[str]):
     return DocumentTreeGuard(BaseConfig.CREMIND_SYSTEM_DIR, own_uid=own_uid)
 
 
+def _normcase_dir(path: str) -> str:
+    """Case-folded, no trailing separator (a bare root keeps its own) — the
+    shape :func:`app.config.working_dirs.foreign_dirs_inside` returns."""
+    return os.path.normcase(path).rstrip("\\/") or os.path.normcase(path)
+
+
+def _foreign_working_dirs(root: str, profile: Optional[str]) -> set:
+    """Other profiles' working directories (and unowned workspaces entries)
+    strictly inside ``root``, normcased — what a walk or listing of ``root``
+    must not show ``profile``. Empty when ownership is unknown."""
+    from app.config.working_dirs import foreign_dirs_inside
+
+    try:
+        return set(foreign_dirs_inside(root, profile or ""))
+    except Exception:  # noqa: BLE001 — a failed lookup must not break the walk
+        logger.debug("system_file: foreign working-dir lookup failed", exc_info=True)
+        return set()
+
+
 def _protected_tree_pruner(root: str, profile: Optional[str] = None):
     """``prune(dirpath, dirnames, filenames=None)`` for a recursive walk of
     ``root``: drops the Documentation search index store (current and
@@ -198,15 +217,33 @@ def _protected_tree_pruner(root: str, profile: Optional[str] = None):
     filtered the same way when given (a stray file directly in ``profiles/``
     is nobody's to read either).
 
+    It also drops every OTHER profile's working directory (and unowned
+    workspaces entry) inside ``root`` — an admin whose folder contains the
+    workspaces root must not walk into the others' (the admin is not
+    exempt). Those are looked up once per walk; only a directory that is the
+    parent of one pays for the per-entry test.
+
     ``os.walk`` builds every ``dirpath`` by joining onto ``root`` and never
     descends a symlinked directory, so one ``realpath`` of the root places
     every directory it visits — none per directory. Only directories on the
     way to (or inside) a protected tree pay for the per-entry test."""
     guard = _document_tree_guard(profile)
     real_root = os.path.realpath(root)
+    foreign = _foreign_working_dirs(real_root, profile)
+    foreign_parents = {_normcase_dir(os.path.dirname(f)) for f in foreign}
 
     def prune(dirpath: str, dirnames: List[str], filenames: Optional[List[str]] = None) -> None:
         real_dir = real_root + dirpath[len(root):] if dirpath.startswith(root) else os.path.realpath(dirpath)
+        if foreign_parents and _normcase_dir(real_dir) in foreign_parents:
+            dirnames[:] = [
+                d for d in dirnames
+                if os.path.normcase(os.path.join(real_dir, d)) not in foreign
+            ]
+            if filenames is not None:
+                filenames[:] = [
+                    f for f in filenames
+                    if os.path.normcase(os.path.join(real_dir, f)) not in foreign
+                ]
         if not guard.near(real_dir):
             return
         dirnames[:] = [d for d in dirnames if not guard.hides(os.path.join(real_dir, d))]
@@ -223,6 +260,28 @@ def _report_path(full_path: str, base: str) -> str:
     if full_path == base or full_path.startswith(base + os.sep):
         return os.path.relpath(full_path, base).replace(os.sep, "/")
     return full_path.replace(os.sep, "/")
+
+
+def _foreign_to_caller(target: str, profile: Optional[str], base: str) -> bool:
+    """Whether ``target`` lies in a working directory the caller may not reach.
+
+    ``profile`` decides when given — and every tool passes it (these file
+    tools, image and audio understanding through :func:`_safe_resolve`, the
+    markdown converter's own resolver). A caller without one (no profile in
+    the call's context) is judged by its working directory ``base``, which
+    the adapter never points into another profile's folder: a target in a
+    zone that ``base``'s owners do not share is refused, and with ``base`` in
+    no zone every owned target is (fail closed — pass the profile to reach
+    your own folder from elsewhere)."""
+    from app.config.working_dirs import is_foreign, owners_of
+
+    if profile:
+        return is_foreign(target, profile)
+    owners = owners_of(target)
+    if owners is None:
+        return False
+    base_owners = owners_of(base) or frozenset()
+    return not (owners & base_owners)
 
 
 def _safe_resolve(
@@ -293,6 +352,17 @@ def _safe_resolve(
                 "pages. Only this profile's own manual folder is reachable."
             )
         return target
+
+    # Another profile's working directory (or an unowned workspaces entry) is
+    # off-limits under ANY root — an admin whose folder contains the
+    # workspaces root included. After the manual-pages rule: those pages sit
+    # in the system folder, which a legacy working directory may contain.
+    if _foreign_to_caller(target, profile, base):
+        raise ValueError(
+            f"Access denied: '{relative_path}' is inside another profile's working "
+            "directory. That folder belongs to another profile; each profile's "
+            "working directory is private to it."
+        )
 
     for root in roots:
         if target == root or target.startswith(root + os.sep):
@@ -1552,6 +1622,9 @@ class ListFilesTool(BuiltInTool):
         # ``target`` is resolved, so entries are placed without a realpath.
         guard = _document_tree_guard(arguments.get("_profile"))
         filter_entries = guard.near(target)
+        # Nor does it name another profile's working directory (a folder that
+        # contains the workspaces root lists the others' workspaces).
+        foreign = _foreign_working_dirs(target, arguments.get("_profile"))
         entries = []
         try:
             with os.scandir(target) as it:
@@ -1559,6 +1632,8 @@ class ListFilesTool(BuiltInTool):
                     if pattern and not fnmatch.fnmatch(entry.name, pattern):
                         continue
                     if filter_entries and guard.hides(os.path.join(target, entry.name)):
+                        continue
+                    if foreign and os.path.normcase(os.path.join(target, entry.name)) in foreign:
                         continue
                     try:
                         stat = entry.stat()
@@ -2165,6 +2240,16 @@ def _resolve_relocation(
         return None, None, BuiltInToolResult(structured_content={
             "error": "Access denied",
             "message": f"'{source_path}' holds other profiles' documents and cannot be moved.",
+        })
+    # Likewise a folder holding another profile's working directory (the
+    # workspaces root inside an admin's folder): it is not the caller's to move.
+    if os.path.isdir(src) and _foreign_working_dirs(src, profile):
+        return None, None, BuiltInToolResult(structured_content={
+            "error": "Access denied",
+            "message": (
+                f"'{source_path}' holds other profiles' working directories and "
+                "cannot be moved."
+            ),
         })
 
     try:

@@ -132,9 +132,10 @@ def _runtime(profile: str) -> dict[str, Any] | None:
 def _source_view(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
+    # ``root``: the folder the index was built from — the profile's working
+    # directory, or its previous one while a move waits for confirmation.
     return {
         "enabled": bool(row.get("enabled")),
-        "root_mode": row.get("root_mode"),
         "root": row.get("root_path"),
         "first_sync_confirmed": bool(row.get("first_sync_confirmed_at")),
     }

@@ -37,7 +37,7 @@ Q1_NEW = "# Q1 2025 results\n\nQ1 2025 revenue: 13,500\nQ1 2025 cost: 700\n"
 
 
 def _start_polling(env) -> object:
-    env.storage.upsert_source("alice", "local", enabled=True, root_mode="custom",
+    env.storage.upsert_source("alice", "local", enabled=True,
                               root_path=os.path.realpath(env.alice), first_sync_confirmed_at=1.0,
                               options={"observer": {"mode": "poll"}})
     env.svc.start()

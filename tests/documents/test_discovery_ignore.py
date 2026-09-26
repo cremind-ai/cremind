@@ -84,6 +84,30 @@ def test_a_root_inside_a_locked_dir_indexes_nothing(tmp_path):
     assert _cls(m, root, "a.txt") == SKIP
 
 
+def test_a_sanctioned_root_inside_the_system_dir_indexes(tmp_path):
+    """validate_root approved it (the profile's own default workspace,
+    ``<SYS>/workspaces/<profile>``): the system dir no longer locks the root,
+    but every other rule still applies inside it."""
+    root = tmp_path / "sys" / "workspaces" / "dog"
+    root.mkdir(parents=True)
+    m = _m(root, system_dir=str(tmp_path / "sys"), root_sanctioned=True, include_hidden=True)
+    assert _cls(m, root, "a.txt") == INDEX
+    assert _cls(m, root, "keys/id_rsa") == METADATA_ONLY
+    assert m.prune_dir(".ssh", str(root / ".ssh"))
+
+
+def test_the_sanctioned_exemption_is_for_the_system_dir_only(tmp_path):
+    """Another locked exclude holding the root (another profile's folder)
+    still locks it, and the system dir itself is never a sanctioned root."""
+    root = tmp_path / "sys" / "workspaces" / "dog"
+    root.mkdir(parents=True)
+    other = _m(root, locked=[str(tmp_path / "sys" / "workspaces")], system_dir=str(tmp_path / "sys"),
+               root_sanctioned=True)
+    assert _cls(other, root, "a.txt") == SKIP
+    sysroot = _m(tmp_path / "sys", system_dir=str(tmp_path / "sys"), root_sanctioned=True)
+    assert _cls(sysroot, tmp_path / "sys", "a.txt") == SKIP
+
+
 # ── layer 2: defaults ──────────────────────────────────────────────────────
 
 

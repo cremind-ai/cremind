@@ -644,12 +644,14 @@ async def run_agent_to_bus(
     # in-memory ContextStorage so the reasoning agent's prompt-builder
     # picks up the same cwd the user last selected (in the file tree or
     # via change_working_directory) before the previous restart. A
-    # persisted path that has since been deleted is cleared and the run
-    # falls back to the user default.
+    # persisted path that has since been deleted (or now lies in another
+    # profile's working directory) is cleared and the run falls back to the
+    # profile's own folder.
     try:
         from app.utils.working_directory import hydrate_working_directory
         await hydrate_working_directory(
             conversation_id, conversation_storage, context_key=context_id,
+            profile=profile,
         )
     except Exception:  # noqa: BLE001
         logger.exception(

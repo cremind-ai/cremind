@@ -1,7 +1,8 @@
 """`cremind backup ...` — full-system backup & restore.
 
 A ``.cremind-backup`` archive captures the whole system (database, skills,
-OAuth tokens, personas, channels, browser login state) in an
+OAuth tokens, personas, channels, browser login state — and, unless
+``--no-workspaces``, every profile's default working directory) in an
 environment-independent form and restores it into this or a fresh install,
 across OSes and database backends. Distinct from ``cremind db backup``, which
 snapshots only the database.
@@ -92,6 +93,8 @@ def _poll_status(cfg, mode, *, restore: bool) -> int:
                     detail = st.get("detail") or {}
                     if detail:
                         typer.echo(f"  {detail}")
+                    if not restore and "workspaces_included" in detail:
+                        typer.echo(f"  {_workspaces_line(detail)}")
                     return 0
         time.sleep(1.5)
     typer.echo("Timed out waiting for completion; check `cremind backup status`.", err=True)
@@ -99,6 +102,25 @@ def _poll_status(cfg, mode, *, restore: bool) -> int:
 
 
 # ── create ─────────────────────────────────────────────────────────────────
+
+
+def _workspaces_line(detail: dict) -> str:
+    """What happened to the profiles' working directories: one line, plus one
+    per folder an admin chose outside the workspaces folder (never archived)."""
+    if not detail.get("workspaces_included"):
+        line = ("working directories: not included (--no-workspaces); "
+                "the archive restores without touching them")
+    else:
+        count = detail.get("workspaces_file_count")
+        root = detail.get("workspaces_root") or "the workspaces folder"
+        files = f"{count} file(s)" if isinstance(count, int) else "included"
+        line = (f"working directories: {files} from {root} "
+                "(folders an admin chose outside it are not included)")
+    elsewhere = detail.get("working_dirs_elsewhere") or {}
+    if isinstance(elsewhere, dict):
+        for name, path in sorted(elsewhere.items()):
+            line += f"\n  not included: profile '{name}' works in {path} (back it up yourself)"
+    return line
 
 
 @backup_app.command("create")
@@ -109,8 +131,18 @@ def backup_create(
     to: Optional[Path] = typer.Option(None, "--to", help="Output path (offline only). Defaults to backups/<name>."),
     passphrase: Optional[str] = typer.Option(None, "--passphrase", help="Encrypt the archive with this passphrase."),
     passphrase_prompt: bool = typer.Option(False, "--passphrase-prompt", help="Prompt for an encryption passphrase."),
+    no_workspaces: bool = typer.Option(
+        False, "--no-workspaces",
+        help="Leave out the profiles' working directories (the workspaces folder). "
+             "Included by default.",
+    ),
 ) -> None:
-    """Create a full-system backup archive."""
+    """Create a full-system backup archive.
+
+    Includes every profile's default working directory (the workspaces
+    folder) unless --no-workspaces. Folders an admin chose outside it are
+    never included.
+    """
     pw = _resolve_passphrase(passphrase, passphrase_prompt, confirm=True)
 
     if offline:
@@ -118,12 +150,23 @@ def backup_create(
         from app.backup.manifest import BackupError
 
         try:
-            result = create_backup(BackupOptions(dest=to, passphrase=pw))
+            result = create_backup(BackupOptions(
+                dest=to, passphrase=pw, include_workspaces=not no_workspaces,
+            ))
         except BackupError as e:
             typer.echo(str(e), err=True)
             raise typer.Exit(code=1) from e
         typer.echo(f"Created {result.path}")
         typer.echo(f"  files={result.file_count} bytes={result.bytes_written} encrypted={bool(pw)}")
+        typer.echo("  " + _workspaces_line({
+            "workspaces_included": result.manifest.workspaces_included,
+            "workspaces_file_count": result.workspaces_file_count,
+            "workspaces_root": result.manifest.source_paths.workspaces_root,
+            "working_dirs_elsewhere": {
+                name: result.manifest.working_dirs[name].get("path")
+                for name in result.manifest.working_dirs_elsewhere()
+            },
+        }))
         if result.skipped:
             typer.echo(f"  skipped {len(result.skipped)} entr(ies) (symlinks/unreadable)")
         return
@@ -140,7 +183,7 @@ def backup_create(
 
     async def _kick() -> None:
         async with Client(cfg) as client:
-            await api.create(client, pw)
+            await api.create(client, pw, include_workspaces=not no_workspaces)
 
     asyncio.run(_kick())
     typer.echo("Backup started:")
@@ -178,7 +221,7 @@ def backup_list(ctx: typer.Context) -> None:
     if not rows:
         typer.echo("No backups found.")
         return
-    table = Table(mode, "NAME", "CREATED", "SIZE", "PROVIDER", "ENCRYPTED")
+    table = Table(mode, "NAME", "CREATED", "SIZE", "PROVIDER", "ENCRYPTED", "WORKING DIRS")
     for r in rows:
         man = r.get("manifest") or {}
         table.add_row(
@@ -187,6 +230,7 @@ def backup_list(ctx: typer.Context) -> None:
             f"{r.get('size_bytes', 0):,}",
             man.get("db_provider") or "-",
             "yes" if man.get("encrypted") else "no",
+            "yes" if man.get("workspaces_included") else "no",
         )
     table.render()
 

@@ -98,17 +98,23 @@ def _system_dir() -> str:
     return BaseConfig.CREMIND_SYSTEM_DIR
 
 
-def _source_paths() -> SourcePaths:
+def _source_paths(profile: str) -> SourcePaths:
+    """The exporting environment's roots. ``user_working_dir`` is the EXPORTING
+    profile's own working directory (each profile has its own), which is what
+    an import remaps that profile's file-watcher roots from."""
     from app.config.settings import get_user_working_directory
 
     try:
-        uwd = get_user_working_directory()
+        uwd = get_user_working_directory(profile)
     except Exception:  # noqa: BLE001
         uwd = ""
+    from app.config.working_dirs import workspaces_root
+
     return SourcePaths(
         system_dir=_system_dir(),
         home_dir=os.path.expanduser("~"),
         user_working_dir=uwd or "",
+        workspaces_root=workspaces_root(),
         sep=os.sep,
         case_insensitive=(sys.platform == "win32"),
     )
@@ -328,7 +334,7 @@ def create_blueprint(
         app_version=ver,
         platform=sys.platform,
         source_profile=profile,
-        source_paths=_source_paths(),
+        source_paths=_source_paths(profile),
         name=slug_filename(options.name or options.display_name or "blueprint"),
         display_name=options.display_name or options.name or profile,
         description=options.description or "",

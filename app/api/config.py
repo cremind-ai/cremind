@@ -14,10 +14,10 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api._auth import is_admin, require_admin, require_auth
+from app.config import working_dirs
 from app.config.bootstrap import write_bootstrap
 from app.config.settings import (
     BaseConfig,
-    DEFAULT_USER_WORKING_DIR,
     relocate_system_directory,
 )
 from app.config.install_catalog import (
@@ -42,6 +42,17 @@ from app.utils.persona import ensure_persona_file
 # ``CREMIND_SYSTEM_DIR`` env var (and the file it lives in), not the DB —
 # it must also be filtered out of generic server_config writes.
 _BOOTSTRAP_ONLY_KEYS = {"db_provider", "postgres", "system_dir"}
+
+# Server-config keys that no longer are server settings. ``user_working_dir``
+# was the one folder every profile shared; each profile now has its own
+# (app/config/working_dirs.py), so a write here would change nothing — and
+# silently accepting it would let an operator believe it had.
+_MOVED_SERVER_CONFIG_KEYS = {
+    "user_working_dir": (
+        "Each profile has its own working directory now. The admin sets one with "
+        "PUT /api/profiles/{name}/working-dir (CLI: cremind profile working-dir NAME PATH)."
+    ),
+}
 
 
 # Profile name validation: lowercase, numbers, underscore, hyphen only
@@ -99,6 +110,32 @@ def _emit_setup(step: str, message: str, level: str = "info") -> None:
         logger.debug("setup-progress emit failed", exc_info=True)
 
 
+def _working_dir_rejected(check: working_dirs.WorkingDirCheck) -> JSONResponse:
+    """Setup's 400 for a working directory that failed validation. ``error``
+    carries the sentence (the wizard and the CLI show that field);
+    ``reason`` is :func:`working_dirs.validate_working_dir`'s code."""
+    message = f"Working directory rejected: {check.message}"
+    _emit_setup("working_dir", message, level="error")
+    return JSONResponse(
+        {
+            "error": message,
+            "code": "invalid_working_dir",
+            "reason": check.code,
+            "path": check.path,
+        },
+        status_code=400,
+    )
+
+
+def _same_folder(a: str, b: str) -> bool:
+    """``a`` and ``b`` spell one folder (``~`` expanded, case-folded where the
+    platform folds it, links resolved when they exist)."""
+    def _n(p: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(os.path.expanduser(p.strip()))))
+
+    return _n(a) == _n(b) or _n(working_dirs.real_path(a)) == _n(working_dirs.real_path(b))
+
+
 def _validate_profile_name(name: str) -> str | None:
     """Validate profile name. Returns error message or None if valid."""
     if not name:
@@ -107,6 +144,10 @@ def _validate_profile_name(name: str) -> str | None:
         return "Profile name must contain only lowercase letters, numbers, hyphens, and underscores"
     if len(name) > 64:
         return "Profile name must be 64 characters or less"
+    # ``__…`` names are Cremind's own pseudo profiles (``__server__``): such a
+    # name gets no working directory, so every turn of it would fail.
+    if not working_dirs.valid_profile_dirname(name):
+        return "Profile names cannot start with '__' (reserved for Cremind's internal profiles)"
     return None
 
 
@@ -641,6 +682,14 @@ def get_config_routes(state: BootedState) -> list[Route]:
         The preset is purely a pre-fill hint: the wizard seeds form values
         from it, but every field stays editable so the operator can override
         anything before submitting.
+
+        ``suggested_working_dir`` is the folder the profile being set up will
+        get: the admin's on first setup (its current one on a re-run), else
+        ``?profile=`` (or the caller's own). Once setup is complete it is only
+        told to an authenticated caller — its own, or any profile's for admin
+        — since a server path is deployment detail. ``working_dir_editable``
+        is true only on first setup: afterwards a profile's folder changes
+        from Settings → Profiles (admin), never from its own setup.
         """
         try:
             profiles = list_setup_profiles()
@@ -652,7 +701,46 @@ def get_config_routes(state: BootedState) -> list[Route]:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Failed to resolve active setup profile: {exc}")
             selected = None
-        return JSONResponse({"profiles": profiles, "selected": selected})
+        suggested, editable = None, False
+        try:
+            suggested, editable = await _suggest_working_dir(request)
+        except Exception as exc:  # noqa: BLE001 — a hint; never fail the catalogue
+            logger.warning(f"Failed to resolve the suggested working directory: {exc}")
+        return JSONResponse({
+            "profiles": profiles,
+            "selected": selected,
+            "suggested_working_dir": suggested,
+            "working_dir_editable": editable,
+        })
+
+    async def _suggest_working_dir(request: Request) -> tuple[str | None, bool]:
+        first_setup = not state.storage_ready or not state.config_storage.is_setup_complete()
+        if first_setup:
+            target = "admin"
+        else:
+            try:
+                user = request.user
+            except Exception:  # noqa: BLE001 — no auth middleware (tests)
+                user = None
+            caller = getattr(user, "username", "") if getattr(user, "is_authenticated", False) else ""
+            query = getattr(request, "query_params", None) or {}
+            target = (query.get("profile") or "").strip() or caller
+            if not caller or (target != caller and caller != "admin"):
+                return None, False
+        if _validate_profile_name(target) is not None:
+            return None, first_setup
+        exists = (
+            state.storage_ready
+            and state.conversation_storage is not None
+            and await state.conversation_storage.profile_exists(target)
+        )
+
+        def _resolve() -> str:
+            if exists or target == "admin":
+                return working_dirs.profile_working_dir(target, create=False)
+            return working_dirs.fresh_default_for_new_profile(target) or working_dirs.default_working_dir(target)
+
+        return await asyncio.to_thread(_resolve), first_setup
 
     async def handle_setup_status(request: Request) -> JSONResponse:
         """Check if first-time setup has been completed. No auth required.
@@ -909,6 +997,13 @@ def get_config_routes(state: BootedState) -> list[Route]:
         Expects JSON body with:
         - profile: str (required) — the profile name to create
         - server_config: dict of server settings (first setup only)
+        - working_dir: str — the profile's working directory. On first setup
+          the admin's own (``server_config.user_working_dir`` is the older
+          spelling; omitted on a Reconfigure re-run keeps the current one);
+          afterwards the folder the admin picked for a profile this call
+          creates (ignored, with a warning, when adopting). Omitted → the
+          default, ``<workspaces root>/<profile>``. The admin changes any
+          profile's later with ``PUT /api/profiles/{name}/working-dir``.
         - llm_config: dict of LLM settings
         - tool_configs: dict of {tool_name: {key: value}}
         - user_config: dict of per-profile settings (e.g. {"memory.enabled": "true"})
@@ -1012,6 +1107,32 @@ def get_config_routes(state: BootedState) -> list[Route]:
                     status_code=409,
                 )
             adopted = exists_now
+
+        # An additional profile's working directory, when the admin picked one
+        # (Settings → Profiles → Create New Profile passes it through the
+        # wizard). Only for a profile this call creates — an existing one keeps
+        # its folder; ``PUT /api/profiles/{name}/working-dir`` changes that.
+        # Checked here, before the feature install, so a bad path is a fast 400.
+        requested_working_dir: working_dirs.WorkingDirCheck | None = None
+        raw_requested_dir = body.get("working_dir")
+        if not is_first_setup and raw_requested_dir is not None:
+            if not isinstance(raw_requested_dir, str):
+                return JSONResponse({"error": "'working_dir' must be a path"}, status_code=400)
+            if raw_requested_dir.strip() and adopted:
+                setup_warnings.append({
+                    "code": "working_dir_ignored",
+                    "message": (
+                        f"Profile '{profile_name}' already exists, so it keeps its working "
+                        "directory; change it in Settings → Profiles (or `cremind profile "
+                        "working-dir`)."
+                    ),
+                })
+            elif raw_requested_dir.strip():
+                requested_working_dir = await asyncio.to_thread(
+                    working_dirs.validate_working_dir, profile_name, raw_requested_dir, create=True,
+                )
+                if not requested_working_dir.ok:
+                    return _working_dir_rejected(requested_working_dir)
 
         _emit_setup(
             "start",
@@ -1154,6 +1275,17 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # and before ``boot_fn()`` creates the SQLite DB. At this point
         # the System Directory holds at most an install-script ``.env``,
         # so the move is cheap.
+        # The wizard suggested the admin's folder under the System Directory it
+        # was served from (``/api/config/setup-profiles``) and sends it back
+        # as ``working_dir``. Captured before a relocation moves the default,
+        # so that value still reads as "the default" below — not as an
+        # explicit folder under the System Directory just abandoned.
+        pre_relocation_default: str | None = None
+        if is_first_setup:
+            try:
+                pre_relocation_default = working_dirs.default_working_dir(profile_name)
+            except ValueError:
+                pre_relocation_default = None
         if is_first_setup:
             requested_system_dir = (body.get("server_config", {}) or {}).get("system_dir")
             if requested_system_dir:
@@ -1177,6 +1309,38 @@ def get_config_routes(state: BootedState) -> list[Route]:
                         level="error",
                     )
                     return JSONResponse({"error": str(exc)}, status_code=400)
+
+        # ── The admin's working directory (first setup only) ─────────────
+        # Its own folder, like every profile's (app/config/working_dirs.py):
+        # a top-level ``working_dir``, or ``server_config.user_working_dir``
+        # from an older CLI or wizard. Checked (and created) after the System
+        # Directory settled — the default lives under it — and before
+        # anything is persisted, so a bad path costs nothing but a retry.
+        # Absent on a re-run (Reconfigure: the admin already exists) keeps the
+        # folder it has; absent on a fresh install (or ``""``) is the default.
+        admin_working_dir: working_dirs.WorkingDirCheck | None = None
+        if is_first_setup:
+            raw_working_dir = body.get("working_dir")
+            if raw_working_dir is None:
+                raw_working_dir = (body.get("server_config") or {}).get("user_working_dir")
+            if raw_working_dir is not None and not isinstance(raw_working_dir, str):
+                return JSONResponse({"error": "'working_dir' must be a path"}, status_code=400)
+            if (
+                raw_working_dir and raw_working_dir.strip() and pre_relocation_default
+                and _same_folder(raw_working_dir, pre_relocation_default)
+            ):
+                raw_working_dir = ""  # the default, wherever the System Directory now is
+            keep_current = raw_working_dir is None and (
+                state.storage_ready
+                and state.conversation_storage is not None
+                and await state.conversation_storage.profile_exists(profile_name)
+            )
+            if not keep_current:
+                admin_working_dir = await asyncio.to_thread(
+                    working_dirs.validate_working_dir, profile_name, raw_working_dir, create=True,
+                )
+                if not admin_working_dir.ok:
+                    return _working_dir_rejected(admin_working_dir)
 
         # ── Database provider selection ──────────────────────────────────
         # First-setup-only. Validate the requested DB provider (Postgres
@@ -1279,11 +1443,38 @@ def get_config_routes(state: BootedState) -> list[Route]:
             })
         else:
             _emit_setup("profile", f"Creating profile {profile_name!r}…")
+        created_now = False
         if not await conversation_storage.profile_exists(profile_name):
             await conversation_storage.create_profile(profile_name)
+            created_now = True
 
         # Create profile directory and copy PERSONA.md template
         ensure_persona_file(profile_name)
+
+        # Every other profile's working directory: the folder the admin picked
+        # (checked above), else its default (or a fresh ``<name>-2`` when a
+        # folder of that name already holds files — a new profile never adopts
+        # them), created now. The profile itself never picks it. An adopted
+        # profile keeps the folder it already has. Never fatal.
+        working_dir_path: str | None = None
+        if not is_first_setup:
+            try:
+                if created_now:
+                    from app.api.profiles import provision_new_profile_working_dir
+
+                    working_dir_path = provision_new_profile_working_dir(
+                        profile_name, requested_working_dir,
+                    )["path"]
+                else:
+                    working_dir_path = await asyncio.to_thread(
+                        working_dirs.profile_working_dir, profile_name,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"Could not set up the working directory of '{profile_name}'")
+                setup_warnings.append({
+                    "code": "working_dir_failed",
+                    "message": f"Could not set up this profile's working directory: {exc}",
+                })
 
         # For additional profiles, seed skills + backfill a2a/mcp tool rows NOW
         # (before the tool_configs loop below), mirroring handle_add_profile in
@@ -1326,28 +1517,13 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 """
                 for key, value in server_config.items():
                     # The DB-provider keys live in bootstrap.toml, never in the
-                    # server_config table — they were applied above.
-                    if key in _BOOTSTRAP_ONLY_KEYS:
+                    # server_config table — they were applied above. A legacy
+                    # ``user_working_dir`` was taken as the admin's own folder
+                    # above and is stored on its profile row below.
+                    if key in _BOOTSTRAP_ONLY_KEYS or key in _MOVED_SERVER_CONFIG_KEYS:
                         continue
                     is_secret = key in ("jwt_secret",)
                     config_storage.set("server_config", key, str(value), is_secret=is_secret)
-
-                # Ensure the User Working Directory is recorded with a sensible
-                # default so all built-in tools have a writable active path on
-                # first run, even if the wizard payload didn't include it.
-                user_working_dir = server_config.get("user_working_dir")
-                if not user_working_dir:
-                    user_working_dir = DEFAULT_USER_WORKING_DIR
-                    config_storage.set("server_config", "user_working_dir", user_working_dir)
-                expanded_uwd = (
-                    os.path.expanduser(user_working_dir)
-                    if user_working_dir.startswith("~")
-                    else user_working_dir
-                )
-                try:
-                    os.makedirs(expanded_uwd, exist_ok=True)
-                except OSError as exc:
-                    logger.warning(f"Could not create user working directory {expanded_uwd!r}: {exc}")
 
                 # Generate JWT secret if not provided
                 if not config_storage.get("server_config", "jwt_secret") and not BaseConfig.get_jwt_secret():
@@ -1356,6 +1532,30 @@ def get_config_routes(state: BootedState) -> list[Route]:
                     )
 
             await asyncio.to_thread(_write_server_config)
+
+            # The admin's working directory, validated and created above. The
+            # default is stored as NULL (``set_working_dir``), so a re-run that
+            # picks the default undoes an earlier explicit choice. On the loop:
+            # it notifies the change listeners. None: a re-run keeping its own.
+            try:
+                if admin_working_dir is not None:
+                    working_dir_path = working_dirs.set_working_dir(
+                        profile_name,
+                        None if admin_working_dir.is_default else admin_working_dir.path,
+                    )
+                else:
+                    working_dir_path = await asyncio.to_thread(
+                        working_dirs.profile_working_dir, profile_name,
+                    )
+                _emit_setup(
+                    "working_dir", f"Working directory: {working_dir_path}", level="success",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Could not store the admin's working directory")
+                setup_warnings.append({
+                    "code": "working_dir_failed",
+                    "message": f"Could not store the working directory: {exc}",
+                })
 
             # Vector embedding configuration. Stored in server_config because
             # the model loads once into the Cremind process and is shared
@@ -1736,6 +1936,9 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 "token": token,
                 "expires_at": expires_at,
                 "profile": profile_name,
+                # The profile's own working directory (null if it could not
+                # be set up — see ``warnings``).
+                "working_dir": working_dir_path,
                 "embedding_enabled": BaseConfig.is_embedding_enabled(),
                 "channels": created_channels,
                 "channel_errors": channel_errors,
@@ -2035,6 +2238,11 @@ def get_config_routes(state: BootedState) -> list[Route]:
         if gate := _require_storage():
             return gate
         config = state.config_storage.get_all("server_config", include_secrets=False)
+        # A leftover row (a restore of an old dump, a write that predates the
+        # refusal below) is not a setting any more; showing it would read as
+        # the folder everyone uses.
+        for key in _MOVED_SERVER_CONFIG_KEYS:
+            config.pop(key, None)
         return JSONResponse({"config": config})
 
     async def handle_update_server_config(request: Request) -> JSONResponse:
@@ -2050,6 +2258,18 @@ def get_config_routes(state: BootedState) -> list[Route]:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
         config = body.get("config", {})
+        # Refused before anything is written, so a request mixing it with valid
+        # keys applies none of them rather than half.
+        for key, hint in _MOVED_SERVER_CONFIG_KEYS.items():
+            if key in config:
+                return JSONResponse(
+                    {
+                        "error": f"'{key}' is no longer a server setting",
+                        "code": "moved_per_profile",
+                        "message": hint,
+                    },
+                    status_code=400,
+                )
         cfg_storage = state.config_storage
         for key, value in config.items():
             # The DB-provider choice can only change during the very first
@@ -2257,7 +2477,8 @@ def get_config_routes(state: BootedState) -> list[Route]:
             install_custom_values=custom_values,
             install_secrets=install_secrets,
             db_provider=db_provider,
-            user_working_dir=_path(get_user_working_directory()),
+            # The exporting profile's own folder — each profile has its own.
+            user_working_dir=_path(get_user_working_directory(profile)),
             system_dir=_path(BaseConfig.CREMIND_SYSTEM_DIR),
             sqlite_db_path=_path(BaseConfig.SQLITE_DB_PATH),
             embedding_config=embedding_config,

@@ -1,19 +1,21 @@
 """`cremind docs ...` — Documentation search for the current profile.
 
 Mirrors Settings → My Documents: turn indexing of your own files on or off,
-choose the folder, manage exclude rules, and watch sync progress. `drive`
-does the same for Google Drive files (documented in
-`[cli]cremind docs drive.md`). `admin` subcommands mirror the gate on the
-Vector Embedding page. `search`, `find`, `read` and `cite` query the index the
-way the agent does (documented separately, in `[cli]cremind docs
-search.md`), and `research` runs the agent's deep-research jobs (in
-`[cli]cremind docs research.md`).
+manage exclude rules, and watch sync progress. The indexed folder is always
+the profile's working directory — only the admin changes it (`cremind profile
+working-dir`), and `confirm-root-change` accepts a move. `drive` does the same
+for Google Drive files (documented in `[cli]cremind docs drive.md`). `admin`
+subcommands mirror the Administrator settings section of My Documents (the
+server-wide gate). `search`, `find`,
+`read` and `cite` query the index the way the agent does (documented
+separately, in `[cli]cremind docs search.md`), and `research` runs the
+agent's deep-research jobs (in `[cli]cremind docs research.md`).
 
-Changes that would remove indexed content (moving the folder, adding excludes
-that drop files, deleting the index, turning Drive off, dropping Drive
-folders) are refused with a plan of what would go. Re-run with `--yes` to
-apply — non-interactive callers (scripts, the agent's own shell) must pass it
-explicitly; nothing is ever deleted by default.
+Changes that would remove indexed content (accepting a moved working
+directory, adding excludes that drop files, deleting the index, turning Drive
+off, dropping Drive folders) are refused with a plan of what would go. Re-run
+with `--yes` to apply — non-interactive callers (scripts, the agent's own
+shell) must pass it explicitly; nothing is ever deleted by default.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from app.cli.commands._helpers import graceful_errors
 
 docs_app = typer.Typer(
     name="docs",
-    help="Search your own files: enable indexing, choose the folder, follow sync progress.",
+    help="Search your own files (your working directory): enable indexing, follow sync progress.",
     no_args_is_help=True,
 )
 excludes_app = typer.Typer(
@@ -239,6 +241,29 @@ def docker_warning(snap: dict[str, Any]) -> Optional[str]:
             f"(copy out any files you need) — {fix}")
 
 
+def _root_change(snap: dict[str, Any]) -> Optional[tuple[Any, Any]]:
+    """``(from, to)`` while a moved working directory waits for the profile
+    to confirm it (``hold(pending_root_change)``), else None."""
+    conf = snap.get("confirmation") if isinstance(snap.get("confirmation"), dict) else {}
+    if snap.get("reason") != "pending_root_change" and conf.get("kind") != "root_change":
+        return None
+    detail = snap.get("detail") if isinstance(snap.get("detail"), dict) else {}
+    return detail.get("from") or conf.get("from"), detail.get("to") or conf.get("to")
+
+
+def folder_line(snap: dict[str, Any]) -> Optional[str]:
+    """`status`'s second line: the indexed folder, which is always the
+    profile's working directory — or, while a move waits, what to run."""
+    moved = _root_change(snap)
+    if moved:
+        return (f"your working directory changed from {moved[0]} to {moved[1]}; syncing is on hold "
+                "until you run: cremind docs confirm-root-change")
+    local = (snap.get("sources") or {}).get("local")
+    if not isinstance(local, dict) or not local.get("enabled") or not local.get("root"):
+        return None
+    return f"folder: {local['root']} (your working directory)"
+
+
 def _when(ts: Any) -> str:
     """An epoch timestamp (seconds or milliseconds) as local 'YYYY-MM-DD HH:MM'."""
     import datetime as _dt
@@ -360,6 +385,9 @@ def documents_status(
         _print(ctx, out)  # the docker block is in the snapshot itself
     else:
         sys.stdout.write(summarize_snapshot(out) + "\n")
+        folder = folder_line(out)
+        if folder:
+            sys.stdout.write(folder + "\n")
         warning = docker_warning(out)
         if warning:
             sys.stderr.write(warning + "\n")
@@ -373,14 +401,16 @@ def documents_status(
 @docs_app.command("settings")
 @graceful_errors
 def documents_settings(ctx: typer.Context) -> None:
-    """Print this profile's folder, Drive and option settings."""
+    """Print this profile's folder (your working directory), Drive and option settings."""
     import asyncio
 
     from app.cli.client._base import Client
     from app.cli.client.docs import get_settings
     from app.cli.config import Config
+    from app.cli.output import OutputMode
 
     cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
     cfg.require_token()
 
     async def _run() -> dict[str, Any]:
@@ -388,26 +418,26 @@ def documents_settings(ctx: typer.Context) -> None:
             return await get_settings(client)
 
     out = asyncio.run(_run())
+    wd = (out.get("policy_view") or {}).get("working_dir")
+    if wd and not mode.json:
+        # On stderr: stdout stays the JSON document scripts read.
+        who = "change it with `cremind profile working-dir`" if (out.get("policy_view") or {}).get(
+            "working_dir_editable") else "the admin changes it"
+        sys.stderr.write(f"folder: {wd} (your working directory — {who})\n")
     sys.stdout.write(_json.dumps(out, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
-# ── enable / disable / root ────────────────────────────────────────────────
+# ── enable / disable / working-directory moves ─────────────────────────────
 
 
 @docs_app.command("enable")
 @graceful_errors
 def documents_enable(
     ctx: typer.Context,
-    root: Optional[str] = typer.Option(
-        None, "--root",
-        help="Folder to index. Omit to use the working directory.",
-    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Apply without asking if it removes content."),
 ) -> None:
-    """Turn on Documentation search for this profile (your folder; Drive is `drive enable`)."""
+    """Turn on Documentation search for this profile: it indexes your working directory (Drive is `drive enable`)."""
     body: dict[str, Any] = {"kind": "local", "enabled": True}
-    if root:
-        body.update(root_mode="custom", root_path=root)
     out = _put_settings(ctx, body, yes)
     _print(ctx, (out.get("settings") or {}).get("local") or out)
 
@@ -430,25 +460,57 @@ def documents_disable(
     _print(ctx, (out.get("settings") or {}).get("local") or out)
 
 
-@docs_app.command("set-root")
+@docs_app.command("confirm-root-change")
 @graceful_errors
-def documents_set_root(
+def documents_confirm_root_change(
     ctx: typer.Context,
-    path: Optional[str] = typer.Argument(None, help="Folder to index."),
-    inherit: bool = typer.Option(False, "--inherit", help="Use the working directory instead."),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Apply even if files leave the index."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply: files outside the new folder leave the index."),
 ) -> None:
-    """Change the indexed folder."""
-    if bool(path) == inherit:
-        typer.echo("give a PATH or --inherit (exactly one)", err=True)
+    """Index your working directory where it is now, after the admin moved it (syncing waits for this)."""
+    import asyncio
+
+    from app.cli.client._base import APIError, Client
+    from app.cli.client.docs import confirm_root_change, get_status
+    from app.cli.config import Config
+
+    cfg: Config = ctx.obj["cfg"]
+    cfg.require_token()
+
+    async def _status() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_status(client)
+
+    snap = asyncio.run(_status())
+    moved = _root_change(snap)
+    if not moved:
+        sys.stderr.write("There is no working directory change waiting for confirmation.\n")
         raise typer.Exit(code=1)
-    body: dict[str, Any] = {"kind": "local"}
-    if inherit:
-        body["root_mode"] = "inherit"
+    conf = snap.get("confirmation") if isinstance(snap.get("confirmation"), dict) else {}
+    sys.stderr.write(f"Your working directory changed from {moved[0]} to {moved[1]}.\n")
+    files, leaving = conf.get("files"), conf.get("leaving")
+    if isinstance(leaving, int) and isinstance(files, int):
+        sys.stderr.write(f"Confirming indexes the new folder: {leaving} of the {files} indexed files are "
+                         "outside it and leave the index; the rest keep theirs. Your files are not touched.\n")
     else:
-        body.update(root_mode="custom", root_path=path)
-    out = _put_settings(ctx, body, yes)
-    _print(ctx, (out.get("settings") or {}).get("local") or out)
+        sys.stderr.write("Confirming indexes the new folder: indexed files outside it leave the index; "
+                         "the rest keep theirs. Your files are not touched.\n")
+    if not yes:
+        sys.stderr.write("Nothing was changed. Re-run with --yes to apply.\n")
+        raise typer.Exit(code=2)
+
+    async def _confirm() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await confirm_root_change(client)
+
+    try:
+        out = asyncio.run(_confirm())
+    except APIError as e:
+        detail = _api_detail(e)
+        if detail and detail.get("message"):
+            sys.stderr.write(f"{detail['message']}\n")
+            raise typer.Exit(code=1) from e
+        raise
+    _print_summary(ctx, out)
 
 
 # ── sync control ───────────────────────────────────────────────────────────

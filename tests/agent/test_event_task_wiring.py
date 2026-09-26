@@ -286,3 +286,10 @@ def test_a_trigger_turn_is_event_triggered_and_carries_its_chain_depth(tmp_path,
     assert agent.seen[0]["task_chain_depth"] == 4
     # A normal chat turn is unaffected.
     assert agent.seen[0]["event_run"] is False
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

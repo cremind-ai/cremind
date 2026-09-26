@@ -606,11 +606,17 @@ embeddings.
 
 ## Sizing for Documentation search
 
-By default Documentation search indexes the agent's working folder,
-`/root/Documents`, which is the `work` volume (plus Google Drive, when linked).
-Keep `persistence.work` enabled: without it the folder lives in the pod's
-filesystem and is gone after the next rollout. The feature's own data lands on
-two volumes.
+Documentation search indexes each profile's own working directory (plus Google
+Drive, when linked). With `persistence.work` enabled — the default — every
+profile's folder is on the `work` volume, at
+`<persistence.work.mountPath>/cremind-workspaces/<profile>`
+(`/root/Documents/cremind-workspaces/…`; the chart sets `CREMIND_WORKSPACES_DIR`
+to the `cremind-workspaces` folder). A release
+upgraded from before per-profile folders keeps the admin on
+`/root/Documents` itself. With the volume disabled the folders move to
+`<cremind.systemDir>/workspaces` on the system volume, so size that one for
+them instead. Size the `work` volume for every profile's files together. The
+feature's own data lands on two volumes.
 
 **The system volume** (`persistence.system`) holds the per-profile index
 (`storage/documents/`) and the local embedding models, which are downloaded on
@@ -666,7 +672,7 @@ existing release fails the upgrade, because a StatefulSet's
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles; with Documentation search on, also its index and the local embedding models. **8Gi+ recommended for document search** — see [Sizing for Documentation search](#sizing-for-documentation-search). |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
-| `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |
+| `persistence.work.*` | `10Gi`, RWO | Every profile's working directory, at `<mountPath>/cremind-workspaces/<profile>` (the chart sets `CREMIND_WORKSPACES_DIR`); an upgraded release's admin keeps `mountPath` itself. Disabled → `<systemDir>/workspaces` on the system volume. Deleted by `helm uninstall` unless annotated `helm.sh/resource-policy: keep`. |
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `postgresql.primary.persistence.size` | `8Gi` | Bundled PostgreSQL's data volume; also passed to the app as `CREMIND_DB_CAPACITY`. Choose it before the first install — a StatefulSet's claim template cannot change on upgrade. |
@@ -714,7 +720,8 @@ State survives a pod reschedule without scaling: PostgreSQL holds the dynamic
 config (JWT signing secret, LLM keys, tool configs, profiles) and three PVCs hold
 the rest — `system` (`/root/.cremind`: `bootstrap.toml`, OAuth tokens, per-profile
 files), `venv` (`/opt/cremind/venv`: installed deps), and `work`
-(`/root/Documents`: the files the agent creates). So a restarted/rescheduled
+(`/root/Documents`: every profile's working directory under `cremind-workspaces/`, the
+files the agents create). So a restarted/rescheduled
 single pod boots straight through with no re-setup and no lost files. Only these
 mounted paths persist — data written elsewhere (e.g. `/tmp`, or a manual
 `kubectl exec` into `/root`) is ephemeral; add `extraVolumes`/`extraVolumeMounts`
@@ -730,6 +737,14 @@ the generated Secret, and the chart's own three PVCs (`<release>-system`,
 `-venv`, `-work`). Whether each PVC's underlying **PV and disk** also disappear
 is governed by the StorageClass `reclaimPolicy`: `Delete` (the default on most
 cloud provisioners) destroys the disk; `Retain` leaves a `Released` PV behind.
+
+The `-work` claim holds every profile's working directory — the users' files.
+Unlike the installers' `--uninstall --purge`, which keeps those folders on a
+native or Docker install, `helm uninstall` takes them with the claim. Either
+keep the claim (`--set-json 'persistence.work.annotations={"helm.sh/resource-policy":"keep"}'`
+on install or upgrade; Helm then leaves it behind, to delete by hand later) or
+take a backup first — `cremind backup create` includes the working directories
+by default.
 
 The bundled **StatefulSet** subcharts are the exception — their data PVCs come
 from `volumeClaimTemplates`, which neither Helm nor Kubernetes garbage-collects

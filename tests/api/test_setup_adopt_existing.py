@@ -92,6 +92,8 @@ def _request(body: dict[str, Any]):
 @pytest.fixture
 def setup_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Neutralise the side effects that are not what these tests are about."""
+    # Setup creates the profile's working directory; keep it out of the real one.
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))
     monkeypatch.setattr(config_api, "require_admin", lambda _req: None)
     monkeypatch.setattr(config_api, "_features_required_by_setup_payload", lambda _b: [])
     monkeypatch.setattr(config_api, "ensure_persona_file", lambda _p: None)

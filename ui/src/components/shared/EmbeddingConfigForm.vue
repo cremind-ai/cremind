@@ -42,10 +42,6 @@ import type { InstallCatalog } from '../../services/installCatalogApi';
  * - `store-hint` — under the Vector Store provider select. Only Settings fills
  *   it ("switching stores triggers a full rebuild"); during setup there is
  *   nothing to rebuild yet.
- * - `after-enable` (scoped: `{ enabled }`) — right after the enable switch,
- *   rendered whether or not embedding is enabled. Only Settings fills it, with
- *   the Documentation search admin gate, which saves on its own and so must
- *   not ride the wizard's setup payload.
  *
  * Note for hosts: slot content is compiled in the *parent's* scope, so a host
  * that renders a `.field-hint` into one of these slots must keep that rule in
@@ -257,11 +253,6 @@ onMounted(() => {
           </div>
         </slot>
       </ElFormItem>
-
-      <!-- Settings puts the Documentation search admin gate here. Outside the
-           ``form.enabled`` block on purpose: the gate stays visible (read-only)
-           while embedding is off. The wizard leaves it empty. -->
-      <slot name="after-enable" :enabled="form.enabled" />
 
       <template v-if="form.enabled">
         <div class="section-divider"></div>

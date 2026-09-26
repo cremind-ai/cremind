@@ -76,10 +76,10 @@ def test_get_server_config_rejects_non_admin_profile() -> None:
 
 def test_get_server_config_allows_admin() -> None:
     state, storage = _state()
-    storage.set("server_config", "user_working_dir", "/srv/cremind")
+    storage.set("server_config", "log_level", "debug")
     resp = asyncio.run(_handler(state, "GET")(_req(username="admin")))
     assert resp.status_code == 200, resp.body
-    assert json.loads(resp.body)["config"]["user_working_dir"] == "/srv/cremind"
+    assert json.loads(resp.body)["config"]["log_level"] == "debug"
 
 
 def test_put_server_config_rejects_non_admin_and_writes_nothing() -> None:

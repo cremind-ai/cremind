@@ -58,6 +58,13 @@ _RESULT_SUFFIX = ".result.json"
 # refusing a name the server would refuse anyway, one round trip earlier.
 _PROFILE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
+# Names a NEW profile may not take — mirrors ``RESERVED_PROFILE_NAMES`` in
+# app/cremind_documents/paths.py (the manual's ``shared`` / ``cli`` scopes, and
+# ``workspaces``, the folder holding every profile's working directory).
+# Spelled out for the same reason as the pattern above; a test pins the two
+# equal.
+_RESERVED_PROFILE_NAMES = frozenset({"shared", "cli", "workspaces"})
+
 #: Values whose key looks like a credential are never printed by ``status``.
 _SECRET_KEY_RE = re.compile(
     r"api_key|setup_token|oauth_token|bearer_token|service_account"
@@ -87,7 +94,32 @@ def validate_profile_name(name: str) -> str:
         )
     if len(name) > 64:
         raise ValueError("profile name must be 64 characters or less")
+    # The server refuses these too (``valid_profile_dirname`` in
+    # app/config/working_dirs.py): ``__…`` is Cremind's own pseudo profiles.
+    if name.startswith("__"):
+        raise ValueError(
+            f"invalid profile name {name!r}: names starting with '__' are reserved "
+            "for Cremind's internal profiles"
+        )
     return name
+
+
+def reserved_profile_name_error(name: str) -> Optional[str]:
+    """The server's refusal for a name a new profile may not take, or None.
+
+    Only for creating: a profile that already carries one (made before the
+    name was reserved) may still be adopted, as the server allows."""
+    if name not in _RESERVED_PROFILE_NAMES:
+        return None
+    if name == "workspaces":
+        return (
+            f"the profile name '{name}' is reserved (Cremind keeps every profile's "
+            "working directory in a folder of that name); choose another name"
+        )
+    return (
+        f"the profile name '{name}' is reserved (Cremind's manual uses it "
+        "internally); choose another name"
+    )
 
 
 def drafts_dir(acting_profile: str) -> Path:

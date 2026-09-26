@@ -53,6 +53,7 @@ from app.config import (
 )
 from app.config.runtime_env import runtime_environment_prompt_line
 from app.config.settings import get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.config.user_config import resolve_agent_config, resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.constants.status import Status
@@ -1314,6 +1315,32 @@ _PLAN_READONLY_CLI_GROUPS: Dict[str, frozenset] = {
     "setup server-config": frozenset({"get"}),
 }
 
+# ``cremind profile working-dir`` is its own reader AND setter, decided by its
+# ARGUMENTS rather than a verb: ``working-dir [NAME]`` shows a profile's working
+# directory, while ``working-dir [NAME] PATH`` and ``working-dir [NAME]
+# --default`` move it (admin only) — re-pointing that profile's file panel,
+# default tool directory and Documentation search index. A lone argument is a
+# NAME only when it passes the CLI's own profile-name test (below, kept equal to
+# ``app/cli/commands/profile.py::_looks_like_profile_name`` by
+# ``tests/agent/test_plan_mode_gating.py``); anything else is a PATH. So only
+# the bare form and the one-NAME form read, and no option rides along at all —
+# ``--default`` is the setter, and refusing every option keeps a new one from
+# quietly inheriting the read.
+_PLAN_PROFILE_NAME_RE = re.compile(r"[a-z0-9_-]{1,64}\Z")
+
+
+def _profile_working_dir_reads(args: List[str]) -> bool:
+    if any(a.startswith("-") for a in args):
+        return False
+    return not args or (len(args) == 1 and _PLAN_PROFILE_NAME_RE.match(args[0]) is not None)
+
+
+# Leaves under a group whose reading or writing turns on their arguments, mapped
+# to the judge of the tokens that follow the leaf (``--`` already dropped).
+_PLAN_READONLY_CLI_ARG_LEAVES: Dict[str, Callable[[List[str]], bool]] = {
+    "profile working-dir": _profile_working_dir_reads,
+}
+
 # Leaves under a group whose own NAME is a read-only verb, which must not ride
 # in on it. ``coding-agents`` is on the verb list above, so the "second word is
 # a read-only verb" rule returns True without ever looking at the third — which
@@ -1461,12 +1488,15 @@ def _is_readonly_cremind_command(command: str) -> bool:
     """True for a single, plain, read-only ``cremind ...`` invocation.
 
     Accepts ``cremind <verb>`` (a root command such as ``cremind me``),
-    ``cremind <group> <verb>`` (``cremind channels catalog --json``) and
-    ``cremind <known nested group> <verb>`` (``cremind llm providers models``),
-    optionally behind the root flags above. Everything else — a second chained
-    command, a shell metacharacter, an unknown leading flag, a blocked group, a
-    refused sub-command of an otherwise admitted group, an unknown nested group,
-    or a verb that is not on the read-only list — is rejected. Pure and
+    ``cremind <group> <verb>`` (``cremind channels catalog --json``),
+    ``cremind <known nested group> <verb>`` (``cremind llm providers models``)
+    and the reading form of a leaf whose arguments decide
+    (``cremind profile working-dir [NAME]``), optionally behind the root flags
+    above. Everything else — a second chained command, a shell metacharacter,
+    an unknown leading flag, a blocked group, a refused sub-command of an
+    otherwise admitted group, an unknown nested group, the writing form of an
+    argument-decided leaf, or a verb that is not on the read-only list — is
+    rejected. Pure and
     side-effect free so it can be unit-tested directly.
     """
     if not isinstance(command, str):
@@ -1562,6 +1592,10 @@ def _is_readonly_cremind_command(command: str) -> bool:
         return False
     if len(rest) >= 2 and rest[1] in _PLAN_READONLY_CLI_VERBS:
         return True
+    # A leaf that reads or writes by its arguments: its own judge decides.
+    judge = _PLAN_READONLY_CLI_ARG_LEAVES.get(" ".join(rest[:2]))
+    if judge is not None:
+        return judge(rest[2:])
     # Depth 3, but only for a group pair that really exists, and only for the
     # verbs that are readers in THAT pair — never for an arbitrary word followed
     # by a read-only-looking one.
@@ -2234,7 +2268,12 @@ class ReasoningAgent:
             get_context(self.context_id, "_working_directory_override")
             if self.context_id else None
         )
-        cwd = override or get_user_working_directory()
+        # The profile's own folder unless the conversation switched elsewhere —
+        # and never into another profile's (the tool adapter drops such an
+        # override the same way, so the prompt and the tools agree).
+        if override and is_foreign(override, self.profile):
+            override = None
+        cwd = override or get_user_working_directory(self.profile)
         instruction = SYSTEM_TEMPLATE.format(
             persona_description=read_persona_file(self.profile),  # raw; resolved below
             current_os=platform.system(),

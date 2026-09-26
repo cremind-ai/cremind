@@ -60,6 +60,7 @@ from app.documents.query import ReadError, open_engine  # noqa: E402
 from app.documents.textnorm import fold  # noqa: E402
 from app.vectorstores.base import VectorStore  # noqa: E402
 from app.vectorstores.qdrant import QdrantClient  # noqa: E402
+from tests.documents._workspaces import install as install_working_dirs  # noqa: E402
 from tests.documents.legal_samples import vietnamese_law_lines  # noqa: E402
 
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
@@ -196,8 +197,8 @@ def corpus(tmp_path_factory):
         _write(alice / "Photos" / "IMG_2041.jpg", photo, NOW - 5 * 86400)
     _write(bob / "bob-notes.txt", "Bob private budget. AI challenges plan for bob only.\n", NOW - 2 * 86400)
 
-    mp.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
-    mp.setattr(uds, "get_user_working_directory", lambda: str(wd))
+    # Each profile's working directory is the folder its index covers.
+    install_working_dirs(mp, sysdir, {"alice": alice, "bob": bob})
     provider = SqliteDatabaseProvider(str(tmp / "main.db"))
     eng = provider.sync_engine()
     for name in _TABLES:
@@ -218,7 +219,7 @@ def corpus(tmp_path_factory):
     embedding_state.mark_ready(embedder, store)
     options = uds.normalize_options({"identity": {"author_names": ["Alice Nguyen"], "camera_devices": ["Canon"]}})
     for profile, root in (("alice", alice), ("bob", bob)):
-        storage.upsert_source(profile, "local", enabled=True, root_mode="custom",
+        storage.upsert_source(profile, "local", enabled=True,
                               root_path=os.path.realpath(root), first_sync_confirmed_at=1.0,
                               options=options)
     svc = svc_module.DocumentsService()
@@ -568,7 +569,7 @@ def _agent(monkeypatch, *, origin=None, allowed=True, search_tools=None):
         max_llm_retries=0, reasoning_temperature=1.0, reasoning_max_tokens=1024, reasoning_retry=0,
         tool_result_enabled=False, tool_result_max_tokens=4096, enable_prompt_cache=False, max_steps=6))
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     calls = []
 

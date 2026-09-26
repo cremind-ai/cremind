@@ -16,7 +16,7 @@ from app.backup.paths import (
     relocate_path,
     transform_row,
 )
-from app.backup.rules import is_excluded, iter_backup_files
+from app.backup.rules import is_excluded, iter_backup_files, iter_workspace_files
 
 
 def _win_manifest() -> Manifest:
@@ -134,6 +134,195 @@ def test_transform_row_server_config_only_working_dir_key():
     other = {"key": "jwt_secret", "value": r"C:\not\a\path\secret"}
     transform_row(pm, "server_config", other, rep2)
     assert other["value"] == r"C:\not\a\path\secret"  # untouched
+
+
+# ── per-profile working directories ─────────────────────────────────────────
+
+
+def _win_manifest_with_workspaces() -> Manifest:
+    m = _win_manifest()
+    m.source_paths.workspaces_root = r"C:\Users\alice\.cremind\workspaces"
+    return m
+
+
+def test_a_profiles_chosen_working_dir_is_relocated():
+    """``profiles.working_dir`` holds a folder the admin chose (NULL = the
+    default, which needs no relocation)."""
+    pm = build_path_map(_win_manifest(), "/root/.cremind", "/root")
+    rep = RelocationReport()
+    admin = {"name": "admin", "working_dir": r"C:\Users\alice\Documents"}
+    transform_row(pm, "profiles", admin, rep)
+    assert admin["working_dir"] == "/root/Documents"
+    assert rep.relocated == [{"table": "profiles", "column": "working_dir", "profile": "admin",
+                              "old": r"C:\Users\alice\Documents", "new": "/root/Documents"}]
+
+    bob = {"name": "bob", "working_dir": None}
+    transform_row(pm, "profiles", bob, rep)
+    assert bob["working_dir"] is None and len(rep.relocated) == 1 and not rep.unmapped
+
+    # An archive from before the column existed carries no such key at all.
+    old = {"name": "carol"}
+    transform_row(pm, "profiles", old, rep)
+    assert "working_dir" not in old
+
+
+def test_a_chosen_folder_from_the_other_os_that_cannot_be_mapped_falls_back_to_the_default():
+    """``D:\\work`` means nothing on Linux: resolving it there would make a
+    folder named ``D:\\work`` in the server's cwd. The profile goes back to
+    its default folder, and the report names it. On the same OS family the
+    folder may exist, so it is kept (and reported as unmapped)."""
+    pm = build_path_map(_win_manifest(), "/root/.cremind", "/root")
+    rep = RelocationReport()
+    bob = {"name": "bob", "working_dir": r"D:\work"}
+    transform_row(pm, "profiles", bob, rep)
+    assert bob["working_dir"] is None
+    assert rep.unmapped == [{"table": "profiles", "column": "working_dir", "value": r"D:\work",
+                             "profile": "bob", "reset_to_default": True}]
+
+    # An older archive's server-wide folder becomes the admin's: an empty
+    # value leaves the admin on its default after the migration.
+    legacy = {"key": "user_working_dir", "value": r"D:\work"}
+    transform_row(pm, "server_config", legacy, rep)
+    assert legacy["value"] == ""
+    assert rep.unmapped[-1]["profile"] == "admin" and rep.unmapped[-1]["reset_to_default"]
+
+    same_os = build_path_map(_win_manifest(), r"C:\Users\bob\.cremind", r"C:\Users\bob")
+    rep = RelocationReport()
+    carol = {"name": "carol", "working_dir": r"D:\work"}
+    transform_row(same_os, "profiles", carol, rep)
+    assert carol["working_dir"] == r"D:\work"
+    assert rep.unmapped == [{"table": "profiles", "column": "working_dir", "value": r"D:\work",
+                             "profile": "carol"}]
+
+
+def test_a_path_in_the_workspaces_root_follows_the_targets_root():
+    """The target may keep the workspaces outside its system dir (a
+    container's CREMIND_WORKSPACES_DIR): the longer workspaces rule wins over
+    the system-dir rule it sits under."""
+    pm = build_path_map(
+        _win_manifest_with_workspaces(), "/root/.cremind", "/root",
+        target_workspaces_root="/root/Documents/cremind-workspaces",
+    )
+    got, changed, _ = relocate_path(pm, r"C:\Users\alice\.cremind\workspaces\bob-2\src")
+    assert changed and got == "/root/Documents/cremind-workspaces/bob-2/src"
+    # Everything else in the system dir still maps to the target's.
+    got, _, _ = relocate_path(pm, r"C:\Users\alice\.cremind\admin\skills\x")
+    assert got == "/root/.cremind/admin/skills/x"
+
+    rep = RelocationReport()
+    row = {"name": "bob", "working_dir": r"C:\Users\alice\.cremind\workspaces\bob-2"}
+    transform_row(pm, "profiles", row, rep)
+    assert row["working_dir"] == "/root/Documents/cremind-workspaces/bob-2"
+    # The admin's folder follows the same rule; a user's own ``workspaces``
+    # folder under the home dir relocates by the home rule, as any other.
+    row = {"name": "admin", "working_dir": r"C:\Users\alice\.cremind\workspaces\admin"}
+    transform_row(pm, "profiles", row, rep)
+    assert row["working_dir"] == "/root/Documents/cremind-workspaces/admin"
+    got, _, _ = relocate_path(pm, r"C:\Users\alice\Documents\workspaces\client-x")
+    assert got == "/root/Documents/workspaces/client-x"
+
+
+def test_without_a_target_root_the_source_root_adds_no_rule():
+    """Blueprints (and callers that predate the workspaces) pass no target
+    root: such paths relocate through the system/home rules as before."""
+    pm = build_path_map(_win_manifest_with_workspaces(), "/root/.cremind", "/root")
+    got, _, _ = relocate_path(pm, r"C:\Users\alice\.cremind\workspaces\bob")
+    assert got == "/root/.cremind/workspaces/bob"
+    assert len(pm.rules) == 2
+
+
+def test_a_workspaces_root_outside_home_and_system_dir_is_mapped_not_left_unmapped():
+    m = Manifest(
+        app_version="0.0.8", alembic_revision="r1", db_provider="sqlite",
+        platform="linux", hostname="srv",
+        source_paths=SourcePaths(system_dir="/root/.cremind", home_dir="/root",
+                                 user_working_dir="/root/Documents", sep="/",
+                                 case_insensitive=False, workspaces_root="/data/workspaces"),
+    )
+    pm = build_path_map(m, r"C:\Users\bob\.cremind", r"C:\Users\bob",
+                        target_workspaces_root=r"C:\Users\bob\.cremind\workspaces")
+    rep = RelocationReport()
+    row = {"id": "c1", "working_directory": "/data/workspaces/ann/project"}
+    transform_row(pm, "conversations", row, rep)
+    assert row["working_directory"] == r"C:\Users\bob\.cremind\workspaces\ann\project"
+    assert not rep.unmapped
+
+
+def test_manifest_records_the_workspaces_and_reads_old_archives():
+    m = _win_manifest_with_workspaces()
+    m.workspaces_included = True
+    d = m.to_dict()
+    assert d["files"]["workspaces_included"] is True
+    assert d["files"]["workspaces_member_prefix"] == "workspaces/"
+    assert d["source_paths"]["workspaces_root"] == r"C:\Users\alice\.cremind\workspaces"
+    back = Manifest.from_dict(d)
+    assert back.workspaces_included is True
+    assert back.source_paths.workspaces_root == r"C:\Users\alice\.cremind\workspaces"
+    assert back.summary()["workspaces_included"] is True
+
+    # An archive made before the per-profile working directories: none of the
+    # new keys, and it never carried the workspaces.
+    d.pop("files")
+    d["source_paths"].pop("workspaces_root")
+    old = Manifest.from_dict(d)
+    assert old.workspaces_included is False
+    assert old.source_paths.workspaces_root == ""
+    assert old.source_paths.user_working_dir == r"C:\Users\alice\Documents"
+
+
+def test_the_workspaces_keep_user_files_that_the_system_prunes_drop(tmp_path: Path):
+    """Suffix prunes (``.lock .tmp .pyc .pyo``) are for Cremind's own trees; in
+    a working directory they are the user's files. Only the dependency and
+    virtualenv directories stay out."""
+    root = tmp_path / "workspaces"
+    for rel in (
+        "admin/notes.md",
+        "admin/project/poetry.lock",
+        "admin/project/draft.tmp",
+        "admin/project/compiled.pyc",
+        "bob/report.pyo",
+        "bob/app/node_modules/left-pad/index.js",
+        "bob/app/.venv/pyvenv.cfg",
+        "bob/app/venv/bin/python",
+        "bob/app/pkg/__pycache__/m.cpython-313.pyc",
+        ".deleted/carol-20260101-000000/kept.md",
+    ):
+        _touch(root, rel)
+
+    got = {rel for _, rel in iter_workspace_files(str(root))}
+    assert got == {
+        "admin/notes.md",
+        "admin/project/poetry.lock",
+        "admin/project/draft.tmp",
+        "admin/project/compiled.pyc",
+        "bob/report.pyo",
+        ".deleted/carol-20260101-000000/kept.md",
+    }
+    # The same names inside a profile tree of the system dir ARE pruned.
+    assert is_excluded("admin/project/poetry.lock", is_dir=False)
+
+
+def test_the_workspaces_walk_never_enters_the_system_dir(tmp_path: Path):
+    """A workspaces root that contains the system dir (an odd
+    CREMIND_WORKSPACES_DIR) must not archive the DB or the tokens through
+    the back door; nor the archive being written into it."""
+    root = tmp_path / "home"
+    sysdir = root / ".cremind"
+    _touch(root, ".cremind/storage/cremind.db")
+    _touch(root, ".cremind/tokens/admin.token")
+    _touch(root, "ann/notes.md")
+    _touch(root, "ann/out.cremind-backup.part")
+
+    got = {
+        rel for _, rel in iter_workspace_files(
+            str(root), exclude_dirs=[str(sysdir)],
+            exclude_files=[str(root / "ann" / "out.cremind-backup.part")],
+        )
+    }
+    assert got == {"ann/notes.md"}
+    # A root that IS the excluded dir yields nothing; a missing root too.
+    assert list(iter_workspace_files(str(sysdir), exclude_dirs=[str(sysdir)])) == []
+    assert list(iter_workspace_files(str(tmp_path / "missing"))) == []
 
 
 # ── inclusion / exclusion rules ─────────────────────────────────────────────

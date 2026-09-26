@@ -66,7 +66,7 @@ def _build(monkeypatch, *, in_a_group, origin=None):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda p: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda p: "PERSONA")
     monkeypatch.setattr(ra, "read_instructions_file", lambda p: "")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     monkeypatch.setattr(channel_registry, "has_any_channel", lambda p: False)
     monkeypatch.setattr(channel_registry, "has_notification_channel", lambda p: False)

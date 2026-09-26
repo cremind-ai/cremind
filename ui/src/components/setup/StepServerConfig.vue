@@ -21,11 +21,25 @@ const props = defineProps<{
   // DeploymentModeRadio so service-mode labels stay in sync with the
   // install scripts.
   installCatalog?: InstallCatalog | null;
+  // The admin's own working directory (v-model:working-dir). Every profile
+  // has its own; this one is sent as the setup payload's top-level
+  // ``working_dir``, not inside ``server_config``.
+  workingDir?: string;
+  // The server's suggestion (``suggested_working_dir``) — the placeholder
+  // only, never the value: it predates a System Directory changed on this
+  // step (see utils/setupWorkingDir.ts).
+  suggestedWorkingDir?: string | null;
 }>();
 
 const emit = defineEmits<{
   update: [config: Record<string, any>];
+  'update:workingDir': [value: string];
 }>();
+
+const workingDirModel = computed({
+  get: () => props.workingDir ?? '',
+  set: (value: string) => emit('update:workingDir', value),
+});
 
 const isFirstSetup = computed(() => props.firstSetup ?? true);
 const postgresCapability = computed(() => props.serviceCapabilities?.services?.postgres ?? null);
@@ -62,10 +76,6 @@ function pickInitialDeploymentMode(saved: string | undefined): DeploymentMode {
 const form = ref({
   service_name: props.config.service_name || 'cremind-agent',
   agent_name: props.config.agent_name || 'Cremind Agent',
-  // CREMIND_WORKING_DIR — the user's interaction folder. Default for
-  // every built-in tool's ``_working_directory`` and root of the
-  // Tree Dir file panel. Distinct from the System Directory below.
-  user_working_dir: props.config.user_working_dir || '~/Documents',
   // CREMIND_SYSTEM_DIR — Cremind's internal storage. Editable on first
   // setup (the backend relocates before bootstrap.toml is written);
   // read-only thereafter (requires env var + restart to change).
@@ -115,7 +125,6 @@ function buildPayload() {
   const base: Record<string, any> = {
     service_name: form.value.service_name,
     agent_name: form.value.agent_name,
-    user_working_dir: form.value.user_working_dir,
   };
   // ``system_dir`` is applied by the backend only on first setup
   // (relocation runs before bootstrap.toml is written). On reconfigure
@@ -174,12 +183,18 @@ onMounted(() => {
       <ElFormItem label="Agent Display Name">
         <ElInput v-model="form.agent_name" placeholder="Cremind Agent" />
       </ElFormItem>
-      <ElFormItem label="User Working Directory">
-        <ElInput v-model="form.user_working_dir" placeholder="~/Documents" />
+      <ElFormItem label="Your working directory">
+        <ElInput
+          v-model="workingDirModel"
+          :placeholder="suggestedWorkingDir || ''"
+          :disabled="!isFirstSetup"
+        />
         <div class="field-hint">
-          Your working folder. The agent reads, writes, and lists files
-          here by default; this is also the root of the Tree Dir panel.
-          Created on first run if missing.
+          Leave it blank for Cremind's default (shown greyed out), which the
+          server settles after the System Directory below. Cremind creates it.
+          Only this profile can see its files. The agent works here by
+          default, and it is the root of the file panel; every other profile
+          gets a folder of its own.
         </div>
       </ElFormItem>
       <ElFormItem label="Cremind System Working Directory">

@@ -15,7 +15,8 @@ library plus up to 50 of the profile's own documents instead of a
 vector-ranked shortlist; Documentation search keeps its index and answers by
 keyword only (`mode: lexical_only`) but stops syncing
 (`suspended(embedding_off)`), and an admin cannot allow it until embedding is
-back on; long-term memory search returns the stored facts unranked.
+back on (Settings → My Documents is hidden while it is off); long-term memory
+search returns the stored facts unranked.
 
 The `get` and `set` operations are admin-only. `status` and `initialize` back
 the Setup Wizard's pre-token polling, so they don't require a token; `get`/`set`

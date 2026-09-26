@@ -153,6 +153,16 @@ watch(() => activeGroup.value?.member_rows, (rows) => {
   }
 }, { immediate: true, deep: true });
 
+// A member's working directory is that member's alone — the admin may watch
+// its agent work but not browse its folder, so the server sends no path for
+// it. Without a path the file tree would fall back to the VIEWER's own folder
+// under the member's name; the panel shows a short note instead (the tab strip
+// stays, so the other seats remain one click away).
+const selectedSeatPrivate = computed(() => (
+  !!selectedSeat.value
+  && store.seatDirPrivate(props.groupId ?? null, selectedSeat.value.profile)
+));
+
 const COLLAPSED_PANEL_WIDTH = 36;
 const showRightPanel = computed(
   () => !terminalPanel.minimized && visibleSeats.value.length > 0,
@@ -462,13 +472,32 @@ const handleSend = async (text: string) => {
         v-if="!terminalPanel.collapsed"
         @update:width="terminalPanel.setWidth"
       />
-      <GroupRightPanel
+      <div
         class="right-panel-host"
+        :class="{ 'seat-private': selectedSeatPrivate && !terminalPanel.collapsed }"
         :style="{ width: rightPanelWidth + 'px' }"
-        :group-id="props.groupId ?? null"
-        :seats="visibleSeats"
-        v-model="selectedSeatProfile"
-      />
+      >
+        <GroupRightPanel
+          class="right-panel-inner"
+          :group-id="props.groupId ?? null"
+          :seats="visibleSeats"
+          v-model="selectedSeatProfile"
+        />
+        <div
+          v-if="selectedSeatPrivate && !terminalPanel.collapsed"
+          class="seat-private-note"
+        >
+          <Icon icon="mdi:lock-outline" class="seat-private-icon" />
+          <div class="seat-private-title">Private working directory</div>
+          <div class="seat-private-text">
+            {{ selectedSeat?.name }}'s files belong to that profile and are not
+            shown here.
+          </div>
+          <ElButton size="small" text @click="terminalPanel.minimize()">
+            Hide panel
+          </ElButton>
+        </div>
+      </div>
     </template>
 
     <!-- A seat's owner and the admin may read its memory, but folding it on
@@ -508,6 +537,51 @@ const handleSend = async (text: string) => {
 .right-panel-host {
   flex-shrink: 0;
   height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.right-panel-inner {
+  flex: 1;
+  min-height: 0;
+}
+
+/* A private seat keeps only the agent tab strip; the workspace below it (file
+   tree and shells) is replaced by the note. */
+.right-panel-host.seat-private > .right-panel-inner {
+  flex: 0 0 auto;
+  height: auto;
+}
+
+.right-panel-host.seat-private :deep(.panel-host) {
+  display: none;
+}
+
+.seat-private-note {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  text-align: center;
+  /* The workspace panel's own dark ground, so the note reads as the panel. */
+  background: #0b1220;
+  color: #94a3b8;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.seat-private-icon {
+  font-size: 28px;
+  color: #64748b;
+}
+
+.seat-private-title {
+  font-weight: 600;
+  color: #e5e7eb;
 }
 
 /* Floating agent tools, opposite the room title. Kept out of the header row so

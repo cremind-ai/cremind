@@ -176,8 +176,9 @@ hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ign
 
 # ── Docker documents folder ────────────────────────────────────────────────
 # Asked only when the install mode is Docker, after [vnc_password]: which
-# folder on this machine the container sees as /root/Documents — the folder
-# Documentation search indexes and the agent's default working folder — and
+# folder on this machine the container sees as /root/Documents — every
+# profile's working directory (its agent's default working folder, what its
+# Documentation search indexes) lives in its cremind-workspaces/ subfolder — and
 # whether the container may write to it. Without a bind mount that folder
 # lives on the container's own layer and is lost whenever the container is
 # recreated. Kubernetes never asks: the chart's persistence.work volume is
@@ -198,12 +199,12 @@ hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ign
 
 [docker_documents]
 prompt             = "Which folder should Cremind use as your Documents folder?"
-hint               = "The container sees it as /root/Documents: document search indexes it, and the agent reads and saves files there by default. It is created if it does not exist. The path cannot contain $, # or double quotes."
+hint               = "The container sees it as /root/Documents. Each profile works in its own folder inside it, cremind-workspaces/<profile>: the agent reads and saves files there by default, and document search indexes it. It is created if it does not exist. The path cannot contain $, # or double quotes."
 access_prompt      = "Can Cremind change files in this folder?"
 rw_label           = "Read-write"
 rw_disclosure      = "The agent's file tools write to your real folder: files it creates, edits or deletes there change on this machine."
 ro_label           = "Read-only"
-ro_disclosure      = "Cremind can read and search the folder, but the agent cannot save files there, and its default working folder is read-only."
+ro_disclosure      = "Cremind can read the folder, but the agent cannot save files there. The profiles' own working folders then live inside Cremind's data volume instead, where you cannot see them from this computer."
 linux_owner_note   = "On Linux the container runs as root, so files the agent creates in this folder are owned by root on the host (sudo chown -R $USER <folder> takes them back)."
 macos_privacy_note = "macOS will ask whether Docker may access your Documents folder. Allow it: if you deny it, the folder looks empty inside the container and nothing is indexed."
 wsl_note           = "Inside WSL, ~/Documents is your Linux home, not your Windows Documents folder. For the Windows one, use /mnt/c/Users/<you>/Documents."

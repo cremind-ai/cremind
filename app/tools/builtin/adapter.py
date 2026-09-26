@@ -38,6 +38,7 @@ from a2a.types import (
 )
 
 from app.config.settings import BaseConfig, get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.lib.llm.base import LLMProvider
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.tools.mcp.mcp_auth import MCPOAuthClient
@@ -46,7 +47,9 @@ from app.utils.logger import logger
 
 
 def resolve_sandbox_recovery_dir(
-    result_data: Any, tool_args: Dict[str, Any]
+    result_data: Any,
+    tool_args: Dict[str, Any],
+    profile: Optional[str] = None,
 ) -> Optional[str]:
     """Directory the conversation cwd should switch to so a denied ``system_file``
     call succeeds on retry — or ``None`` when auto-recovery must not apply.
@@ -58,9 +61,15 @@ def resolve_sandbox_recovery_dir(
     paths the user themselves can reach. Non-existent (typo) paths and paths
     outside home return ``None`` so they still surface the denial to the model.
 
-    Pure/deterministic and side-effect free, so the decision is unit-testable
-    without the adapter's LLM.
+    Nor does it ever land inside ANOTHER profile's working directory (or an
+    unowned workspaces entry): ``profile`` — default ``tool_args['_profile']``
+    — is the caller, and with neither the recovery refuses every owned path.
+    The admin is not exempt.
+
+    Side-effect free, so the decision is unit-testable without the adapter's LLM.
     """
+    if profile is None:
+        profile = tool_args.get("_profile") if isinstance(tool_args, dict) else None
     if not isinstance(result_data, dict):
         return None
     if result_data.get("error") != "Access denied":
@@ -110,9 +119,13 @@ def resolve_sandbox_recovery_dir(
     # user can still cd anywhere deliberately.
     home = os.path.realpath(os.path.expanduser("~"))
     recovery_real = os.path.realpath(recovery)
-    if recovery_real.startswith(home + os.sep):
-        return recovery_real
-    return None
+    if not recovery_real.startswith(home + os.sep):
+        return None
+    # Checked on the TARGET too: a denied file inside another profile's folder
+    # whose parent happens to be ordinary must not pull the cwd next to it.
+    if is_foreign(recovery_real, profile) or is_foreign(target, profile):
+        return None
+    return recovery_real
 
 
 class BuiltInToolAdapter:
@@ -336,18 +349,26 @@ class BuiltInToolAdapter:
                 if profile and "profile" in tool_args:
                     tool_args["profile"] = profile
 
-                # Inject the User Working Directory (default ~/Documents,
-                # configurable via the setup wizard) as the active path for
-                # all built-in tools. This is intentionally distinct from
-                # CREMIND_SYSTEM_DIR/<profile>, which is reserved for
-                # Cremind-internal storage (skills, persona, exec_shell stdout).
-                # ``change_working_directory`` may store a per-conversation
-                # override under ``_working_directory_override`` -- honor it.
+                # Inject the profile's own User Working Directory (default
+                # <workspaces root>/<profile>, the admin may point it
+                # elsewhere) as the active path for all built-in tools. This is
+                # intentionally distinct from CREMIND_SYSTEM_DIR/<profile>,
+                # which is reserved for Cremind-internal storage (skills,
+                # persona, exec_shell stdout). ``change_working_directory`` may
+                # store a per-conversation override under
+                # ``_working_directory_override`` -- honor it, unless it now
+                # lies in another profile's folder (the admin moved one since).
                 override = (
                     get_context(context_id, "_working_directory_override")
                     if context_id else None
                 )
-                tool_args["_working_directory"] = override or get_user_working_directory()
+                if override and is_foreign(override, profile):
+                    logger.warning(
+                        f"Built-in adapter: ignoring cwd override {override!r} of "
+                        f"{context_id}: it is inside another profile's working directory"
+                    )
+                    override = None
+                tool_args["_working_directory"] = override or get_user_working_directory(profile)
 
                 # Inject the active profile name so tools can scope per-profile
                 # state (e.g. browser keeps a separate Chrome profile per Cremind profile).
@@ -418,7 +439,9 @@ class BuiltInToolAdapter:
                     # folders reachable without relying on a weak model to call
                     # change_working_directory itself.
                     if context_id:
-                        recovery_dir = resolve_sandbox_recovery_dir(result_data, tool_args)
+                        recovery_dir = resolve_sandbox_recovery_dir(
+                            result_data, tool_args, profile,
+                        )
                         if recovery_dir:
                             logger.info(
                                 f"Sandbox denial from '{tool_name}'; auto-switching "

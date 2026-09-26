@@ -24,6 +24,7 @@ import {
   fetchMessageTrace,
   type CreateGroupPayload,
   type GroupChat,
+  type GroupMember,
   type GroupMessage,
   type GroupMessageTrace,
   type UpdateGroupPayload,
@@ -108,6 +109,16 @@ const PAGE_SIZE = 200;
 // returns a short page from spinning the tab forever.
 const RECONCILE_MAX_PAGES = 25;
 
+/**
+ * Whether the GET of a group reported this member's working directory as
+ * private to the viewer: the admin may watch every seat work, but each
+ * profile's working directory is its own, so another member's folder comes back
+ * as `working_directory: null` plus this flag.
+ */
+function memberWorkingDirPrivate(row: GroupMember): boolean {
+  return row.working_directory_private === true;
+}
+
 function closeStream(groupId: string) {
   const handle = streamHandles.get(groupId);
   if (!handle) return;
@@ -148,6 +159,12 @@ export const useGroupChatStore = defineStore('groupChat', {
      */
     traceBySource: {} as Record<string, Record<string, GroupTrace>>,
     streamStatusByGroup: {} as Record<string, GroupStreamStatus>,
+    /**
+     * groupId → profile → true for a seat whose working directory is private to
+     * this viewer (another profile's folder). Kept apart from `member_rows`
+     * because a `group_updated` frame re-merges the rows without the flag.
+     */
+    privateSeatDirsByGroup: {} as Record<string, Record<string, true>>,
     /** profile → agent name, for member chips and "X is thinking…". */
     agentNames: {} as Record<string, string>,
     sending: false,
@@ -210,6 +227,13 @@ export const useGroupChatStore = defineStore('groupChat', {
         // A seat created during this session is on the frames before it is on
         // the group row we loaded.
         return state.liveTurns[group.id]?.[profile]?.conversationId ?? null;
+      };
+    },
+    /** Whether this member's working directory is private to the viewer. */
+    seatDirPrivate(state): (groupId: string | null, profile: string) => boolean {
+      return (groupId: string | null, profile: string) => {
+        if (!groupId || !profile) return false;
+        return state.privateSeatDirsByGroup[groupId]?.[profile] === true;
       };
     },
     liveTurnFor(state): (groupId: string | null, profile: string) => GroupLiveTurn | null {
@@ -303,6 +327,11 @@ export const useGroupChatStore = defineStore('groupChat', {
           }),
         ]);
         this.mergeGroup(detail.group);
+        const privateDirs: Record<string, true> = {};
+        for (const row of detail.group.member_rows ?? []) {
+          if (memberWorkingDirPrivate(row)) privateDirs[row.profile] = true;
+        }
+        this.privateSeatDirsByGroup[groupId] = privateDirs;
         const statuses: Record<string, string> = {};
         for (const profile of detail.thinking) statuses[profile] = 'thinking';
         this.agentStatusByGroup[groupId] = statuses;
@@ -420,6 +449,7 @@ export const useGroupChatStore = defineStore('groupChat', {
         delete this.agentStatusByGroup[groupId];
         delete this.liveTurns[groupId];
         delete this.traceBySource[groupId];
+        delete this.privateSeatDirsByGroup[groupId];
         useSearchToolsStore().forget({ kind: 'group', id: groupId });
         this.streamStatusByGroup[groupId] = 'closed';
         if (this.activeGroupId === groupId) this.activeGroupId = null;
@@ -495,6 +525,10 @@ export const useGroupChatStore = defineStore('groupChat', {
         // tree per member, and the panel keeps them in separate buckets.
         if (typeof data.working_directory === 'string' && data.working_directory) {
           useTerminalPanelStore().setConversationCwd(seatId, data.working_directory);
+          // The server drops a `cwd` frame naming another profile's folder,
+          // so one that arrives is a folder this viewer may open.
+          const privateDirs = this.privateSeatDirsByGroup[groupId];
+          if (privateDirs?.[profile]) delete privateDirs[profile];
         }
         return;
       }
@@ -822,6 +856,7 @@ export const useGroupChatStore = defineStore('groupChat', {
       delete this.liveTurns[groupId];
       delete this.traceBySource[groupId];
       delete this.streamStatusByGroup[groupId];
+      delete this.privateSeatDirsByGroup[groupId];
       useSearchToolsStore().forget({ kind: 'group', id: groupId });
       if (this.activeGroupId === groupId) this.activeGroupId = null;
     },
@@ -861,6 +896,7 @@ export const useGroupChatStore = defineStore('groupChat', {
       // being switched to may be allowed less.
       this.liveTurns = {};
       this.traceBySource = {};
+      this.privateSeatDirsByGroup = {};
       this.streamStatusByGroup = {};
       this.agentNames = {};
       this.sending = false;

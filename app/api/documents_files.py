@@ -157,8 +157,8 @@ def _local_root(profile: str) -> Optional[str]:
     """The folder this profile's local index is relative to, as it stands now.
 
     The running engine's value when it has one (it validated it on configure).
-    Otherwise the saved setting, re-validated for this profile — and only if
-    it still resolves to the folder that was saved: an inherited working
+    Otherwise the profile's working directory, validated for this profile —
+    and only if it is still the folder the index was built from: a working
     directory that has moved since is a pending change, not a new root.
     """
     from app.storage.documents_storage import get_documents_storage
@@ -173,8 +173,7 @@ def _local_root(profile: str) -> Optional[str]:
     stored = row.get("root_path")
     if not stored:
         return None
-    custom = row.get("root_mode") == uds.ROOT_CUSTOM
-    check = uds.validate_root(stored if custom else None, is_admin=profile == "admin")
+    check = uds.validate_root(profile)
     if not check.ok or not check.path:
         return None
     if os.path.normcase(check.path) != os.path.normcase(uds.real_path(stored)):
@@ -184,6 +183,7 @@ def _local_root(profile: str) -> Optional[str]:
 
 def _local_file(profile: str, rec: Dict[str, Any]) -> str:
     """The real path of an indexed local file, re-checked against the root."""
+    from app.config import working_dirs
     from app.documents import settings as uds
 
     if rec.get("source") != uds.SOURCE_LOCAL:
@@ -198,9 +198,15 @@ def _local_file(profile: str, rec: Dict[str, Any]) -> str:
     rel = str(rec.get("rel_path") or "")
     real = os.path.realpath(os.path.join(root_real, *[p for p in rel.split("/") if p]))
     # realpath follows symlinks, so a link planted inside the folder cannot
-    # hand out a file outside it — or Cremind's own system folder, which may
-    # sit inside an admin's root.
-    if not rel or not uds.is_inside(real, root_real) or uds.is_inside(real, uds.system_dir()):
+    # hand out a file outside it — nor into Cremind's own system folder, which
+    # may sit inside an admin's root (only a root that IS inside it, the
+    # profile's own default workspace, is served from there), nor into
+    # another profile's working directory inside this one.
+    in_system_dir = uds.is_inside(real, uds.system_dir()) and not uds.system_dir_exempt(root_real)
+    if (
+        not rel or not uds.is_inside(real, root_real) or in_system_dir
+        or working_dirs.is_foreign(real, profile)
+    ):
         logger.warning(f"[documents] {profile}: refused to serve {rel!r}: outside the indexed folder")
         raise _Fail(403, "OutsideRoot", "That file is outside your documents folder.")
     if not os.path.isfile(real):

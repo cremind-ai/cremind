@@ -12,7 +12,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
-  ElButton, ElCard, ElDialog, ElEmpty, ElInput, ElMessageBox, ElTable,
+  ElButton, ElCard, ElCheckbox, ElDialog, ElEmpty, ElInput, ElMessageBox, ElTable,
   ElTableColumn, ElTag, ElUpload,
 } from 'element-plus';
 import type { UploadRawFile } from 'element-plus';
@@ -34,6 +34,9 @@ const {
 const showCreate = ref(false);
 const createPass = ref('');
 const createPassConfirm = ref('');
+// Every profile's default working directory (the workspaces folder). On by
+// default; unchecking sends include_workspaces=false (CLI: --no-workspaces).
+const includeWorkspaces = ref(true);
 const creating = computed(() => !['idle', 'done', 'failed'].includes(createPhase.value));
 
 async function doCreate() {
@@ -42,10 +45,12 @@ async function doCreate() {
     return;
   }
   const pass = createPass.value || undefined;
+  const withWorkspaces = includeWorkspaces.value;
   showCreate.value = false;
   createPass.value = '';
   createPassConfirm.value = '';
-  await create(pass);
+  includeWorkspaces.value = true;
+  await create(pass, withWorkspaces);
 }
 
 // ── upload ────────────────────────────────────────────────────────────────
@@ -221,6 +226,13 @@ onMounted(() => { void refresh(); });
               <span v-else class="muted">no</span>
             </template>
           </ElTableColumn>
+          <ElTableColumn label="Working dirs" width="120">
+            <template #default="{ row }">
+              <span :class="{ muted: !row.manifest?.workspaces_included }">
+                {{ row.manifest?.workspaces_included ? 'included' : 'no' }}
+              </span>
+            </template>
+          </ElTableColumn>
           <ElTableColumn label="Actions" width="240">
             <template #default="{ row }">
               <ElButton size="small" @click="onDownload(row as BackupEntry)">Download</ElButton>
@@ -245,6 +257,15 @@ onMounted(() => { void refresh(); });
         v-model="createPassConfirm" type="password" placeholder="Confirm passphrase"
         show-password style="margin-top: 8px"
       />
+      <ElCheckbox v-model="includeWorkspaces" class="workspaces-check">
+        Include the profiles' working directories
+      </ElCheckbox>
+      <p class="muted">
+        Every profile's own folder in the workspaces folder (and the folders
+        kept from deleted profiles). Folders an admin chose outside it are not
+        included. Leave this off to keep the backup small; restoring it then
+        leaves the working directories as they are.
+      </p>
       <template #footer>
         <ElButton @click="showCreate = false">Cancel</ElButton>
         <ElButton type="primary" @click="doCreate">Create</ElButton>
@@ -258,6 +279,19 @@ onMounted(() => { void refresh(); });
         and restarts the server. A safety backup is taken first.
       </p>
       <p class="muted">Restoring: <code>{{ restoreTarget?.name }}</code></p>
+      <p v-if="restoreTarget?.manifest && !restoreTarget.manifest.workspaces_included" class="muted">
+        This backup does not include the profiles' working directories; the
+        ones on this server are left as they are.
+      </p>
+      <p v-else-if="restoreTarget?.manifest?.workspaces_included" class="muted">
+        Working-directory files in the backup overwrite files of the same name;
+        nothing else in those folders is deleted.
+      </p>
+      <p v-if="restoreTarget?.manifest?.working_dirs_elsewhere?.length" class="muted">
+        Not in this backup: the working directory an admin chose outside the
+        workspaces folder for {{ restoreTarget.manifest.working_dirs_elsewhere.join(', ') }}.
+        On another machine, copy those files across yourself.
+      </p>
       <ElInput
         v-if="restoreTarget?.manifest?.encrypted"
         v-model="restorePass" type="password" placeholder="Passphrase" show-password
@@ -320,6 +354,7 @@ onMounted(() => { void refresh(); });
 .report-warnings { margin: 8px 0 0; padding-left: 20px; font-size: 0.85rem; }
 .report-warnings a { color: var(--primary-color); cursor: pointer; }
 .danger-copy { color: var(--el-color-danger); display: flex; align-items: center; gap: 6px; }
+.workspaces-check { margin-top: 12px; }
 .restore-progress { display: flex; align-items: center; gap: 10px; font-size: 0.95rem; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

@@ -25,6 +25,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from app.config.settings import get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.events import get_file_watcher_manager
 from app.events.task_policy import (
     TASK_TIMEOUT_DEFAULT_MINUTES,
@@ -80,14 +81,16 @@ def _normalize_extensions(raw: Any) -> List[str]:
     return out
 
 
-def _resolve_path(raw_path: Optional[str]) -> tuple[str, bool]:
-    """Resolve user-provided ``path`` against ``CREMIND_USER_WORKING_DIR``.
+def _resolve_path(raw_path: Optional[str], profile: str) -> tuple[str, bool]:
+    """Resolve user-provided ``path`` against ``profile``'s own working
+    directory (its ``CREMIND_USER_WORKING_DIR``).
 
     Returns ``(absolute_normalized_path, was_relative)``. Relative paths
-    (or empty/None) are joined with the user working directory; absolute
-    paths are returned verbatim after normalization.
+    (or empty/None) are joined with that working directory; absolute
+    paths are returned verbatim after normalization. Whether the result is
+    another profile's is the caller's check (:func:`is_foreign`).
     """
-    base = get_user_working_directory()
+    base = get_user_working_directory(profile)
     if not raw_path or not str(raw_path).strip():
         resolved = base
         was_relative = True
@@ -158,9 +161,10 @@ class RegisterFileWatcherTool(BuiltInTool):
                 "type": "string",
                 "description": (
                     "Directory to watch. Relative paths are resolved against "
-                    "the user's working directory (CREMIND_USER_WORKING_DIR). "
-                    "Absolute paths are used as-is. Leave empty to watch the "
-                    "user working directory itself."
+                    "your own working directory (CREMIND_USER_WORKING_DIR). "
+                    "Absolute paths are used as-is, but never one inside "
+                    "another profile's working directory. Leave empty to "
+                    "watch your working directory itself."
                 ),
             },
             "name": {
@@ -321,17 +325,28 @@ class RegisterFileWatcherTool(BuiltInTool):
         else:
             recursive_flag = bool(recursive)
 
-        resolved_path, was_relative = _resolve_path(raw_path if isinstance(raw_path, str) else None)
+        resolved_path, was_relative = _resolve_path(
+            raw_path if isinstance(raw_path, str) else None, profile,
+        )
 
         # Block ../ traversal escapes for relative paths only. Absolute paths
         # are an explicit user opt-in to watch outside the working dir.
         if was_relative:
-            base = get_user_working_directory()
+            base = get_user_working_directory(profile)
             if not _is_under(resolved_path, base):
                 return _err(
                     f"Relative path {raw_path!r} resolves outside the user "
                     f"working directory ({base}); refusing to watch."
                 )
+        # Never another profile's working directory — absolute or not (an
+        # admin whose folder contains the workspaces root reaches them by a
+        # relative path too). Before the existence checks, so the answer
+        # reveals nothing about what is there. The admin is not exempt.
+        if is_foreign(resolved_path, profile):
+            return _err(
+                f"Cannot watch {resolved_path}: That folder belongs to another "
+                "profile. Each profile's working directory is private to it."
+            )
 
         if not os.path.exists(resolved_path):
             return _err(

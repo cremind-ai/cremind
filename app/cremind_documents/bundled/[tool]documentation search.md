@@ -23,7 +23,7 @@ It has four sub-tools, which the agent sees as `documentation_search__find_files
 The tool is on by default but only appears when all of these hold:
 
 - the admin allowed Documentation search (`cremind docs admin set --allow`);
-- the profile turned it on and chose a folder;
+- the profile turned it on (it indexes the profile's own working directory);
 - the conversation happens somewhere the profile allowed it. The web UI, the
   CLI and the profile's own automations are allowed by default; **messaging
   channels** and **group rooms** are off by default, because an answer there
@@ -279,7 +279,7 @@ no Tool Arguments.
 Per profile:
 
 - **UI** — Settings → Tools & Skills → Documentation Search (variables and the
-  four sub-tools); Settings → My Documents (folder, identity, where the
+  four sub-tools); Settings → My Documents (on/off, identity, where the
   agent may use the documents).
 - **CLI** — `cremind tools set-var documentation_search DEFAULT_TOP_K=12`;
   `cremind --json tools get documentation_search`; `cremind tools leaves

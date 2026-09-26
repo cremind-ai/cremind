@@ -2,10 +2,14 @@
 
 Two questions the sync engine cannot answer from the root path alone:
 
-1. **Is this folder really the user's?** In a Docker install the documents
-   root (``/root/Documents``) only holds the user's files when the compose file
-   bind-mounts a host folder there. Installs made before the bind mount existed
-   have nothing mounted, and :func:`app.config.settings.get_user_working_directory`
+1. **Is this folder really the user's?** In a Docker install a profile's
+   documents root — its working directory,
+   ``/root/Documents/cremind-workspaces/<profile>`` by default
+   (``CREMIND_WORKSPACES_DIR``), or ``/root/Documents`` itself for
+   the admin of an install that predates per-profile folders — only holds the
+   user's files when the compose file bind-mounts a host folder at
+   ``/root/Documents``. Installs made before the bind mount existed have
+   nothing mounted, and :func:`app.config.settings.get_user_working_directory`
    happily ``makedirs`` the path — so the root *exists*, is empty, and lives on
    the container's overlay filesystem, where anything written vanishes with the
    container. :func:`docker_root_status` spots that from ``/proc/self/mountinfo``
@@ -174,9 +178,26 @@ def in_container() -> bool:
         return False
 
 
+# Where the Docker bundle binds the host's documents folder. Every profile's
+# default working directory lives inside it (``cremind-workspaces/<profile>``;
+# not ``workspaces/``, a name users already give their own folders), so a
+# root anywhere under it is fixed by that one mount, not by a mount of its own.
+_CONTAINER_DOCUMENTS = "/root/Documents"
+
+
 def _compose_snippet(root: str, host_hint: str | None) -> str:
+    """The ``volumes:`` line that puts the host folder behind ``root``. A root
+    inside ``/root/Documents`` (a profile's workspace) names the mount the
+    bundle defines — the host's documents folder, which then shows the
+    workspace at ``<folder>/cremind-workspaces/<profile>`` — never the workspace
+    itself, which would hide every other profile's folder from the host."""
     host = (host_hint or "").strip() or "~/Documents"
-    return f'- "{host}:{root}"'
+    target = posixpath.normpath((root or "").replace("\\", "/") or "/")
+    if target == _CONTAINER_DOCUMENTS or target.startswith(_CONTAINER_DOCUMENTS + "/"):
+        target = _CONTAINER_DOCUMENTS
+    else:
+        target = root
+    return f'- "{host}:{target}"'
 
 
 def docker_root_status(root: str) -> dict:

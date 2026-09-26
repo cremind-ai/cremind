@@ -870,3 +870,10 @@ def test_a_hyphenated_heading_is_found_with_spaces(tmp_path, svc, monkeypatch):
     text = _text(_read("[cli]cremind tools", "set args"))
 
     assert "SET-ARGS-BODY" in text
+
+
+@pytest.fixture(autouse=True)
+def _workspaces_in_tmp(tmp_path, monkeypatch):
+    """Each profile's working directory resolves under the workspaces root;
+    keep it in this test's tmp dir, never the developer's ~/.cremind."""
+    monkeypatch.setenv("CREMIND_WORKSPACES_DIR", str(tmp_path / "workspaces"))

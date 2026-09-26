@@ -44,6 +44,8 @@ from app.documents import service as svc_module  # noqa: E402
 from app.documents import settings as uds  # noqa: E402
 from app.vectorstores.base import VectorStore  # noqa: E402
 from app.vectorstores.qdrant import QdrantClient  # noqa: E402
+from app.config import working_dirs as working_dirs_module  # noqa: E402
+from tests.documents._workspaces import install as install_working_dirs, move  # noqa: E402
 
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
 
@@ -110,8 +112,8 @@ def env(tmp_path: Path, monkeypatch):
     wd = tmp_path / "work"
     for d in (sysdir, wd / "alice", wd / "bob"):
         d.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
-    monkeypatch.setattr(uds, "get_user_working_directory", lambda: str(wd))
+    # Each profile's working directory is the folder its index covers.
+    working_dirs = install_working_dirs(monkeypatch, sysdir, {"alice": wd / "alice", "bob": wd / "bob"})
 
     provider = SqliteDatabaseProvider(str(tmp_path / "main.db"))
     eng = provider.sync_engine()
@@ -139,7 +141,7 @@ def env(tmp_path: Path, monkeypatch):
     embedding_state.mark_ready(embedder, store)
 
     def enable(profile: str, root: Path) -> None:
-        storage.upsert_source(profile, "local", enabled=True, root_mode="custom",
+        storage.upsert_source(profile, "local", enabled=True,
                               root_path=os.path.realpath(root), first_sync_confirmed_at=1.0)
 
     svc = svc_module.DocumentsService()
@@ -153,7 +155,7 @@ def env(tmp_path: Path, monkeypatch):
 
     svc.extract = spy_extract
     ns = SimpleNamespace(
-        svc=svc, storage=storage, wd=wd, alice=wd / "alice", bob=wd / "bob",
+        svc=svc, storage=storage, wd=wd, alice=wd / "alice", bob=wd / "bob", working_dirs=working_dirs,
         embedder=embedder, store=store, raw=raw, extracted=extracted, enable=enable,
     )
     try:
@@ -340,3 +342,134 @@ def test_stop_is_fast(env):
     started = time.monotonic()
     env.svc.stop(budget_s=1.5)
     assert time.monotonic() - started < 3.0
+
+
+# ── the folder is the working directory ────────────────────────────────────
+
+
+def _held_for_root_change(rt) -> bool:
+    return bool(rt and rt.hold and rt.hold.get("reason") == "pending_root_change"
+                and rt.confirmation and rt.confirmation.get("kind") == "root_change")
+
+
+def test_the_default_workspace_inside_the_system_dir_is_indexed(env):
+    """Each profile's default working directory lives in the system folder,
+    ``<SYS>/workspaces/<profile>``; that one folder there indexes, and each
+    profile only its own."""
+    move(env.working_dirs, "alice", None)
+    move(env.working_dirs, "bob", None)
+    alice_ws = Path(uds.validate_root("alice").path)
+    bob_ws = Path(uds.validate_root("bob").path)
+    assert uds.system_dir_exempt(str(alice_ws))
+    (alice_ws / "plan.md").write_text("# Alice plan\n\n" + _para(1), encoding="utf-8")
+    (bob_ws / "bob.md").write_text("# Bob notes\n\n" + _para(2), encoding="utf-8")
+    env.enable("alice", alice_ws)
+    env.enable("bob", bob_ws)
+    env.svc.start()
+    alice = _idle(env, "alice")
+    bob = _idle(env, "bob")
+    assert set(_files(alice)) == {"plan.md"}
+    assert set(_files(bob)) == {"bob.md"}
+
+
+def test_another_profiles_workspace_inside_the_folder_is_never_indexed(env, monkeypatch):
+    """alice's folder holds the workspaces root (an upgraded admin whose legacy
+    folder is the documents mount): bob's workspace in it is his alone."""
+    env.working_dirs.rows["bob"] = None
+    monkeypatch.setenv(working_dirs_module.WORKSPACES_ENV, str(env.alice / "workspaces"))
+    working_dirs_module.invalidate()
+    bob_ws = Path(uds.validate_root("bob").path)
+    assert bob_ws == Path(os.path.realpath(env.alice / "workspaces" / "bob"))
+    (bob_ws / "secret.md").write_text("# Bob private\n\n" + _para(7), encoding="utf-8")
+    (env.alice / "mine.md").write_text("# Alice\n\n" + _para(3), encoding="utf-8")
+    env.enable("alice", env.alice)
+    env.enable("bob", bob_ws)
+    env.svc.start()
+    alice = _idle(env, "alice")
+    bob = _idle(env, "bob")
+    assert set(_files(alice)) == {"mine.md"}
+    assert "word7_1" not in _chunk_texts(alice)
+    assert set(_files(bob)) == {"secret.md"}
+
+
+def test_a_folder_chosen_by_an_earlier_build_waits_for_confirmation(env):
+    """A row saved with a folder of its own (root_mode "custom") now follows
+    the working directory: nothing syncs, and nothing leaves the index, until
+    the profile confirms the move."""
+    old = env.wd / "old-choice"
+    old.mkdir()
+    (env.alice / "notes.md").write_text("# Notes\n\n" + _para(4), encoding="utf-8")
+    env.storage.upsert_source("alice", "local", enabled=True, root_mode="custom",
+                              root_path=os.path.realpath(old), first_sync_confirmed_at=1.0)
+    env.svc.start()
+    _wait(lambda: _held_for_root_change(env.svc.runtime("alice")))
+    rt = env.svc.runtime("alice")
+    assert rt.confirmation["from"] == os.path.realpath(old)
+    assert rt.confirmation["to"] == os.path.realpath(env.alice)
+    assert "working directory changed" in rt.confirmation["message"]
+    assert not rt.active
+
+    env.svc.control("alice", "confirm_root_change")
+    rt = _idle(env, "alice")
+    assert set(_files(rt)) == {"notes.md"}
+    row = env.storage.get_source("alice", "local")
+    assert (row["root_mode"], row["root_path"]) == ("inherit", os.path.realpath(env.alice))
+
+
+def test_a_moved_working_directory_is_noticed_at_once_and_waits(env):
+    """The admin moves alice's working directory: the change listener puts
+    her folder on hold straight away (not at the next restart), with a count
+    of what would leave the index; bob is untouched. Confirming indexes the
+    new folder."""
+    (env.alice / "a.md").write_text("# A\n\n" + _para(5), encoding="utf-8")
+    (env.bob / "b.md").write_text("# B\n\n" + _para(6), encoding="utf-8")
+    _start(env, "alice", "bob")
+    _idle(env, "alice")
+    _idle(env, "bob")
+
+    moved = env.wd / "alice-new"
+    moved.mkdir()
+    (moved / "c.md").write_text("# C\n\n" + _para(8), encoding="utf-8")
+    move(env.working_dirs, "alice", moved)
+    _wait(lambda: _held_for_root_change(env.svc.runtime("alice")), timeout=15)
+    rt = env.svc.runtime("alice")
+    assert rt.confirmation["to"] == os.path.realpath(moved)
+    assert (rt.confirmation["files"], rt.confirmation["leaving"]) == (1, 1)
+    assert set(_files(rt)) == {"a.md"}, "nothing leaves the index before the confirmation"
+    bob = env.svc.runtime("bob")
+    assert bob.active and not bob.hold
+
+    env.svc.control("alice", "confirm_root_change")
+    _wait(lambda: set(_files(env.svc.runtime("alice"))) == {"c.md"})
+    _idle(env, "alice")
+
+
+def test_the_working_dir_listener_lives_with_the_engine(env):
+    env.svc.start()
+    assert env.svc._on_working_dir_changed in working_dirs_module._listeners
+    env.svc.stop(budget_s=3.0)
+    assert env.svc._on_working_dir_changed not in working_dirs_module._listeners
+
+
+def test_a_profile_created_later_is_locked_out_of_a_folder_that_holds_it(env, monkeypatch):
+    """alice's folder holds the workspaces root. carol is created after alice
+    started indexing: the change listener re-checks alice's folder at once,
+    and nothing carol puts in her workspace reaches alice's index."""
+    monkeypatch.setenv(working_dirs_module.WORKSPACES_ENV, str(env.alice / "workspaces"))
+    working_dirs_module.invalidate()
+    (env.alice / "mine.md").write_text("# Alice\n\n" + _para(3), encoding="utf-8")
+    _start(env, "alice")
+    rt = _idle(env, "alice")
+    assert not any("carol" in p for p in rt.locked_excludes)
+
+    move(env.working_dirs, "carol", None)  # the profile is created
+    carol = Path(uds.validate_root("carol").path)
+    assert carol == Path(os.path.realpath(env.alice / "workspaces" / "carol"))
+    _wait(lambda: any(os.path.normcase(str(carol)) == p for p in env.svc.runtime("alice").locked_excludes),
+          timeout=15)
+    (carol / "carol.md").write_text("# Carol private\n\n" + _para(9), encoding="utf-8")
+    rt.request_scan("test")
+    _wait(lambda: not rt.scanning and rt.scans_finished >= rt.scans_started)
+    rt = _idle(env, "alice")
+    assert set(_files(rt)) == {"mine.md"}
+    assert "word9_1" not in _chunk_texts(rt)

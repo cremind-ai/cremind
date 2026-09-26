@@ -61,16 +61,22 @@ def _make_create_handler(state: BootedState):
             )
 
         passphrase = None
+        # The profiles' working directories are archived unless the client
+        # says ``"include_workspaces": false`` (CLI --no-workspaces, the UI
+        # checkbox). Anything but an explicit false keeps the default.
+        include_workspaces = True
         try:
             body = await request.json()
             if isinstance(body, dict):
                 p = body.get("passphrase")
                 if isinstance(p, str) and p.strip():
                     passphrase = p
+                if body.get("include_workspaces") is False:
+                    include_workspaces = False
         except Exception:  # noqa: BLE001
             passphrase = None
 
-        asyncio.create_task(_run_create(passphrase))
+        asyncio.create_task(_run_create(passphrase, include_workspaces))
         return JSONResponse(
             {"ok": True, "status_url": "/api/backup/status"}, status_code=202
         )
@@ -78,11 +84,13 @@ def _make_create_handler(state: BootedState):
     return post_create
 
 
-async def _run_create(passphrase: str | None) -> None:
+async def _run_create(passphrase: str | None, include_workspaces: bool = True) -> None:
     from app.backup import status as bstatus
     from app.backup.engine import BackupOptions, create_backup
 
-    bstatus.backup_status.begin(detail={"encrypted": bool(passphrase)})
+    bstatus.backup_status.begin(
+        detail={"encrypted": bool(passphrase), "workspaces_included": include_workspaces}
+    )
 
     def _progress(phase: str, cur: int, total: int) -> None:
         try:
@@ -93,7 +101,9 @@ async def _run_create(passphrase: str | None) -> None:
     try:
         bstatus.backup_status.update_phase("dumping", "Creating backup...")
         result = await asyncio.to_thread(
-            create_backup, BackupOptions(passphrase=passphrase), _progress
+            create_backup,
+            BackupOptions(passphrase=passphrase, include_workspaces=include_workspaces),
+            _progress,
         )
         bstatus.backup_status.finish(
             ok=True,
@@ -102,6 +112,14 @@ async def _run_create(passphrase: str | None) -> None:
                 "bytes": result.bytes_written,
                 "file_count": result.file_count,
                 "skipped": len(result.skipped),
+                "workspaces_included": result.manifest.workspaces_included,
+                "workspaces_file_count": result.workspaces_file_count,
+                "workspaces_root": result.manifest.source_paths.workspaces_root,
+                # Folders an admin chose outside that root: never archived.
+                "working_dirs_elsewhere": {
+                    name: result.manifest.working_dirs[name].get("path")
+                    for name in result.manifest.working_dirs_elsewhere()
+                },
             },
         )
         logger.info(f"[api:backup] create done: {result.path.name}")

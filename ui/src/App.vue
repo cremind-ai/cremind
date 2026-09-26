@@ -5,6 +5,7 @@ import { useChatStore } from './stores/chat';
 import { useGroupChatStore } from './stores/groupChat';
 import { useSearchToolsStore } from './stores/searchTools';
 import { useSettingsStore } from './stores/settings';
+import { followSignedInProfile } from './stores/terminalPanel';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
 import { useDocumentsStore } from './stores/documents';
 import { checkSetupStatus } from './services/configApi';
@@ -206,6 +207,8 @@ async function handleProfileNavigation(
     // the previous profile's — cleared whatever route we land on (the chat
     // store's own reset only runs on chat routes).
     searchToolsStore.resetForProfileSwitch();
+    // The file panel's folder is not dropped here: followSignedInProfile
+    // (below) does it on identity, which also covers the profile picker.
     // Reset chat state when switching to a different profile.
     if (onChatRoute) {
       await chatStore.resetForProfileSwitch();
@@ -222,6 +225,12 @@ async function handleProfileNavigation(
     }
   }
 }
+
+// The file panel's working directory (and every conversation's cwd) belongs to
+// the signed-in profile alone, so it is dropped whenever that profile changes —
+// keyed on identity, not the route below: "Switch profile" passes through '/',
+// which has no profile param, so the route watch sees no previous profile.
+followSignedInProfile();
 
 watch(
   () => [route.name, route.params.profile],
@@ -323,7 +332,8 @@ const handleLogout = () => {
   if (chatStore.isConnected) {
     chatStore.disconnect();
   }
-  // Clear active session
+  // Clear active session (this also drops the file panel's folder — see
+  // followSignedInProfile — so the next sign-in re-seeds from its own).
   settingsStore.authToken = '';
   settingsStore.profileId = '';
   router.push('/');

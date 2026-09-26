@@ -121,9 +121,9 @@ from **stdin**. `--json` and `--json-file` are mutually exclusive.
 ```json
 {
   "profile": "admin",
+  "working_dir": "/home/li/work",
   "server_config": {
-    "jwt_secret": "...",
-    "user_working_dir": "..."
+    "jwt_secret": "..."
   },
   "llm_config": {
     "anthropic.api_key": "sk-...",
@@ -151,6 +151,16 @@ from **stdin**. `--json` and `--json-file` are mutually exclusive.
 The first profile must be named `admin`. A `profile` field is required
 either inside the JSON or via `--profile`.
 
+**`working_dir`** is the profile's own, private working directory (see
+`cremind profile working-dir`) — on first setup, the admin's (omitted on a
+`reconfigure` re-run: kept). Otherwise omitted means the default
+`<workspaces>/<profile>` (`<workspaces>` =
+`<CREMIND_SYSTEM_DIR>/workspaces`, or `$CREMIND_WORKSPACES_DIR`). It is
+created; a folder that fails the checks is refused with `400`,
+`"code": "invalid_working_dir"`, before anything is written. The older
+`server_config.user_working_dir` is still accepted on first setup. When
+adopting, it is ignored (warning `working_dir_ignored`).
+
 Three keys are easy to miss because the wizard collects them on their own steps:
 `user_config` holds per-profile settings validated against the config schema
 (an unknown key is skipped with a log line, not an error), `channel_configs` is
@@ -173,8 +183,9 @@ error, and messages in a group chat are ignored with no reply at all.
 `profile`, `expires_at`, and `token`, then writes any **warnings** followed
 by the recommended `export CREMIND_TOKEN=...` line to **stderr** so users can
 copy/paste it. With `--json`, the full response object — including the
-`warnings` array of `{code, message}` entries — is emitted to stdout instead.
-The only code today is `no_main_model`.
+profile's `working_dir` and the `warnings` array of `{code, message}`
+entries — is emitted to stdout instead. Render any warning code that
+arrives (`no_main_model`, `adopted_existing`, `working_dir_*`, …).
 
 **One run per profile at a time.** A second `complete` for a profile whose
 setup is still running is refused with `409` and
@@ -282,13 +293,12 @@ full JSON object (or `{<key>: <value>}` for the single-key form).
 ```bash
 # Everything
 $ cremind setup server-config get
-user_working_dir   /home/li/work
 jwt_issuer         cremind
 log_level          info
 
 # A single key (handy for scripts)
-$ cremind setup server-config get user_working_dir
-/home/li/work
+$ cremind setup server-config get log_level
+info
 ```
 
 ### `cremind setup server-config set`
@@ -306,13 +316,18 @@ cremind setup server-config set KEY=VALUE [KEY=VALUE...]
 - `KEY=VALUE` — Repeatable. Each pair is split on the first `=`. The
   value side may contain further `=` characters.
 
-**Behavior.** **Requires admin auth.** All updates are sent in a single
-PATCH; if any one is rejected, none are applied. Silent on success.
+**Behavior.** **Requires admin auth.** All pairs go in one `PUT
+/api/config/server`, written one key at a time; `db_provider`, `postgres`
+and `system_dir` are silently ignored (fixed at first setup). Silent on
+success. **`user_working_dir` is no longer a server setting** — each
+profile has its own working directory — so a request naming it fails
+whole with `400 'user_working_dir' is no longer a server setting: …` and
+nothing is written. Use `cremind profile working-dir <name> <path>`.
 
 **Examples.**
 
 ```bash
-$ cremind setup server-config set log_level=debug user_working_dir=/srv/cremind
+$ cremind setup server-config set log_level=debug
 $ cremind setup server-config get log_level
 debug
 ```
@@ -330,7 +345,7 @@ setup_complete  false
 $ cat > bootstrap.json <<'EOF'
 {
   "profile": "admin",
-  "server_config": { "user_working_dir": "/srv/cremind" },
+  "working_dir":   "/srv/cremind",
   "llm_config":    { "anthropic.api_key": "sk-...", "auth_method": "anthropic" }
 }
 EOF
@@ -348,14 +363,6 @@ profile  admin
 $ cremind setup reconfigure        # invalidates setup_complete
 $ unset CREMIND_TOKEN              # no longer needed
 $ cremind setup complete --json-file bootstrap.json
-```
-
-### Rotate the configured working directory
-
-```bash
-$ cremind setup server-config set user_working_dir=/mnt/cremind
-$ cremind setup server-config get user_working_dir
-/mnt/cremind
 ```
 
 ## Troubleshooting
@@ -383,6 +390,10 @@ the search-tool rename, and a payload's `tool_configs` are keyed by tool id
 (`documentation_search` is now the user's own documents; Cremind's manual is
 `cremind_documentation_search`). Run `pip install -U cremind` and retry;
 nothing was created.
+
+**`setup complete` returns `400` / `Working directory rejected: …`** — The
+payload's `working_dir` failed a check (the message says which). Drop it
+for the default folder, or choose one outside `<CREMIND_SYSTEM_DIR>`.
 
 **`reset-orphaned` rejected** — The recovery path only fires when the
 database is genuinely orphaned (`setup_complete=true` but no profiles).

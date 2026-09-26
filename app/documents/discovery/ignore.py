@@ -11,7 +11,8 @@ The rules come in three layers, and the order is the security property:
 
 1. **Non-overridable.** Credential directories (``.ssh``, ``.aws``, the
    coding-CLI login stores, Cremind's own system directory when it sits under
-   the root, and any other locked exclude) are pruned outright. Secret-looking
+   the root, other profiles' working directories, and any other locked
+   exclude) are pruned outright. Secret-looking
    files (``.env``, ``*.pem``, ``id_rsa``, ``credentials.json`` …) are capped
    at ``metadata_only``. Nothing in layers 2 and 3 can lift either: a
    ``!*.pem`` in a ``.cremindignore`` does not make a private key readable by
@@ -319,10 +320,18 @@ class IgnoreMatcher:
         locked_excludes: list[str] | None = None,
         include_hidden: bool = False,
         system_dir: str | None = None,
+        root_sanctioned: bool = False,
     ):
+        """``root_sanctioned``: ``validate_root`` approved this root although
+        it lies inside ``system_dir`` — the profile's own default workspace
+        (``<SYS>/workspaces/<profile>``). Only then does the system folder
+        not lock the whole root; it still locks everything else, and every
+        other locked exclude applies as always. Pass it only for a root that
+        check approved."""
         self.root = os.path.abspath(root)
         self.include_hidden = bool(include_hidden)
         root_n = _norm_abs(self.root)
+        sys_n = _norm_abs(system_dir) if system_dir else None
 
         locked = [p for p in (locked_excludes or []) if p]
         if system_dir:
@@ -334,6 +343,8 @@ class IgnoreMatcher:
             n = _norm_abs(p)
             self._locked_abs.add(n)
             if _inside(root_n, n):
+                if root_sanctioned and n == sys_n and root_n != n:
+                    continue
                 # The whole root is inside a locked directory: index nothing.
                 # validate_root refuses such a root; this is the backstop.
                 self._root_locked = True

@@ -1,5 +1,5 @@
 ---
-description: "Browse and manage **files in the Cremind workspace**: `list`, `download`, `upload`, `upload-temp` (into a conversation's temp dir, returning attach-ready paths), `mkdir`, `move`, and `delete` files, read or set a conversation's working directory (`cwd`, `set-cwd`), and `watch` filesystem-change events. Use this to move files into or out of the workspace and manage the agent's working directory — file operations, distinct from `cremind file-watchers` (which subscribes to change events)."
+description: "Browse and manage **files in your profile's Cremind workspace** (each profile's own, private working directory): `list`, `download`, `upload`, `upload-temp` (into a conversation's temp dir, returning attach-ready paths), `mkdir`, `move`, and `delete` files, read your working directory or set a conversation's (`cwd`, `set-cwd`), and `watch` filesystem-change events. Use this to move files into or out of the workspace and manage the agent's working directory — file operations, distinct from `cremind file-watchers` (which subscribes to change events)."
 ---
 
 # `cremind files` — Workspace File Management
@@ -7,13 +7,33 @@ description: "Browse and manage **files in the Cremind workspace**: `list`, `dow
 `cremind files` is the CLI for browsing and managing files that the Cremind
 agent can see. It talks to the file-serving API (`/api/files/*`), which is
 **sandboxed**: every path must resolve inside one of the allowed roots — the
-Cremind system directory or the user working directory — or the server returns
-`403 Access denied`. A conversation that has switched into a custom directory
-(via the `change_working_directory` tool) widens its own allowlist; pass
-`--conversation <id>` to reach those paths.
+Cremind system directory or **your profile's own working directory** — or the
+server returns `403 Access denied`. A conversation that has switched into a
+custom directory (via the `change_working_directory` tool) widens its own
+allowlist; pass `--conversation <id>` to reach those paths.
 
 All paths are **absolute server-side paths**. Start from `cremind files cwd`
-to learn the workspace root, then `cremind files list <path>` to walk down.
+to learn your working directory, then `cremind files list <path>` to walk down.
+
+## Your working directory is yours alone
+
+Every profile has its **own** working directory — by default
+`<system dir>/workspaces/<profile>` (in the container images
+`/root/Documents/cremind-workspaces/<profile>`), or a folder the admin chose
+for it.
+It is the root of the file tree, the default directory of the agent's tools
+and terminals, and the folder Documentation search indexes. `cremind files cwd`
+prints yours; which profile you are is decided by your token.
+
+It is **private**: a path inside another profile's working directory is
+refused on every subcommand — `list`, `download`, `upload`, `mkdir`, `move`,
+`delete`, `watch` and `set-cwd` — with `403` and the message *"That location
+belongs to another profile's working directory"*. **The admin is not exempt**,
+and a `--conversation` override does not widen the rule (in a group room the
+admin may read a member seat's tree, but not inside that member's working
+directory). Listing the workspaces folder shows only your own folder, and
+`watch` never reports changes inside another profile's folder. Only the admin
+can change which folder a profile uses (not through `cremind files`).
 
 ## Finding this in the web UI
 
@@ -28,10 +48,15 @@ on disk is driven by the same watch stream as `cremind files watch`.
 
 ## The sandbox & `--conversation`
 
-- Reads and writes are confined to the Cremind system dir and the user working
-  dir. A path outside both is rejected with `403 Access denied`.
-- `delete` and `move` additionally refuse to touch an allowed *base* root
-  itself (you can't delete the workspace root).
+- Reads and writes are confined to the Cremind system dir and your own working
+  dir. A path outside both is rejected with `403 Access denied`; a path inside
+  another profile's working directory is always rejected (see above).
+- `delete` and `move` additionally refuse to touch a *root* folder itself —
+  any working directory (yours included), the workspaces folder, or the system
+  dir — and any directory that contains another profile's working directory.
+  Delete and move freely *inside* your own folder.
+- Nothing can be created directly in the workspaces folder (`upload`, `mkdir`
+  and `move` refuse it): it holds only the profiles' own folders.
 - `--conversation <id>` widens the allowlist to include the directory that
   conversation was switched into with `change_working_directory` — needed only
   when the file lives outside the static roots.
@@ -56,14 +81,16 @@ All `cremind files` subcommands accept the root-level `--json` flag. It goes rig
 
 ### `cremind files cwd`
 
-**Purpose.** Print the workspace working directory — the seed path the file
-tree opens at.
+**Purpose.** Print **your profile's** working directory — the seed path the
+file tree opens at.
 
 ```bash
 cremind files cwd
 ```
 
 Prints the absolute path on a single line (or `{"cwd": "..."}` with `--json`).
+Each profile gets its own folder, so the answer depends on which profile's
+token you use.
 
 ### `cremind files set-cwd`
 
@@ -75,8 +102,9 @@ moves without a tool round-trip.
 cremind files set-cwd <conversation_id> <path>
 ```
 
-- `<conversation_id>` — Conversation to repoint.
-- `<path>` — An existing absolute directory.
+- `<conversation_id>` — Conversation to repoint (one of your own).
+- `<path>` — An existing absolute directory — not inside another profile's
+  working directory or private folders.
 
 Prints the resolved working directory. The override persists across restarts.
 
@@ -204,8 +232,9 @@ descendant. Prints the resolved destination.
 cremind files delete <path> [--conversation <id>]
 ```
 
-**There is no confirmation prompt.** Refuses to delete an allowed base root.
-Silent on success.
+**There is no confirmation prompt.** Refuses to delete a root folder (a
+working directory, the workspaces folder, the system dir) or a directory that
+holds another profile's working directory. Silent on success.
 
 ### `cremind files watch`
 
@@ -252,10 +281,16 @@ $ cremind files watch "C:\Users\me\workspace"
 
 ## Troubleshooting
 
-**`403 Access denied`** — The path is outside the Cremind system dir and the
-user working dir. If the path belongs to a conversation's custom cwd, pass
-`--conversation <id>`. Otherwise pick a path under the workspace
+**`403 Access denied`** — The path is outside the Cremind system dir and your
+working dir. If the path belongs to a conversation's custom cwd, pass
+`--conversation <id>`. Otherwise pick a path under your working directory
 (`cremind files cwd`).
+
+**`403 That location belongs to another profile's working directory`** — The
+path is inside another profile's working directory (or a deleted profile's
+archived folder). Working directories are private to their profile, the
+admin's included; no flag widens this. Sign in as that profile to work with
+its files.
 
 **`404 Not a directory` / `File not found`** — `list`/`watch` need an existing
 directory; `download` needs an existing file. Re-check the path with

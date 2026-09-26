@@ -235,7 +235,7 @@ cremind file-watchers register --action "<instruction>"
 | Flag             | Type   | Default                              | Meaning                                                                                                                          |
 |------------------|--------|--------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
 | `--action`       | string | — (**required**)                     | Natural-language instruction the assistant runs on each matching event. Don't include event metadata — the runtime appends it.   |
-| `--path`         | string | `CREMIND_USER_WORKING_DIR`            | Directory to watch. Relative paths join the user working dir; absolute paths are used as-is. Must exist and be a directory.      |
+| `--path`         | string | `CREMIND_USER_WORKING_DIR`            | Directory to watch. Relative paths join **your own** working dir; absolute paths are used as-is. Must exist and be a directory, and must not be inside another profile's working directory. |
 | `--name`         | string | auto from `path` + `extensions`      | Short display label.                                                                                                             |
 | `--triggers`     | string | `created,modified,deleted,moved`     | Comma-separated subset of the four event types.                                                                                  |
 | `--target`       | string | `any`                                | Restrict to `file`, `folder`, or both (`any`).                                                                                   |
@@ -269,17 +269,25 @@ the server and the boot-time re-arm will retry.
 
 **Path resolution rules.**
 
-- `--path Lee` (relative) → `<CREMIND_USER_WORKING_DIR>/Lee`. A
-  `..`-traversal that escapes the user working directory is rejected.
+Each profile has its own working directory (`cremind me` prints yours;
+`$CREMIND_USER_WORKING_DIR` in an agent shell), and a watcher resolves
+against the one of the profile that registers it.
+
+- `--path Lee` (relative) → `<your working directory>/Lee`. A
+  `..`-traversal that escapes your working directory is rejected.
 - `--path C:\Users\me\Lee` (absolute) → used verbatim. The traversal
   guard does not apply to absolute paths — that's an explicit user
   opt-in.
-- `--path` omitted or empty → watches `CREMIND_USER_WORKING_DIR` itself.
+- `--path` omitted or empty → watches your working directory itself.
+- **A path inside another profile's working directory is refused**,
+  relative or absolute, `admin` included: a profile's folder is private
+  to it. A watcher over a folder that merely *contains* other profiles'
+  folders is allowed, but never fires for anything inside them.
 
 **Examples.**
 
 ```bash
-# Watch every change to .py files in <USER_WORKING_DIR>/Lee
+# Watch every change to .py files in <your working directory>/Lee
 $ cremind file-watchers register \
     --path Lee \
     --triggers modified,created \
@@ -288,7 +296,7 @@ $ cremind file-watchers register \
     --action "notify the user about the change"
 id               fw_a3f1
 name             Lee-.py
-root_path        C:\Users\me\Documents\Lee
+root_path        C:\Users\me\.cremind\workspaces\admin\Lee
 event_types      modified,created
 target_kind      file
 extensions       .py
@@ -461,7 +469,7 @@ $ cremind file-watchers register \
     --action "notify the user that something changed in the 'Lee' directory"
 id               fw_a3f1
 name             Lee-all
-root_path        C:\Users\me\Documents\Lee
+root_path        C:\Users\me\.cremind\workspaces\admin\Lee
 event_types      created,modified,deleted,moved
 target_kind      any
 extensions
@@ -469,7 +477,7 @@ recursive        yes
 armed            yes
 ```
 
-Now drop a file into `<USER_WORKING_DIR>/Lee` from any tool —
+Now drop a file into `<your working directory>/Lee` from any tool —
 Explorer, `touch`, an editor — and the agent receives a trigger
 within ~500 ms (after the debounce window), runs the action in a hidden
 per-run conversation, and reports the result into the conversation that
@@ -493,7 +501,7 @@ $ cremind file-watchers register --path Lee --action "notify me"
 
 ```bash
 $ cremind --json file-watchers stream | jq '.data.subscriptions[] | {name, path: .root_path, armed}'
-{"name":"py-only","path":"C:\\Users\\me\\Documents\\Lee","armed":true}
+{"name":"py-only","path":"C:\\Users\\me\\.cremind\\workspaces\\admin\\Lee","armed":true}
 ```
 
 ### Tail combined notifications (skill events + file watcher events)
@@ -514,11 +522,11 @@ a watcher end-to-end during development, just touch a real file at
 the watched path:
 
 ```bash
-# Linux/macOS
-$ touch "$$CREMIND_USER_WORKING_DIR/Lee/test.py"
+# Linux/macOS (in an agent shell, where the variable names your own folder)
+$ touch "$CREMIND_USER_WORKING_DIR/Lee/test.py"
 
 # Windows PowerShell
-> ni $env:USERPROFILE\Documents\Lee\test.py -Force | Out-Null
+> ni "$env:CREMIND_USER_WORKING_DIR\Lee\test.py" -Force | Out-Null
 ```
 
 This exercises the full pipeline: watchdog → ignore filter →

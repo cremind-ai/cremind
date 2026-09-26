@@ -106,7 +106,7 @@ class _FakeRegistry:
 def _agent(monkeypatch, tools) -> "ra.ReasoningAgent":
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")
     return ra.ReasoningAgent(

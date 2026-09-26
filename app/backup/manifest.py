@@ -10,7 +10,11 @@ archive is even compatible with the running build:
 - the app version + Alembic revision the DB dump was taken at (drives the
   "create schema at that revision, then upgrade to head" restore recipe)
 - the source environment's absolute roots (``system_dir`` / ``home_dir`` /
-  ``user_working_dir``) and path separator — the inputs to path relocation
+  ``workspaces_root``) and path separator — the inputs to path relocation
+- whether the profiles' working directories (the workspaces root) were
+  archived — under their own ``workspaces/`` member prefix, restored into the
+  TARGET's workspaces root wherever that is — and each profile's folder, so a
+  restore can name the ones an admin chose elsewhere (never archived)
 - the DB provider the dump came from (informational — the target keeps its own)
 
 Nothing here is secret: paths, versions, profile names, and row counts only.
@@ -35,6 +39,12 @@ ARCHIVE_SUFFIX = ".cremind-backup"
 MANIFEST_MEMBER = "manifest.json"
 DB_MEMBER = "db/dump.jsonl.gz"
 FILES_PREFIX = "files/"
+# Every profile's default-location working directory, relative to the
+# workspaces root (``workspaces/<profile>/…``, ``workspaces/.deleted/…``). Its
+# own prefix rather than a path under ``files/``: the root may live outside
+# the system dir (``CREMIND_WORKSPACES_DIR`` in a container), and a restore
+# puts it into the target's root, which need not be where the source kept it.
+WORKSPACES_PREFIX = "workspaces/"
 INVENTORY_MEMBER = "inventory.json"
 
 
@@ -52,19 +62,28 @@ class BackupPassphraseError(BackupError):
 
 @dataclass
 class SourcePaths:
-    """The source environment's absolute roots — inputs to path relocation."""
+    """The source environment's absolute roots — inputs to path relocation.
+
+    ``user_working_dir`` is informational: before each profile had its own
+    working directory it was the one server-wide folder; archives made since
+    carry the admin's folder there. ``workspaces_root`` is the folder holding
+    every profile's default working directory (``""`` in older archives) —
+    relocated to the target's root, which is where a restore puts them.
+    """
 
     system_dir: str
     home_dir: str
     user_working_dir: str
     sep: str
     case_insensitive: bool
+    workspaces_root: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "system_dir": self.system_dir,
             "home_dir": self.home_dir,
             "user_working_dir": self.user_working_dir,
+            "workspaces_root": self.workspaces_root,
             "sep": self.sep,
             "case_insensitive": self.case_insensitive,
         }
@@ -77,6 +96,7 @@ class SourcePaths:
             user_working_dir=d.get("user_working_dir", ""),
             sep=d.get("sep", "/"),
             case_insensitive=bool(d.get("case_insensitive", False)),
+            workspaces_root=d.get("workspaces_root", "") or "",
         )
 
 
@@ -92,6 +112,16 @@ class Manifest:
     db_row_counts: dict[str, int] = field(default_factory=dict)
     files_approx_bytes: int = 0
     browser_profiles_included: bool = True
+    # False for every archive made before the per-profile working directories
+    # (they never carried them) and for ``--no-workspaces``.
+    workspaces_included: bool = False
+    # Each profile's working directory when the backup was made:
+    # ``{name: {"path", "default", "in_workspaces", "archived"}}``. A folder
+    # an admin chose outside the workspaces root is never archived
+    # (``in_workspaces`` False); ``archived`` is also False for every folder
+    # under ``--no-workspaces``. Empty in archives made before the per-profile
+    # working directories.
+    working_dirs: dict[str, dict[str, Any]] = field(default_factory=dict)
     encrypted: bool = False
     created_at: str = ""
     format: str = BACKUP_FORMAT
@@ -114,7 +144,10 @@ class Manifest:
                 "member_prefix": FILES_PREFIX,
                 "approx_total_bytes": self.files_approx_bytes,
                 "browser_profiles_included": self.browser_profiles_included,
+                "workspaces_included": self.workspaces_included,
+                "workspaces_member_prefix": WORKSPACES_PREFIX,
             },
+            "working_dirs": {name: dict(v) for name, v in self.working_dirs.items()},
             "encrypted": self.encrypted,
         }
 
@@ -133,6 +166,12 @@ class Manifest:
             db_row_counts=dict(db.get("row_counts") or {}),
             files_approx_bytes=int(files.get("approx_total_bytes") or 0),
             browser_profiles_included=bool(files.get("browser_profiles_included", True)),
+            workspaces_included=bool(files.get("workspaces_included", False)),
+            working_dirs={
+                str(name): dict(v)
+                for name, v in (d.get("working_dirs") or {}).items()
+                if isinstance(v, dict)
+            },
             encrypted=bool(d.get("encrypted", False)),
             created_at=d.get("created_at", ""),
             format=d.get("format", BACKUP_FORMAT),
@@ -151,7 +190,16 @@ class Manifest:
             "encrypted": self.encrypted,
             "alembic_revision": self.alembic_revision,
             "db_row_total": sum(self.db_row_counts.values()) if self.db_row_counts else 0,
+            "workspaces_included": self.workspaces_included,
+            # Profiles whose working directory an admin chose outside the
+            # workspaces root: never in the archive, whatever the flag says.
+            "working_dirs_elsewhere": self.working_dirs_elsewhere(),
         }
+
+    def working_dirs_elsewhere(self) -> list[str]:
+        return sorted(
+            name for name, v in self.working_dirs.items() if not v.get("in_workspaces", True)
+        )
 
 
 def now_iso() -> str:
@@ -230,6 +278,7 @@ __all__ = [
     "FILES_PREFIX",
     "INVENTORY_MEMBER",
     "MANIFEST_MEMBER",
+    "WORKSPACES_PREFIX",
     "BackupError",
     "BackupIncompatibleError",
     "BackupPassphraseError",

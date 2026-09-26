@@ -54,7 +54,7 @@ def _build_agent(monkeypatch, *, any_channel, notification_channel=False):
 
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
-    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda *a, **k: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
     monkeypatch.setattr(reg, "has_any_channel", lambda profile: any_channel)
     monkeypatch.setattr(

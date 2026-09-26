@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from app.config.settings import get_user_working_directory
+from app.config.working_dirs import is_foreign
 from app.events import get_file_watcher_manager
 from app.events.file_watcher_admin_bus import get_file_watcher_admin_stream_bus
 from app.storage import get_conversation_storage, get_file_watcher_storage
@@ -91,9 +92,10 @@ def publish_file_watchers_admin_changed(profile: Optional[str]) -> None:
         logger.debug(f"file-watchers admin bus publish failed: {exc}")
 
 
-def _resolve_path(raw_path: Optional[str]) -> tuple[str, bool]:
-    """Resolve relative→USER_WORKING_DIR, absolute→as-is. Returns (abs_path, was_relative)."""
-    base = get_user_working_directory()
+def _resolve_path(raw_path: Optional[str], profile: str) -> tuple[str, bool]:
+    """Resolve relative→``profile``'s own working directory, absolute→as-is.
+    Returns (abs_path, was_relative)."""
+    base = get_user_working_directory(profile)
     if not raw_path or not raw_path.strip():
         return os.path.abspath(os.path.normpath(base)), True
     candidate = raw_path.strip()
@@ -112,6 +114,58 @@ def _is_under(path: str, parent: str) -> bool:
         return common == normalized_parent
     except ValueError:
         return False
+
+
+def _checked_watch_root(
+    raw_path: Optional[str], profile: str,
+) -> tuple[Optional[str], Optional[JSONResponse]]:
+    """``(root, None)`` for a watch root ``profile`` may use, else ``(None, error)``.
+
+    Relative paths join the profile's own working directory and may not climb
+    out of it; no path, absolute or relative, may lie inside ANOTHER profile's
+    working directory (the admin is not exempt — an admin folder containing
+    the workspaces root reaches the others' by a relative path too). That
+    refusal comes before the existence check, so it reveals nothing about
+    what is there."""
+    if not profile:
+        return None, JSONResponse(
+            {"error": "Forbidden", "message": "No profile on this request."},
+            status_code=403,
+        )
+    resolved_path, was_relative = _resolve_path(raw_path, profile)
+    if was_relative:
+        base = get_user_working_directory(profile)
+        if not _is_under(resolved_path, base):
+            return None, JSONResponse(
+                {
+                    "error": "path_escape",
+                    "message": (
+                        f"Relative path resolves outside the user working "
+                        f"directory ({base}); refusing to watch."
+                    ),
+                },
+                status_code=400,
+            )
+    if is_foreign(resolved_path, profile):
+        return None, JSONResponse(
+            {
+                "error": "foreign_working_dir",
+                "message": (
+                    f"Cannot watch {resolved_path}: That folder belongs to another "
+                    "profile. Each profile's working directory is private to it."
+                ),
+            },
+            status_code=400,
+        )
+    if not os.path.exists(resolved_path) or not os.path.isdir(resolved_path):
+        return None, JSONResponse(
+            {
+                "error": "invalid_path",
+                "message": f"{resolved_path} is not an existing directory",
+            },
+            status_code=400,
+        )
+    return resolved_path, None
 
 
 def _auto_name(root_path: str, extensions: List[str], target_kind: str) -> str:
@@ -263,28 +317,9 @@ def get_file_watcher_routes() -> list[Route]:
 
         extensions = _normalize_extensions(body.get("extensions"))
 
-        resolved_path, was_relative = _resolve_path(body.get("path"))
-        if was_relative:
-            base = get_user_working_directory()
-            if not _is_under(resolved_path, base):
-                return JSONResponse(
-                    {
-                        "error": "path_escape",
-                        "message": (
-                            f"Relative path resolves outside the user working "
-                            f"directory ({base}); refusing to watch."
-                        ),
-                    },
-                    status_code=400,
-                )
-        if not os.path.exists(resolved_path) or not os.path.isdir(resolved_path):
-            return JSONResponse(
-                {
-                    "error": "invalid_path",
-                    "message": f"{resolved_path} is not an existing directory",
-                },
-                status_code=400,
-            )
+        resolved_path, path_error = _checked_watch_root(body.get("path"), profile)
+        if path_error is not None:
+            return path_error
 
         name = (body.get("name") or "").strip()
         if not name:
@@ -433,28 +468,13 @@ def get_file_watcher_routes() -> list[Route]:
             fields["recursive"] = bool(body.get("recursive"))
 
         if "path" in body:
-            resolved_path, was_relative = _resolve_path(body.get("path"))
-            if was_relative:
-                base = get_user_working_directory()
-                if not _is_under(resolved_path, base):
-                    return JSONResponse(
-                        {
-                            "error": "path_escape",
-                            "message": (
-                                f"Relative path resolves outside the user working "
-                                f"directory ({base}); refusing to watch."
-                            ),
-                        },
-                        status_code=400,
-                    )
-            if not os.path.exists(resolved_path) or not os.path.isdir(resolved_path):
-                return JSONResponse(
-                    {
-                        "error": "invalid_path",
-                        "message": f"{resolved_path} is not an existing directory",
-                    },
-                    status_code=400,
-                )
+            # The watcher's owner, not the caller: that is whose working
+            # directory a relative path means and whose privacy applies.
+            resolved_path, path_error = _checked_watch_root(
+                body.get("path"), existing["profile"],
+            )
+            if path_error is not None:
+                return path_error
             fields["root_path"] = resolved_path
 
         if "name" in body:

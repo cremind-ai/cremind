@@ -205,12 +205,18 @@ cremind:
 #   venv:   /opt/cremind/venv — Python deps the Setup Wizard installs at runtime
 #           (LLM SDKs, embeddings). Without it a restart reverts to the thin
 #           baseline and the agent loses its LLM SDK until re-setup.
-#   work:   the agent's User Working Directory — the folder it reads/writes
-#           files in (root of the Tree Dir panel, default for every built-in
-#           tool). Files the agent creates live here; without this volume they
-#           vanish on restart. mountPath MUST match the wizard's
-#           "User Working Directory" (the kubernetes profile defaults it to
-#           ~/Documents -> /root/Documents). The database lives in PostgreSQL.
+#   work:   the profiles' working directories — each profile's own folder at
+#           <mountPath>/cremind-workspaces/<profile> (the chart sets
+#           CREMIND_WORKSPACES_DIR to that): the root of its Tree Dir panel,
+#           the default for every built-in tool, what its Documentation search
+#           indexes. Files the agents create live here; without this volume
+#           they fall back to <systemDir>/workspaces on the system PVC. An
+#           install upgraded from before per-profile folders keeps the admin
+#           on mountPath itself (its old User Working Directory, default
+#           /root/Documents); every other profile gets its folder in
+#           cremind-workspaces/ (not workspaces/: a name users give their own
+#           folders, and everything inside is treated as some profile's).
+#           The database lives in PostgreSQL.
 #
 # NOTE: only these mounted paths persist. Files written elsewhere in the
 # container (e.g. /tmp, or an ad-hoc `kubectl exec` into /root) are ephemeral —
@@ -232,7 +238,9 @@ persistence:
     annotations: {}
   work:
     enabled: true
-    mountPath: /root/Documents   # must match the wizard's User Working Directory
+    mountPath: /root/Documents   # profiles' folders: <mountPath>/cremind-workspaces/<profile>
+    # `helm uninstall` deletes this claim, and every profile's folder with it.
+    # To keep it: annotations: {helm.sh/resource-policy: keep}
     storageClass: ""
     accessModes: [ReadWriteOnce]
     size: 10Gi

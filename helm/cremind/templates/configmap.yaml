@@ -98,6 +98,17 @@ data:
   PORT: {{ .Values.cremind.apiPort | quote }}
   CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}
   CREMIND_SYSTEM_DIR: {{ .Values.cremind.systemDir | quote }}
+  {{- /* Where every profile's own working directory lives:
+         <this>/<profile name>. On the work volume when it is enabled, so the
+         files a profile's agent creates survive a rollout; unset otherwise,
+         which puts them in <systemDir>/workspaces on the system PVC (never
+         in the pod filesystem). The admin of a release upgraded from before
+         per-profile folders keeps its old User Working Directory — the work
+         volume's root — and every other profile starts here. A
+         CREMIND_WORKSPACES_DIR in cremind.extraEnv overrides this. */}}
+  {{- if .Values.persistence.work.enabled }}
+  CREMIND_WORKSPACES_DIR: {{ printf "%s/cremind-workspaces" (trimSuffix "/" .Values.persistence.work.mountPath) | quote }}
+  {{- end }}
   {{- /* Where the Claude Code and Codex CLIs keep their sign-in. Their
          defaults (~/.claude, ~/.codex) are in the container filesystem, which
          a rollout throws away — a user who signed in through the terminal
