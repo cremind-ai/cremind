@@ -263,6 +263,16 @@ dev = [
     "anthropic>=0.52.0",
     "openai>=2.6.0",
     "groq>=0.33.0",
+    # Documentation search's extractors (the `documents` + `documentation-search`
+    # extras, installed on demand when a profile turns the feature on). Same
+    # rationale again: tests/documents drives real PDF, Office, ODF, EPUB and
+    # image extraction through the worker, and CI's `uv sync --all-groups`
+    # never installs extras — without these those tests fail on a clean runner
+    # while passing on any dev box that has used the feature.
+    "markitdown[all]>=0.1.0",
+    "pandas>=3.0.1",
+    "pillow>=10.0",
+    "pillow-heif>=0.18",
 ]
 
 # ── Ruff (lint + format) ─────────────────────────────────────────────────
