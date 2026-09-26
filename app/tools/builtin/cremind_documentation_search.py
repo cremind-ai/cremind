@@ -157,8 +157,9 @@ _CLI_EXECUTION_DIRECTIVE = (
 
 _JUDGE_SYSTEM_PROMPT = (
     "You are the Cremind Documentation Search relevance judge. You are given a numbered "
-    "list of candidate documents -- ranked by vector similarity when semantic "
-    "search is available, otherwise every document in the library. Each "
+    "list of candidate documents -- ranked by vector similarity and keyword "
+    "match when semantic search is available, otherwise every document in the "
+    "library. Each "
     "candidate has a short name and a description -- you do NOT see the body.\n"
     "\n"
     "Your sole job is to pick the SINGLE candidate that best answers the "
@@ -251,10 +252,12 @@ TOOL_CONFIG: ToolConfig = {
     "required_config": {
         Var.DEFAULT_TOP_K_KEY: {
             "description": (
-                "Maximum number of documents the vector store returns to "
-                "the relevance judge for each search call. Ignored when Vector "
-                "Embedding is off: the judge then reviews the whole shared "
-                "library plus up to 50 of the profile's own documents."
+                "Maximum number of candidate documents the relevance judge "
+                "reviews for each search call: the vector ranking's best, with "
+                "up to half the seats kept for the best keyword matches. "
+                "Ignored when Vector Embedding is off: the judge then reviews "
+                "the whole shared library plus up to 50 of the profile's own "
+                "documents."
             ),
             "type": "number",
             "default": DEFAULT_TOP_K,
@@ -292,9 +295,9 @@ class CremindDocumentationSearchTool(BuiltInTool):
             "top_k": {
                 "type": "integer",
                 "description": (
-                    "Maximum number of vector-search candidates the LLM "
-                    "judge considers. Defaults to 10 and is capped at 20. "
-                    "Ignored when semantic search is off."
+                    "Maximum number of candidates the LLM judge considers "
+                    "(vector and keyword matches). Defaults to 10 and is "
+                    "capped at 20. Ignored when semantic search is off."
                 ),
                 "minimum": 1,
                 "maximum": 20,
@@ -432,6 +435,7 @@ async def run_doc_search(
             "scope": hit.get("scope"),
             "relpath": hit.get("relpath"),
             "score": hit.get("score"),
+            "match": hit.get("match"),
         })
 
     if not candidates:
@@ -1337,12 +1341,15 @@ async def _select_best_candidate(
     # Lets us tell a ranking miss (target doc never reached top-K) from a judge
     # miss (target ranked but rejected) without dumping bodies or descriptions,
     # and — via mode — a ranked search from a degraded full scan.
-    def _fmt_score(v: Any) -> str:
-        return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
+    # A candidate only the keyword ranking returned has no vector score; it is
+    # labelled so a ranking miss rescued by keywords reads as one.
+    def _fmt_score(c: Dict[str, Any]) -> str:
+        v = c.get("score")
+        if isinstance(v, (int, float)):
+            return f"{v:.4f}"
+        return "keyword" if c.get("match") == "keyword" else "n/a"
 
-    ranked = ", ".join(
-        f"{c.get('name', '')}={_fmt_score(c.get('score'))}" for c in candidates
-    )
+    ranked = ", ".join(f"{c.get('name', '')}={_fmt_score(c)}" for c in candidates)
 
     def _log(decision: str) -> None:
         logger.info(

@@ -1,5 +1,5 @@
 ---
-description: "The Cremind Documentation Search (cremind_documentation_search) built-in tool, which searches Cremind's own manuals — features, settings and the cremind CLI: how the agent finds a document (vector ranking plus an LLM relevance judge, or the judge alone when Vector Embedding is off), how a long document is delivered (its head, a table of contents with section sizes, and the matching sections, sized to the profile's tool_result.max_tokens), reading one section with read_documentation_section, and its DEFAULT_TOP_K variable. How to view and change the cremind_documentation_search top-k and toggle its two sub-tools per profile. Named documentation_search before the rename; that id is now the user's own files (Documentation search)."
+description: "The Cremind Documentation Search (cremind_documentation_search) built-in tool, which searches Cremind's own manuals — features, settings and the cremind CLI: how the agent finds a document (vector and keyword ranking plus an LLM relevance judge, or the judge alone when Vector Embedding is off), how a long document is delivered (its head, a table of contents with section sizes, and the matching sections, sized to the profile's tool_result.max_tokens), reading one section with read_documentation_section, and its DEFAULT_TOP_K variable. How to view and change the cremind_documentation_search top-k and toggle its two sub-tools per profile. Named documentation_search before the rename; that id is now the user's own files (Documentation search)."
 ---
 
 # Cremind Documentation Search Tool (cremind_documentation_search)
@@ -35,11 +35,24 @@ response; see `[tool]documentation search` and `cremind conv search-tools`.
 
 ## How a document is found
 
-The agent's query is embedded and the vector store returns the `DEFAULT_TOP_K`
-closest documents from the shared library and the active profile's own
-documents. An internal LLM relevance judge — the profile's `low` model group —
-then reads each candidate's name and description (never the body) and picks the
-single one that answers the query, or none.
+The agent's query is ranked against the shared library and the active
+profile's own documents two ways, and the relevance judge sees `DEFAULT_TOP_K`
+candidates from both:
+
+- **Vector ranking** — the query is embedded and the vector store returns the
+  closest documents.
+- **Keyword ranking** — up to half of the candidates are the documents whose
+  name and description share the query's rarer words. A word most documents
+  contain ("Cremind", "CLI", "list", "command") earns no candidate, so a query
+  such as "list all configured Cremind LLM providers CLI command" still reaches
+  `[cli]cremind llm` through "LLM" even when the vector ranking buries it under
+  every other CLI page. A query with no such word — typically a non-English one
+  — is ranked by vectors alone.
+
+An internal LLM relevance judge — the profile's `low` model group — then reads
+each candidate's name and description (never the body) and picks the single one
+that answers the query, or none. The search's log line marks a candidate only
+the keyword ranking found as `name=keyword` instead of a vector score.
 
 When **Vector Embedding is disabled** (or its store is unreachable, or the
 document collection has not been built yet), the tool skips vector ranking and
@@ -116,7 +129,7 @@ documents share — the candidates are their `scope/path` references),
 
 | Variable | Type | Default | Meaning |
 |----------|------|---------|---------|
-| `DEFAULT_TOP_K` | number | `10` | Maximum number of documents the vector store returns to the relevance judge for each search call. Ignored when Vector Embedding is off. |
+| `DEFAULT_TOP_K` | number | `10` | Maximum number of candidate documents the relevance judge reviews for each search call — the vector ranking's best, with up to half kept for the best keyword matches. Ignored when Vector Embedding is off. |
 
 `cremind_documentation_search` has no Tool Arguments. The delivery budget has no
 variable of its own — it follows `tool_result.max_tokens`.

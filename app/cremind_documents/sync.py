@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional
 
 from app.config.embedding_state import embedding_state
+from app.cremind_documents import lexical
 from app.cremind_documents import paths as doc_paths
 from app.cremind_documents.parser import parse_document
 from app.lib.embedding import LocalEmbeddings
@@ -499,14 +500,19 @@ class CremindDocumentSyncService:
         limit: int = 10,
         scopes: Optional[list[str]] = None,
     ) -> list[dict]:
-        """Vector-search the collection, filtered to ``scopes``.
+        """Vector-search the collection, filtered to ``scopes``, with keyword seats.
 
         ``scopes`` defaults to ``[shared, profile]`` (the general documentation
         corpus). It is a generic filter, so a caller may narrow the search to a
         subset of scopes if needed.
 
-        Returns flat payload dicts plus ``id`` and ``score`` keys. Body
-        content is loaded from disk by the caller, not stored here.
+        Returns at most ``limit`` flat payload dicts plus ``id`` and ``score``
+        keys. Up to half of them are the best keyword matches in ``scopes``
+        (:mod:`app.cremind_documents.lexical`), so a page a query names by a
+        rare word reaches the judge even when the vector ranking buries it; one
+        the vector ranking did not return has ``score`` None and ``match``
+        ``"keyword"``. Body content is loaded from disk by the caller, not
+        stored here.
 
         When Vector Embedding is disabled (no embedding model and/or no
         vector store), when the collection has not been built yet, or when the
@@ -560,7 +566,33 @@ class CremindDocumentSyncService:
             return self._list_all_for_scopes(scopes=scopes)
 
         self._note_mode(MODE_VECTOR)
+        hits = lexical.merge(hits, self._keyword_hits(query, scopes), limit, key=_hit_key)
         return [self._current_location(hit) for hit in hits]
+
+    def _keyword_hits(self, query: str, scopes: list[str]) -> list[dict]:
+        """Every page in ``scopes`` with an informative keyword match, best
+        first, shaped like a vector hit (``score`` None, ``match``
+        ``"keyword"``).
+
+        Ranked over each page's cleaned name and the same capped description
+        that is embedded. Empty on any failure: the keyword ranking only ever
+        adds candidates to a vector search, so a problem here must not cost the
+        search its vector hits.
+        """
+        try:
+            rows = [row for scope in scopes for row in self._fetch_scope_payloads(scope)]
+            corpus = [
+                (
+                    _clean_name(row.get("name") or Path(row.get("relpath") or "").stem),
+                    _cap_description_for_embedding(row.get("text") or ""),
+                )
+                for row in rows
+            ]
+            ranked = lexical.rank(query, corpus)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[cremind_documents] keyword ranking failed: {e}")
+            return []
+        return [dict(rows[index], score=None, match="keyword") for index, _ in ranked]
 
     def _current_location(self, hit: dict) -> dict:
         """Point a vector hit's ``file_path`` at where the doc lives NOW.
@@ -979,6 +1011,14 @@ def remove_profile_documents(
             logger.exception(f"[cremind_documents] could not prune the points of deleted profile {profile!r}")
         service.forget_profile(profile)
     return removed
+
+
+def _hit_key(hit: dict) -> object:
+    """What makes two hits the same page: its point id, which is derived from
+    ``scope``/``relpath`` (:meth:`CremindDocumentSyncService._file_id`) — or
+    those two when a hit carries no id."""
+    pid = hit.get("id")
+    return pid if pid is not None else (hit.get("scope"), hit.get("relpath"), hit.get("name"))
 
 
 def _hash_text(text: str) -> str:

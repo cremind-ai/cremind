@@ -229,6 +229,19 @@ def test_log_label_tags_the_summary_line(monkeypatch):
     assert "mode=vector" in lines[0]
 
 
+def test_a_candidate_only_the_keyword_ranking_found_is_labelled(monkeypatch):
+    """A keyword seat has no vector score; the summary says where it came
+    from, so a ranking miss rescued by keywords reads as one."""
+    keyword_hit = {
+        "file_path": "/docs/llm.md", "text": "Configure LLM providers.", "name": "llm",
+        "scope": "shared", "score": None, "match": "keyword",
+    }
+    _, lines = _run(_SvcWithMode(mode="vector", hits=[dict(_HIT), keyword_hit]), monkeypatch)
+
+    assert len(lines) == 1
+    assert f"ranked=[{_NAME}=0.9000, llm=keyword]" in lines[0]
+
+
 def test_select_best_candidate_defaults_the_mode_to_unknown():
     messages: List[str] = []
     sink_id = logger.add(lambda m: messages.append(str(m)), level="INFO")
