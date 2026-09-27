@@ -43,8 +43,8 @@ input`, `failed (24 h)`), then `ID / NAME / STATUS / PENDING / BATTERY / LAST
 CONTACT / SCREEN / COMPANION`. PENDING is how many cards are still on their way
 to that tag. SCREEN `rev 17 (18 pending)` means the tag shows screen revision
 17 and 18 is on its way; `clearing` means it is being blanked after a change of
-owner. STATUS `clear_failed` means that blanking failed three times (see
-Troubleshooting).
+owner. STATUS `clear_failed` means that blanking failed three times, and
+`assign_failed` that the tag's bridge could not take it (see Troubleshooting).
 
 ### `cremind tags show`
 
@@ -278,6 +278,9 @@ cremind --json tags deliveries list --state failed | jq '.deliveries[] | {id, de
   three times (it was asleep or out of range), so nothing is shown on it. Ask
   the admin to claim it for you again (`cremind tags hardware claim`) or to
   release it; either starts a fresh clear.
+- **STATUS `assign_failed`** — the tag's bridge could not take it (usually
+  `bridge_full`: every slot of its table is taken), so nothing reaches it. Ask
+  the admin to assign it to another bridge (`cremind tags hardware assign`).
 - **`422 invalid_title`, `invalid_body`, `invalid_icon`, `invalid_ttl`** — see
   the limits under `display`.
 - **`422 invalid_settings`** — one line per rejected field follows (an

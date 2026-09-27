@@ -1,5 +1,5 @@
 ---
-description: "Set up **Cremind Tag hardware** as admin: add a companion PC and rotate its credential, scan for and provision bridges, claim an e-paper tag for a profile, move, release or forget it, follow hardware commands, and set the Tags defaults every profile inherits. Admin only; a profile's own tags, notes and routing are `cremind tags`."
+description: "Set up **Cremind Tag hardware** as admin: add a companion PC and rotate its credential, scan for and provision bridges, claim an e-paper tag for a profile, move, release or forget it, see how full each bridge's tag table is, follow hardware commands, and set the Tags defaults every profile inherits. Admin only; a profile's own tags, notes and routing are `cremind tags`."
 ---
 
 # `cremind tags hardware` — Cremind Tag hardware (admin)
@@ -37,9 +37,16 @@ cremind tags hardware list
 
 Three tables: companions (`ONLINE` = heard from in the last 2 minutes, active
 credentials), devices (`KIND` gateway / bridge / tag, `HW ID`, `OWNER`,
-`STATUS`, `PENDING` cards on their way to a tag, battery), and the pending plus
-recent commands. A tag with STATUS `clear_failed` could not be blanked after a
-change of owner (see Troubleshooting).
+`STATUS`, `PENDING` cards on their way to a tag, `TAGS` on a bridge, battery),
+and the pending plus recent commands. A tag with STATUS `clear_failed` could
+not be blanked after a change of owner; one with `assign_failed` could not be
+added to its bridge (see Troubleshooting).
+
+`TAGS` is a bridge's slots in use: `3/10` means Cremind has assigned 3 tags to
+it (owned or not) and its assignment table holds 10 — an nRF52832 bridge holds
+10, an nRF52840 20. A bare `3` means the bridge has not reported its capacity.
+In `--json`, a bridge carries `assigned_count` and `max_tags` (`null` when
+unknown).
 
 ### `cremind tags hardware status`
 
@@ -127,7 +134,8 @@ before the new owner's cards appear (`clear_required` until then; what arrives
 meanwhile is delivered once the clear succeeds). The tag starts clean: its name
 is `--name` or empty, and the previous owner's screen previews are deleted.
 Queues `assign_tag` and `clear_tag`. A clear that fails or expires is retried,
-three attempts in all.
+three attempts in all. A bridge whose table is already full is refused
+(`409 bridge_full`); pick another with `--bridge`.
 
 ### `cremind tags hardware assign`
 
@@ -136,7 +144,8 @@ cremind tags hardware assign <tag> --bridge <bridge>
 ```
 
 Moves the tag to another bridge on the same companion (`--bridge` is
-required); its owner and pending cards stay.
+required); its owner and pending cards stay. A full bridge is refused
+(`409 bridge_full`). This is also how a tag in STATUS `assign_failed` recovers.
 
 ### `cremind tags hardware release`
 
@@ -226,6 +235,19 @@ cremind --json tags hardware list | jq '.devices[] | select(.kind == "tag" and .
 - **`422 bridge_not_found`** — that bridge is not on the tag's companion.
 - **`422 unknown_profile`** — no such profile (`cremind profile list`).
 - **`422 use_tag_endpoint`** — use `claim`, `assign` or `release`.
+- **`409 bridge_full`** on `claim` / `assign` — every slot of the bridge's
+  assignment table is taken (`TAGS` in `list` reads e.g. `10/10`; the error's
+  `bridge` object in `--json` has `max_tags` and `assigned`). Pass `--bridge`
+  with a bridge that has room, move a tag off the full one (`cremind tags
+  hardware assign <tag> --bridge <other>`), or `forget` a tag it no longer
+  serves. Cremind counts every tag it has assigned to the bridge, owned or
+  not.
+- **STATUS `assign_failed`** — the companion could not add the tag to its
+  bridge. The tag's `assign_tag` command in `list` shows why in ERROR:
+  `bridge_full` means the bridge's own table was full (Cremind then records
+  the bridge's capacity and no longer counts the tag on it). Assign the tag to
+  a bridge with room (`cremind tags hardware assign <tag> --bridge <bridge>`)
+  or release it (`cremind tags hardware release <tag>`).
 - **`409 tag_owned`** on `forget` — a profile owns the tag; `release` it first.
 - **STATUS `clear_failed`** — the tag's clear failed three times (asleep, out
   of range, flat battery), so no content reaches it. Check the tag and its

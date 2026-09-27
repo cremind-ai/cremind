@@ -82,6 +82,9 @@ _ADMIN_HINTS = {
     "unknown_profile": "List profiles: cremind profile list",
     "use_tag_endpoint": "Use `cremind tags hardware claim`, `assign` or `release` instead.",
     "tag_owned": "Release it first: cremind tags hardware release <tag>",
+    "bridge_full": "Every slot of that bridge's table is taken (TAGS in `cremind tags hardware list`). Pick a "
+                   "bridge with room (--bridge <bridge>), or move a tag off it "
+                   "(cremind tags hardware assign <tag> --bridge <other>) or forget one it no longer serves.",
     "unknown_command": "Kinds: scan_unprovisioned, provision_bridge, configure_bridge, remove_bridge, "
                        "identify, refresh_tag, install_fontpack, collect_diagnostics.",
 }
@@ -95,6 +98,16 @@ _CLEAR_FAILED_ADMIN_HINT = (
     "clear_failed: the tag could not be blanked after a change of owner (3 attempts). Retry by claiming "
     "it again (cremind tags hardware claim <tag> --owner <profile>) or releasing it "
     "(cremind tags hardware release <tag>)."
+)
+ASSIGN_FAILED = "assign_failed"
+_ASSIGN_FAILED_HINT = (
+    "assign_failed: the tag's bridge could not take it (bridge_full: every slot of its table is taken). "
+    "Ask the admin to assign it to another bridge (cremind tags hardware assign <tag> --bridge <bridge>)."
+)
+_ASSIGN_FAILED_ADMIN_HINT = (
+    "assign_failed: the bridge could not take the tag — its assign_tag command's ERROR says why "
+    "(bridge_full: every slot of its table is taken; see TAGS). Assign it to a bridge with room "
+    "(cremind tags hardware assign <tag> --bridge <bridge>) or release it (cremind tags hardware release <tag>)."
 )
 
 _ADMIN_REQUIRED = (
@@ -491,9 +504,21 @@ def _pending(device: dict[str, Any]) -> str:
     return "" if value is None else str(value)
 
 
-def _clear_failed_hint(devices: list[dict[str, Any]], *, admin: bool) -> None:
-    if any(d.get("status") == CLEAR_FAILED for d in devices):
+def _stuck_hints(devices: list[dict[str, Any]], *, admin: bool) -> None:
+    """A hint under a table for each stuck status (clear_failed, assign_failed) in it."""
+    statuses = {d.get("status") for d in devices}
+    if CLEAR_FAILED in statuses:
         sys.stdout.write("\n" + (_CLEAR_FAILED_ADMIN_HINT if admin else _CLEAR_FAILED_HINT) + "\n")
+    if ASSIGN_FAILED in statuses:
+        sys.stdout.write("\n" + (_ASSIGN_FAILED_ADMIN_HINT if admin else _ASSIGN_FAILED_HINT) + "\n")
+
+
+def _bridge_tags(device: dict[str, Any]) -> str:
+    """A bridge's slots in use: ``3/10``, ``3`` when its capacity is unknown, blank for other kinds."""
+    if device.get("kind") != "bridge" or device.get("assigned_count") is None:
+        return ""
+    used = str(device.get("assigned_count"))
+    return f"{used}/{device['max_tags']}" if device.get("max_tags") else used
 
 
 def _device_table(mode: Any, devices: list[dict[str, Any]]) -> None:
@@ -510,7 +535,7 @@ def _device_table(mode: Any, devices: list[dict[str, Any]]) -> None:
             _fmt_ts(d.get("last_contact_at")), _screen(d), _cell(mode, companion),
         )
     table.render()
-    _clear_failed_hint(devices, admin=False)
+    _stuck_hints(devices, admin=False)
 
 
 def _card_title(delivery: dict[str, Any]) -> str:
@@ -613,7 +638,7 @@ def tags_show(
         ("claimed", _fmt_ts(d.get("claimed_at"))),
         ("previews", f"desired rev {previews.get('desired') or '-'}, displayed rev {previews.get('displayed') or '-'}"),
     ])
-    _clear_failed_hint([d], admin=False)
+    _stuck_hints([d], admin=False)
     rows = _rows(out.get("deliveries"))
     if rows:
         sys.stdout.write("\nrecent deliveries\n")
@@ -1104,15 +1129,16 @@ def hardware_list(ctx: typer.Context) -> None:
     devices = _rows(out.get("devices"))
     sys.stdout.write("\ndevices\n")
     if devices:
-        table = Table(mode, "ID", "KIND", "HW ID", "NAME", "OWNER", "STATUS", "PENDING", "BATTERY",
+        table = Table(mode, "ID", "KIND", "HW ID", "NAME", "OWNER", "STATUS", "PENDING", "TAGS", "BATTERY",
                       "LAST CONTACT", "COMPANION")
         for d in devices:
             table.add_row(str(d.get("id") or ""), str(d.get("kind") or ""), _cell(mode, d.get("hw_id")),
                           _cell(mode, d.get("name")), str(d.get("owner_profile") or ""), str(d.get("status") or ""),
-                          _pending(d), _battery(d.get("battery_mv")), _fmt_ts(d.get("last_contact_at")),
+                          _pending(d), _bridge_tags(d), _battery(d.get("battery_mv")),
+                          _fmt_ts(d.get("last_contact_at")),
                           _cell(mode, names.get(str(d.get("companion_id"))) or d.get("companion_id")))
         table.render()
-        _clear_failed_hint(devices, admin=True)
+        _stuck_hints(devices, admin=True)
     else:
         sys.stdout.write("none reported yet — the companion sends its inventory once it is connected.\n")
     commands = _rows(out.get("commands"))

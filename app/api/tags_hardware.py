@@ -7,7 +7,11 @@ owns which tag. Timestamps are epoch milliseconds; errors are ``{"error",
 
 - ``GET    /api/tags/hardware``                             ``{companions, devices, commands}``
   (each tag carries ``pending_count``; a tag whose clear failed 3 times reads
-  status ``clear_failed`` — claim or release it again to retry)
+  status ``clear_failed`` — claim or release it again to retry; a tag whose
+  ``assign_tag`` failed reads ``assign_failed`` — assign it to another bridge
+  or release it. Each bridge carries ``max_tags`` (its assignment-table
+  capacity, ``null`` when not reported) and ``assigned_count`` (the tags
+  Cremind has assigned to it, owned or not))
 - ``POST   /api/tags/hardware/companions``                  ``{name}`` -> 201 ``{companion, credential, secret, authorization}``
 - ``POST   /api/tags/hardware/companions/{id}/rotate``      -> ``{credential, secret, authorization, revoked}``
 - ``DELETE /api/tags/hardware/companions/{id}``             -> ``{deleted: true}``
@@ -15,7 +19,9 @@ owns which tag. Timestamps are epoch milliseconds; errors are ``{"error",
 - ``GET    /api/tags/hardware/commands/{id}``               -> ``{command}``
 - ``POST   /api/tags/hardware/tags/{id}/claim``             ``{owner, bridge_id?, name?}`` -> ``{device, commands}``
   (the tag starts clean: name = ``name`` or ``""``, revisions 0, previews gone)
-- ``POST   /api/tags/hardware/tags/{id}/assign``            ``{bridge_id}`` -> ``{device, command}``
+- ``POST   /api/tags/hardware/tags/{id}/assign``            ``{bridge_id}`` -> ``{device, command}``;
+  claim and assign answer 409 ``bridge_full`` ``{…, bridge: {id, name, max_tags, assigned}}``
+  when the bridge's known ``max_tags`` is used up (unknown capacity allows)
 - ``POST   /api/tags/hardware/tags/{id}/release``           -> ``{device, commands}``
 - ``PATCH  /api/tags/hardware/devices/{id}``                ``{name}`` (1..128 once stripped) -> ``{device}``
 - ``DELETE /api/tags/hardware/devices/{id}``                -> ``{deleted: true, device, last_epoch}``;
@@ -33,6 +39,8 @@ Command kinds an admin may queue directly: ``scan_unprovisioned {duration_s}``,
 """
 
 from __future__ import annotations
+
+from collections import Counter
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -64,9 +72,14 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
             c["credentials"] = [h for h in hardware if h["companion_id"] == c["id"]]
         devices = await s.list_devices()
         pending = await s.pending_counts([d["id"] for d in devices if d["kind"] == "tag"])
+        on_bridge = Counter(d["bridge_device_id"] for d in devices
+                            if d["kind"] == "tag" and d["bridge_device_id"])
         for d in devices:
             if d["kind"] == "tag":
                 d["pending_count"] = pending.get(d["id"], 0)
+            elif d["kind"] == "bridge":
+                d["max_tags"] = service.bridge_capacity(d["info"])
+                d["assigned_count"] = on_bridge.get(d["id"], 0)
         active = await s.list_commands(statuses=COMMAND_ACTIVE, limit=200)
         recent = await s.list_commands(limit=50)
         seen = {c["id"] for c in active}

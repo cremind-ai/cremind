@@ -126,7 +126,8 @@ def test_the_docs_explain_what_a_script_cannot_guess():
     for word in ("403", "cremind -p admin", "bridge_required", "bridge_not_found", "unknown_profile",
                  "use_tag_endpoint", "tag_owned", "invalid_name", "--yes", "exits 2", "last epoch",
                  "release it first (`cremind tags hardware release <tag>`)", "cremind-tag connect", "**once**",
-                 "cremind tags credentials create", "milliseconds", "merged into the current defaults"):
+                 "cremind tags credentials create", "milliseconds", "merged into the current defaults",
+                 "bridge_full", "assign_failed", "`TAGS`", "`3/10`", "assigned_count", "max_tags"):
         assert word in hardware, f"hardware doc never explains {word!r}"
 
 
@@ -138,9 +139,12 @@ def test_every_hint_the_cli_prints_is_a_code_the_docs_explain():
     documented = _doc_text() + _doc_text(HARDWARE_DOC)
     for code in ("otp_refused", "clear_pending", "device_not_found", "no_preview", "already_terminal",
                  "bridge_required", "bridge_not_found", "unknown_profile", "use_tag_endpoint",
-                 "unknown_command", "tag_owned"):
+                 "unknown_command", "tag_owned", "bridge_full"):
         assert code in cmd._HINTS or code in cmd._ADMIN_HINTS, code
         assert code in documented, code
+    for status in (cmd.CLEAR_FAILED, cmd.ASSIGN_FAILED):
+        assert f"STATUS `{status}`" in _doc_text(), status
+        assert f"STATUS `{status}`" in _doc_text(HARDWARE_DOC), status
 
 
 # ── lists the docs and the CLI spell out, pinned to the server ──────────────

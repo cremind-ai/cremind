@@ -93,7 +93,8 @@ INVENTORY = {
     "devices": [
         _device(DESK, "Desk", "1A2B3C4D"),
         _device(KITCHEN, "", "5E6F7A8B", owner_profile=None, status="unclaimed"),
-        {**_device(BRIDGE, "Hall bridge", "br-9f"), "kind": "bridge", "owner_profile": None},
+        {**_device(BRIDGE, "Hall bridge", "br-9f"), "kind": "bridge", "owner_profile": None,
+         "max_tags": 10, "assigned_count": 3},
     ],
     "commands": [_command()],
 }
@@ -666,6 +667,46 @@ def test_hardware_claim_explains_a_missing_bridge_and_an_unknown_profile(api):
     result = _run("tags", "hardware", "claim", KITCHEN, "--owner", "bobo")
     assert result.exit_code == 1
     assert "cremind profile list" in result.output
+
+
+def test_hardware_list_shows_each_bridges_slots(api):
+    result = _run("tags", "hardware", "list")
+    assert result.exit_code == 0, result.output
+    assert "TAGS" in result.output and "3/10" in result.output
+    api["responses"]["hardware_inventory"]["devices"][2].update(max_tags=None, assigned_count=4)
+    unknown = _run("tags", "hardware", "list")
+    assert unknown.exit_code == 0, unknown.output
+    assert "/10" not in unknown.output
+    row = next(line for line in unknown.output.splitlines() if "br-9f" in line)
+    assert "4" in row.split("\t")
+
+
+def test_hardware_claim_and_assign_explain_a_full_bridge(api):
+    full = {"id": BRIDGE, "name": "Hall bridge", "max_tags": 10, "assigned": 10}
+    for fn, args in (("claim_tag", ("claim", KITCHEN, "--owner", "bob", "--bridge", BRIDGE)),
+                     ("assign_tag", ("assign", DESK, "--bridge", BRIDGE))):
+        api["raise"][fn] = _tag_error(409, "bridge_full",
+                                      "Bridge 'Hall bridge' is full: it holds 10 of 10 tags.", bridge=full)
+        result = _run("tags", "hardware", *args)
+        assert result.exit_code == 1, result.output
+        assert "409: bridge_full" in result.output and "10 of 10" in result.output
+        assert "--bridge <bridge>" in result.output and "cremind tags hardware assign <tag>" in result.output
+
+
+def test_assign_failed_is_shown_with_a_hint(api):
+    api["responses"]["hardware_inventory"]["devices"][0].update(status="assign_failed")
+    inventory = _run("tags", "hardware", "list")
+    assert inventory.exit_code == 0, inventory.output
+    assert "assign_failed:" in inventory.output and "cremind tags hardware release <tag>" in inventory.output
+    assert "clear_failed:" not in inventory.output
+    api["responses"]["overview"]["devices"][0].update(status="assign_failed")
+    listed = _run("tags", "list")
+    assert listed.exit_code == 0, listed.output
+    assert "assign_failed:" in listed.output and "Ask the admin" in listed.output
+    api["responses"]["get_device"]["device"].update(status="assign_failed")
+    shown = _run("tags", "show", DESK)
+    assert shown.exit_code == 0, shown.output
+    assert "assign_failed:" in shown.output
 
 
 def test_hardware_assign_release_rename(api):

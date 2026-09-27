@@ -10,6 +10,8 @@ queued per-tag commands, then queue the hardware commands:
 
 - **claim**   owner := X, ``clear_required``, ``assign_tag`` + ``clear_tag``;
 - **assign**  bridge := B, ``assign_tag`` (active deliveries move to the new epoch);
+  claim and assign refuse a bridge whose known ``max_tags`` is used up (409
+  ``bridge_full``);
 - **release** owner := none, ``clear_required``, ``clear_tag``;
 - **profile deleted** — every tag it owned is released the same way, in a
   transaction of its own just before the profile row is deleted.
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.storage.models import ProfileModel
 from app.tags import credentials as creds
@@ -281,6 +283,42 @@ async def _bridge_row(conn, tag_row, bridge_id: str | None):
                    f"{len(bridges)} bridges.")
 
 
+def bridge_capacity(info: Any) -> int | None:
+    """A bridge's ``max_tags`` from its device ``info``, or ``None`` (unknown)."""
+    value = info.get("max_tags") if isinstance(info, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 255:
+        return None
+    return value
+
+
+async def _bridge_with_room(conn, bridge, tag_id: str):
+    """The bridge row, locked (after the tag row, the order every writer
+    uses) so two claims cannot both take its last slot. 409 ``bridge_full``
+    when its assignment table (``max_tags`` from its inventory) already holds
+    that many of Cremind's tags, owned or not, other than ``tag_id``; unknown
+    capacity allows."""
+    locked = (await conn.execute(
+        select(DEVICES).where(DEVICES.c.id == bridge.id).with_for_update()
+    )).first()
+    if locked is None:
+        raise TagError(422, "bridge_not_found", "No bridge with that id on the tag's companion.")
+    bridge = locked
+    max_tags = bridge_capacity(bridge.info)
+    if max_tags is None:
+        return bridge
+    assigned = int((await conn.execute(select(func.count()).select_from(DEVICES).where(
+        DEVICES.c.bridge_device_id == bridge.id, DEVICES.c.kind == "tag", DEVICES.c.id != tag_id,
+    ))).scalar_one() or 0)
+    if assigned >= max_tags:
+        label = bridge.name or bridge.hw_id
+        raise TagError(409, "bridge_full",
+                       f"Bridge '{label}' is full: it holds {assigned} of {max_tags} tags. "
+                       "Assign the tag to another bridge, or move or forget a tag this bridge no longer needs.",
+                       bridge={"id": bridge.id, "name": bridge.name or "", "max_tags": max_tags,
+                               "assigned": assigned})
+    return bridge
+
+
 async def _queue(conn, companion_id: str, kind: str, args: dict[str, Any], requested_by: str, now: float):
     return await insert_command(conn, companion_id=companion_id, kind=kind, args=args,
                                 requested_by=requested_by, ttl_s=_ttl(kind), now=now)
@@ -301,7 +339,7 @@ async def claim_tag(device_id: str, *, owner: Any, bridge_id: Any = None, name: 
         exists = (await conn.execute(select(ProfileModel.name).where(ProfileModel.name == owner))).first()
         if exists is None:
             raise TagError(422, "unknown_profile", f"No profile named '{owner}'.")
-        bridge = await _bridge_row(conn, tag, bridge_id)
+        bridge = await _bridge_with_room(conn, await _bridge_row(conn, tag, bridge_id), tag.id)
         # A new owner starts clean: nothing of the previous owner's screen,
         # name or revision state survives (previews are deleted below).
         row = await _bump(conn, tag.id, now, owner_profile=owner, clear_required=True,
@@ -327,9 +365,13 @@ async def assign_tag(device_id: str, *, bridge_id: Any, requested_by: str) -> di
     now = now_ms()
     async with store.engine.begin() as conn:
         tag = await _tag_row(conn, device_id, now)
-        bridge = await _bridge_row(conn, tag, bridge_id)
-        row = await _bump(conn, tag.id, now, bridge_device_id=bridge.id,
-                          status="assigning" if tag.owner_profile else tag.status)
+        bridge = await _bridge_with_room(conn, await _bridge_row(conn, tag, bridge_id), tag.id)
+        status = tag.status
+        if tag.owner_profile:
+            status = "assigning"
+        elif status == "assign_failed":
+            status = "unclaimed"
+        row = await _bump(conn, tag.id, now, bridge_device_id=bridge.id, status=status)
         epoch = int(row.epoch)
         # Same owner, new key: the queued cards stay valid under the new epoch.
         await conn.execute(update(DELIVERIES).where(

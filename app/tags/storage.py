@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Sequence
 
-from sqlalchemy import case, delete, func, insert, or_, select, update
+from sqlalchemy import and_, case, delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -69,6 +69,10 @@ COMMAND_TERMINAL = ("succeeded", "failed", "expired", "cancelled")
 CLAIMED_GRACE_MS = 3_600_000.0
 
 ONLINE_WINDOW_MS = 120_000
+
+# Device statuses only an admin action (claim, assign, release) or a later
+# success of the failed command clears — a heartbeat never overwrites them.
+STUCK_STATUSES = ("clear_failed", "assign_failed")
 
 
 def now_ms() -> float:
@@ -386,6 +390,38 @@ async def requeue_clear(conn: AsyncConnection, companion_id: str, hw_id: str, ep
                          args={"tag_id": hw_id, "epoch": int(epoch)}, requested_by="system",
                          ttl_s=_CLEAR_TTL_S, now=now)
     return "requeued"
+
+
+async def _settle_assign(conn: AsyncConnection, device: Any, args: dict[str, Any], epoch: int, *,
+                         status: str, error: str | None, result: dict[str, Any] | None,
+                         now: float) -> None:
+    """An ``assign_tag`` result at the tag's current epoch. A failure marks
+    the tag ``assign_failed`` until an admin assigns it elsewhere or releases
+    it; ``bridge_full`` also drops the tag from that bridge (it holds no slot
+    there) and records the bridge's ``max_tags`` when the result names it.
+    A success clears an earlier ``assign_failed``. Locks: the device (held),
+    then the bridge."""
+    if int(device.epoch or 0) != int(epoch):
+        return
+    if status == "succeeded":
+        if device.status == "assign_failed":
+            await conn.execute(update(DEVICES).where(DEVICES.c.id == device.id).values(
+                status="assigning" if device.owner_profile else "unclaimed", updated_at=now))
+        return
+    values: dict[str, Any] = {"status": "assign_failed", "updated_at": now}
+    if error == "bridge_full":
+        values["bridge_device_id"] = None
+        max_tags = _bounded((result or {}).get("max_tags"), 1, 255)
+        bridge_hw = args.get("bridge_hw_id")
+        if max_tags is not None and isinstance(bridge_hw, str):
+            bridge = (await conn.execute(select(DEVICES).where(
+                DEVICES.c.companion_id == device.companion_id, DEVICES.c.kind == "bridge",
+                DEVICES.c.hw_id == bridge_hw,
+            ).with_for_update())).first()
+            if bridge is not None:
+                await conn.execute(update(DEVICES).where(DEVICES.c.id == bridge.id).values(
+                    info={**(bridge.info or {}), "max_tags": max_tags}, updated_at=now))
+    await conn.execute(update(DEVICES).where(DEVICES.c.id == device.id).values(**values))
 
 
 async def allocate_delivery_seqs(conn: AsyncConnection, profile: str, n: int, now: float) -> list[int]:
@@ -779,14 +815,18 @@ class TagStorage:
                     select(DEVICES).where(DEVICES.c.companion_id == companion_id)
                 )).all()
             }
+            found = []
             for item in devices[:500]:
                 if not isinstance(item, dict):
                     continue
-                hw_id = str(item.get("hw_id") or "").strip()
                 kind = str(item.get("kind") or "tag").strip()
-                row = existing.get((kind, hw_id))
-                if row is None:
-                    continue
+                row = existing.get((kind, str(item.get("hw_id") or "").strip()))
+                if row is not None:
+                    found.append((kind, row, item))
+            # Device rows in one order — tags, then bridges, each by id — as
+            # claim / assign lock a tag, then its bridge.
+            found.sort(key=lambda f: (f[0] != "tag", f[0], f[1].id))
+            for kind, row, item in found:
                 values: dict[str, Any] = {"updated_at": now}
                 if _bounded(item.get("battery_mv"), 0, 100_000) is not None:
                     values["battery_mv"] = item["battery_mv"]
@@ -801,9 +841,13 @@ class TagStorage:
                     if isinstance(item.get("displayed_digest"), str):
                         values["displayed_digest"] = item["displayed_digest"][:64]
                 status = item.get("status")
-                if (status in ("ok", "pending", "offline", "error") and (kind != "tag" or row.owner_profile)
-                        and row.status != "clear_failed"):
-                    values["status"] = status
+                if status in ("ok", "pending", "offline", "error"):
+                    # Judged on the row as the UPDATE finds it, not as first read.
+                    values["status"] = case(
+                        (DEVICES.c.status.in_(STUCK_STATUSES), DEVICES.c.status),
+                        (and_(DEVICES.c.kind == "tag", DEVICES.c.owner_profile.is_(None)), DEVICES.c.status),
+                        else_=status,
+                    )
                 await conn.execute(update(DEVICES).where(DEVICES.c.id == row.id).values(**values))
             pending = (await conn.execute(
                 select(func.count()).select_from(COMMANDS).where(
@@ -924,6 +968,12 @@ class TagStorage:
         no ``clear_tag`` — and leave the owner's last screen up. Returns
         ``(device, None)``, ``(None, "not_found")`` or ``(device, "tag_owned")``."""
         async with self.engine.begin() as conn:
+            # A bridge's tags lose their bridge (FK SET NULL): lock them before
+            # the bridge row, the order claim / assign use.
+            await begin_write(conn)
+            await conn.execute(select(DEVICES.c.id).where(
+                DEVICES.c.bridge_device_id == device_id,
+            ).order_by(DEVICES.c.id).with_for_update())
             result = await conn.execute(delete(DEVICES).where(
                 DEVICES.c.id == device_id,
                 or_(DEVICES.c.kind != "tag", DEVICES.c.owner_profile.is_(None)),
@@ -950,8 +1000,8 @@ class TagStorage:
         one epoch above the report, exactly as ``assign`` / ``release`` would."""
         now = now_ms()
         wanted: list[tuple[str, str, dict[str, Any]]] = []
-        for kind, key, id_field in (("gateway", "gateways", "hw_id"), ("bridge", "bridges", "hw_id"),
-                                    ("tag", "tags", "tag_id")):
+        for kind, key, id_field in (("tag", "tags", "tag_id"), ("bridge", "bridges", "hw_id"),
+                                    ("gateway", "gateways", "hw_id")):
             items = body.get(key) if isinstance(body.get(key), list) else []
             for item in items[:500]:
                 if not isinstance(item, dict):
@@ -962,6 +1012,9 @@ class TagStorage:
                 wanted.append((kind, hw_id, item))
         async with self.engine.begin() as conn:
             await begin_write(conn)
+            # The companion row first, as a heartbeat takes it.
+            await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == companion_id)
+                               .values(last_seen_at=now, updated_at=now))
             existing = {
                 (r.kind, r.hw_id): r for r in (await conn.execute(
                     select(DEVICES).where(DEVICES.c.companion_id == companion_id)
@@ -977,6 +1030,10 @@ class TagStorage:
             })
             for owner in ahead_owners:
                 await lock_stream(conn, owner, now)
+            # Then device rows in one order — tags, then bridges, each by id —
+            # as claim / assign lock a tag, then its bridge.
+            rank = {"tag": 0, "bridge": 1, "gateway": 2}
+            wanted.sort(key=lambda w: (rank[w[0]], getattr(existing.get((w[0], w[1])), "id", "")))
             requeued = False
             for kind, hw_id, item in wanted:
                 values = _inventory_values(kind, item)
@@ -1007,8 +1064,6 @@ class TagStorage:
                         requeued = requeued or values["epoch"] != reported
                 await conn.execute(update(DEVICES).where(DEVICES.c.id == row.id)
                                    .values(**values, info=info, updated_at=now))
-            await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == companion_id)
-                               .values(last_seen_at=now, updated_at=now))
             rows = (await conn.execute(
                 select(DEVICES).where(DEVICES.c.companion_id == companion_id)
                 .order_by(DEVICES.c.kind.asc(), DEVICES.c.created_at.asc())
@@ -1498,7 +1553,11 @@ class TagStorage:
         delivered to the tag, and the owner's periodic/diagnostics state is
         reset so it is sent afresh. A failure while the tag still waits
         re-queues the clear (bounded; then the device reads ``clear_failed``).
-        Locks: the owner's stream row, then the command, then the device."""
+
+        ``assign_tag``: see :func:`_settle_assign`. A failed command's
+        ``error`` defaults to ``result.error`` (``{"error": "bridge_full",
+        "max_tags": n}``).
+        Locks: the owner's stream row, then the device, then the command."""
         now = now_ms()
         lifted: list[str] = []
         async with self.engine.begin() as conn:
@@ -1512,7 +1571,7 @@ class TagStorage:
             tag_id = str(args.get("tag_id") or "")
             epoch = int(args.get("epoch") or 0)
             device = None
-            if peek.kind == "clear_tag" and tag_id:
+            if peek.kind in ("clear_tag", "assign_tag") and tag_id:
                 found = (await conn.execute(select(DEVICES.c.id).where(
                     DEVICES.c.companion_id == companion_id, DEVICES.c.kind == "tag",
                     DEVICES.c.hw_id == tag_id,
@@ -1525,11 +1584,17 @@ class TagStorage:
             late = row.status == "expired"
             if row.status in COMMAND_TERMINAL and not late:
                 return dict(row._mapping), (None if row.status == status else "conflict")
+            if not error and status == "failed" and isinstance(result, dict) and isinstance(result.get("error"), str):
+                error = result["error"]
             await conn.execute(update(COMMANDS).where(COMMANDS.c.id == command_id).values(
                 status=status, result=_small(result) if result else None,
                 error=(error or None) and str(error)[:1000], completed_at=now,
             ))
-            if device is not None and status == "succeeded":
+            if peek.kind == "assign_tag":
+                if device is not None:
+                    await _settle_assign(conn, device, args, epoch, status=status, error=error,
+                                         result=result, now=now)
+            elif device is not None and status == "succeeded":
                 cleared = (await conn.execute(update(DEVICES).where(
                     DEVICES.c.id == device.id, DEVICES.c.epoch == epoch,
                     DEVICES.c.clear_required.is_(True),
@@ -1548,7 +1613,7 @@ class TagStorage:
             elif device is not None and status == "failed":
                 await requeue_clear(conn, companion_id, tag_id, epoch, now)
             row = (await conn.execute(select(COMMANDS).where(COMMANDS.c.id == command_id))).first()
-        if device is not None:
+        if device is not None and peek.kind == "clear_tag":
             notify_commands([companion_id])
         if lifted:
             journal.wake()
@@ -1605,6 +1670,11 @@ def _inventory_values(kind: str, item: dict[str, Any]) -> dict[str, Any]:
         for key in ("addr", "fontpack_id", "flash_size"):
             if key in item:
                 info[key] = _small(item[key])
+        # Assignment-table capacity (nRF52832: 10, nRF52840: 20) and the
+        # bridge's own count; a bad value is dropped, the last good one kept.
+        for key, lo in (("max_tags", 1), ("assigned", 0)):
+            if _bounded(item.get(key), lo, 255) is not None:
+                info[key] = item[key]
     else:
         for key in ("panel", "width", "height", "planes"):
             if _bounded(item.get(key), 0, 65535) is not None:

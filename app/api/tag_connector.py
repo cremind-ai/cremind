@@ -33,6 +33,13 @@ Hardware credential (one companion):
   ``assignments`` in the response carry the new epoch. Omitted, negative,
   non-integer or out-of-range values are ignored — as is any out-of-range
   field of an item, so one bad item never fails the whole report.
+  Each ``bridges[]`` item may carry its assignment-table capacity from CAPS:
+  ``"max_tags": <1..255>`` (nRF52832: 10, nRF52840: 20) and
+  ``"assigned": <0..255>``. They are kept in the bridge's ``info``; a bad
+  value is dropped and the last good one kept. With ``max_tags`` known,
+  Cremind refuses to claim or assign a tag onto a bridge that already holds
+  that many (409 ``bridge_full`` to the admin), so no such ``assign_tag`` is
+  queued.
 - ``POST heartbeat``  ``{companion, queue, devices}`` -> ``{server_time, commands_pending}``
 - ``GET  commands?wait=<s≤30>`` -> ``{commands}``; returns early when one is queued.
   Ownership commands (``assign_tag`` / ``clear_tag``) come first. A profile's
@@ -42,7 +49,14 @@ Hardware credential (one companion):
   the same status again is a no-op, a different one 409 ``already_completed``.
   A command Cremind stopped waiting for (``expired``) still takes a late
   result. A failed or expired ``clear_tag`` is re-queued (3 attempts in all),
-  after which the tag's status reads ``clear_failed``.
+  after which the tag's status reads ``clear_failed``. A failed ``assign_tag``
+  at the tag's current epoch sets the tag's status to ``assign_failed`` (an
+  admin assigns it to another bridge or releases it; a later success of an
+  assign clears it). A bridge whose table is full reports
+  ``{"status": "failed", "result": {"error": "bridge_full", "max_tags": <n>}}``:
+  the command's ``error`` becomes ``bridge_full`` (``result.error`` is used
+  when ``error`` is omitted), the tag is no longer counted on that bridge,
+  and ``max_tags`` is recorded on the bridge.
 
 Content credential (one profile + one companion):
 
