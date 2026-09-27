@@ -12,6 +12,7 @@ owns which tag. Timestamps are epoch milliseconds; errors are ``{"error",
 - ``POST   /api/tags/hardware/commands``                    ``{companion_id, kind, args?}`` -> 202 ``{command}``
 - ``GET    /api/tags/hardware/commands/{id}``               -> ``{command}``
 - ``POST   /api/tags/hardware/tags/{id}/claim``             ``{owner, bridge_id?, name?}`` -> ``{device, commands}``
+  (the tag starts clean: name = ``name`` or ``""``, revisions 0, previews gone)
 - ``POST   /api/tags/hardware/tags/{id}/assign``            ``{bridge_id}`` -> ``{device, command}``
 - ``POST   /api/tags/hardware/tags/{id}/release``           -> ``{device, commands}``
 - ``PATCH  /api/tags/hardware/devices/{id}``                ``{name}`` (1..128 once stripped) -> ``{device}``

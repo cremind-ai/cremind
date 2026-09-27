@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.databases import DatabaseProvider, get_database_provider
 from app.storage.migrations import ensure_at_head
 from app.storage.models import (
-    ChannelModel, ChannelSenderModel, ConversationModel,
+    ChannelModel, ChannelSenderModel, ConversationModel, EventRunModel,
     MessageModel, ProfileModel, UsageRecordModel,
 )
 from app.utils.logger import logger
@@ -220,16 +220,28 @@ class ConversationStorage:
     async def delete_profile(self, name: str) -> bool:
         await self._ensure_initialized()
         woken: list[str] = []
-        has_tags = await self._has_tag_tables()
-        async with self.async_session_maker.begin() as session:
-            # Tags the profile owns are released first, in this transaction:
-            # the FK would only null the owner, leaving the old screen up and
-            # the old key (epoch) valid.
-            if has_tags:
-                from app.tags.service import release_profile_tags
+        if await self._has_tag_tables():
+            # Tags the profile owns are released first — the FK would only null
+            # the owner, leaving the old screen up and the old key (epoch)
+            # valid — in a transaction of its own: it holds the profile's
+            # journal lock, which must not wait on the cascade below (a message
+            # or run status being written for this profile holds its row and
+            # then appends to the journal; PostgreSQL would deadlock the two).
+            from app.tags.service import release_profile_tags
 
-                woken = await release_profile_tags(session, name)
-            # Cascade will handle conversations and messages
+            async with self.engine.begin() as conn:
+                woken = await release_profile_tags(conn, name)
+        async with self.async_session_maker.begin() as session:
+            # The rows a journalled write holds before it appends to the Tags
+            # journal (a conversation, a run, a channel or its sender) go
+            # first, explicitly: the cascade from ``profiles`` may otherwise
+            # reach the profile's journal head row before them, and a write in
+            # flight would then wait on that row while this delete waits on
+            # its conversation — a deadlock on PostgreSQL. Deleting these
+            # first just waits for such a write to commit.
+            for model in (ConversationModel, EventRunModel, ChannelModel):
+                await session.execute(delete(model).where(model.profile == name))
+            # Cascade handles everything else
             result = await session.execute(
                 delete(ProfileModel).where(ProfileModel.name == name)
             )

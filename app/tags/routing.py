@@ -19,8 +19,10 @@ admin's row).
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import time
 from typing import Any, Iterable
 
 from app.utils.logger import logger
@@ -169,28 +171,65 @@ def merge_options(current: dict[str, Any] | None, patch: Any) -> dict[str, Any]:
     return out
 
 
+# The admin defaults are read on every projection batch and settings read, and
+# the config store is synchronous: keep them in memory (invalidated on every
+# write through this module, re-read at most every 30 s otherwise).
+_DEFAULTS_TTL_S = 30.0
+_defaults_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def invalidate_admin_defaults() -> None:
+    global _defaults_cache
+    _defaults_cache = None
+
+
+def _cached_defaults() -> dict[str, Any] | None:
+    hit = _defaults_cache
+    if hit is not None and time.monotonic() - hit[0] < _DEFAULTS_TTL_S:
+        return copy.deepcopy(hit[1])
+    return None
+
+
 def read_admin_defaults() -> dict[str, Any]:
-    """The admin's defaults (validated; a damaged value reads as none)."""
+    """The admin's defaults (validated; a damaged value reads as none).
+    Synchronous; async code uses :func:`admin_defaults`."""
+    global _defaults_cache
+    hit = _cached_defaults()
+    if hit is not None:
+        return hit
     try:
         from app.config.settings import get_dynamic
 
         raw = get_dynamic("server_config", DEFAULTS_KEY)
     except Exception:  # noqa: BLE001 — storage not wired yet
         return {}
-    if not raw:
-        return {}
-    try:
-        value = json.loads(raw) if isinstance(raw, str) else raw
-        return normalize_options(value)
-    except (ValueError, TypeError):
-        logger.warning("[tags] ignoring a damaged tags_defaults value")
-        return {}
+    value: dict[str, Any] = {}
+    if raw:
+        try:
+            value = normalize_options(json.loads(raw) if isinstance(raw, str) else raw)
+        except (ValueError, TypeError):
+            logger.warning("[tags] ignoring a damaged tags_defaults value")
+    _defaults_cache = (time.monotonic(), copy.deepcopy(value))
+    return value
+
+
+async def admin_defaults() -> dict[str, Any]:
+    """:func:`read_admin_defaults` without blocking the event loop."""
+    hit = _cached_defaults()
+    if hit is not None:
+        return hit
+    return await asyncio.to_thread(read_admin_defaults)
+
+
+async def effective_options_async(own: dict[str, Any] | None) -> dict[str, Any]:
+    return effective_options(own, await admin_defaults())
 
 
 def write_admin_defaults(raw: Any, config_storage) -> dict[str, Any]:
     """Validate and persist the admin defaults (whole object); return them."""
     value = normalize_options(raw)
     config_storage.set("server_config", DEFAULTS_KEY, json.dumps(value, sort_keys=True))
+    invalidate_admin_defaults()
     return value
 
 
@@ -215,15 +254,26 @@ def effective_options(own: dict[str, Any] | None, defaults: dict[str, Any] | Non
 
 
 def resolved_timezone(profile: str, options: dict[str, Any]) -> str:
-    """The IANA name / offset the companion should render times in."""
-    tz = (options.get("timezone") or "").strip()
-    if tz:
-        return tz
-    try:
-        from app.config.timezone import resolve_tz_name
+    """The IANA name the companion should render times in — always an IANA
+    name (a UTC offset becomes ``Etc/GMT∓N``, a Windows zone id is mapped;
+    see :mod:`app.tags.tzmap`)."""
+    from datetime import timezone as fixed_offset
 
-        return resolve_tz_name(profile)
+    from app.tags.tzmap import iana_name
+
+    try:
+        from app.config.timezone import _explicit_zone, resolve_tzinfo
+
+        text = (options.get("timezone") or "").strip()
+        zone = _explicit_zone(text) if text else None
+        if zone is not None:
+            return iana_name(zone)
+        zone = resolve_tzinfo(profile)
+        name = zone.tzname(None) if isinstance(zone, fixed_offset) else ""
+        os_local = isinstance(zone, fixed_offset) and not (name or "").startswith("UTC")
+        return iana_name(zone, os_local=os_local)
     except Exception:  # noqa: BLE001
+        logger.warning("[tags] could not resolve a timezone; using UTC", exc_info=True)
         return "UTC"
 
 

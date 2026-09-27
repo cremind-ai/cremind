@@ -2,15 +2,21 @@
 
 Each function runs in ONE transaction and raises :class:`TagError` (status,
 code, message) for anything the caller should answer with a 4xx. Ownership
-changes follow one pattern — bump ``epoch`` (the companion re-keys the tag
-from it), cancel the tag's active deliveries and queued per-tag commands, then
-queue the hardware commands:
+changes follow one pattern — lock the tag (its current owner's stream row,
+then the device row: see ``storage.lock_device``, so no content writer of the
+old owner can slip a card in), bump ``epoch`` in the UPDATE itself (the
+companion re-keys the tag from it), cancel the tag's active deliveries and
+queued per-tag commands, then queue the hardware commands:
 
 - **claim**   owner := X, ``clear_required``, ``assign_tag`` + ``clear_tag``;
 - **assign**  bridge := B, ``assign_tag`` (active deliveries move to the new epoch);
 - **release** owner := none, ``clear_required``, ``clear_tag``;
-- **profile deleted** — every tag it owned is released the same way, inside
-  the profile delete's own transaction.
+- **profile deleted** — every tag it owned is released the same way, in a
+  transaction of its own just before the profile row is deleted.
+
+Every change of OWNER (claim, release, profile deleted) also deletes the tag's
+previews and resets its name, desired/displayed revision and digest: nothing
+of one profile's screen is ever shown to the next.
 
 Content (``display``/``clear``) is written straight into ``tag_deliveries``;
 it is not a journal event, because it targets one tag the caller named.
@@ -27,9 +33,10 @@ from app.tags import credentials as creds
 from app.tags.cards import ICONS, NON_CONTENT_KINDS, CardSpec, make_card
 from app.tags.sanitize import clean_multiline, clean_text, contains_otp
 from app.tags.storage import (
-    ACTIVE_STAGES, DELIVERIES, DEVICES, STREAMS, cancel_device_deliveries, cancel_tag_commands,
-    command_json, credential_json, delivery_json, device_json, get_tag_storage,
-    insert_command, lock_stream, notify_commands, now_ms, write_deliveries,
+    ACTIVE_STAGES, DELIVERIES, DEVICES, OWNER_RESET, begin_write, cancel_device_deliveries,
+    cancel_tag_commands, command_json, credential_json, delivery_json, device_json, drop_previews,
+    get_tag_storage, insert_command, lock_device, lock_stream, notify_commands, now_ms,
+    write_deliveries,
 )
 
 HOUR_S = 3600.0
@@ -235,11 +242,23 @@ async def create_content_credential(profile: str, *, companion_id: Any, label: A
 # ── ownership ───────────────────────────────────────────────────────────────
 
 
-async def _tag_row(conn, device_id: str):
-    row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == device_id))).first()
+async def _tag_row(conn, device_id: str, now: float):
+    """The tag row, locked for an ownership/epoch change (its current owner's
+    stream row first, then the row; see :func:`app.tags.storage.lock_device`)."""
+    await begin_write(conn)
+    row = await lock_device(conn, device_id, now)
     if row is None or row.kind != "tag":
         raise TagError(404, "device_not_found", "No tag with that id.")
     return row
+
+
+async def _bump(conn, tag_id: str, now: float, **values: Any):
+    """``epoch = epoch + 1`` in the UPDATE itself, returning the new row."""
+    return (await conn.execute(
+        update(DEVICES).where(DEVICES.c.id == tag_id)
+        .values(epoch=DEVICES.c.epoch + 1, updated_at=now, **values)
+        .returning(*DEVICES.c)
+    )).first()
 
 
 async def _bridge_row(conn, tag_row, bridge_id: str | None):
@@ -278,19 +297,18 @@ async def claim_tag(device_id: str, *, owner: Any, bridge_id: Any = None, name: 
     store = get_tag_storage()
     now = now_ms()
     async with store.engine.begin() as conn:
-        tag = await _tag_row(conn, device_id)
+        tag = await _tag_row(conn, device_id, now)
         exists = (await conn.execute(select(ProfileModel.name).where(ProfileModel.name == owner))).first()
         if exists is None:
             raise TagError(422, "unknown_profile", f"No profile named '{owner}'.")
         bridge = await _bridge_row(conn, tag, bridge_id)
-        epoch = int(tag.epoch or 0) + 1
-        values: dict[str, Any] = {
-            "owner_profile": owner, "epoch": epoch, "clear_required": True,
-            "bridge_device_id": bridge.id, "status": "assigning", "claimed_at": now, "updated_at": now,
-        }
-        if new_name is not None:
-            values["name"] = new_name
-        await conn.execute(update(DEVICES).where(DEVICES.c.id == tag.id).values(**values))
+        # A new owner starts clean: nothing of the previous owner's screen,
+        # name or revision state survives (previews are deleted below).
+        row = await _bump(conn, tag.id, now, owner_profile=owner, clear_required=True,
+                          bridge_device_id=bridge.id, status="assigning", claimed_at=now,
+                          **{**OWNER_RESET, "name": new_name or ""})
+        epoch = int(row.epoch)
+        await drop_previews(conn, [tag.id])
         await cancel_device_deliveries(conn, tag.id, now, "reassigned")
         await cancel_tag_commands(conn, tag.companion_id, tag.hw_id, now)
         assign = await _queue(conn, tag.companion_id, "assign_tag",
@@ -298,7 +316,6 @@ async def claim_tag(device_id: str, *, owner: Any, bridge_id: Any = None, name: 
                               requested_by, now)
         clear = await _queue(conn, tag.companion_id, "clear_tag", {"tag_id": tag.hw_id, "epoch": epoch},
                              requested_by, now)
-        row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == tag.id))).first()
     notify_commands([tag.companion_id])
     return {"device": device_json(row), "commands": [command_json(assign), command_json(clear)]}
 
@@ -309,13 +326,11 @@ async def assign_tag(device_id: str, *, bridge_id: Any, requested_by: str) -> di
     store = get_tag_storage()
     now = now_ms()
     async with store.engine.begin() as conn:
-        tag = await _tag_row(conn, device_id)
+        tag = await _tag_row(conn, device_id, now)
         bridge = await _bridge_row(conn, tag, bridge_id)
-        epoch = int(tag.epoch or 0) + 1
-        await conn.execute(update(DEVICES).where(DEVICES.c.id == tag.id).values(
-            epoch=epoch, bridge_device_id=bridge.id, updated_at=now,
-            status="assigning" if tag.owner_profile else tag.status,
-        ))
+        row = await _bump(conn, tag.id, now, bridge_device_id=bridge.id,
+                          status="assigning" if tag.owner_profile else tag.status)
+        epoch = int(row.epoch)
         # Same owner, new key: the queued cards stay valid under the new epoch.
         await conn.execute(update(DELIVERIES).where(
             DELIVERIES.c.tag_device_id == tag.id, DELIVERIES.c.stage.in_(ACTIVE_STAGES),
@@ -324,63 +339,64 @@ async def assign_tag(device_id: str, *, bridge_id: Any, requested_by: str) -> di
         assign = await _queue(conn, tag.companion_id, "assign_tag",
                               {"tag_id": tag.hw_id, "bridge_hw_id": bridge.hw_id, "epoch": epoch},
                               requested_by, now)
-        row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == tag.id))).first()
     notify_commands([tag.companion_id])
     return {"device": device_json(row), "command": command_json(assign)}
 
 
-async def _release_rows(conn, rows, *, detail: str, requested_by: str, now: float) -> list[dict[str, Any]]:
-    commands = []
-    for tag in rows:
-        epoch = int(tag.epoch or 0) + 1
-        await conn.execute(update(DEVICES).where(DEVICES.c.id == tag.id).values(
-            owner_profile=None, epoch=epoch, clear_required=True, status="unclaimed",
-            claimed_at=None, updated_at=now,
-        ))
-        await cancel_device_deliveries(conn, tag.id, now, detail)
-        await cancel_tag_commands(conn, tag.companion_id, tag.hw_id, now)
-        commands.append(await _queue(conn, tag.companion_id, "clear_tag",
-                                     {"tag_id": tag.hw_id, "epoch": epoch}, requested_by, now))
-    return commands
+async def _release_locked(conn, tag, *, detail: str, requested_by: str, now: float):
+    """Release one locked tag: owner none, epoch + 1, the old owner's screen
+    state gone (previews deleted, name and revisions reset), its cards
+    cancelled, a ``clear_tag`` queued. Returns ``(row, clear_command)``."""
+    row = await _bump(conn, tag.id, now, owner_profile=None, clear_required=True,
+                      status="unclaimed", claimed_at=None, **OWNER_RESET)
+    await drop_previews(conn, [tag.id])
+    await cancel_device_deliveries(conn, tag.id, now, detail)
+    await cancel_tag_commands(conn, tag.companion_id, tag.hw_id, now)
+    command = await _queue(conn, tag.companion_id, "clear_tag",
+                           {"tag_id": tag.hw_id, "epoch": int(row.epoch)}, requested_by, now)
+    return row, command
 
 
 async def release_tag(device_id: str, *, requested_by: str) -> dict[str, Any]:
     store = get_tag_storage()
     now = now_ms()
     async with store.engine.begin() as conn:
-        tag = await _tag_row(conn, device_id)
-        commands = await _release_rows(conn, [tag], detail="released", requested_by=requested_by, now=now)
-        row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == tag.id))).first()
+        tag = await _tag_row(conn, device_id, now)
+        row, command = await _release_locked(conn, tag, detail="released",
+                                             requested_by=requested_by, now=now)
     notify_commands([tag.companion_id])
-    return {"device": device_json(row), "commands": [command_json(c) for c in commands]}
+    return {"device": device_json(row), "commands": [command_json(command)]}
 
 
-async def release_profile_tags(session, profile: str) -> list[str]:
-    """Release every tag ``profile`` owns, inside the caller's transaction
-    (``ConversationStorage.delete_profile``). Returns the companions to wake
-    once that transaction commits.
+async def release_profile_tags(conn, profile: str) -> list[str]:
+    """Release every tag ``profile`` owns, in a transaction of its own that
+    ``ConversationStorage.delete_profile`` runs BEFORE deleting the profile.
+    Returns the companions to wake.
 
-    The first statement is a write (the stream-row lock, then the device
-    UPDATE ``RETURNING`` the new epochs), so SQLite takes its write lock
-    before any read, and PostgreSQL orders this after an in-flight projection
-    of the same profile instead of deadlocking with it."""
+    It starts with the profile's stream-row lock — every content writer of the
+    profile takes that first — and touches nothing but tag rows. Deleting the
+    profile afterwards, separately, keeps this lock out of the cascade: a
+    source write (a message, a run status) that holds a conversation or run
+    row and then appends to the journal can otherwise deadlock against it on
+    PostgreSQL."""
     now = now_ms()
-    await session.execute(
-        update(STREAMS).where(STREAMS.c.profile == profile).values(updated_at=now)
-    )
-    rows = (await session.execute(
-        update(DEVICES)
-        .where(DEVICES.c.owner_profile == profile, DEVICES.c.kind == "tag")
-        .values(owner_profile=None, epoch=DEVICES.c.epoch + 1, clear_required=True,
-                status="unclaimed", claimed_at=None, updated_at=now)
-        .returning(DEVICES.c.id, DEVICES.c.companion_id, DEVICES.c.hw_id, DEVICES.c.epoch)
-    )).all()
-    for tag in rows:
-        await cancel_device_deliveries(session, tag.id, now, "profile deleted")
-        await cancel_tag_commands(session, tag.companion_id, tag.hw_id, now)
-        await _queue(session, tag.companion_id, "clear_tag",
-                     {"tag_id": tag.hw_id, "epoch": int(tag.epoch)}, "system", now)
-    return sorted({r.companion_id for r in rows})
+    await begin_write(conn)
+    if (await conn.execute(select(ProfileModel.name).where(ProfileModel.name == profile))).first() is None:
+        return []
+    await lock_stream(conn, profile, now)
+    ids = (await conn.execute(select(DEVICES.c.id).where(
+        DEVICES.c.owner_profile == profile, DEVICES.c.kind == "tag",
+    ).order_by(DEVICES.c.id))).scalars().all()
+    companions = set()
+    for device_id in ids:
+        tag = (await conn.execute(
+            select(DEVICES).where(DEVICES.c.id == device_id).with_for_update()
+        )).first()
+        if tag is None or tag.owner_profile != profile:
+            continue
+        await _release_locked(conn, tag, detail="profile deleted", requested_by="system", now=now)
+        companions.add(tag.companion_id)
+    return sorted(companions)
 
 
 # ── a profile's own tags ────────────────────────────────────────────────────
@@ -419,15 +435,21 @@ def _pinned_fields(body: dict[str, Any]) -> tuple[str, str | None, str, float]:
 
 async def display(profile: str, device_id: str, body: dict[str, Any]) -> dict[str, Any]:
     """Pin a note on one of the profile's tags (sanitised, OTP-checked). The
-    title is one line; the body keeps its paragraphs. A tag still waiting for
-    its screen to be cleared answers 409 ``clear_pending`` — decided inside
-    the transaction that would write the delivery."""
+    title is one line; the body keeps its paragraphs. Every note is its own
+    card; with ``"replace": true`` it takes the tag's single replaceable slot
+    (``replace_key`` ``pinned:<device id>``), replacing the previous note that
+    was also sent with ``replace: true``. A tag still waiting for its screen
+    to be cleared answers 409 ``clear_pending`` — decided inside the
+    transaction that would write the delivery."""
     title, text, icon, ttl = _pinned_fields(body)
+    replace = body.get("replace", False)
+    if not isinstance(replace, bool):
+        raise TagError(422, "invalid_replace", "'replace' must be true or false.")
     await owned_tag(profile, device_id)
-    from app.tags.routing import effective_options
+    from app.tags.routing import effective_options_async
 
     settings = await get_tag_storage().get_settings(profile)
-    lang = effective_options((settings or {}).get("options")).get("language") or "en"
+    lang = (await effective_options_async((settings or {}).get("options"))).get("language") or "en"
     now = now_ms()
     spec = CardSpec(
         kind="pinned_note",
@@ -435,7 +457,7 @@ async def display(profile: str, device_id: str, body: dict[str, Any]) -> dict[st
                        source_type="user", source_id=device_id),
         priority=55,
         expires_at=now + ttl * 1000.0,
-        replace_key=f"pinned:{device_id}",
+        replace_key=f"pinned:{device_id}" if replace else None,
     )
     return await _write_direct(profile, device_id, spec, now)
 
@@ -479,10 +501,25 @@ async def _write_direct(profile: str, device_id: str, spec: CardSpec, now: float
 
 
 async def device_command(profile: str, device_id: str, kind: str, *, requested_by: str) -> dict[str, Any]:
-    """``refresh_tag`` / ``identify`` for one of the profile's own tags."""
+    """``refresh_tag`` / ``identify`` for one of the profile's own tags. A
+    request while the same command is still queued returns that command (one
+    per tag and kind), so a profile cannot flood the shared hardware queue."""
     device = await owned_tag(profile, device_id)
     args = {"tag_id": device["hw_id"]} if kind == "refresh_tag" else {"hw_id": device["hw_id"]}
     return await get_tag_storage().create_command(
         companion_id=device["companion_id"], kind=kind, args=args,
-        requested_by=requested_by, ttl_s=_ttl(kind),
+        requested_by=requested_by, ttl_s=_ttl(kind), dedupe=True,
     )
+
+
+async def cancel_delivery(profile: str, delivery_id: int) -> dict[str, Any]:
+    """Cancel one of the profile's active deliveries; the companion is told
+    through a ``resolved`` job (see ``TagStorage.cancel_delivery``). Returns
+    ``{"delivery", "resolved"}``."""
+    cancelled, resolved, problem = await get_tag_storage().cancel_delivery(profile, delivery_id)
+    if problem == "not_found":
+        raise TagError(404, "delivery_not_found", "No delivery with that id.")
+    if problem == "already_terminal":
+        raise TagError(409, "already_terminal", f"The delivery already finished ({cancelled['stage']}).",
+                       delivery=cancelled)
+    return {"delivery": cancelled, "resolved": resolved}

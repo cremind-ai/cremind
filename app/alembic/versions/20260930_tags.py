@@ -21,7 +21,9 @@ Purely additive: no existing table is altered, every create is guarded by an
 inspector check and every index is re-inspected, so a re-run (or a partial
 earlier run) is a no-op on SQLite and PostgreSQL alike. ``tag_deliveries.id``
 is ``BIGINT`` with ``autoincrement=False`` so PostgreSQL does not make it a
-``BIGSERIAL``. ``MIN_SUPPORTED_UPGRADE_FROM`` is not bumped.
+``BIGSERIAL``. Epochs and revisions are ``BIGINT`` too: the protocol's are
+uint32, which PostgreSQL's ``INTEGER`` cannot hold past 2**31 - 1.
+``MIN_SUPPORTED_UPGRADE_FROM`` is not bumped.
 """
 
 from __future__ import annotations
@@ -101,7 +103,7 @@ def _table_defs() -> dict[str, tuple]:
             sa.Column("name", sa.String(length=128), nullable=False, server_default=empty),
             sa.Column("owner_profile", sa.String(length=128), nullable=True),
             sa.Column("bridge_device_id", sa.String(length=36), nullable=True),
-            sa.Column("epoch", sa.Integer(), nullable=False, server_default=zero),
+            sa.Column("epoch", sa.BigInteger(), nullable=False, server_default=zero),
             sa.Column("rotation", sa.Integer(), nullable=False, server_default=zero),
             sa.Column("board", sa.Integer(), nullable=True),
             sa.Column("panel", sa.Integer(), nullable=True),
@@ -114,8 +116,8 @@ def _table_defs() -> dict[str, tuple]:
             sa.Column("battery_mv", sa.Integer(), nullable=True),
             sa.Column("rssi", sa.Integer(), nullable=True),
             sa.Column("last_contact_at", sa.Float(), nullable=True),
-            sa.Column("desired_revision", sa.Integer(), nullable=False, server_default=zero),
-            sa.Column("displayed_revision", sa.Integer(), nullable=False, server_default=zero),
+            sa.Column("desired_revision", sa.BigInteger(), nullable=False, server_default=zero),
+            sa.Column("displayed_revision", sa.BigInteger(), nullable=False, server_default=zero),
             sa.Column("displayed_digest", sa.String(length=64), nullable=True),
             sa.Column("clear_required", sa.Boolean(), nullable=False, server_default=sa.false()),
             sa.Column("claimed_at", sa.Float(), nullable=True),
@@ -160,7 +162,7 @@ def _table_defs() -> dict[str, tuple]:
             sa.Column("seq", sa.BigInteger(), nullable=False),
             sa.Column("companion_id", sa.String(length=36), nullable=True),
             sa.Column("tag_device_id", sa.String(length=36), nullable=False),
-            sa.Column("epoch", sa.Integer(), nullable=False, server_default=zero),
+            sa.Column("epoch", sa.BigInteger(), nullable=False, server_default=zero),
             sa.Column("event_id", sa.String(length=36), nullable=True),
             sa.Column("kind", sa.String(length=32), nullable=False),
             sa.Column("priority", sa.Integer(), nullable=False, server_default=zero),
@@ -170,7 +172,7 @@ def _table_defs() -> dict[str, tuple]:
             sa.Column("stage", sa.String(length=32), nullable=False, server_default=sa.text("'queued'")),
             sa.Column("outcome", sa.String(length=32), nullable=True),
             sa.Column("status_code", sa.Integer(), nullable=True),
-            sa.Column("revision", sa.Integer(), nullable=True),
+            sa.Column("revision", sa.BigInteger(), nullable=True),
             sa.Column("digest", sa.String(length=64), nullable=True),
             sa.Column("detail", sa.Text(), nullable=True),
             sa.Column("timing", sa.JSON(), nullable=True),
@@ -211,7 +213,8 @@ def _table_defs() -> dict[str, tuple]:
             sa.Column("id", sa.String(length=36), nullable=False),
             sa.Column("tag_device_id", sa.String(length=36), nullable=False),
             sa.Column("kind", sa.String(length=16), nullable=False),
-            sa.Column("revision", sa.Integer(), nullable=False, server_default=zero),
+            sa.Column("revision", sa.BigInteger(), nullable=False, server_default=zero),
+            sa.Column("epoch", sa.BigInteger(), nullable=False, server_default=zero),
             sa.Column("png_base64", sa.Text(), nullable=False),
             sa.Column("delivery_ids", sa.JSON(), nullable=True),
             sa.Column("created_at", sa.Float(), nullable=False),

@@ -66,7 +66,7 @@ def world(tagenv):
     enable(tagenv, "p2")
     _deliver(tagenv, "p1", 2)
     _deliver(tagenv, "p2", 1)
-    run(tagenv.store.store_preview(hw["tags"]["T1"], kind="displayed", revision=1,
+    run(tagenv.store.store_preview(hw["companion_id"], "p1", "T1", kind="displayed", revision=1, epoch=None,
                                    png_base64=base64.b64encode(PNG).decode(), delivery_ids=[]))
     c1 = content_credential(tagenv, "p1", hw["companion_id"])
     hw["c1_id"] = c1.split(" ", 1)[1].split(".", 1)[0]
@@ -158,10 +158,19 @@ def test_display_sanitises_and_refuses_codes(tagenv, world) -> None:
     assert scalar(tagenv, "SELECT COUNT(*) FROM tag_deliveries") == before + 1
     bad = call(display_path, "POST", "p1", path={"device_id": t1}, body={"title": "x", "icon": "rocket"})
     assert bad.status_code == 422 and body_of(bad)["error"] == "invalid_icon"
-    # A second note replaces the first.
+    # Each note is its own card (its own key); only ``replace: true`` notes
+    # share the tag's one replaceable slot.
     call(display_path, "POST", "p1", path={"device_id": t1}, body={"title": "Newer"})
-    stages = [r["stage"] for r in rows(tagenv, "SELECT stage FROM tag_deliveries WHERE kind='pinned_note' ORDER BY id")]
-    assert stages == ["superseded", "queued"]
+    notes = rows(tagenv, "SELECT stage, replace_key FROM tag_deliveries WHERE kind='pinned_note' ORDER BY id")
+    assert [n["stage"] for n in notes] == ["queued", "queued"]
+    assert all(n["replace_key"].startswith("delivery:") for n in notes)
+    for title in ("slot 1", "slot 2"):
+        call(display_path, "POST", "p1", path={"device_id": t1}, body={"title": title, "replace": True})
+    notes = rows(tagenv, "SELECT stage, replace_key FROM tag_deliveries WHERE kind='pinned_note' ORDER BY id")
+    assert [n["stage"] for n in notes] == ["queued", "queued", "superseded", "queued"]
+    assert notes[3]["replace_key"] == f"pinned:{t1}"
+    bad = call(display_path, "POST", "p1", path={"device_id": t1}, body={"title": "x", "replace": "yes"})
+    assert bad.status_code == 422 and body_of(bad)["error"] == "invalid_replace"
 
 
 def test_clear_cancels_the_tags_active_cards(tagenv, world) -> None:

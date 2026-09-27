@@ -15,7 +15,8 @@ backend never authenticates it.
 
 Errors are ``{"error": <code>, "message": <sentence>, "detail": <same>}`` —
 connector-api.md names the sentence ``detail``, the rest of Cremind
-``message``; both are sent. Timestamps are ISO 8601 UTC strings here.
+``message``; both are sent. Timestamps are ISO 8601 UTC strings with
+milliseconds (``2026-09-27T10:00:00.123Z``). Epochs and revisions are uint32.
 
 Hardware credential (one companion):
 
@@ -29,25 +30,46 @@ Hardware credential (one companion):
   (``STALE_EPOCH``). When the report is ahead of work Cremind still owes under
   the old epoch (an owned tag's assignment, a pending clear), that work is
   re-queued as ``assign_tag`` / ``clear_tag`` at ``reported + 1`` and the
-  ``assignments`` in the response carry the new epoch. Omitted, negative or
-  non-integer values are ignored.
+  ``assignments`` in the response carry the new epoch. Omitted, negative,
+  non-integer or out-of-range values are ignored — as is any out-of-range
+  field of an item, so one bad item never fails the whole report.
 - ``POST heartbeat``  ``{companion, queue, devices}`` -> ``{server_time, commands_pending}``
-- ``GET  commands?wait=<s≤30>`` -> ``{commands}``; returns early when one is queued
+- ``GET  commands?wait=<s≤30>`` -> ``{commands}``; returns early when one is queued.
+  Ownership commands (``assign_tag`` / ``clear_tag``) come first. A profile's
+  identify / refresh is queued at most once per tag while pending.
 - ``POST commands/{id}/claim`` -> 200 the command object, or 409 ``already_claimed``
 - ``POST commands/{id}/result`` ``{status: succeeded|failed, result?, error?}`` -> ``{ok, command}``;
-  the same status again is a no-op, a different one 409 ``already_completed``
+  the same status again is a no-op, a different one 409 ``already_completed``.
+  A command Cremind stopped waiting for (``expired``) still takes a late
+  result. A failed or expired ``clear_tag`` is re-queued (3 attempts in all),
+  after which the tag's status reads ``clear_failed``.
 
 Content credential (one profile + one companion):
 
 - ``POST sync`` ``{cursor?}`` -> ``{profile, companion_id, stream_id, cursor_valid, oldest_seq,
-  head_seq, outstanding, tags, settings}``
+  head_seq, outstanding, tags, settings}``. ``settings`` is ``{enabled, layout,
+  show_excerpts, qr_links, progress_cadence_s, timezone, language}``;
+  ``timezone`` is always an IANA name; ``enabled`` false means the profile has
+  switched Tags off (no new jobs until it is on again).
 - ``GET  events?after=<seq>&limit=<n≤200>`` -> ``{stream_id, jobs, next_after, head_seq}``;
   410 ``cursor_expired`` (with ``oldest_seq``) when ``after`` is older than the
-  retained history or newer than ``head_seq`` (a restore) — call ``sync``
+  retained history or newer than ``head_seq`` (a restore) — call ``sync``.
+  ``jobs`` may include deliveries that are ALREADY TERMINAL (superseded,
+  cancelled, expired … while the companion was away): check ``stage`` and skip
+  them. Only jobs for tags the profile still owns are listed, and a live one
+  only at the tag's current epoch; ``next_after`` still advances past the rest.
+  Every content job has a ``replace_key`` (``delivery:<id>`` when the card has
+  no shared one). A cancel from Cremind arrives as a ``resolved`` job whose
+  ``resolves`` names that key.
 - ``POST accepted`` ``{through_seq, delivery_ids}`` -> ``{accepted}``
-- ``POST receipts`` ``{receipts: [...]}`` -> ``{applied}`` (idempotent, monotonic)
-- ``POST previews`` ``{tag_id, revision, kind, png_base64, delivery_ids}`` -> ``{stored}``
-  (1-bit PNG, ≤ 64 KiB decoded)
+- ``POST receipts`` ``{receipts: [...]}`` -> ``{applied, rejected: [{delivery_id, reason}]}``
+  (idempotent, monotonic, compare-and-set). ``reason`` ∈ ``invalid`` /
+  ``unknown`` / ``not_owned`` / ``epoch_mismatch`` / ``terminal``; a repeat of a
+  receipt already applied is neither applied nor rejected.
+- ``POST previews`` ``{tag_id, revision, kind, png_base64, delivery_ids, epoch?}`` -> ``{stored}``
+  (1-bit PNG, ≤ 64 KiB decoded). ``epoch`` (the tag epoch it was rendered
+  for) is refused with 409 ``epoch_mismatch`` when it is not the current one;
+  revisions compare within one epoch, and a change of owner deletes previews.
 
 A content credential only ever sees deliveries of its profile on its
 companion, and only tags that profile owns there.
@@ -59,7 +81,6 @@ import asyncio
 import base64
 import binascii
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 from starlette.requests import Request
@@ -69,6 +90,7 @@ from starlette.routing import Route
 from app.api.tags import error_response
 from app.tags import credentials as creds
 from app.tags import routing
+from app.tags.cards import iso
 from app.tags.storage import (
     command_event, connector_command_json, ensure_stream, get_tag_storage,
 )
@@ -78,13 +100,14 @@ PREFIX = "/api/tag-connector/v1"
 API_VERSION = 1
 MAX_WAIT_S = 30
 MAX_PREVIEW_BYTES = 64 * 1024
+MAX_U32 = 2 ** 32 - 1
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _TOUCH_EVERY_S = 60.0
 _last_touch: dict[str, float] = {}
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return iso(time.time() * 1000)
 
 
 async def authenticate(request: Request, kind: str | None) -> tuple[dict[str, Any] | None, JSONResponse | None]:
@@ -308,7 +331,7 @@ def get_tag_connector_routes() -> list[Route]:
         pruned = int((stream.get("state") or {}).get("pruned_through_seq") or 0)
         cursor_valid = cursor is not None and pruned <= _as_int(cursor) <= head
         settings = await s.get_settings(profile)
-        options = routing.effective_options((settings or {}).get("options"))
+        options = await routing.effective_options_async((settings or {}).get("options"))
         return JSONResponse({
             "profile": profile,
             "companion_id": companion_id,
@@ -378,8 +401,8 @@ def get_tag_connector_routes() -> list[Route]:
         receipts = body.get("receipts")
         if not isinstance(receipts, list) or len(receipts) > 500 or not all(isinstance(r, dict) for r in receipts):
             return error_response(422, "invalid_receipts", "'receipts' must be a list of receipt objects.")
-        applied = await store().apply_receipts(grant["profile"], grant["companion_id"], receipts)
-        return JSONResponse({"applied": applied})
+        applied, rejected = await store().apply_receipts(grant["profile"], grant["companion_id"], receipts)
+        return JSONResponse({"applied": applied, "rejected": rejected})
 
     async def handle_previews(request: Request) -> JSONResponse:
         grant, err = await authenticate(request, creds.KIND_CONTENT)
@@ -392,8 +415,11 @@ def get_tag_connector_routes() -> list[Route]:
         if kind not in ("desired", "displayed"):
             return error_response(422, "invalid_kind", "'kind' must be 'desired' or 'displayed'.")
         revision = _as_int(body.get("revision"))
-        if revision is None or revision < 0:
-            return error_response(422, "invalid_revision", "'revision' must be a whole number.")
+        if revision is None or not 0 <= revision <= MAX_U32:
+            return error_response(422, "invalid_revision", "'revision' must be a whole number (uint32).")
+        epoch = body.get("epoch")
+        if epoch is not None and (_as_int(epoch) is None or not 0 <= _as_int(epoch) <= MAX_U32):
+            return error_response(422, "invalid_epoch", "'epoch' must be a whole number (uint32).")
         ids = body.get("delivery_ids") or []
         if not isinstance(ids, list) or len(ids) > 200 or any(_as_int(i) is None for i in ids):
             return error_response(422, "invalid_delivery_ids", "'delivery_ids' must be a list of delivery ids.")
@@ -410,15 +436,16 @@ def get_tag_connector_routes() -> list[Route]:
             return error_response(422, "preview_too_large", "A preview is at most 64 KiB.")
         if not png.startswith(_PNG_MAGIC):
             return error_response(422, "invalid_preview", "The preview is not a PNG image.")
-        tag_id = body.get("tag_id")
-        s = store()
-        tags = [d for d in await s.list_devices(companion_id=grant["companion_id"], kind="tag")
-                if d["hw_id"] == tag_id and d["owner_profile"] == grant["profile"]]
-        if not tags:
+        stored, problem = await store().store_preview(
+            grant["companion_id"], grant["profile"], body.get("tag_id"), kind=kind, revision=revision,
+            epoch=_as_int(epoch) if epoch is not None else None,
+            png_base64=base64.b64encode(png).decode("ascii"), delivery_ids=[_as_int(i) for i in ids],
+        )
+        if problem == "tag_not_found":
             return error_response(404, "tag_not_found", "No tag with that id belongs to this profile.")
-        stored = await s.store_preview(tags[0]["id"], kind=kind, revision=revision,
-                                       png_base64=base64.b64encode(png).decode("ascii"),
-                                       delivery_ids=[_as_int(i) for i in ids])
+        if problem == "epoch_mismatch":
+            return error_response(409, "epoch_mismatch",
+                                  "The preview was rendered for another epoch of the tag.")
         return JSONResponse({"stored": stored})
 
     return [

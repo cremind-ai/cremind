@@ -128,12 +128,18 @@ async def try_park_user_message(
         "mid_turn": {"state": "pending", "run_id": active_run},
     }
     try:
+        from app.tags.journal import TurnContext
+
         row = await conversation_storage.add_message(
             conversation_id=conversation_id,
             role="user",
             content=query,
             parts=attachment_file_parts(attachments) or None,
             metadata=metadata,
+            # Cremind Tag: a reply retires the chat's "waiting for you" card
+            # (a no-op wherever no such card is open).
+            turn=TurnContext(profile=profile, conversation_kind="event_run" if event_run else "chat",
+                             result=False),
         )
         message_id = row.get("id") if isinstance(row, dict) else None
     except Exception:  # noqa: BLE001

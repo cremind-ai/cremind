@@ -646,16 +646,42 @@ def _capture_tag_credentials(engine: Any) -> list[dict[str, Any]]:
         return []
 
 
-def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]]) -> dict[str, int]:
+def _capture_tag_counter(engine: Any) -> int:
+    """This install's ``delivery_id`` counter, read before the wipe: ids up to
+    it may already sit in a companion's queue, so the restored counter must
+    start past it (not only past the archive's). 0 when there is none."""
+    from sqlalchemy import inspect as sa_inspect, select
+
+    try:
+        if not sa_inspect(engine).has_table("tag_counters"):
+            return 0
+        from app.storage.models import TagCounterModel
+
+        counters = TagCounterModel.__table__
+        with engine.connect() as conn:
+            value = conn.execute(
+                select(counters.c.value).where(counters.c.name == "delivery_id")
+            ).scalar()
+        return int(value or 0)
+    except Exception:  # noqa: BLE001
+        logger.warning("[backup:restore] could not read the local tag delivery counter", exc_info=True)
+        return 0
+
+
+def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]],
+                    local_counter: int = 0) -> dict[str, int]:
     """Stop an archive's tag state from replaying onto live tags.
 
     Deliveries, streams and the journal travel inside the archive, so a restore
     rewinds them. Close-out: every non-terminal delivery -> ``cancelled``
     (detail ``restored``); every stream gets a new ``stream_id`` (a companion
-    that sees it calls ``sync`` and drops what Cremind no longer lists); the
-    ``delivery_id`` counter jumps 2**32 past every restored id, so no id a
-    companion already knows is ever issued again. Then this install's own
-    connector credentials are re-pinned where their companion (and, for a
+    that sees it calls ``sync`` and drops what Cremind no longer lists) and
+    forgets which periodic/diagnostics cards it sent (the cancelled ones are
+    sent again); the ``delivery_id`` counter jumps 2**32 past every restored
+    id AND past this install's own counter as it stood before the wipe
+    (``local_counter``), so no id a companion already knows is ever issued
+    again — also when an older archive is restored twice. Then this install's
+    own connector credentials are re-pinned where their companion (and, for a
     content credential, profile) survived the restore."""
     import uuid as _uuid
 
@@ -681,16 +707,17 @@ def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]]) -> dic
                         finished_at=now_ms, updated_at=now_ms)
             )
             report["cancelled"] = int(result.rowcount or 0)
-            for (profile,) in conn.execute(select(streams.c.profile)).all():
+            for profile, state in conn.execute(select(streams.c.profile, streams.c.state)).all():
+                kept = {k: v for k, v in dict(state or {}).items() if k not in ("periodic", "diag")}
                 conn.execute(update(streams).where(streams.c.profile == profile).values(
-                    stream_id=str(_uuid.uuid4()), updated_at=now_ms,
+                    stream_id=str(_uuid.uuid4()), state=kept, updated_at=now_ms,
                 ))
                 report["streams"] += 1
             top = conn.execute(select(func.max(deliveries.c.id))).scalar() or 0
             current = conn.execute(
                 select(counters.c.value).where(counters.c.name == "delivery_id")
             ).scalar()
-            value = max(int(top), int(current or 0)) + _TAG_DELIVERY_ID_JUMP
+            value = max(int(top), int(current or 0), int(local_counter or 0)) + _TAG_DELIVERY_ID_JUMP
             if current is None:
                 conn.execute(insert(counters), [{"name": "delivery_id", "value": value}])
             else:
@@ -759,8 +786,10 @@ def apply_staged_restore(
     # the archive's secret instead would invalidate every token this install
     # already issued — a 401 across the board on the next boot.
     local_secret = _read_local_jwt_secret(engine) or secrets.token_urlsafe(32)
-    # Likewise this install's Cremind Tag connector credentials (never archived).
+    # Likewise this install's Cremind Tag connector credentials (never archived)
+    # and its delivery-id counter (ids up to it may be in a companion's queue).
     local_tag_credentials = _capture_tag_credentials(engine)
+    local_tag_counter = _capture_tag_counter(engine)
 
     load_stats = None
     try:
@@ -784,7 +813,7 @@ def apply_staged_restore(
         )
         # Cremind Tag, unconditionally: even a rollback rewinds delivery ids
         # and cursors a live companion has already seen past.
-        _close_out_tags(engine, local_tag_credentials)
+        _close_out_tags(engine, local_tag_credentials, local_tag_counter)
 
         # Re-pin the local secret — overwrites any value an older archive
         # carried and guarantees the row exists for newer archives that omit it

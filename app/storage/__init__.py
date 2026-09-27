@@ -144,6 +144,8 @@ def invalidate_storage_singletons() -> None:
     _tgs._instance = None
     import app.tags.journal as _tgj
     _tgj.invalidate_enabled_cache()
+    import app.tags.routing as _tgr
+    _tgr.invalidate_admin_defaults()
     try:
         from app.utils.client_storage import _reset_auth_client_storage_singleton
         _reset_auth_client_storage_singleton()

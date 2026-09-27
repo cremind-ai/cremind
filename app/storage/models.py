@@ -1370,7 +1370,7 @@ class TagDeviceModel(Base):
     bridge_device_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("tag_devices.id", ondelete="SET NULL"), nullable=True,
     )
-    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     rotation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     board: Mapped[int | None] = mapped_column(Integer, nullable=True)
     panel: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1385,8 +1385,8 @@ class TagDeviceModel(Base):
     battery_mv: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rssi: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_contact_at: Mapped[float | None] = mapped_column(Float, nullable=True)
-    desired_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
-    displayed_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    desired_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    displayed_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     displayed_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clear_required: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false(),
@@ -1466,7 +1466,7 @@ class TagDeliveryModel(Base):
     tag_device_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("tag_devices.id", ondelete="CASCADE"), nullable=False,
     )
-    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     event_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("tag_events.id", ondelete="SET NULL"), nullable=True,
     )
@@ -1480,7 +1480,7 @@ class TagDeliveryModel(Base):
     )
     outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     timing: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -1545,7 +1545,10 @@ class TagPreviewModel(Base):
     )
     # desired | displayed
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
-    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    # The tag's epoch when it was rendered: revisions compare within one epoch
+    # only, and every change of owner deletes the rows outright.
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     png_base64: Mapped[str] = mapped_column(Text, nullable=False)
     delivery_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)

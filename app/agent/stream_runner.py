@@ -807,12 +807,25 @@ async def run_agent_to_bus(
 
             user_msg_id: Optional[str] = None
             try:
+                from app.tags.journal import TurnContext
+
                 user_msg = await conversation_storage.add_message(
                     conversation_id=conversation_id,
                     role="user",
                     content=query,
                     parts=effective_user_parts,
                     metadata=user_message_metadata,
+                    # Cremind Tag: any reply (a plan Accept included) retires
+                    # the chat's "waiting for you" card.
+                    turn=TurnContext(
+                        profile=profile,
+                        conversation_kind=(
+                            "channel_group" if is_channel_group
+                            else (conv or {}).get("kind") or "chat"
+                        ),
+                        conversation_title=title,
+                        result=False,
+                    ),
                 )
                 user_msg_id = user_msg.get("id") if isinstance(user_msg, dict) else None
             except Exception:  # noqa: BLE001

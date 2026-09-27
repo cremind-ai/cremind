@@ -10,22 +10,30 @@ stopped in ``_do_shutdown``.
 1. read the stream head (``projected_seq``, ``next_seq``) and at most 200
    events in ``(projected_seq, next_seq]``;
 2. claim them: ``UPDATE tag_streams SET projected_seq = :last WHERE
-   projected_seq = :old`` (a second projector loses and rolls back);
+   projected_seq = :old`` (a second projector loses and rolls back). That
+   takes the profile's stream-row lock, which every change of a tag's owner
+   or epoch also takes first (``storage.lock_device``), so the owned tags
+   read next cannot change hands before this batch commits;
 3. build cards (:mod:`app.tags.cards`), route them to the profile's own tags
-   (:mod:`app.tags.routing`) — content never goes to a tag that still waits
-   for its screen to be cleared — and insert the deliveries, retiring older
-   active ones with the same ``(tag, replace_key)``.
+   (:mod:`app.tags.routing`) — a tag that still waits for its screen to be
+   cleared gets nothing now; :mod:`app.tags.backfill` delivers what it missed
+   when the clear succeeds — and insert the deliveries, retiring older active
+   ones with the same ``(tag, replace_key)``.
 
-**Maintenance** (every minute) — expire deliveries and commands past
-``expires_at``; prune terminal deliveries and projected events older than 30
-days (recording the pruned-through delivery seq, which makes an older
-connector cursor answer 410); derive ``tag.diagnostics`` (battery low, not
-seen for 2 h); sample event-run todo progress (``run.progress``).
+**Maintenance** (every minute) — expire deliveries past ``expires_at`` and
+commands (a claimed one only an hour after its deadline; an expired
+``clear_tag`` is re-queued, see ``storage.requeue_clear``); prune terminal
+deliveries and projected events older than 30 days (recording the
+pruned-through delivery seq, which makes an older connector cursor answer
+410); derive ``tag.diagnostics`` (battery low, not seen for 2 h); sample
+event-run todo progress (``run.progress``).
 
 **Periodic content** (every 5 minutes) — ``calendar.upcoming``,
 ``automation.upcoming``, ``usage.summary``, ``indexing.problem``,
-``health.summary``: journalled only when the content's hash changed, and only
-when the profile routes that card kind somewhere.
+``health.summary``: journalled when the content's hash changed, or when the
+same content was last sent 12 h ago (its card lives 24 h, so a standing
+condition never drops off the tag), and only when the profile routes that
+card kind somewhere. Diagnostics are refreshed the same way.
 """
 
 from __future__ import annotations
@@ -43,8 +51,8 @@ from app.tags import journal, routing
 from app.tags.cards import NON_CONTENT_KINDS, cards_for_event
 from app.tags.journal import JournalEntry
 from app.tags.storage import (
-    ACTIVE_STAGES, COMMANDS, DELIVERIES, DEVICES, STREAMS, TERMINAL_STAGES,
-    TagStorage, device_json, get_tag_storage, now_ms, open_key_devices, write_deliveries,
+    ACTIVE_STAGES, DELIVERIES, DEVICES, STREAMS, TERMINAL_STAGES, TagStorage, device_json,
+    get_tag_storage, merge_stream_state, now_ms, open_key_devices, write_deliveries,
 )
 from app.storage.models import TagEventModel
 from app.utils.logger import logger
@@ -58,6 +66,9 @@ PERIODIC_S = 300.0
 RETENTION_MS = 30 * 24 * 3600 * 1000.0
 BATTERY_LOW_MV = 2400
 OFFLINE_AFTER_MS = 2 * 3600 * 1000.0
+# Periodic and diagnostics cards live 24 h: a condition that still holds is
+# journalled again after half of that.
+REFRESH_AFTER_MS = 12 * 3600 * 1000.0
 
 
 def _hash(payload: Any) -> str:
@@ -149,7 +160,7 @@ class TagProjectionWorker:
 
     async def _options(self, profile: str) -> dict[str, Any]:
         settings = await self.storage.get_settings(profile)
-        return routing.effective_options((settings or {}).get("options"))
+        return await routing.effective_options_async((settings or {}).get("options"))
 
     async def project_profile(self, profile: str) -> int:
         """Project one batch of ``profile``'s journal. Returns events consumed."""
@@ -249,9 +260,7 @@ class TagProjectionWorker:
             result = await conn.execute(update(DELIVERIES).where(
                 DELIVERIES.c.stage.in_(ACTIVE_STAGES), DELIVERIES.c.expires_at <= now,
             ).values(stage="expired", outcome="expired", finished_at=now, updated_at=now))
-            await conn.execute(update(COMMANDS).where(
-                COMMANDS.c.status.in_(("queued", "claimed")), COMMANDS.c.expires_at <= now,
-            ).values(status="expired", completed_at=now))
+        await self.storage.expire_commands(now)
         return int(result.rowcount or 0)
 
     async def prune(self, now: float) -> None:
@@ -268,7 +277,7 @@ class TagProjectionWorker:
                         DELIVERIES.c.profile == s.profile, DELIVERIES.c.stage.in_(TERMINAL_STAGES),
                         func.coalesce(DELIVERIES.c.finished_at, DELIVERIES.c.updated_at) < cutoff,
                     ))
-                    await _merge_state(conn, s.profile, lambda st, m=int(pruned_max): st.update(
+                    await merge_stream_state(conn, s.profile, lambda st, m=int(pruned_max): st.update(
                         pruned_through_seq=max(int(st.get("pruned_through_seq") or 0), m)))
                 await conn.execute(delete(EVENTS).where(
                     EVENTS.c.profile == s.profile, EVENTS.c.created_at < cutoff,
@@ -281,9 +290,12 @@ class TagProjectionWorker:
                 DEVICES.c.owner_profile == profile, DEVICES.c.kind == "tag",
             ))).all()
             stream = (await conn.execute(select(STREAMS.c.state).where(STREAMS.c.profile == profile))).first()
-        known = dict(((stream.state if stream is not None else None) or {}).get("diag") or {})
+        known = {
+            dev: _stamped(value, "issue")
+            for dev, value in (((stream.state if stream is not None else None) or {}).get("diag") or {}).items()
+        }
         entries: list[JournalEntry] = []
-        current: dict[str, str] = {}
+        current: dict[str, dict[str, Any]] = {}
         for dev in owned:
             if dev.battery_mv is not None and dev.battery_mv < BATTERY_LOW_MV:
                 issue, detail = "battery_low", f"{dev.battery_mv} mV"
@@ -292,9 +304,13 @@ class TagProjectionWorker:
                 issue, detail = "offline", f"Last seen {hours} h ago"
             else:
                 issue, detail = "ok", None
-            current[dev.id] = issue
-            if known.get(dev.id, "ok") == issue:
+            before = known.get(dev.id) or {"issue": "ok", "at": now}
+            # Unchanged: nothing, unless a standing problem's card is due to
+            # expire (it lives 24 h) — then it is sent again.
+            if before["issue"] == issue and (issue == "ok" or now - before["at"] < REFRESH_AFTER_MS):
+                current[dev.id] = before
                 continue
+            current[dev.id] = {"issue": issue, "at": now}
             entries.append(JournalEntry(
                 kind="tag.diagnostics",
                 payload={"device_id": dev.id, "name": dev.name or dev.hw_id, "issue": issue,
@@ -366,7 +382,11 @@ class TagProjectionWorker:
             ("health.summary", "health", self._health),
         )
         stream = await self.storage.get_stream(profile)
-        hashes = dict(((stream or {}).get("state") or {}).get("periodic") or {})
+        hashes = {
+            kind: _stamped(value, "h")
+            for kind, value in (((stream or {}).get("state") or {}).get("periodic") or {}).items()
+        }
+        now = now_ms()
         entries: list[JournalEntry] = []
         new_hashes = dict(hashes)
         for kind, card_kind, producer in producers:
@@ -380,9 +400,12 @@ class TagProjectionWorker:
             if payload is None:
                 continue
             digest = _hash(payload)
-            if hashes.get(kind) == digest:
+            before = hashes.get(kind)
+            # Unchanged content is sent again once its card is half-way to its
+            # 24 h expiry, so a standing condition never drops off the tag.
+            if before and before["h"] == digest and (payload.get("empty") or now - before["at"] < REFRESH_AFTER_MS):
                 continue
-            new_hashes[kind] = digest
+            new_hashes[kind] = {"h": digest, "at": now}
             if payload.get("empty") and kind not in hashes:
                 continue  # nothing was ever shown, so there is nothing to retire
             entries.append(JournalEntry(kind=kind, payload=payload, source_type="periodic",
@@ -397,7 +420,7 @@ class TagProjectionWorker:
         async with engine.begin() as conn:
             if entries:
                 await journal.append_async(conn, profile, entries)
-            await _merge_state(conn, profile, mutate)
+            await merge_stream_state(conn, profile, mutate)
         if entries:
             self.wake()
 
@@ -493,13 +516,12 @@ class TagProjectionWorker:
                 "count": len(problems)}
 
 
-async def _merge_state(conn, profile: str, mutate) -> None:
-    row = (await conn.execute(select(STREAMS.c.state).where(STREAMS.c.profile == profile))).first()
-    if row is None:
-        return
-    state = dict(row.state or {})
-    mutate(state)
-    await conn.execute(update(STREAMS).where(STREAMS.c.profile == profile).values(state=state))
+def _stamped(value: Any, field: str) -> dict[str, Any]:
+    """A stored ``{field, "at"}`` entry; an entry from before timestamps
+    were kept counts as sent long ago (so it is refreshed on the next run)."""
+    if isinstance(value, dict):
+        return {field: value.get(field), "at": float(value.get("at") or 0)}
+    return {field: value, "at": 0.0}
 
 
 _instance: TagProjectionWorker | None = None

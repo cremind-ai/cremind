@@ -1400,6 +1400,8 @@ async def main(
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            # Cremind Tag previews carry their revision in a header the UI reads.
+            expose_headers=["X-Tag-Revision"],
         ),
         # Refuses tool-config / setup / cleanup writes from a UI or CLI built
         # before tool ids changed meaning (426 ClientUpgradeRequired). Inside

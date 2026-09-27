@@ -31,8 +31,9 @@ _OTP_WORDS = (
     r"2fa|mfa|code|m[aã]\s+(?:x[aá]c\s+(?:nh[aậ]n|th[uự]c)|otp))"
 )
 _OTP_DIGITS = r"(\d{4,8}|\d{3}[\s-]\d{3})"
-_OTP_AFTER = re.compile(rf"(?i)\b{_OTP_WORDS}\b[^\d\n]{{0,24}}?{_OTP_DIGITS}(?!\d)")
-_OTP_BEFORE = re.compile(rf"(?i)(?<!\d){_OTP_DIGITS}\b[^\d\n]{{0,24}}?\b{_OTP_WORDS}\b")
+# The gap may cross a line break: "Your code:\n482913" is still a code.
+_OTP_AFTER = re.compile(rf"(?i)\b{_OTP_WORDS}\b[^\d]{{0,24}}?{_OTP_DIGITS}(?!\d)")
+_OTP_BEFORE = re.compile(rf"(?i)(?<!\d){_OTP_DIGITS}\b[^\d]{{0,24}}?\b{_OTP_WORDS}\b")
 
 _SCHEME_TOKEN = re.compile(r"(?i)\b(bearer|cremindtag|basic|token)\s+[A-Za-z0-9._~+/=:-]{8,}")
 _KNOWN_TOKENS = re.compile(
@@ -57,10 +58,15 @@ _OTP_MASK = "••••"
 
 
 def contains_otp(text: Any) -> bool:
-    """Whether ``text`` looks like it carries a one-time code."""
+    """Whether ``text`` looks like it carries a one-time code — checked on the
+    text as given and on a whitespace-collapsed copy, so blank lines or a run
+    of spaces between the word and the digits do not hide it."""
     if not isinstance(text, str) or not text:
         return False
-    return bool(_OTP_AFTER.search(text) or _OTP_BEFORE.search(text))
+    for candidate in (text, re.sub(r"\s+", " ", text)):
+        if _OTP_AFTER.search(candidate) or _OTP_BEFORE.search(candidate):
+            return True
+    return False
 
 
 def _mask_otp(match: re.Match) -> str:
@@ -122,7 +128,8 @@ def clean_multiline(text: Any, limit: int) -> str:
     """Body text that keeps its paragraphs: line breaks stay, a run of blank
     lines becomes one, trailing whitespace goes, runs of spaces inside a line
     become one (leading indentation is kept, tabs as two spaces), and every
-    line is redacted on its own. At most ``limit`` characters."""
+    line is redacted on its own; a one-time code split from its keyword by a
+    line break is masked across the lines too. At most ``limit`` characters."""
     if not isinstance(text, str):
         text = "" if text is None else str(text)
     lines: list[str] = []
@@ -139,6 +146,8 @@ def clean_multiline(text: Any, limit: int) -> str:
     while lines and lines[-1] == "":
         lines.pop()
     out = "\n".join(lines)
+    out = _OTP_AFTER.sub(_mask_otp, out)
+    out = _OTP_BEFORE.sub(_mask_otp, out)
     if len(out) > limit:
         out = out[: max(0, limit - 1)].rstrip() + "…"
     return out
@@ -170,7 +179,6 @@ def mask_sender(sender_id: Any, display_name: Any = None) -> str:
 # ── builders ─────────────────────────────────────────────────────────────────
 
 _NEEDS_INPUT_STAGES = ("awaiting_answers", "awaiting_approval")
-_RESOLVING_STAGES = ("cancelled", "executing", "completed")
 
 
 def _first_question(plan: dict[str, Any]) -> str:
@@ -195,7 +203,13 @@ def turn_entries(
     """Entries for one persisted message of a ``chat`` conversation.
 
     Event-run and group-chat seats never produce ``assistant.result`` (runs
-    report through ``run.*``; a seat's answer is a room post)."""
+    report through ``run.*``; a seat's answer is a room post).
+
+    A chat's "waiting for you" card is resolved by ANY later user message in
+    the conversation (an answer, a plan Accept or Cancel, a plain reply) and
+    by any agent message that does not itself ask again — with or without
+    plan metadata. The projection routes a resolution only to tags that still
+    show the question, so the common case costs one lookup and no delivery."""
     if turn.conversation_kind != "chat" or not turn.profile:
         return []
     title = clean_text(turn.conversation_title or "Untitled Chat", 120)
@@ -231,10 +245,11 @@ def turn_entries(
             source_id=conversation_id,
             replace_key=f"{key}:input",
         ))
-    elif stage in _RESOLVING_STAGES:
+    elif role in ("agent", "user"):
         out.append(JournalEntry(
             kind="chat.needs_input_resolved",
-            payload={"conversation_id": conversation_id, "title": title, "stage": stage},
+            payload={"conversation_id": conversation_id, "title": title,
+                     "stage": stage if isinstance(stage, str) else None, "by": role},
             source_type="conversation",
             source_id=conversation_id,
             replace_key=f"{key}:input",
@@ -303,6 +318,28 @@ def channel_entry(kind: str, *, channel: dict[str, Any], error: Any = None) -> J
     )
 
 
+_OUTPUT_TAIL = re.compile(r"(?is)\s*\|?\s*\b(?:stderr|stdout|output|traceback)\b\s*[:|].*$")
+_EXIT_CODE = re.compile(r"(?i)\bexit(?:ed)?\s*(?:with\s*)?code\s*[:=]?\s*(-?\d+)")
+
+
+def failure_summary(error: Any) -> str | None:
+    """An error with any captured process output cut off — the journal never
+    carries stdout/stderr or a traceback, whatever the caller passed."""
+    if not error:
+        return None
+    text = _OUTPUT_TAIL.sub("", str(error)).strip(" |:-")
+    return clean_text(text, 200) or "failed"
+
+
+def autostart_failure(error: Any) -> str:
+    """A fixed summary of an autostart spawn error, built from the exit code
+    only — never from the process's output or its command line."""
+    match = _EXIT_CODE.search(str(error or ""))
+    if match:
+        return f"exited with code {match.group(1)}"
+    return "could not be started"
+
+
 def automation_failed_entry(*, automation_kind: str, name: Any, error: Any,
                             source_id: str | None) -> JournalEntry:
     return JournalEntry(
@@ -310,7 +347,7 @@ def automation_failed_entry(*, automation_kind: str, name: Any, error: Any,
         payload={
             "automation_kind": automation_kind,
             "name": clean_text(name or automation_kind, 120),
-            "error": clean_text(error, 200) if error else None,
+            "error": failure_summary(error),
         },
         source_type=automation_kind,
         source_id=source_id,
@@ -367,6 +404,22 @@ def _strings(values: Iterable[Any]) -> Iterable[str]:
             yield from _strings(value)
 
 
+# Requests from people or groups outside the profile: their notification text
+# names the sender (a phone number, a full name, a group title). On a tag they
+# get fixed wording and, for a person, the masked sender only.
+_GROUP_REQUEST_KINDS = frozenset({"channel_group_request", "channel_group_brake"})
+
+
+def _masked_request(kind: str, entry: dict[str, Any]) -> tuple[str, str]:
+    ctype = str(entry.get("channel_type") or "channel").replace("_", " ")
+    if kind == "channel_group_brake":
+        return f"Paused in a {ctype} group", "Review it under Settings → Channels."
+    if kind in _GROUP_REQUEST_KINDS:
+        return f"{ctype.title()} group request", "A group is waiting for approval under Settings → Channels."
+    who = mask_sender(entry.get("sender_id"), entry.get("sender_name"))
+    return f"{ctype.title()} access request", f"{who} is waiting for approval under Settings → Channels."
+
+
 def notification_entry(entry: dict[str, Any]) -> JournalEntry | None:
     """The journal entry for a notifications-buffer push, or ``None`` when it
     must not reach a tag (an OTP, or a kind journalled on its own)."""
@@ -377,12 +430,17 @@ def notification_entry(entry: dict[str, Any]) -> JournalEntry | None:
         return None
     if any(contains_otp(s) for s in _strings(entry.values())):
         return None
+    if kind in _GROUP_REQUEST_KINDS or entry.get("sender_id") or entry.get("sender_name"):
+        title, preview = _masked_request(kind, entry)
+    else:
+        title = clean_text(entry.get("conversation_title") or kind.replace("_", " "), 120)
+        preview = clean_text(entry.get("message_preview"), 280)
     return JournalEntry(
         kind="notification",
         payload={
             "kind": kind,
-            "title": clean_text(entry.get("conversation_title") or kind.replace("_", " "), 120),
-            "preview": clean_text(entry.get("message_preview"), 280),
+            "title": title,
+            "preview": preview,
             "priority": "high" if entry.get("priority") == "high" else "normal",
             "conversation_id": str(entry.get("conversation_id") or "") or None,
         },

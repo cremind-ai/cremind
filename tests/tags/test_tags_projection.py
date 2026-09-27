@@ -160,9 +160,13 @@ def test_clear_required_holds_content_until_the_clear_is_confirmed(tagenv) -> No
     run(tagenv.store.complete_command(hw["companion_id"], clear_cmd["id"], status="succeeded",
                                       result=None, error=None))
     assert scalar(tagenv, "SELECT clear_required FROM tag_devices WHERE hw_id='T1'") == 0
+    # The held card arrives with the lift; later content flows as usual.
+    titles = lambda: [r["card"] for r in rows(tagenv, "SELECT card FROM tag_deliveries ORDER BY seq")]  # noqa: E731
+    assert ['"held"' in c for c in titles()] == [True]
     _append(tagenv, "p1", [_note("now")])
     run(worker.project_profile("p1"))
-    assert [d["kind"] for d in _deliveries(tagenv)] == ["notification"]
+    assert [d["kind"] for d in _deliveries(tagenv)] == ["notification", "notification"]
+    assert '"now"' in titles()[1]
 
 
 def test_expiry_and_pruning(tagenv, owned) -> None:

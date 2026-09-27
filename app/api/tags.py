@@ -7,22 +7,29 @@ Timestamps are epoch **milliseconds**. Errors are ``{"error": <code>,
 "message": <sentence>, "detail": <same sentence>}`` (``detail`` so readers of
 the connector's error shape work too).
 
-- ``GET    /api/tags``                          overview
-- ``GET    /api/tags/settings``                 own + admin-default + effective settings
+- ``GET    /api/tags``                          overview (each device carries ``pending_count``,
+  its active deliveries)
+- ``GET    /api/tags/settings``                 own + admin-default + built-in + effective settings;
+  ``timezone`` is always an IANA name
 - ``PUT    /api/tags/settings``                 ``{enabled?, options?}`` (options replace own overrides)
 - ``PATCH  /api/tags/settings``                 ``{enabled?, options?}`` (options merge: ``null`` =
   inherit again; ``routes`` merges per kind)
 - ``GET    /api/tags/devices/{id}``             ``{device, deliveries}`` (20 latest)
 - ``PATCH  /api/tags/devices/{id}``             ``{name}`` (1..128 once stripped) -> ``{device}``
-- ``POST   /api/tags/devices/{id}/display``     ``{title, body?, icon?, ttl_s?}`` -> 201 ``{delivery}``
-  (title one line; body keeps its line breaks, blank-line runs collapsed)
+- ``POST   /api/tags/devices/{id}/display``     ``{title, body?, icon?, ttl_s?, replace?}`` -> 201
+  ``{delivery}`` (title one line; body keeps its line breaks, blank-line runs
+  collapsed; each note is its own card unless ``replace: true``, which takes
+  the tag's one replaceable note slot)
 - ``POST   /api/tags/devices/{id}/clear``       -> 201 ``{delivery}``
 - ``POST   /api/tags/devices/{id}/refresh``     -> 202 ``{command}``
 - ``POST   /api/tags/devices/{id}/identify``    -> 202 ``{command}``
 - ``GET    /api/tags/devices/{id}/preview``     ``?kind=desired|displayed`` -> ``image/png``
+  (header ``X-Tag-Revision``, exposed to CORS; previews never outlive a change of owner)
 - ``GET    /api/tags/deliveries``               ``?device=&state=&limit=&before=`` -> ``{deliveries, next_before}``
 - ``GET    /api/tags/deliveries/{id}``          -> ``{delivery}``
-- ``POST   /api/tags/deliveries/{id}/cancel``   -> ``{delivery}``
+- ``POST   /api/tags/deliveries/{id}/cancel``   -> ``{delivery, resolved}``: ``resolved`` is the
+  ``resolved`` job sent to the companion so it drops a card it may already hold
+  (``null`` when the tag has changed hands)
 - ``GET    /api/tags/companions``               -> ``{companions}``
 - ``GET    /api/tags/credentials``              -> ``{credentials}`` (own content credentials)
 - ``POST   /api/tags/credentials``              ``{companion_id, label?}`` -> 201 ``{credential, secret, authorization}``
@@ -87,13 +94,14 @@ def _int_param(raw: Any) -> int | None:
 async def _settings_payload(request: Request, profile: str) -> dict[str, Any]:
     store = get_tag_storage()
     row = await store.get_settings(profile) or {"enabled": False, "options": {}, "updated_at": None}
-    defaults = routing.read_admin_defaults()
+    defaults = await routing.admin_defaults()
     effective = routing.effective_options(row.get("options"), defaults)
     return {
         "profile": profile,
         "enabled": bool(row.get("enabled")),
         "options": row.get("options") or {},
         "defaults": defaults,
+        "builtin": routing.BUILTIN_DEFAULTS,
         "effective": effective,
         "timezone": routing.resolved_timezone(profile, effective),
         "updated_at": row.get("updated_at"),
@@ -116,10 +124,12 @@ def get_tags_routes() -> list[Route]:
         settings = await s.get_settings(profile)
         devices = await s.list_devices(owner=profile, kind="tag")
         revisions = await s.preview_revisions([d["id"] for d in devices])
+        pending = await s.pending_counts([d["id"] for d in devices])
         companions = {c["id"]: c for c in await s.list_companions()}
         for d in devices:
             revs = revisions.get(d["id"], {})
             d["previews"] = {"desired": revs.get("desired"), "displayed": revs.get("displayed")}
+            d["pending_count"] = pending.get(d["id"], 0)
             comp = companions.get(d["companion_id"]) or {}
             d["companion_name"] = comp.get("name")
             d["companion_online"] = bool(comp.get("online"))
@@ -346,13 +356,12 @@ def get_tags_routes() -> list[Route]:
         did = _int_param(request.path_params["delivery_id"])
         if did is None:
             return error_response(404, "delivery_not_found", "No delivery with that id.")
-        row, problem = await store().cancel_delivery(_profile(request), did)
-        if problem == "not_found":
-            return error_response(404, "delivery_not_found", "No delivery with that id.")
-        if problem == "already_terminal":
-            return error_response(409, "already_terminal",
-                                  f"The delivery already finished ({row['stage']}).", delivery=row)
-        return JSONResponse({"delivery": row})
+        from app.tags import service
+
+        try:
+            return JSONResponse(await service.cancel_delivery(_profile(request), did))
+        except TagError as exc:
+            return tag_error_response(exc)
 
     async def handle_companions(request: Request) -> JSONResponse:
         unauth = require_auth(request)

@@ -56,9 +56,11 @@ PRIORITY = {
 
 
 def iso(ms: float | None) -> str | None:
+    """Epoch ms -> ISO 8601 UTC with milliseconds (``2026-09-27T10:00:00.123Z``)."""
     if ms is None:
         return None
-    return datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dt = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 @dataclass
@@ -146,8 +148,11 @@ def cards_for_event(event: dict[str, Any], *, profile: str, options: dict[str, A
         link = _link(options, profile, f"c/{cid}")
         title = p.get("title") or "Chat"
         if p.get("errored"):
+            # The excerpt of a failed turn is the partial answer plus the
+            # error: private text, shown only when excerpts are opted in.
+            body = (p.get("excerpt") or None) if options.get("show_excerpts") else "The reply failed."
             return [spec("task_outcome", title=f"Reply failed: {title}", severity="error",
-                         icon="error", body=p.get("excerpt") or None, link=link, priority=70)]
+                         icon="error", body=body, link=link, priority=70)]
         if options.get("show_excerpts") and p.get("excerpt"):
             return [spec("excerpt", title=title, icon="chat", body=p.get("excerpt"), link=link)]
         return [spec("task_outcome", title=f"Reply ready: {title}", severity="success",

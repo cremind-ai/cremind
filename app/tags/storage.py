@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Sequence
 
-from sqlalchemy import delete, func, insert, or_, select, update
+from sqlalchemy import case, delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -37,7 +37,7 @@ from app.storage.models import (
     TagStreamModel,
 )
 from app.tags import journal
-from app.tags.cards import CardSpec, iso
+from app.tags.cards import CardSpec, iso, make_card
 
 COMPANIONS = TagCompanionModel.__table__
 CREDENTIALS = TagCredentialModel.__table__
@@ -64,6 +64,9 @@ GONE_STAGES = ("superseded", "expired", "cancelled", "failed")
 
 COMMAND_ACTIVE = ("queued", "claimed")
 COMMAND_TERMINAL = ("succeeded", "failed", "expired", "cancelled")
+# A claimed command is the companion's work in progress: expire it only this
+# long after its deadline (a late result is still accepted after that).
+CLAIMED_GRACE_MS = 3_600_000.0
 
 ONLINE_WINDOW_MS = 120_000
 
@@ -244,6 +247,28 @@ def job_json(row: Any, hw_id: str) -> dict[str, Any]:
     }
 
 
+async def cas_stage(conn: AsyncConnection, delivery_id: int, expected: str | Sequence[str],
+                    values: dict[str, Any]) -> bool:
+    """Update a delivery only if its stage is still ``expected`` (one stage,
+    or any of several). The one write path for receipts and user cancels, so a
+    terminal state another transaction committed first is never reopened."""
+    stage_cond = (DELIVERIES.c.stage == expected if isinstance(expected, str)
+                  else DELIVERIES.c.stage.in_(list(expected)))
+    result = await conn.execute(update(DELIVERIES).where(
+        DELIVERIES.c.id == delivery_id, stage_cond,
+    ).values(**values))
+    return bool(result.rowcount)
+
+
+def _servable(row: Any, profile: str) -> bool:
+    """Whether a delivery row (joined with its device's owner and epoch) may
+    be served to ``profile``'s companion: only on a tag the profile still
+    owns, and a live card only at the tag's current epoch."""
+    if row.device_owner != profile:
+        return False
+    return row.stage in TERMINAL_STAGES or int(row.epoch or 0) == int(row.device_epoch or 0)
+
+
 # ── allocation / supersede helpers (inside a caller's transaction) ──────────
 
 
@@ -260,12 +285,107 @@ async def ensure_stream(conn: AsyncConnection, profile: str, now: float | None =
 async def lock_stream(conn: AsyncConnection, profile: str, now: float) -> None:
     """Take the profile's stream-row lock FIRST in a transaction that will
     also touch its deliveries. Every writer orders its locks stream row ->
-    delivery rows -> counter row, so none of them can deadlock another on
-    PostgreSQL (SQLite has one writer anyway)."""
+    device row -> delivery rows -> counter row, so none of them can deadlock
+    another on PostgreSQL (SQLite has one writer anyway)."""
     stmt = update(STREAMS).where(STREAMS.c.profile == profile).values(updated_at=now)
     if not (await conn.execute(stmt)).rowcount:
         await ensure_stream(conn, profile, now)
         await conn.execute(stmt)
+
+
+async def begin_write(conn: AsyncConnection) -> None:
+    """On SQLite, take the database write lock before the transaction's first
+    read: a deferred transaction that reads and THEN writes fails outright
+    (``SQLITE_BUSY_SNAPSHOT``) when another writer committed in between. A
+    no-op on PostgreSQL, whose transactions lock rows, not the database."""
+    if _dialect(conn) == "sqlite":
+        await conn.execute(update(COUNTERS).where(COUNTERS.c.name == DELIVERY_COUNTER)
+                           .values(value=COUNTERS.c.value))
+
+
+async def lock_device(conn: AsyncConnection, device_id: str, now: float) -> Any:
+    """Lock a device for an ownership or epoch change: its CURRENT owner's
+    stream row first — the lock every content writer of that owner (the
+    projection batch, ``display``/``clear``, a clear lift) takes first — then
+    the device row itself (``FOR UPDATE``). A content writer that read the
+    owner under its stream lock therefore never writes onto a tag that
+    changed hands meanwhile. Retries if the owner changed between the read
+    and the lock. Returns the locked row, or ``None``."""
+    for _ in range(5):
+        row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == device_id))).first()
+        if row is None:
+            return None
+        if row.owner_profile:
+            await lock_stream(conn, row.owner_profile, now)
+        locked = (await conn.execute(
+            select(DEVICES).where(DEVICES.c.id == device_id).with_for_update()
+        )).first()
+        if locked is None or locked.owner_profile == row.owner_profile:
+            return locked
+    raise RuntimeError(f"tag {device_id} kept changing owner; try again")
+
+
+async def merge_stream_state(conn: AsyncConnection, profile: str, mutate: Callable[[dict], Any]) -> None:
+    row = (await conn.execute(select(STREAMS.c.state).where(STREAMS.c.profile == profile))).first()
+    if row is None:
+        return
+    state = dict(row.state or {})
+    mutate(state)
+    await conn.execute(update(STREAMS).where(STREAMS.c.profile == profile).values(state=state))
+
+
+def reset_content_state(state: dict[str, Any], device_id: str | None = None) -> None:
+    """Forget what periodic content and diagnostics were already sent, so the
+    next run sends them again (a tag that just became able to show them)."""
+    state.pop("periodic", None)
+    if device_id is None:
+        state.pop("diag", None)
+    elif isinstance(state.get("diag"), dict):
+        state["diag"].pop(device_id, None)
+
+
+# Owner-specific state a device carries, reset on every change of owner.
+OWNER_RESET = {
+    "name": "", "desired_revision": 0, "displayed_revision": 0, "displayed_digest": None,
+}
+
+
+async def drop_previews(conn: AsyncConnection, device_ids: Sequence[str]) -> None:
+    if device_ids:
+        await conn.execute(delete(PREVIEWS).where(PREVIEWS.c.tag_device_id.in_(list(device_ids))))
+
+
+CLEAR_RETRIES = 3
+_CLEAR_TTL_S = 7 * 24 * 3600.0
+
+
+async def requeue_clear(conn: AsyncConnection, companion_id: str, hw_id: str, epoch: int,
+                        now: float) -> str:
+    """A ``clear_tag`` for ``(tag, epoch)`` ended failed or expired while the
+    tag still waits for it: queue another, up to :data:`CLEAR_RETRIES` in
+    all; after that mark the device ``clear_failed`` (the UI/CLI show it; a new
+    claim or release starts over). Returns ``requeued`` / ``clear_failed`` /
+    ``not_needed``."""
+    device = (await conn.execute(select(DEVICES).where(
+        DEVICES.c.companion_id == companion_id, DEVICES.c.kind == "tag", DEVICES.c.hw_id == hw_id,
+    ))).first()
+    if device is None or not device.clear_required or int(device.epoch or 0) != int(epoch):
+        return "not_needed"
+    rows = (await conn.execute(select(COMMANDS.c.status, COMMANDS.c.args).where(
+        COMMANDS.c.companion_id == companion_id, COMMANDS.c.kind == "clear_tag",
+    ))).all()
+    same = [r for r in rows if isinstance(r.args, dict) and r.args.get("tag_id") == hw_id
+            and int(r.args.get("epoch") or 0) == int(epoch)]
+    if any(r.status in COMMAND_ACTIVE for r in same):
+        return "not_needed"
+    if len(same) >= CLEAR_RETRIES:
+        await conn.execute(update(DEVICES).where(DEVICES.c.id == device.id)
+                           .values(status="clear_failed", updated_at=now))
+        return "clear_failed"
+    await insert_command(conn, companion_id=companion_id, kind="clear_tag",
+                         args={"tag_id": hw_id, "epoch": int(epoch)}, requested_by="system",
+                         ttl_s=_CLEAR_TTL_S, now=now)
+    return "requeued"
 
 
 async def allocate_delivery_seqs(conn: AsyncConnection, profile: str, n: int, now: float) -> list[int]:
@@ -370,6 +490,10 @@ async def write_deliveries(
         rows.append(row)
     for row, delivery_id in zip(rows, await allocate_delivery_ids(conn, n)):
         row["id"] = delivery_id
+        # Every card carries a key the companion can remove it by: a cancel is
+        # sent as a ``resolved`` job naming it (see service.cancel_delivery).
+        if row["replace_key"] is None and row["kind"] not in ("resolved", "clear"):
+            row["replace_key"] = f"delivery:{delivery_id}"
     await conn.execute(insert(DELIVERIES), rows)
     return rows
 
@@ -664,20 +788,21 @@ class TagStorage:
                 if row is None:
                     continue
                 values: dict[str, Any] = {"updated_at": now}
-                if isinstance(item.get("battery_mv"), int) and not isinstance(item.get("battery_mv"), bool):
+                if _bounded(item.get("battery_mv"), 0, 100_000) is not None:
                     values["battery_mv"] = item["battery_mv"]
-                if isinstance(item.get("rssi"), int) and not isinstance(item.get("rssi"), bool):
+                if _bounded(item.get("rssi"), -1000, 1000) is not None:
                     values["rssi"] = item["rssi"]
                 contact = parse_ts(item.get("last_contact_at"))
                 if contact is not None:
                     values["last_contact_at"] = contact
-                rev = item.get("displayed_revision")
-                if isinstance(rev, int) and not isinstance(rev, bool) and rev >= int(row.displayed_revision or 0):
+                rev = _bounded(item.get("displayed_revision"), 0, MAX_EPOCH)
+                if rev is not None and rev >= int(row.displayed_revision or 0):
                     values["displayed_revision"] = rev
                     if isinstance(item.get("displayed_digest"), str):
                         values["displayed_digest"] = item["displayed_digest"][:64]
                 status = item.get("status")
-                if status in ("ok", "pending", "offline", "error") and (kind != "tag" or row.owner_profile):
+                if (status in ("ok", "pending", "offline", "error") and (kind != "tag" or row.owner_profile)
+                        and row.status != "clear_failed"):
                     values["status"] = status
                 await conn.execute(update(DEVICES).where(DEVICES.c.id == row.id).values(**values))
             pending = (await conn.execute(
@@ -836,11 +961,22 @@ class TagStorage:
                     continue
                 wanted.append((kind, hw_id, item))
         async with self.engine.begin() as conn:
+            await begin_write(conn)
             existing = {
                 (r.kind, r.hw_id): r for r in (await conn.execute(
                     select(DEVICES).where(DEVICES.c.companion_id == companion_id)
                 )).all()
             }
+            # An epoch raise on an owned tag moves that owner's queued cards:
+            # take those owners' stream locks first (sorted), before any
+            # device row, in the order every content writer uses.
+            ahead_owners = sorted({
+                row.owner_profile for kind, hw_id, item in wanted
+                if kind == "tag" and (row := existing.get((kind, hw_id))) is not None
+                and row.owner_profile and (_reported_epoch(item) or 0) > int(row.epoch or 0)
+            })
+            for owner in ahead_owners:
+                await lock_stream(conn, owner, now)
             requeued = False
             for kind, hw_id, item in wanted:
                 values = _inventory_values(kind, item)
@@ -859,8 +995,16 @@ class TagStorage:
                 info = dict(row.info or {})
                 info.update(values.pop("info", {}) or {})
                 if reported is not None and reported > int(row.epoch or 0):
-                    values["epoch"] = await _raise_epoch(conn, row, reported, now)
-                    requeued = requeued or values["epoch"] != reported
+                    locked = (await conn.execute(
+                        select(DEVICES).where(DEVICES.c.id == row.id).with_for_update()
+                    )).first()
+                    # An owner that changed since the first read has no stream
+                    # lock here: leave the raise to the companion's next report.
+                    owner_locked = locked is not None and (
+                        not locked.owner_profile or locked.owner_profile in ahead_owners)
+                    if owner_locked and reported > int(locked.epoch or 0):
+                        values["epoch"] = await _raise_epoch(conn, locked, reported, now)
+                        requeued = requeued or values["epoch"] != reported
                 await conn.execute(update(DEVICES).where(DEVICES.c.id == row.id)
                                    .values(**values, info=info, updated_at=now))
             await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == companion_id)
@@ -903,26 +1047,63 @@ class TagStorage:
             row = (await conn.execute(select(DELIVERIES).where(*conds))).first()
         return delivery_json(row) if row is not None else None
 
-    async def cancel_delivery(self, profile: str, delivery_id: int) -> tuple[dict[str, Any] | None, str | None]:
-        """Cancel an active delivery. Returns ``(row, None)``, ``(None,
-        "not_found")`` or ``(row, "already_terminal")``."""
+    async def cancel_delivery(self, profile: str, delivery_id: int
+                              ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+        """Cancel an active delivery and tell the companion.
+
+        The row moves to ``cancelled`` with a compare-and-set on its stage, so
+        a card that was displayed (or expired) a moment earlier stays so. The
+        companion may already hold the card, so the cancel is sent on as a
+        ``resolved`` job naming the card's ``replace_key`` (every card has one;
+        see :func:`write_deliveries`) — the job kind a companion already
+        handles. Returns ``(cancelled, resolved_job_row | None, problem)``
+        with problem ``not_found`` / ``already_terminal``."""
         now = now_ms()
         async with self.engine.begin() as conn:
+            await lock_stream(conn, profile, now)
             row = (await conn.execute(select(DELIVERIES).where(
                 DELIVERIES.c.id == delivery_id, DELIVERIES.c.profile == profile,
             ))).first()
             if row is None:
-                return None, "not_found"
+                return None, None, "not_found"
             if row.stage in TERMINAL_STAGES:
-                return delivery_json(row), "already_terminal"
+                return delivery_json(row), None, "already_terminal"
             times = dict(row.stage_times or {})
             times["cancelled"] = now
-            await conn.execute(update(DELIVERIES).where(DELIVERIES.c.id == delivery_id).values(
-                stage="cancelled", outcome="cancelled", detail="cancelled by the user",
-                stage_times=times, finished_at=now, updated_at=now,
-            ))
+            changed = await cas_stage(conn, delivery_id, ACTIVE_STAGES, {
+                "stage": "cancelled", "outcome": "cancelled", "detail": "cancelled by the user",
+                "stage_times": times, "finished_at": now, "updated_at": now,
+            })
             row = (await conn.execute(select(DELIVERIES).where(DELIVERIES.c.id == delivery_id))).first()
-        return delivery_json(row), None
+            if not changed:
+                return delivery_json(row), None, "already_terminal"
+            resolved = None
+            device = (await conn.execute(select(DEVICES).where(DEVICES.c.id == row.tag_device_id))).first()
+            if (device is not None and device.owner_profile == profile and row.replace_key
+                    and int(device.epoch or 0) == int(row.epoch or 0) and row.kind != "clear"):
+                spec = CardSpec(
+                    kind="resolved",
+                    card=make_card("resolved", title="Cancelled", icon="info", ts_ms=now,
+                                   source_type="delivery", source_id=str(delivery_id)),
+                    priority=90,
+                    expires_at=max(float(row.expires_at), now + 3_600_000.0),
+                    resolves=row.replace_key,
+                )
+                resolved = (await write_deliveries(conn, profile, [(device_json(device), spec, None)], now))[0]
+        return delivery_json(row), (delivery_json(resolved) if resolved else None), None
+
+    async def pending_counts(self, device_ids: Sequence[str]) -> dict[str, int]:
+        """Active deliveries per device (the overview's ``pending_count``)."""
+        if not device_ids:
+            return {}
+        async with self.engine.connect() as conn:
+            rows = (await conn.execute(
+                select(DELIVERIES.c.tag_device_id, func.count())
+                .where(DELIVERIES.c.tag_device_id.in_(list(device_ids)),
+                       DELIVERIES.c.stage.in_(ACTIVE_STAGES))
+                .group_by(DELIVERIES.c.tag_device_id)
+            )).all()
+        return {r[0]: int(r[1]) for r in rows}
 
     async def delivery_counts(self, profile: str) -> dict[str, int]:
         now = now_ms()
@@ -955,7 +1136,8 @@ class TagStorage:
             head = int(stream.next_delivery_seq) if stream is not None else 0
             pruned = int(((stream.state or {}) if stream is not None else {}).get("pruned_through_seq") or 0)
             rows = (await conn.execute(
-                select(DELIVERIES, DEVICES.c.hw_id)
+                select(DELIVERIES, DEVICES.c.hw_id, DEVICES.c.owner_profile.label("device_owner"),
+                       DEVICES.c.epoch.label("device_epoch"))
                 .join(DEVICES, DEVICES.c.id == DELIVERIES.c.tag_device_id)
                 .where(
                     DELIVERIES.c.profile == profile,
@@ -966,7 +1148,9 @@ class TagStorage:
                 .order_by(DELIVERIES.c.seq.asc())
                 .limit(limit)
             )).all()
-        jobs = [job_json(r, r.hw_id) for r in rows]
+        # The cursor advances over every row; a job is SERVED only for a tag
+        # this profile still owns, and a live one only at the tag's epoch.
+        jobs = [job_json(r, r.hw_id) for r in rows if _servable(r, profile)]
         next_after = int(rows[-1].seq) if len(rows) >= limit else max(head, after)
         return {
             "stream_id": stream.stream_id if stream is not None else None,
@@ -988,6 +1172,7 @@ class TagStorage:
                     DELIVERIES.c.stage.in_(ACTIVE_STAGES),
                     DELIVERIES.c.expires_at > now,
                     DEVICES.c.owner_profile == profile,
+                    DELIVERIES.c.epoch == DEVICES.c.epoch,
                 )
                 .order_by(DELIVERIES.c.seq.asc())
             )).all()
@@ -995,17 +1180,20 @@ class TagStorage:
 
     async def accept(self, profile: str, companion_id: str, delivery_ids: Sequence[int]) -> int:
         """Move queued deliveries to ``companion_accepted``. Returns how many of
-        ``delivery_ids`` belong to this profile and companion (idempotent)."""
+        ``delivery_ids`` belong to this profile and companion, on a tag the
+        profile still owns at the delivery's epoch (idempotent)."""
         ids = sorted({int(i) for i in delivery_ids})
         if not ids:
             return 0
         now = now_ms()
         async with self.engine.begin() as conn:
+            await begin_write(conn)
             rows = (await conn.execute(select(
                 DELIVERIES.c.id, DELIVERIES.c.stage, DELIVERIES.c.stage_times,
-            ).where(
+            ).join(DEVICES, DEVICES.c.id == DELIVERIES.c.tag_device_id).where(
                 DELIVERIES.c.id.in_(ids), DELIVERIES.c.profile == profile,
                 DELIVERIES.c.companion_id == companion_id,
+                DEVICES.c.owner_profile == profile, DELIVERIES.c.epoch == DEVICES.c.epoch,
             ))).all()
             for r in rows:
                 if r.stage != "queued":
@@ -1018,37 +1206,63 @@ class TagStorage:
         return len(rows)
 
     async def apply_receipts(self, profile: str, companion_id: str,
-                             receipts: Sequence[dict[str, Any]]) -> int:
+                             receipts: Sequence[dict[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
         """Apply delivery receipts. Idempotent: a stage never moves backwards
-        and a terminal outcome is final. Returns how many changed something."""
+        and a terminal outcome is final — every write is a compare-and-set on
+        the stage it read, so a concurrent cancel or expiry is never reopened.
+
+        Returns ``(applied, rejected)``; each rejection is ``{"delivery_id",
+        "reason"}`` with reason ``invalid`` (no delivery id), ``unknown`` (not
+        this profile's delivery on this companion), ``not_owned`` (the tag has
+        changed hands), ``epoch_mismatch`` (the receipt's or the delivery's
+        epoch is not the tag's current one), ``terminal`` (already final with
+        another outcome; a repeat of the same final receipt is a silent no-op)."""
+        rejected: list[dict[str, Any]] = []
         ids = []
         for rec in receipts:
-            try:
-                ids.append(int(rec["delivery_id"]))
-            except (KeyError, TypeError, ValueError):
-                continue
+            did = _bounded(rec.get("delivery_id"), 1, 2 ** 63 - 1)
+            if did is not None:
+                ids.append(did)
         if not ids:
-            return 0
+            return 0, [{"delivery_id": rec.get("delivery_id"), "reason": "invalid"} for rec in receipts]
         now = now_ms()
         applied = 0
         async with self.engine.begin() as conn:
+            await begin_write(conn)
             rows = {
-                int(r.id): dict(r._mapping) for r in (await conn.execute(select(DELIVERIES).where(
-                    DELIVERIES.c.id.in_(sorted(set(ids))), DELIVERIES.c.profile == profile,
-                    DELIVERIES.c.companion_id == companion_id,
-                ))).all()
+                int(r.id): dict(r._mapping) for r in (await conn.execute(
+                    select(DELIVERIES, DEVICES.c.owner_profile.label("device_owner"),
+                           DEVICES.c.epoch.label("device_epoch"))
+                    .join(DEVICES, DEVICES.c.id == DELIVERIES.c.tag_device_id)
+                    .where(
+                        DELIVERIES.c.id.in_(sorted(set(ids))), DELIVERIES.c.profile == profile,
+                        DELIVERIES.c.companion_id == companion_id,
+                    )
+                )).all()
             }
             touched_devices: dict[str, dict[str, Any]] = {}
             for rec in receipts:
-                try:
-                    did = int(rec["delivery_id"])
-                except (KeyError, TypeError, ValueError):
+                did = _bounded(rec.get("delivery_id"), 1, 2 ** 63 - 1)
+                if did is None:
+                    rejected.append({"delivery_id": rec.get("delivery_id"), "reason": "invalid"})
                     continue
                 row = rows.get(did)
-                if row is None or row["stage"] in TERMINAL_STAGES:
+                if row is None:
+                    rejected.append({"delivery_id": did, "reason": "unknown"})
+                    continue
+                if row["stage"] in TERMINAL_STAGES:
+                    repeat = rec.get("outcome") == row["stage"] or rec.get("stage") == row["stage"]
+                    if not repeat:
+                        rejected.append({"delivery_id": did, "reason": "terminal"})
+                    continue
+                if row["device_owner"] != profile:
+                    rejected.append({"delivery_id": did, "reason": "not_owned"})
                     continue
                 epoch = rec.get("epoch")
-                if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch != int(row["epoch"] or 0):
+                row_epoch = int(row["epoch"] or 0)
+                if (row_epoch != int(row["device_epoch"] or 0) or (
+                        isinstance(epoch, int) and not isinstance(epoch, bool) and epoch != row_epoch)):
+                    rejected.append({"delivery_id": did, "reason": "epoch_mismatch"})
                     continue
                 outcome = rec.get("outcome")
                 stage = rec.get("stage")
@@ -1066,9 +1280,9 @@ class TagStorage:
                     if target in TERMINAL_STAGES:
                         values["outcome"] = target
                         values["finished_at"] = now
-                for field in ("status_code", "revision"):
-                    v = rec.get(field)
-                    if isinstance(v, int) and not isinstance(v, bool) and v != row.get(field):
+                for field, lo, hi in (("status_code", *_INT32), ("revision", 0, MAX_EPOCH)):
+                    v = _bounded(rec.get(field), lo, hi)
+                    if v is not None and v != row.get(field):
                         values[field] = v
                 if isinstance(rec.get("digest"), str) and rec["digest"][:64] != row.get("digest"):
                     values["digest"] = rec["digest"][:64]
@@ -1081,7 +1295,12 @@ class TagStorage:
                 if not values:
                     continue
                 values["updated_at"] = now
-                await conn.execute(update(DELIVERIES).where(DELIVERIES.c.id == did).values(**values))
+                if not await cas_stage(conn, did, row["stage"], values):
+                    # Someone else (a cancel, a claim, the expiry sweep) moved
+                    # it first; their terminal state stands.
+                    rejected.append({"delivery_id": did, "reason": "terminal"})
+                    rows.pop(did, None)
+                    continue
                 row.update(values)
                 applied += 1
                 rev = values.get("revision", row.get("revision"))
@@ -1104,33 +1323,50 @@ class TagStorage:
                     values["displayed_revision"] = dev["displayed"][0]
                     values["displayed_digest"] = dev["displayed"][1]
                 await conn.execute(update(DEVICES).where(DEVICES.c.id == device_id).values(**values))
-        return applied
+        return applied, rejected
 
-    async def store_preview(self, device_id: str, *, kind: str, revision: int, png_base64: str,
-                            delivery_ids: list[int]) -> bool:
-        """Keep the newest preview per (tag, kind); an older revision is ignored."""
+    async def store_preview(self, companion_id: str, profile: str, tag_hw_id: Any, *, kind: str,
+                            revision: int, epoch: int | None, png_base64: str,
+                            delivery_ids: list[int]) -> tuple[bool, str | None]:
+        """Keep the newest preview per (tag, kind), for the tag's CURRENT owner
+        and epoch — checked in the transaction that writes, under a share lock
+        on the device row, so a change of owner (which deletes the previews)
+        cannot interleave. Revisions compare within one epoch only: a preview
+        of an older epoch is replaced whatever its revision. Returns
+        ``(stored, problem)``, problem ``tag_not_found`` / ``epoch_mismatch``."""
         now = now_ms()
         async with self.engine.begin() as conn:
+            await begin_write(conn)
+            device = (await conn.execute(select(DEVICES).where(
+                DEVICES.c.companion_id == companion_id, DEVICES.c.kind == "tag",
+                DEVICES.c.hw_id == str(tag_hw_id or ""),
+            ).with_for_update(read=True))).first()
+            if device is None or device.owner_profile != profile:
+                return False, "tag_not_found"
+            current = int(device.epoch or 0)
+            if epoch is not None and int(epoch) != current:
+                return False, "epoch_mismatch"
             row = (await conn.execute(select(PREVIEWS).where(
-                PREVIEWS.c.tag_device_id == device_id, PREVIEWS.c.kind == kind,
+                PREVIEWS.c.tag_device_id == device.id, PREVIEWS.c.kind == kind,
             ))).first()
-            if row is not None and int(row.revision or 0) > revision:
-                return False
+            if row is not None and int(row.epoch or 0) == current and int(row.revision or 0) > revision:
+                return False, None
             if row is None:
                 await conn.execute(insert(PREVIEWS), [{
-                    "id": str(uuid.uuid4()), "tag_device_id": device_id, "kind": kind,
-                    "revision": revision, "png_base64": png_base64,
+                    "id": str(uuid.uuid4()), "tag_device_id": device.id, "kind": kind,
+                    "revision": revision, "epoch": current, "png_base64": png_base64,
                     "delivery_ids": delivery_ids, "created_at": now,
                 }])
             else:
                 await conn.execute(update(PREVIEWS).where(PREVIEWS.c.id == row.id).values(
-                    revision=revision, png_base64=png_base64, delivery_ids=delivery_ids, created_at=now,
+                    revision=revision, epoch=current, png_base64=png_base64,
+                    delivery_ids=delivery_ids, created_at=now,
                 ))
             if kind == "desired":
                 await conn.execute(update(DEVICES).where(
-                    DEVICES.c.id == device_id, DEVICES.c.desired_revision < revision,
+                    DEVICES.c.id == device.id, DEVICES.c.desired_revision < revision,
                 ).values(desired_revision=revision, updated_at=now))
-        return True
+        return True, None
 
     async def get_preview(self, device_id: str, kind: str) -> dict[str, Any] | None:
         async with self.engine.connect() as conn:
@@ -1154,10 +1390,22 @@ class TagStorage:
     # ── commands ──
 
     async def create_command(self, *, companion_id: str, kind: str, args: dict[str, Any],
-                             requested_by: str, ttl_s: float) -> dict[str, Any]:
+                             requested_by: str, ttl_s: float, dedupe: bool = False) -> dict[str, Any]:
+        """Queue a command. With ``dedupe`` (the profile-issued identify /
+        refresh), an identical command still queued is returned instead of a
+        second one, so repeated requests cannot flood the companion's queue."""
+        now = now_ms()
         async with self.engine.begin() as conn:
+            await begin_write(conn)
+            if dedupe:
+                for existing in (await conn.execute(select(COMMANDS).where(
+                    COMMANDS.c.companion_id == companion_id, COMMANDS.c.kind == kind,
+                    COMMANDS.c.status == "queued", COMMANDS.c.expires_at > now,
+                ))).all():
+                    if (existing.args or {}) == args:
+                        return command_json(existing)
             row = await insert_command(conn, companion_id=companion_id, kind=kind, args=args,
-                                       requested_by=requested_by, ttl_s=ttl_s, now=now_ms())
+                                       requested_by=requested_by, ttl_s=ttl_s, now=now)
         notify_commands([companion_id])
         return command_json(row)
 
@@ -1183,20 +1431,40 @@ class TagStorage:
         return [command_json(r) for r in rows]
 
     async def expire_commands(self, now: float | None = None) -> int:
+        """Expire queued commands past ``expires_at`` and claimed ones past it
+        plus :data:`CLAIMED_GRACE_MS` (the companion is working on them). A
+        ``clear_tag`` that expires while its tag still waits is re-queued
+        (bounded, see :func:`requeue_clear`)."""
         now = now or now_ms()
         async with self.engine.begin() as conn:
-            result = await conn.execute(update(COMMANDS).where(
-                COMMANDS.c.status.in_(COMMAND_ACTIVE), COMMANDS.c.expires_at <= now,
-            ).values(status="expired", completed_at=now))
-        return int(result.rowcount or 0)
+            await begin_write(conn)
+            expired = (await conn.execute(update(COMMANDS).where(or_(
+                (COMMANDS.c.status == "queued") & (COMMANDS.c.expires_at <= now),
+                (COMMANDS.c.status == "claimed") & (COMMANDS.c.expires_at + CLAIMED_GRACE_MS <= now),
+            )).values(status="expired", completed_at=now).returning(
+                COMMANDS.c.companion_id, COMMANDS.c.kind, COMMANDS.c.args,
+            ))).all()
+            for cmd in expired:
+                args = cmd.args if isinstance(cmd.args, dict) else {}
+                if cmd.kind == "clear_tag" and args.get("tag_id"):
+                    await requeue_clear(conn, cmd.companion_id, str(args["tag_id"]),
+                                        int(args.get("epoch") or 0), now)
+        if any(c.kind == "clear_tag" for c in expired):
+            notify_commands([c.companion_id for c in expired])
+        return len(expired)
 
     async def queued_commands(self, companion_id: str) -> list[dict[str, Any]]:
+        """The companion's queue: ownership commands (``assign_tag`` /
+        ``clear_tag``) first, then the rest, each oldest first."""
         now = now_ms()
         async with self.engine.connect() as conn:
             rows = (await conn.execute(select(COMMANDS).where(
                 COMMANDS.c.companion_id == companion_id, COMMANDS.c.status == "queued",
                 COMMANDS.c.expires_at > now,
-            ).order_by(COMMANDS.c.created_at.asc()).limit(50))).all()
+            ).order_by(
+                case((COMMANDS.c.kind.in_(("assign_tag", "clear_tag")), 0), else_=1),
+                COMMANDS.c.created_at.asc(),
+            ).limit(50))).all()
         return [dict(r._mapping) for r in rows]
 
     async def claim_command(self, companion_id: str, command_id: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -1219,28 +1487,71 @@ class TagStorage:
                                result: dict[str, Any] | None, error: str | None
                                ) -> tuple[dict[str, Any] | None, str | None]:
         """Record a command's result. Same status twice is a no-op; a
-        different terminal status is ``conflict``. A ``clear_tag`` that
-        succeeded at the tag's current epoch lifts ``clear_required``."""
+        different terminal status is ``conflict`` — except that a command
+        Cremind merely stopped waiting for (``expired``) still takes a late
+        result: the companion did the work.
+
+        ``clear_tag``: a success at the tag's current epoch lifts
+        ``clear_required``, and in the same transaction the owner's content
+        that was held meanwhile — the open cards (needs-input, health,
+        periodic, diagnostics) and whatever arrived since the claim — is
+        delivered to the tag, and the owner's periodic/diagnostics state is
+        reset so it is sent afresh. A failure while the tag still waits
+        re-queues the clear (bounded; then the device reads ``clear_failed``).
+        Locks: the owner's stream row, then the command, then the device."""
         now = now_ms()
+        lifted: list[str] = []
         async with self.engine.begin() as conn:
-            row = (await conn.execute(select(COMMANDS).where(
+            await begin_write(conn)
+            peek = (await conn.execute(select(COMMANDS).where(
                 COMMANDS.c.id == command_id, COMMANDS.c.companion_id == companion_id,
             ))).first()
-            if row is None:
+            if peek is None:
                 return None, "not_found"
-            if row.status in COMMAND_TERMINAL:
+            args = peek.args if isinstance(peek.args, dict) else {}
+            tag_id = str(args.get("tag_id") or "")
+            epoch = int(args.get("epoch") or 0)
+            device = None
+            if peek.kind == "clear_tag" and tag_id:
+                found = (await conn.execute(select(DEVICES.c.id).where(
+                    DEVICES.c.companion_id == companion_id, DEVICES.c.kind == "tag",
+                    DEVICES.c.hw_id == tag_id,
+                ))).scalar_one_or_none()
+                # The same order as claim / assign / release: owner's stream,
+                # device, then command rows.
+                device = await lock_device(conn, found, now) if found else None
+            row = (await conn.execute(select(COMMANDS).where(
+                COMMANDS.c.id == command_id).with_for_update())).first()
+            late = row.status == "expired"
+            if row.status in COMMAND_TERMINAL and not late:
                 return dict(row._mapping), (None if row.status == status else "conflict")
             await conn.execute(update(COMMANDS).where(COMMANDS.c.id == command_id).values(
                 status=status, result=_small(result) if result else None,
                 error=(error or None) and str(error)[:1000], completed_at=now,
             ))
-            args = row.args if isinstance(row.args, dict) else {}
-            if status == "succeeded" and row.kind == "clear_tag" and args.get("tag_id"):
-                await conn.execute(update(DEVICES).where(
-                    DEVICES.c.companion_id == companion_id, DEVICES.c.kind == "tag",
-                    DEVICES.c.hw_id == str(args["tag_id"]), DEVICES.c.epoch == int(args.get("epoch") or 0),
-                ).values(clear_required=False, updated_at=now))
+            if device is not None and status == "succeeded":
+                cleared = (await conn.execute(update(DEVICES).where(
+                    DEVICES.c.id == device.id, DEVICES.c.epoch == epoch,
+                    DEVICES.c.clear_required.is_(True),
+                ).values(clear_required=False, updated_at=now,
+                         status=case((DEVICES.c.status == "clear_failed", "assigning"),
+                                     else_=DEVICES.c.status))
+                .returning(*DEVICES.c))).first()
+                if cleared is not None and cleared.owner_profile and cleared.owner_profile == device.owner_profile:
+                    from app.tags.backfill import backfill_tag
+
+                    await merge_stream_state(conn, cleared.owner_profile,
+                                             lambda st: reset_content_state(st, cleared.id))
+                    await backfill_tag(conn, cleared.owner_profile, device_json(cleared), now,
+                                       since_ms=float(cleared.claimed_at or 0))
+                    lifted.append(cleared.owner_profile)
+            elif device is not None and status == "failed":
+                await requeue_clear(conn, companion_id, tag_id, epoch, now)
             row = (await conn.execute(select(COMMANDS).where(COMMANDS.c.id == command_id))).first()
+        if device is not None:
+            notify_commands([companion_id])
+        if lifted:
+            journal.wake()
         return dict(row._mapping), None
 
 
@@ -1267,11 +1578,23 @@ def _int(value: Any) -> int | None:
     return None
 
 
+_INT32 = (-(2 ** 31), 2 ** 31 - 1)
+
+
+def _bounded(value: Any, lo: int, hi: int) -> int | None:
+    """An int within ``[lo, hi]`` or ``None`` — companion data never reaches a
+    column it could overflow (one bad field must not fail a whole report)."""
+    number = _int(value)
+    if number is None or not lo <= number <= hi:
+        return None
+    return number
+
+
 def _inventory_values(kind: str, item: dict[str, Any]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     if isinstance(item.get("fw"), str):
         values["fw"] = item["fw"][:32]
-    if _int(item.get("board")) is not None:
+    if _bounded(item.get("board"), 0, 65535) is not None:
         values["board"] = item["board"]
     info: dict[str, Any] = {}
     if kind == "gateway":
@@ -1284,7 +1607,7 @@ def _inventory_values(kind: str, item: dict[str, Any]) -> dict[str, Any]:
                 info[key] = _small(item[key])
     else:
         for key in ("panel", "width", "height", "planes"):
-            if _int(item.get(key)) is not None:
+            if _bounded(item.get(key), 0, 65535) is not None:
                 values[key] = item[key]
     values["info"] = info
     return values

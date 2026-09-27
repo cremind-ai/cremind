@@ -254,20 +254,29 @@ def test_accepted_and_monotonic_receipts(client, setup, tagenv) -> None:
     def receipt(**kw):
         return client.post(f"{V1}/receipts", headers=h, json={"receipts": [{"delivery_id": did, **kw}]}).json()
 
-    assert receipt(stage="bridge_received", epoch=job["epoch"]) == {"applied": 1}
-    assert receipt(stage="companion_accepted") == {"applied": 0}  # never backwards
-    assert receipt(stage="refreshing", epoch=job["epoch"] + 5) == {"applied": 0}  # stale epoch
+    def rejected(reason):
+        return {"applied": 0, "rejected": [{"delivery_id": did, "reason": reason}]}
+
+    assert receipt(stage="bridge_received", epoch=job["epoch"]) == {"applied": 1, "rejected": []}
+    assert receipt(stage="companion_accepted") == {"applied": 0, "rejected": []}  # never backwards
+    assert receipt(stage="refreshing", epoch=job["epoch"] + 5) == rejected("epoch_mismatch")
     assert receipt(stage="displayed", outcome="displayed", revision=7, digest="abcd1234",
-                   at="2026-09-27T10:00:00Z", timing={"wake_ms": 1}) == {"applied": 1}
-    assert receipt(stage="displayed", outcome="displayed", revision=7) == {"applied": 0}  # idempotent
-    assert receipt(outcome="failed") == {"applied": 0}  # a terminal outcome is final
+                   at="2026-09-27T10:00:00Z", timing={"wake_ms": 1}) == {"applied": 1, "rejected": []}
+    # A repeat of the final receipt is a quiet no-op; another outcome is refused.
+    assert receipt(stage="displayed", outcome="displayed", revision=7) == {"applied": 0, "rejected": []}
+    assert receipt(outcome="failed") == rejected("terminal")
     assert stage(did) == "displayed"
     dev = run(tagenv.store.get_device(setup["tags"]["T1"]))
     assert dev["displayed_revision"] == 7 and dev["displayed_digest"] == "abcd1234"
     # Another profile's delivery is untouched by this credential.
     r = client.post(f"{V1}/receipts", headers=h,
-                    json={"receipts": [{"delivery_id": other["delivery_id"], "outcome": "failed"}]})
-    assert r.json() == {"applied": 0} and stage(other["delivery_id"]) == "queued"
+                    json={"receipts": [{"delivery_id": other["delivery_id"], "outcome": "failed"},
+                                       {"stage": "displayed"}]})
+    assert r.json() == {"applied": 0, "rejected": [
+        {"delivery_id": other["delivery_id"], "reason": "unknown"},
+        {"delivery_id": None, "reason": "invalid"},
+    ]}
+    assert stage(other["delivery_id"]) == "queued"
 
 
 def test_previews(client, setup, tagenv) -> None:

@@ -81,8 +81,10 @@ def test_a_chat_turn_journals_its_result(tagenv, runner) -> None:
     other = run(cs.create_conversation(profile="p2"))
     run(_turn(cs, conv["id"], "p1"))
     run(_turn(cs, other["id"], "p2"))
-    events = rows(tagenv, "SELECT profile, kind, payload FROM tag_events")
-    assert [(e["profile"], e["kind"]) for e in events] == [("p1", "assistant.result")]
+    events = rows(tagenv, "SELECT profile, kind, payload FROM tag_events ORDER BY seq")
+    assert [(e["profile"], e["kind"]) for e in events] == [
+        ("p1", "assistant.result"), ("p1", "chat.needs_input_resolved"),
+    ]
     payload = json.loads(events[0]["payload"])
     assert payload["title"] == "plan my trip to Hue"
     assert payload["excerpt"].startswith("Day 1: citadel")

@@ -108,6 +108,9 @@ def tagenv(request, tmp_path, monkeypatch):
     run(_pragmas())
     store = tag_storage.TagStorage(provider)
     monkeypatch.setattr(tag_storage, "_instance", store)
+    from app.tags import routing
+
+    routing.invalidate_admin_defaults()
     journal.invalidate_enabled_cache()
     journal.configure_standalone(None)
     journal.set_wake_callback(None)
@@ -117,6 +120,7 @@ def tagenv(request, tmp_path, monkeypatch):
     journal.configure_standalone(None)
     journal.set_wake_callback(None)
     journal.invalidate_enabled_cache()
+    routing.invalidate_admin_defaults()
     run(provider.dispose())
 
 

@@ -21,6 +21,15 @@ from app.storage._sync_base import SyncStorageBase
 from app.utils.logger import logger
 
 
+def _listener_name(working_dir: Optional[str]) -> str:
+    """The skill a listener belongs to, from its working directory
+    (``…/skills/<skill>/scripts`` → ``<skill>``)."""
+    parts = [p for p in str(working_dir or "").replace("\\", "/").split("/") if p]
+    if parts and parts[-1] == "scripts":
+        parts = parts[:-1]
+    return f"{parts[-1]} listener" if parts else "Autostart process"
+
+
 class AutostartStorage(SyncStorageBase):
     """Sync storage for autostart process registrations."""
 
@@ -152,14 +161,16 @@ class AutostartStorage(SyncStorageBase):
                 if not maybe:
                     conn.execute(text(sql), params)
                 else:
-                    row = conn.execute(text(sql + " RETURNING profile, command"), params).first()
+                    row = conn.execute(text(sql + " RETURNING profile, working_dir"), params).first()
                     if row is not None and journal.is_enabled_sync(engine, row.profile):
-                        from app.tags.sanitize import automation_failed_entry
+                        from app.tags.sanitize import autostart_failure, automation_failed_entry
 
-                        command = (row.command or "").strip()
+                        # A fixed summary and the listener's name: never the
+                        # process's output or its command line (either can
+                        # carry secrets), which is what ``error`` holds.
                         journal.append_sync(conn, row.profile, [automation_failed_entry(
-                            automation_kind="autostart", name=command[:60] or "Autostart process",
-                            error=error, source_id=id,
+                            automation_kind="autostart", name=_listener_name(row.working_dir),
+                            error=autostart_failure(error), source_id=id,
                         )])
                         journalled = True
         except Exception as exc:  # noqa: BLE001

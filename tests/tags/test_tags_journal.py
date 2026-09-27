@@ -151,8 +151,10 @@ def test_assistant_result_is_journalled_with_the_message(tagenv) -> None:
     conv = run(cs.create_conversation(profile="p1", title="Trip plan"))
     run(cs.add_message(conv["id"], "agent", "Here is the plan. Bearer abcdefghijklmnop123",
                        turn=TurnContext(profile="p1", conversation_title="Trip plan")))
-    events = rows(tagenv, "SELECT kind, payload, replace_key, source_id FROM tag_events WHERE profile='p1'")
-    assert [e["kind"] for e in events] == ["assistant.result"]
+    events = rows(tagenv, "SELECT kind, payload, replace_key, source_id FROM tag_events "
+                          "WHERE profile='p1' ORDER BY seq")
+    # A reply that asks nothing also retires any open "waiting for you" card.
+    assert [e["kind"] for e in events] == ["assistant.result", "chat.needs_input_resolved"]
     import json
 
     payload = json.loads(events[0]["payload"])

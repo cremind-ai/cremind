@@ -177,6 +177,21 @@ def _sync_engine_of(bind: Any) -> Engine:
 _ENABLED_QUERY = select(_SETTINGS.c.profile).where(_SETTINGS.c.enabled.is_(True))
 
 
+def _read_failed(key: tuple, exc: BaseException) -> frozenset[str]:
+    """A failed read. A database without the Tags tables (an old schema, a
+    test built from a few tables) really has nobody enabled, so that is
+    cached like a result; anything else (a dropped connection, a timeout) is
+    NOT cached — the next hook reads again instead of silently skipping every
+    profile's journal for the whole cache window."""
+    text = str(exc).lower()
+    if "no such table" in text or "does not exist" in text or "undefinedtable" in text:
+        logger.debug("[tags] no tag_settings table; journal disabled", exc_info=True)
+        return _store(key, frozenset())
+    logger.warning(f"[tags] enabled-profile read failed ({type(exc).__name__}: {exc}); "
+                   "skipping this journal entry, retrying on the next one")
+    return frozenset()
+
+
 async def enabled_profiles_async(bind: Any) -> frozenset[str]:
     """Profiles with Tags enabled on this database (cached for 5 s)."""
     key = _db_key(bind)
@@ -186,11 +201,9 @@ async def enabled_profiles_async(bind: Any) -> frozenset[str]:
     try:
         async with _async_engine_of(bind).connect() as conn:
             rows = (await conn.execute(_ENABLED_QUERY)).scalars().all()
-        value = frozenset(str(r) for r in rows)
-    except Exception:  # noqa: BLE001 — no table yet, or a transient failure
-        logger.debug("[tags] enabled-profile read failed; treating as none", exc_info=True)
-        value = frozenset()
-    return _store(key, value)
+    except Exception as exc:  # noqa: BLE001
+        return _read_failed(key, exc)
+    return _store(key, frozenset(str(r) for r in rows))
 
 
 def enabled_profiles_sync(bind: Any) -> frozenset[str]:
@@ -201,11 +214,9 @@ def enabled_profiles_sync(bind: Any) -> frozenset[str]:
     try:
         with _sync_engine_of(bind).connect() as conn:
             rows = conn.execute(_ENABLED_QUERY).scalars().all()
-        value = frozenset(str(r) for r in rows)
-    except Exception:  # noqa: BLE001
-        logger.debug("[tags] enabled-profile read failed; treating as none", exc_info=True)
-        value = frozenset()
-    return _store(key, value)
+    except Exception as exc:  # noqa: BLE001
+        return _read_failed(key, exc)
+    return _store(key, frozenset(str(r) for r in rows))
 
 
 async def is_enabled_async(bind: Any, profile: str | None) -> bool:
