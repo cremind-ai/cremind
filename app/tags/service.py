@@ -24,8 +24,8 @@ from sqlalchemy import select, update
 
 from app.storage.models import ProfileModel
 from app.tags import credentials as creds
-from app.tags.cards import ICONS, CardSpec, make_card
-from app.tags.sanitize import clean_text, contains_otp
+from app.tags.cards import ICONS, NON_CONTENT_KINDS, CardSpec, make_card
+from app.tags.sanitize import clean_multiline, clean_text, contains_otp
 from app.tags.storage import (
     ACTIVE_STAGES, DELIVERIES, DEVICES, STREAMS, cancel_device_deliveries, cancel_tag_commands,
     command_json, credential_json, delivery_json, device_json, get_tag_storage,
@@ -61,6 +61,55 @@ class TagError(Exception):
 
 def _ttl(kind: str) -> float:
     return COMMAND_TTL_S.get(kind, DEFAULT_COMMAND_TTL_S)
+
+
+NAME_MAX = 128
+
+
+def device_name(raw: Any) -> str:
+    """A device name: one line, 1..128 characters once stripped (422
+    ``invalid_name`` otherwise), with anything secret-looking redacted."""
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text or len(text) > NAME_MAX:
+        raise TagError(422, "invalid_name", f"'name' must be 1 to {NAME_MAX} characters.")
+    name = clean_text(text, NAME_MAX)
+    if not name:
+        raise TagError(422, "invalid_name", f"'name' must be 1 to {NAME_MAX} characters.")
+    return name
+
+
+async def rename_owned_tag(profile: str, device_id: str, raw_name: Any) -> dict[str, Any]:
+    """Rename one of ``profile``'s tags. Ownership (404 for anyone else's id,
+    whatever the body) and the name are checked before anything is written;
+    the UPDATE itself is also scoped to the owner and to tags."""
+    await owned_tag(profile, device_id)
+    name = device_name(raw_name)
+    device = await get_tag_storage().rename_device(device_id, name, owner=profile)
+    if device is None:
+        raise TagError(404, "device_not_found", "No tag with that id.")
+    return device
+
+
+async def rename_device(device_id: str, raw_name: Any) -> dict[str, Any]:
+    """Admin rename of any device."""
+    name = device_name(raw_name)
+    device = await get_tag_storage().rename_device(device_id, name)
+    if device is None:
+        raise TagError(404, "device_not_found", "No device with that id.")
+    return device
+
+
+async def forget_device(device_id: str) -> dict[str, Any]:
+    """Admin forget. A tag a profile owns must be released first (409
+    ``tag_owned``) so its screen is cleared and its epoch moves on."""
+    device, problem = await get_tag_storage().delete_device(device_id)
+    if problem == "not_found":
+        raise TagError(404, "device_not_found", "No device with that id.")
+    if problem == "tag_owned":
+        raise TagError(409, "tag_owned",
+                       f"The tag is owned by '{device['owner_profile']}'; release it first "
+                       "(POST /api/tags/hardware/tags/{id}/release).", device=device)
+    return device
 
 
 def _str_arg(args: dict[str, Any], key: str, *, required: bool = True, limit: int = 128) -> str | None:
@@ -225,11 +274,7 @@ async def claim_tag(device_id: str, *, owner: Any, bridge_id: Any = None, name: 
     owner = owner.strip()
     if bridge_id is not None and not isinstance(bridge_id, str):
         raise TagError(422, "invalid_bridge", "'bridge_id' must be a device id.")
-    new_name = None
-    if name is not None:
-        if not isinstance(name, str):
-            raise TagError(422, "invalid_name", "'name' must be a string.")
-        new_name = clean_text(name, 128)
+    new_name = device_name(name) if name is not None else None
     store = get_tag_storage()
     now = now_ms()
     async with store.engine.begin() as conn:
@@ -368,16 +413,17 @@ def _pinned_fields(body: dict[str, Any]) -> tuple[str, str | None, str, float]:
     if contains_otp(title) or contains_otp(text):
         raise TagError(422, "otp_refused",
                        "The text looks like it contains a one-time code; codes are never shown on a tag.")
-    return clean_text(title, 120), (clean_text(text, 400) if text else None), icon, float(ttl)
+    body_text = clean_multiline(text, 400) if text else ""
+    return clean_text(title, 120), (body_text or None), icon, float(ttl)
 
 
 async def display(profile: str, device_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Pin a note on one of the profile's tags (sanitised, OTP-checked)."""
+    """Pin a note on one of the profile's tags (sanitised, OTP-checked). The
+    title is one line; the body keeps its paragraphs. A tag still waiting for
+    its screen to be cleared answers 409 ``clear_pending`` — decided inside
+    the transaction that would write the delivery."""
     title, text, icon, ttl = _pinned_fields(body)
-    device = await owned_tag(profile, device_id)
-    if device["clear_required"]:
-        raise TagError(409, "clear_pending",
-                       "The tag's screen is still being cleared after a change of owner; try again shortly.")
+    await owned_tag(profile, device_id)
     from app.tags.routing import effective_options
 
     settings = await get_tag_storage().get_settings(profile)
@@ -420,6 +466,12 @@ async def _write_direct(profile: str, device_id: str, spec: CardSpec, now: float
         ))).first()
         if row is None:
             raise TagError(404, "device_not_found", "No tag with that id.")
+        # Under the stream-row lock and in the transaction that writes: a
+        # claim that landed after the caller's first read is seen here.
+        if spec.kind not in NON_CONTENT_KINDS and row.clear_required:
+            raise TagError(409, "clear_pending",
+                           "The tag's screen is still being cleared after a change of owner; "
+                           "try again shortly.")
         if cancel_first:
             await cancel_device_deliveries(conn, device_id, now, "cleared")
         written = await write_deliveries(conn, profile, [(device_json(row), spec, None)], now)

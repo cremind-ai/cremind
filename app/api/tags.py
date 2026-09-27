@@ -10,9 +10,12 @@ the connector's error shape work too).
 - ``GET    /api/tags``                          overview
 - ``GET    /api/tags/settings``                 own + admin-default + effective settings
 - ``PUT    /api/tags/settings``                 ``{enabled?, options?}`` (options replace own overrides)
+- ``PATCH  /api/tags/settings``                 ``{enabled?, options?}`` (options merge: ``null`` =
+  inherit again; ``routes`` merges per kind)
 - ``GET    /api/tags/devices/{id}``             ``{device, deliveries}`` (20 latest)
-- ``PATCH  /api/tags/devices/{id}``             ``{name}`` -> ``{device}``
+- ``PATCH  /api/tags/devices/{id}``             ``{name}`` (1..128 once stripped) -> ``{device}``
 - ``POST   /api/tags/devices/{id}/display``     ``{title, body?, icon?, ttl_s?}`` -> 201 ``{delivery}``
+  (title one line; body keeps its line breaks, blank-line runs collapsed)
 - ``POST   /api/tags/devices/{id}/clear``       -> 201 ``{delivery}``
 - ``POST   /api/tags/devices/{id}/refresh``     -> 202 ``{command}``
 - ``POST   /api/tags/devices/{id}/identify``    -> 202 ``{command}``
@@ -135,22 +138,31 @@ def get_tags_routes() -> list[Route]:
             return unauth
         return JSONResponse(await _settings_payload(request, _profile(request)))
 
+    async def _settings_body(request: Request):
+        body, err = await json_body(request)
+        if err is not None:
+            return None, None, err
+        unknown = [k for k in body if k not in ("enabled", "options")]
+        if unknown:
+            return None, None, error_response(
+                422, "invalid_settings", f"Unknown field(s): {', '.join(sorted(unknown))}.",
+                details={k: "unknown field" for k in unknown})
+        enabled = body.get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            return None, None, error_response(422, "invalid_settings", "'enabled' must be true or false.",
+                                              details={"enabled": "must be true or false"})
+        return body, enabled, None
+
     async def handle_put_settings(request: Request) -> JSONResponse:
+        """Full replace: a present ``options`` becomes the profile's whole
+        override set (``{}`` inherits everything)."""
         unauth = require_auth(request)
         if unauth is not None:
             return unauth
         profile = _profile(request)
-        body, err = await json_body(request)
+        body, enabled, err = await _settings_body(request)
         if err is not None:
             return err
-        unknown = [k for k in body if k not in ("enabled", "options")]
-        if unknown:
-            return error_response(422, "invalid_settings", f"Unknown field(s): {', '.join(sorted(unknown))}.",
-                                  details={k: "unknown field" for k in unknown})
-        enabled = body.get("enabled")
-        if enabled is not None and not isinstance(enabled, bool):
-            return error_response(422, "invalid_settings", "'enabled' must be true or false.",
-                                  details={"enabled": "must be true or false"})
         replace = "options" in body
         try:
             options = routing.normalize_options(body.get("options")) if replace else None
@@ -158,6 +170,31 @@ def get_tags_routes() -> list[Route]:
             return error_response(422, "invalid_settings", str(exc), details=exc.details)
         await store().save_settings(profile, enabled=enabled, options=options, replace_options=replace)
         logger.info(f"[tags] settings saved for {profile} (enabled={enabled}, options={replace})")
+        return JSONResponse(await _settings_payload(request, profile))
+
+    async def handle_patch_settings(request: Request) -> JSONResponse:
+        """Merge: only the ``options`` keys given change; ``null`` removes an
+        override (inherit again); ``routes`` merges per card kind."""
+        unauth = require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile(request)
+        body, enabled, err = await _settings_body(request)
+        if err is not None:
+            return err
+        patch = body.get("options") if "options" in body else None
+        if "options" in body and not isinstance(patch, dict):
+            return error_response(422, "invalid_settings", "'options' must be an object.",
+                                  details={"options": "must be an object"})
+        try:
+            await store().save_settings(
+                profile, enabled=enabled,
+                merge=(lambda current: routing.merge_options(current, patch)) if patch is not None else None,
+            )
+        except routing.SettingsError as exc:
+            return error_response(422, "invalid_settings", str(exc), details=exc.details)
+        logger.info(f"[tags] settings patched for {profile} (enabled={enabled}, "
+                    f"options={sorted(patch) if patch else []})")
         return JSONResponse(await _settings_payload(request, profile))
 
     async def handle_get_device(request: Request) -> JSONResponse:
@@ -184,15 +221,12 @@ def get_tags_routes() -> list[Route]:
         body, err = await json_body(request)
         if err is not None:
             return err
-        name = body.get("name")
-        if not isinstance(name, str) or len(name.strip()) > 128:
-            return error_response(422, "invalid_name", "'name' must be a string of at most 128 characters.")
-        from app.tags.sanitize import clean_text
+        from app.tags import service
 
-        device = await store().rename_device(request.path_params["device_id"], clean_text(name, 128),
-                                             owner=profile)
-        if device is None or device["kind"] != "tag":
-            return error_response(404, "device_not_found", "No tag with that id.")
+        try:
+            device = await service.rename_owned_tag(profile, request.path_params["device_id"], body.get("name"))
+        except TagError as exc:
+            return tag_error_response(exc)
         return JSONResponse({"device": device})
 
     async def handle_display(request: Request) -> JSONResponse:
@@ -372,6 +406,7 @@ def get_tags_routes() -> list[Route]:
         Route("/api/tags", handle_overview, methods=["GET"]),
         Route("/api/tags/settings", handle_get_settings, methods=["GET"]),
         Route("/api/tags/settings", handle_put_settings, methods=["PUT"]),
+        Route("/api/tags/settings", handle_patch_settings, methods=["PATCH"]),
         Route("/api/tags/devices/{device_id}", handle_get_device, methods=["GET"]),
         Route("/api/tags/devices/{device_id}", handle_patch_device, methods=["PATCH"]),
         Route("/api/tags/devices/{device_id}/display", handle_display, methods=["POST"]),

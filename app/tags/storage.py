@@ -25,7 +25,7 @@ import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -447,6 +447,47 @@ async def cancel_device_deliveries(conn: AsyncConnection, device_id: str, now: f
     return int(result.rowcount or 0)
 
 
+MAX_EPOCH = 2 ** 32 - 1  # the protocol's uint32
+_TAG_COMMAND_TTL_S = 7 * 24 * 3600.0
+
+
+def _reported_epoch(item: dict[str, Any]) -> int | None:
+    value = item.get("epoch")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_EPOCH:
+        return None
+    return value
+
+
+async def _raise_epoch(conn: AsyncConnection, row: Any, reported: int, now: float) -> int:
+    """The new epoch of a tag the companion reports at ``reported`` (above the
+    stored one). Work still owed under the old epoch — the owner's assignment,
+    a pending clear — is re-queued at ``reported + 1`` and the tag's active
+    deliveries move with it; otherwise the stored epoch simply becomes the
+    reported one."""
+    needs_assign = bool(row.owner_profile) and row.bridge_device_id is not None
+    needs_clear = bool(row.clear_required)
+    if not (needs_assign or needs_clear) or reported >= MAX_EPOCH:
+        return reported
+    epoch = reported + 1
+    await cancel_tag_commands(conn, row.companion_id, row.hw_id, now)
+    if needs_assign:
+        bridge_hw = (await conn.execute(
+            select(DEVICES.c.hw_id).where(DEVICES.c.id == row.bridge_device_id)
+        )).scalar_one_or_none()
+        if bridge_hw:
+            await insert_command(conn, companion_id=row.companion_id, kind="assign_tag",
+                                 args={"tag_id": row.hw_id, "bridge_hw_id": bridge_hw, "epoch": epoch},
+                                 requested_by="system", ttl_s=_TAG_COMMAND_TTL_S, now=now)
+    if needs_clear:
+        await insert_command(conn, companion_id=row.companion_id, kind="clear_tag",
+                             args={"tag_id": row.hw_id, "epoch": epoch},
+                             requested_by="system", ttl_s=_TAG_COMMAND_TTL_S, now=now)
+    await conn.execute(update(DELIVERIES).where(
+        DELIVERIES.c.tag_device_id == row.id, DELIVERIES.c.stage.in_(ACTIVE_STAGES),
+    ).values(epoch=epoch, updated_at=now))
+    return epoch
+
+
 # Long-poll wake-ups for ``GET commands?wait=``: one event per companion,
 # rebuilt when the running loop changes (tests run one loop per case).
 _command_events: dict[str, tuple[Any, asyncio.Event]] = {}
@@ -504,31 +545,35 @@ class TagStorage:
         return {"enabled": bool(row.enabled), "options": row.options or {}, "updated_at": row.updated_at}
 
     async def save_settings(self, profile: str, *, enabled: bool | None = None,
-                            options: dict[str, Any] | None = None, replace_options: bool = False) -> dict[str, Any]:
+                            options: dict[str, Any] | None = None, replace_options: bool = False,
+                            merge: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+                            ) -> dict[str, Any]:
         """Upsert a profile's settings. ``options`` replaces the stored
-        overrides when ``replace_options``; ``None`` leaves them. Enabling
-        makes sure the profile's stream row exists."""
+        overrides when ``replace_options``; ``merge`` maps the stored
+        overrides to new ones (a PATCH; it may raise to refuse, and nothing is
+        written); neither leaves them. The row is locked for the read, so two
+        concurrent merges cannot lose each other's keys. Enabling makes sure
+        the profile's stream row exists."""
         now = now_ms()
         async with self.engine.begin() as conn:
+            await conn.execute(journal.insert_ignore(_dialect(conn), SETTINGS, {
+                "profile": profile, "enabled": False, "options": {}, "updated_at": now,
+            }, ["profile"]))
             row = (await conn.execute(
-                select(SETTINGS).where(SETTINGS.c.profile == profile)
+                select(SETTINGS).where(SETTINGS.c.profile == profile).with_for_update()
             )).first()
-            new_enabled = bool(row.enabled) if row is not None else False
+            new_enabled = bool(row.enabled)
             if enabled is not None:
                 new_enabled = bool(enabled)
-            new_options = (row.options or {}) if row is not None else {}
+            new_options = dict(row.options or {})
             if replace_options:
                 new_options = dict(options or {})
-            if row is None:
-                await conn.execute(insert(SETTINGS), [{
-                    "profile": profile, "enabled": new_enabled,
-                    "options": new_options, "updated_at": now,
-                }])
-            else:
-                await conn.execute(
-                    update(SETTINGS).where(SETTINGS.c.profile == profile)
-                    .values(enabled=new_enabled, options=new_options, updated_at=now)
-                )
+            if merge is not None:
+                new_options = merge(new_options)
+            await conn.execute(
+                update(SETTINGS).where(SETTINGS.c.profile == profile)
+                .values(enabled=new_enabled, options=new_options, updated_at=now)
+            )
             if new_enabled:
                 await ensure_stream(conn, profile, now)
         journal.invalidate_enabled_cache()
@@ -736,9 +781,11 @@ class TagStorage:
         return device_json(row) if row is not None else None
 
     async def rename_device(self, device_id: str, name: str, *, owner: str | None = None) -> dict[str, Any] | None:
+        """Rename one device. With ``owner``, only a TAG that profile owns —
+        the condition is part of the UPDATE, so nothing else is ever written."""
         conds = [DEVICES.c.id == device_id]
         if owner is not None:
-            conds.append(DEVICES.c.owner_profile == owner)
+            conds += [DEVICES.c.owner_profile == owner, DEVICES.c.kind == "tag"]
         async with self.engine.begin() as conn:
             result = await conn.execute(update(DEVICES).where(*conds).values(name=name, updated_at=now_ms()))
             if not result.rowcount:
@@ -746,17 +793,36 @@ class TagStorage:
             row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == device_id))).first()
         return device_json(row)
 
-    async def delete_device(self, device_id: str) -> dict[str, Any] | None:
+    async def delete_device(self, device_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        """Forget a device. A tag a profile still owns is refused
+        (``tag_owned``): forgetting it would skip the release — no epoch bump,
+        no ``clear_tag`` — and leave the owner's last screen up. Returns
+        ``(device, None)``, ``(None, "not_found")`` or ``(device, "tag_owned")``."""
         async with self.engine.begin() as conn:
+            result = await conn.execute(delete(DEVICES).where(
+                DEVICES.c.id == device_id,
+                or_(DEVICES.c.kind != "tag", DEVICES.c.owner_profile.is_(None)),
+            ).returning(*DEVICES.c))
+            gone = result.first()
+            if gone is not None:
+                return device_json(gone), None
             row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == device_id))).first()
-            if row is None:
-                return None
-            await conn.execute(delete(DEVICES).where(DEVICES.c.id == device_id))
-        return device_json(row)
+        if row is None:
+            return None, "not_found"
+        return device_json(row), "tag_owned"
 
     async def upsert_inventory(self, companion_id: str, body: dict[str, Any]) -> list[dict[str, Any]]:
         """Upsert the gateways, bridges and tags a companion reports. Devices it
-        no longer reports are kept (a sleeping tag is not a removed tag)."""
+        no longer reports are kept (a sleeping tag is not a removed tag).
+
+        A tag may carry ``epoch``: the highest assignment epoch the companion
+        has used for it or learned from the tag (its handshake reports
+        ``stored_epoch``). The stored epoch never goes below it — a tag that was
+        forgotten and re-reported, or whose epoch a restore rewound, would
+        otherwise be assigned an epoch the tag refuses (``STALE_EPOCH``). When
+        the report is ahead of an epoch Cremind still has work queued under
+        (an owned tag's assignment, a pending clear), that work is re-queued
+        one epoch above the report, exactly as ``assign`` / ``release`` would."""
         now = now_ms()
         wanted: list[tuple[str, str, dict[str, Any]]] = []
         for kind, key, id_field in (("gateway", "gateways", "hw_id"), ("bridge", "bridges", "hw_id"),
@@ -775,28 +841,36 @@ class TagStorage:
                     select(DEVICES).where(DEVICES.c.companion_id == companion_id)
                 )).all()
             }
+            requeued = False
             for kind, hw_id, item in wanted:
                 values = _inventory_values(kind, item)
+                reported = _reported_epoch(item) if kind == "tag" else None
                 row = existing.get((kind, hw_id))
                 if row is None:
                     await conn.execute(insert(DEVICES), [{
                         "id": str(uuid.uuid4()), "companion_id": companion_id, "kind": kind,
                         "hw_id": hw_id, "name": "", "owner_profile": None, "bridge_device_id": None,
-                        "epoch": 0, "rotation": 0, "status": "unclaimed" if kind == "tag" else "ok",
+                        "epoch": reported or 0, "rotation": 0,
+                        "status": "unclaimed" if kind == "tag" else "ok",
                         "desired_revision": 0, "displayed_revision": 0, "clear_required": False,
                         "created_at": now, "updated_at": now, **values,
                     }])
-                else:
-                    info = dict(row.info or {})
-                    info.update(values.pop("info", {}) or {})
-                    await conn.execute(update(DEVICES).where(DEVICES.c.id == row.id)
-                                       .values(**values, info=info, updated_at=now))
+                    continue
+                info = dict(row.info or {})
+                info.update(values.pop("info", {}) or {})
+                if reported is not None and reported > int(row.epoch or 0):
+                    values["epoch"] = await _raise_epoch(conn, row, reported, now)
+                    requeued = requeued or values["epoch"] != reported
+                await conn.execute(update(DEVICES).where(DEVICES.c.id == row.id)
+                                   .values(**values, info=info, updated_at=now))
             await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == companion_id)
                                .values(last_seen_at=now, updated_at=now))
             rows = (await conn.execute(
                 select(DEVICES).where(DEVICES.c.companion_id == companion_id)
                 .order_by(DEVICES.c.kind.asc(), DEVICES.c.created_at.asc())
             )).all()
+        if requeued:
+            notify_commands([companion_id])
         return [device_json(r) for r in rows]
 
     # ── deliveries ──

@@ -115,6 +115,35 @@ def clean_text(text: Any, limit: int) -> str:
     return text
 
 
+_HSPACE = re.compile(r"[ \t\f\v ]+")
+
+
+def clean_multiline(text: Any, limit: int) -> str:
+    """Body text that keeps its paragraphs: line breaks stay, a run of blank
+    lines becomes one, trailing whitespace goes, runs of spaces inside a line
+    become one (leading indentation is kept, tabs as two spaces), and every
+    line is redacted on its own. At most ``limit`` characters."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    lines: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        raw = raw.rstrip()
+        body = raw.lstrip(" \t")
+        indent = raw[: len(raw) - len(body)].replace("\t", "  ")
+        line = redact(_HSPACE.sub(" ", body))
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        lines.append(indent + line)
+    while lines and lines[-1] == "":
+        lines.pop()
+    out = "\n".join(lines)
+    if len(out) > limit:
+        out = out[: max(0, limit - 1)].rstrip() + "…"
+    return out
+
+
 def excerpt(text: Any, limit: int = 280) -> str:
     """The excerpt policy: prose only — code blocks dropped, markdown and
     citation tokens stripped, secrets redacted, at most ``limit`` characters."""

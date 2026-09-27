@@ -14,10 +14,13 @@ owns which tag. Timestamps are epoch milliseconds; errors are ``{"error",
 - ``POST   /api/tags/hardware/tags/{id}/claim``             ``{owner, bridge_id?, name?}`` -> ``{device, commands}``
 - ``POST   /api/tags/hardware/tags/{id}/assign``            ``{bridge_id}`` -> ``{device, command}``
 - ``POST   /api/tags/hardware/tags/{id}/release``           -> ``{device, commands}``
-- ``PATCH  /api/tags/hardware/devices/{id}``                ``{name}`` -> ``{device}``
-- ``DELETE /api/tags/hardware/devices/{id}``                -> ``{deleted: true, device}``
+- ``PATCH  /api/tags/hardware/devices/{id}``                ``{name}`` (1..128 once stripped) -> ``{device}``
+- ``DELETE /api/tags/hardware/devices/{id}``                -> ``{deleted: true, device, last_epoch}``;
+  409 ``tag_owned`` (with ``device``) for a tag a profile owns — release it first
 - ``GET    /api/tags/hardware/defaults``                    -> ``{defaults, builtin}``
-- ``PUT    /api/tags/hardware/defaults``                    ``{defaults}`` -> ``{defaults, builtin}``
+- ``PUT    /api/tags/hardware/defaults``                    ``{defaults}`` (full replace) -> ``{defaults, builtin}``
+- ``PATCH  /api/tags/hardware/defaults``                    ``{defaults}`` (merge; ``null`` removes a
+  default, ``routes`` merges per kind) -> ``{defaults, builtin}``
 
 Command kinds an admin may queue directly: ``scan_unprovisioned {duration_s}``,
 ``provision_bridge {uuid, name?}``, ``configure_bridge {hw_id}``,
@@ -182,25 +185,23 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         body, err = await json_body(request)
         if err is not None:
             return err
-        name = body.get("name")
-        if not isinstance(name, str) or len(name.strip()) > 128:
-            return error_response(422, "invalid_name", "'name' must be a string of at most 128 characters.")
-        from app.tags.sanitize import clean_text
-
-        device = await store().rename_device(request.path_params["device_id"], clean_text(name, 128))
-        if device is None:
-            return error_response(404, "device_not_found", "No device with that id.")
+        try:
+            device = await service.rename_device(request.path_params["device_id"], body.get("name"))
+        except TagError as exc:
+            return tag_error_response(exc)
         return JSONResponse({"device": device})
 
     async def handle_delete_device(request: Request) -> JSONResponse:
         denied = require_admin(request)
         if denied is not None:
             return denied
-        device = await store().delete_device(request.path_params["device_id"])
-        if device is None:
-            return error_response(404, "device_not_found", "No device with that id.")
-        logger.info(f"[tags] device {device['id']} ({device['kind']} {device['hw_id']}) forgotten")
-        return JSONResponse({"deleted": True, "device": device})
+        try:
+            device = await service.forget_device(request.path_params["device_id"])
+        except TagError as exc:
+            return tag_error_response(exc)
+        logger.info(f"[tags] device {device['id']} ({device['kind']} {device['hw_id']}) forgotten "
+                    f"at epoch {device['epoch']}")
+        return JSONResponse({"deleted": True, "device": device, "last_epoch": device["epoch"]})
 
     async def handle_get_defaults(request: Request) -> JSONResponse:
         denied = require_admin(request)
@@ -215,6 +216,21 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         body, err = await json_body(request)
         if err is not None:
             return err
+        return await _write_defaults(body, routing.write_admin_defaults)
+
+    async def handle_patch_defaults(request: Request) -> JSONResponse:
+        denied = require_admin(request)
+        if denied is not None:
+            return denied
+        body, err = await json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body.get("defaults"), dict):
+            return error_response(422, "invalid_settings", "'defaults' must be an object.",
+                                  details={"defaults": "must be an object"})
+        return await _write_defaults(body, routing.patch_admin_defaults)
+
+    async def _write_defaults(body: dict, write) -> JSONResponse:
         cfg = config_storage
         if cfg is None:
             from app.runtime import get_state
@@ -223,7 +239,7 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         if cfg is None:
             return error_response(503, "storage_not_ready", "Storage is not ready yet.")
         try:
-            defaults = routing.write_admin_defaults(body.get("defaults"), cfg)
+            defaults = write(body.get("defaults"), cfg)
         except routing.SettingsError as exc:
             return error_response(422, "invalid_settings", str(exc), details=exc.details)
         return JSONResponse({"defaults": defaults, "builtin": routing.BUILTIN_DEFAULTS})
@@ -242,4 +258,5 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         Route("/api/tags/hardware/devices/{device_id}", handle_delete_device, methods=["DELETE"]),
         Route("/api/tags/hardware/defaults", handle_get_defaults, methods=["GET"]),
         Route("/api/tags/hardware/defaults", handle_put_defaults, methods=["PUT"]),
+        Route("/api/tags/hardware/defaults", handle_patch_defaults, methods=["PATCH"]),
     ]

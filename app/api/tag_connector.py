@@ -20,7 +20,17 @@ connector-api.md names the sentence ``detail``, the rest of Cremind
 Hardware credential (one companion):
 
 - ``GET  whoami`` (any kind) -> ``{credential_id, kind, companion_id, profile, api_version, server_time}``
-- ``POST inventory``  ``{gateways, bridges, tags}`` -> ``{devices, assignments}``
+- ``POST inventory``  ``{gateways, bridges, tags}`` -> ``{devices, assignments}``.
+  Each ``tags[]`` item may carry ``"epoch": <uint32>`` — the highest
+  assignment epoch the companion has used for that tag or learned from it
+  (the handshake's ``CHALLENGE.stored_epoch``). Cremind keeps
+  ``epoch = max(stored, reported)``, so a forgotten-then-re-reported tag, or
+  one whose epoch a restore rewound, is never assigned an epoch it refuses
+  (``STALE_EPOCH``). When the report is ahead of work Cremind still owes under
+  the old epoch (an owned tag's assignment, a pending clear), that work is
+  re-queued as ``assign_tag`` / ``clear_tag`` at ``reported + 1`` and the
+  ``assignments`` in the response carry the new epoch. Omitted, negative or
+  non-integer values are ignored.
 - ``POST heartbeat``  ``{companion, queue, devices}`` -> ``{server_time, commands_pending}``
 - ``GET  commands?wait=<s≤30>`` -> ``{commands}``; returns early when one is queued
 - ``POST commands/{id}/claim`` -> 200 the command object, or 409 ``already_claimed``

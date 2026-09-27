@@ -142,6 +142,33 @@ def normalize_options(raw: Any) -> dict[str, Any]:
     return out
 
 
+def merge_options(current: dict[str, Any] | None, patch: Any) -> dict[str, Any]:
+    """Merge a partial options object into ``current`` (a stored override
+    set). Keys given replace; ``null`` removes the override (inherit again);
+    ``routes`` merges per card kind the same way (``"routes": null`` drops
+    every route override). Validated exactly like a full write."""
+    if not isinstance(patch, dict):
+        raise SettingsError({"options": "must be an object"})
+    validated = normalize_options(patch)
+    out = copy.deepcopy(current or {})
+    for key, value in patch.items():
+        if value is None:
+            out.pop(key, None)
+        elif key == "routes":
+            routes = dict(out.get("routes") or {})
+            for kind, route in value.items():
+                if route is None:
+                    routes.pop(kind, None)
+            routes.update(validated.get("routes") or {})
+            if routes:
+                out["routes"] = routes
+            else:
+                out.pop("routes", None)
+        else:
+            out[key] = validated[key]
+    return out
+
+
 def read_admin_defaults() -> dict[str, Any]:
     """The admin's defaults (validated; a damaged value reads as none)."""
     try:
@@ -165,6 +192,12 @@ def write_admin_defaults(raw: Any, config_storage) -> dict[str, Any]:
     value = normalize_options(raw)
     config_storage.set("server_config", DEFAULTS_KEY, json.dumps(value, sort_keys=True))
     return value
+
+
+def patch_admin_defaults(patch: Any, config_storage) -> dict[str, Any]:
+    """Merge a partial object into the admin defaults (see
+    :func:`merge_options`); return the result."""
+    return write_admin_defaults(merge_options(read_admin_defaults(), patch), config_storage)
 
 
 def effective_options(own: dict[str, Any] | None, defaults: dict[str, Any] | None = None) -> dict[str, Any]:
