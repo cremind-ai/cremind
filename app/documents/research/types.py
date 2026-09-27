@@ -78,7 +78,7 @@ READ_NONE = "unread"
 UNREAD_REASONS = (
     "legacy_format", "encrypted", "awaiting_vision", "awaiting_consent", "over_cap", "too_large",
     "error", "placeholder", "metadata_only", "awaiting_extractor", "not_indexed_yet",
-    "budget", "time", "not_relevant",
+    "budget", "time", "not_relevant", "awaiting_ocr", "ocr_incomplete", "no_text", "gone",
 )
 
 # ── findings ──────────────────────────────────────────────────────────────
@@ -108,6 +108,15 @@ OUTCOME_REJECTED = "candidates_rejected"
 OUTCOME_EMPTY_SCOPE = "empty_scope"
 # Documents were read; no finding survived verification.
 OUTCOME_NO_FINDINGS = "no_verified_findings"
+# The document the question names was found, but its content cannot be read
+# yet (scanned pages waiting for OCR, still being indexed, encrypted…).
+OUTCOME_CONTENT_UNAVAILABLE = "content_unavailable"
+# The document was found and read only in part (pages still waiting for
+# OCR); no finding was verified in the part that could be read.
+OUTCOME_PARTLY_READABLE = "partly_readable"
+# A document the job selected or read changed or disappeared from the index
+# while the job ran, and nothing verified remains.
+OUTCOME_DOCUMENT_CHANGED = "document_changed"
 # A search or the model's structured answers failed.
 OUTCOME_RETRIEVAL_FAILED = "retrieval_failed"
 OUTCOME_MODEL_FAILED = "model_failed"
@@ -126,7 +135,8 @@ OUTCOME_RUNNING = "running"
 # opposed to a job stopped by a limit or a failure).
 INSUFFICIENT_OUTCOMES = frozenset({
     OUTCOME_INSUFFICIENT, OUTCOME_UNRESOLVED_INSTRUMENT, OUTCOME_NO_CANDIDATES, OUTCOME_UNREADABLE,
-    OUTCOME_REJECTED, OUTCOME_EMPTY_SCOPE, OUTCOME_NO_FINDINGS,
+    OUTCOME_REJECTED, OUTCOME_EMPTY_SCOPE, OUTCOME_NO_FINDINGS, OUTCOME_CONTENT_UNAVAILABLE,
+    OUTCOME_PARTLY_READABLE, OUTCOME_DOCUMENT_CHANGED,
 })
 OUTCOME_TEXT = {
     OUTCOME_EVIDENCED: "every issue has verified findings",
@@ -137,6 +147,10 @@ OUTCOME_TEXT = {
     OUTCOME_REJECTED: "candidate documents were found but none was a relevant legal document",
     OUTCOME_EMPTY_SCOPE: "the reference scope held no readable file",
     OUTCOME_NO_FINDINGS: "documents were read but no finding could be verified against them",
+    OUTCOME_CONTENT_UNAVAILABLE: "the document was found but its content cannot be read yet",
+    OUTCOME_PARTLY_READABLE: "the document was found but only part of it is readable, and that part yielded no "
+                             "verified finding",
+    OUTCOME_DOCUMENT_CHANGED: "a document the job was reading changed or disappeared from the index while it ran",
     OUTCOME_RETRIEVAL_FAILED: "a search failed",
     OUTCOME_MODEL_FAILED: "the research model's answers failed",
     OUTCOME_FAILED: "the job failed",
@@ -403,8 +417,8 @@ __all__ = [
     "Conflict", "CoverageRow", "DOMAINS", "DOMAIN_FINANCIAL", "DOMAIN_GENERAL", "DOMAIN_LEGAL", "Dossier",
     "Evidence", "FAILED", "FINAL", "Finding", "INSUFFICIENT_OUTCOMES", "INTERRUPTED", "IN_FORCE", "Issue", "JobView",
     "MODES", "MODE_ANALYZE", "MODE_COMPILE", "NEEDS_CLARIFICATION", "NEEDS_CONFIRMATION", "OUTCOME_BUDGET",
-    "OUTCOME_CANCELLED", "OUTCOME_COMPILED", "OUTCOME_EMPTY_SCOPE", "OUTCOME_EVIDENCED", "OUTCOME_FAILED",
-    "OUTCOME_INSUFFICIENT",
+    "OUTCOME_CANCELLED", "OUTCOME_COMPILED", "OUTCOME_CONTENT_UNAVAILABLE", "OUTCOME_DOCUMENT_CHANGED",
+    "OUTCOME_EMPTY_SCOPE", "OUTCOME_EVIDENCED", "OUTCOME_FAILED", "OUTCOME_INSUFFICIENT", "OUTCOME_PARTLY_READABLE",
     "OUTCOME_MODEL_FAILED", "OUTCOME_NO_CANDIDATES", "OUTCOME_NO_FINDINGS", "OUTCOME_REJECTED",
     "OUTCOME_RETRIEVAL_FAILED", "OUTCOME_RUNNING", "OUTCOME_TEXT", "OUTCOME_TIME", "OUTCOME_UNREADABLE",
     "OUTCOME_UNRESOLVED_INSTRUMENT", "Outcome", "PARTIAL", "PLANNING", "QUEUED", "READ_FULL", "READ_NONE",

@@ -330,6 +330,12 @@ def _file_line(n: int, row: dict[str, Any], issued: _Issued, leaf: str, tz: _dt.
             bits.append("no caption (too small: icon or thumbnail)")
     if row.get("status") in ("metadata_only", "awaiting_extractor", "error"):
         bits.append(f"content not indexed ({row.get('status_reason') or row.get('status')})")
+    else:
+        from app.documents.content import content_note
+
+        note = content_note(row)
+        if note:
+            bits.append(note)
     bits += extra
     return f"{n}. {_clean(row.get('name') or '')} {token} — " + " · ".join(b for b in bits if b)
 
@@ -724,6 +730,7 @@ def render_find(outcome: Any, ctx: RenderContext) -> Rendered:
         "mode_reason": outcome.mode_reason, "overview": outcome.overview, "filters": outcome.filters,
         "relaxed": outcome.relaxed, "notes": outcome.notes, "total": outcome.total, "page": outcome.page,
         "limit": outcome.limit, "sort": outcome.sort, "shown": n, "aggregate": outcome.aggregate,
+        "identity": list(getattr(outcome, "identity", None) or []),
         "items": [
             {
                 "kind": it.kind, "fid": it.row.get("cite_id"), "token": make_token(it.row["cite_id"]),
@@ -883,6 +890,15 @@ def render_read(outcome: Any, ctx: RenderContext) -> Rendered:
         head.append("stale: true")
     for note in outcome.notes:
         head.append(f"Note: {note}")
+    from app.documents.content import content_note
+
+    missing = content_note(row)
+    if missing:
+        head.append(f"Coverage: {missing} — what is not transcribed cannot be read or cited; say so rather than "
+                    "concluding the document lacks it.")
+    elif not outcome.body and row.get("status") == "indexed" and row.get("kind") == t.KIND_PDF:
+        head.append("Coverage: only the file's details are indexed (no text was extracted); say so rather than "
+                    "concluding the document lacks something.")
 
     def how_to(example: dict[str, str] | None) -> str:
         eg = ""

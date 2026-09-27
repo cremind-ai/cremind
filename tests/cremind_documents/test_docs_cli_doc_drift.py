@@ -1,16 +1,17 @@
 """Doc/code drift pin for `[cli]cremind docs.md`,
-`[cli]cremind docs search.md`, `[cli]cremind docs research.md` and
-`[cli]cremind docs drive.md`.
+`[cli]cremind docs search.md`, `[cli]cremind docs research.md`,
+`[cli]cremind docs drive.md` and `[cli]cremind docs inspect.md`.
 
 CLAUDE.md mandates that a CLI command and its bundled doc move in lockstep.
 This walks the nested Typer groups (`docs`, `docs excludes`,
 `docs admin`, `docs research`, `docs drive`, `docs drive
 folders`) so a new subcommand or flag cannot land undocumented. The query
 subcommands (`search`, `find`, `read`, `cite`), the research jobs
-(`research …`) and Google Drive indexing (`drive …`) live in their own docs —
-one reference per question a user asks ("set it up" vs "search my files" vs
-"research this folder" vs "index my Drive"), each small enough to be
-delivered whole.
+(`research …`), Google Drive indexing (`drive …`) and one file's index entry
+(`inspect`) live in their own docs — one reference per question a user asks
+("set it up" vs "search my files" vs "research this folder" vs "index my
+Drive" vs "why can't it read this file"), each small enough to be delivered
+whole.
 
 The ``description`` is the only text embedded into ``cremind_documentation_search``,
 so it must carry what users actually ask ("search my files", "index my
@@ -32,16 +33,19 @@ DOC = BUNDLED / "[cli]cremind docs.md"
 SEARCH_DOC = BUNDLED / "[cli]cremind docs search.md"
 RESEARCH_DOC = BUNDLED / "[cli]cremind docs research.md"
 DRIVE_DOC = BUNDLED / "[cli]cremind docs drive.md"
+INSPECT_DOC = BUNDLED / "[cli]cremind docs inspect.md"
 
 # Documented in SEARCH_DOC instead of DOC.
 SEARCH_COMMANDS = frozenset({"search", "find", "read", "cite"})
+# Documented in INSPECT_DOC instead of DOC.
+INSPECT_COMMAND = "inspect"
 # Every command of this group is documented in RESEARCH_DOC.
 RESEARCH_GROUP = "research"
 RESEARCH_COMMANDS = frozenset({"run", "status", "continue", "cancel", "list"})
 # Every command of this group (and its `folders` subgroup) is in DRIVE_DOC.
 DRIVE_GROUP = "drive"
 DRIVE_COMMANDS = frozenset({"status", "enable", "disable", "sync", "folders list", "folders set"})
-ALL_DOCS = [DOC, SEARCH_DOC, RESEARCH_DOC, DRIVE_DOC]
+ALL_DOCS = [DOC, SEARCH_DOC, RESEARCH_DOC, DRIVE_DOC, INSPECT_DOC]
 
 
 def _doc_text(doc: Path = DOC) -> str:
@@ -89,6 +93,8 @@ def _doc_for(path: str) -> Path:
         return DRIVE_DOC
     if parts[2] in SEARCH_COMMANDS and len(parts) == 3:
         return SEARCH_DOC
+    if parts[2] == INSPECT_COMMAND and len(parts) == 3:
+        return INSPECT_DOC
     return DOC
 
 
@@ -112,6 +118,7 @@ def test_every_subcommand_and_flag_is_documented():
                     if flag.startswith("--"):
                         assert flag in text, f"flag {flag} of `{path}` is undocumented"
     assert "cremind docs status" in seen
+    assert f"cremind docs {INSPECT_COMMAND}" in seen
     assert {f"cremind docs {c}" for c in SEARCH_COMMANDS} <= set(seen)
     assert {f"cremind docs research {c}" for c in RESEARCH_COMMANDS} <= set(seen)
     assert {f"cremind docs drive {c}" for c in DRIVE_COMMANDS} <= set(seen)
@@ -161,6 +168,25 @@ def test_the_search_doc_carries_what_users_ask():
     # The modes a result reports, and the citation token shape, are explained.
     for word in ("hybrid", "lexical_only", "catalog_only", "[doc:"):
         assert word in text
+
+
+def test_the_inspect_doc_carries_what_users_ask():
+    """Retrieval must find it for "why can't it read my scanned PDF" / "what
+    was indexed from this file", and the body must teach what a script cannot
+    guess: what FILE may be, the lookup failures, the stale restart, --json."""
+    description = _description(INSPECT_DOC).lower()
+    for keyword in ("own files", "inspect", "indexed", "metadata only", "scanned pdf", "ocr", "citation token",
+                    "--text", "--all", "not for cremind's own documentation"):
+        assert keyword in description, f"inspect doc description never mentions {keyword!r}"
+    text = _doc_text(INSPECT_DOC)
+    for word in ("[doc:k7m2xq9a#", "[ud:", "relative to the current directory", "Not in the indexed folder",
+                 "Excluded from indexing", "Not indexed yet", "Removed from the index",
+                 "Search my documents is off for this profile", "waiting for OCR", "starts over once",
+                 "cremind docs reindex", "cremind docs caption --consent-vision", "exits 1"):
+        assert word in text, f"inspect doc never explains {word!r}"
+    # The main doc points to it, and names it in its own description.
+    assert "cremind docs inspect" in _doc_text()
+    assert "`inspect`" in _description()
 
 
 def test_the_doc_covers_the_confirmation_trap():

@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN files with Documentation search via `cremind docs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`) — it always indexes the profile's own working directory (the admin changes that with `cremind profile working-dir`; accept a moved one with `confirm-root-change`), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind docs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind docs research`. Formerly `cremind userdocs`. Not for Cremind's own documentation (that is cremind_documentation_search)."
+description: "Search the user's OWN files with Documentation search via `cremind docs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`) — it always indexes the profile's own working directory (the admin changes that with `cremind profile working-dir`; accept a moved one with `confirm-root-change`), index Google Drive files too (`drive enable|disable|status|sync|folders`, see `cremind docs drive`), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), see what one file's index holds (`inspect`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Deep research across many files (compile a folder, legal or financial analysis) is `cremind docs research`. Formerly `cremind userdocs`. Not for Cremind's own documentation (that is cremind_documentation_search)."
 ---
 
 # `cremind docs` — Documentation search
@@ -264,6 +264,7 @@ Without flags, prints the current setting.
 
 ```bash
 cremind docs files [--status S] [--kind K] [--query TEXT] [--source local|drive|all] [--limit N] [--all]
+cremind docs inspect FILE [--text|--all]
 cremind docs activity [--limit N]
 cremind docs estimate [--wait]
 cremind docs storage
@@ -271,10 +272,11 @@ cremind docs storage
 
 `files --source drive` lists only Google Drive files (`Drive/…` paths).
 `files --status error` lists files that failed and why (`encrypted`,
-`timeout`, `too_large`, `permission_denied`, …); `metadata_only` files are
-indexed by name, type, size and dates only (executables, archives, media,
-secret-looking files). `activity` shows what changed, e.g. "report.docx — 3 of
-128 chunks re-embedded": only the edited parts of a document are re-embedded.
+`timeout`, `too_large`, …); `metadata_only` files are indexed by name, type,
+size and dates only. `inspect` shows what the index holds for one file
+(readable text, OCR pages, why content is missing): see
+**`cremind docs inspect`**. `activity` lists what changed (chunks
+re-embedded per file).
 `estimate` counts what a full sync would do (files by type, images to caption,
 index size, time). `storage` shows index size against the budget and free disk
 space; syncing pauses before the disk fills (deletions and search keep working).

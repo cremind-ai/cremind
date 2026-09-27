@@ -673,12 +673,13 @@ class DriveSource:
             self._next_poll_at = _now() + POLL_INTERVAL_S
         # Drive is working: files an older chunker cut differently are
         # re-read once (a no-op when there are none).
-        try:
-            requeue = getattr(self.rt, "queue_stale_chunking", None)
-            if requeue is not None:
-                requeue(SOURCE)
-        except Exception:  # noqa: BLE001 — never fails a sync that succeeded
-            logger.exception(f"[documents] {self.profile}: queueing Drive files for the new chunker failed")
+        for name in ("queue_stale_chunking", "queue_stale_extraction"):
+            try:
+                requeue = getattr(self.rt, name, None)
+                if requeue is not None:
+                    requeue(SOURCE)
+            except Exception:  # noqa: BLE001 — never fails a sync that succeeded
+                logger.exception(f"[documents] {self.profile}: {name} for Drive failed")
 
     # ── identity and account ───────────────────────────────────────────────
 
@@ -1370,6 +1371,10 @@ class DriveSource:
                 created_ts=None,
             )
         limits = dict(self.rt.service.extract_limits() or {})
+        ocr_limits = getattr(self.rt, "ocr_limits", None)
+        if ocr_limits is not None:
+            # A scan's next OCR batch: skip the pages already transcribed.
+            limits.update(ocr_limits(row, sha, kind))
         if export and kind == t.KIND_MARKDOWN:
             # Citations point into a converted document the user cannot open
             # as Markdown: locate by heading, and drop the export's escapes and
@@ -1408,18 +1413,22 @@ class DriveSource:
 
     def _same_content(self, row: dict[str, Any], sha: str, kind: str) -> bool:
         """The bytes are the ones indexed last time, that indexing succeeded
-        with today's extractor and chunker, and nothing (a caption) waits on
-        them: only the card may need refreshing."""
+        with today's extractor and chunker, and nothing (a caption, scanned
+        pages waiting for OCR) waits on them: only the card may need
+        refreshing."""
         from app.documents.chunking import CHUNKER_VERSION
-        from app.documents.extract import EXTRACTOR_VERSION
+        from app.documents.content import ocr_unfinished
+        from app.documents.extract import extractor_version
 
         reason = row.get("status_reason")
         return bool(
             sha and row.get("sha256") == sha
-            and row.get("extractor_version") == EXTRACTOR_VERSION and row.get("chunker_version") == CHUNKER_VERSION
+            and row.get("extractor_version") == extractor_version(kind)
+            and row.get("chunker_version") == CHUNKER_VERSION
             and not row.get("error") and row.get("indexed_at") and int(row.get("chunk_count") or 0) > 0
             and (reason is None or str(reason).startswith("partial:"))
             and (kind != t.KIND_IMAGE or row.get("caption_state") == "done")
+            and not ocr_unfinished(row.get("doc_meta"))
         )
 
     def _unchanged(self, db: Any, row: dict[str, Any], name: str, fields: dict[str, Any],

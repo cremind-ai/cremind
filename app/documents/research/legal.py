@@ -661,11 +661,22 @@ class Named:
     names: list[str]
     number: str | None = None
     year: int | None = None
+    # What the question wrote when ``number`` was completed by identity
+    # resolution ("Nghị định 165" → 165/2024/NĐ-CP, see app.documents.identity).
+    requested: str | None = None
 
     @property
     def label(self) -> str:
         base = next((n for n in self.names if n), "")
-        extra = self.number or (str(self.year) if self.year and str(self.year) not in base else "")
+        if self.requested and self.number:
+            # Completed by identity resolution: "Decree 165 (165/2024/NĐ-CP)".
+            return f"{self.requested} ({self.number})"
+        if self.number:
+            # "Nghị định 165" with number 165 is "Nghị định 165", not "… 165 165".
+            written = _squash(base)
+            extra = "" if _squash(self.number) in written or _number_written(self.number, base) else self.number
+        else:
+            extra = str(self.year) if self.year and str(self.year) not in base else ""
         return f"{base} {extra}".strip()
 
     def to_dict(self) -> dict[str, Any]:
@@ -673,7 +684,40 @@ class Named:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Named":
-        return cls(names=list(d.get("names") or []), number=d.get("number"), year=d.get("year"))
+        return cls(names=list(d.get("names") or []), number=d.get("number"), year=d.get("year"),
+                   requested=d.get("requested"))
+
+
+def _number_written(number: str, text: str) -> bool:
+    """Is ``number`` — a bare document number ("165") — already written in
+    ``text`` as a number of its own ("Nghị định 165", not "1650")?"""
+    num = str(number or "").strip()
+    return num.isdigit() and bool(re.search(rf"(?<![\d/]){re.escape(num)}(?![\d/])", text or ""))
+
+
+def number_matches(named: str | None, doc_number: str | None) -> bool:
+    """Does the number a question names match a document's? A complete
+    identifier only its equal; a bare number ("165", from "Decree 165") the
+    document's number component — never 1650/… (see
+    :mod:`app.documents.identity`)."""
+    if not named or not doc_number:
+        return False
+    if norm_number(named) == norm_number(doc_number):
+        return True
+    from app.documents import identity as ID
+
+    ref_parts = ID.parse_complete(named)
+    doc_parts = ID.parse_complete(doc_number)
+    if doc_parts is None:
+        return False
+    if ref_parts is not None:
+        return ref_parts.id == doc_parts.id
+    m = re.fullmatch(r"\s*(\d{1,4})\s*(?:/\s*((?:19|20)\d{2})\s*)?", str(named))
+    if not m:
+        return False
+    if int(m.group(1)) != doc_parts.num:
+        return False
+    return not m.group(2) or int(m.group(2)) == doc_parts.year
 
 
 _KW_BEFORE = re.compile(
@@ -828,7 +872,7 @@ def match_family(named: Named, fams: dict[str, list[LegalDoc]], *,
     for a law the question named."""
     if named.number:
         for key, members in fams.items():
-            if any(norm_number(m.number) == norm_number(named.number) for m in members):
+            if any(number_matches(named.number, m.number) for m in members):
                 return key
     best, score = _best_family(named.names, fams)
     if best is not None and score >= MATCH_MIN:
@@ -1000,7 +1044,7 @@ def select_editions(
         chosen: list[LegalDoc] = []
         for n in named_by_family.get(key, []):
             if n.number:
-                hit = [e for e in members if norm_number(e.number) == norm_number(n.number)]
+                hit = [e for e in members if number_matches(n.number, e.number)]
                 if not hit:
                     return ask("no_match", named=n)
                 chosen += [h for h in hit if h not in chosen]

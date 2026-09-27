@@ -990,23 +990,36 @@ class DocumentsService:
 
     def list_files(self, profile: str, *, status=None, kind=None, source=None, q=None,
                    after=None, limit: int = 100) -> dict[str, Any]:
+        from app.documents.inspect import summaries
+
         rt = self._require(profile)
         rows = rt.db.list_files(status=status, kind=kind, source=source, q=q, after=after, limit=limit)
-        files = [_file_view(r) for r in rows]
+        with rt.lock:
+            busy = set(rt.in_flight)
+        content = summaries(rt.db, rows, in_flight=busy)
+        files = [{**_file_view(r), "content": content.get(int(r["id"]))} for r in rows]
         nxt = {"rel_path": rows[-1]["rel_path"], "id": int(rows[-1]["id"])} if len(rows) == limit else None
         return {"files": files, "next": nxt, "counts": rt.db.count_by_status()}
 
     def file_detail(self, profile: str, fid: str) -> dict[str, Any]:
+        from app.documents import content as C
+
         rt = self._require(profile)
         row = rt.db.file_by_cite(str(fid).lower())
         if row is None:
             raise NotFound("No such file.")
         view = _file_view(row)
+        gen = C.active_gen(rt.db)
+        stats = C.chunk_stats(rt.db, [int(row["id"])], gen=gen).get(int(row["id"]))
+        with rt.lock:
+            busy = int(row["id"]) in rt.in_flight
         view.update({
             "doc_meta": row.get("doc_meta"), "exif": row.get("exif"), "error": row.get("error"),
             "attempts": row.get("attempts"), "first_seen_at": _ms(row.get("first_seen_at")),
             "taken_at": _ms(row.get("taken_at")), "doc_created_at": _ms(row.get("doc_created_at")),
             "source": row.get("source"),
+            "content": C.summarize(row, stats, in_flight=busy, gen=gen,
+                                   revision=C.file_revision(rt.db, int(row["id"]))),
         })
         return view
 

@@ -15,10 +15,19 @@ among a page's first or last two whose text (digits folded) recurs on at
 least 30% of pages are dropped.
 
 **Scanned pages.** A page with under 25 characters of text where images
-cover at least half the page is a scan. It is rendered with pypdfium2 at
-144 dpi (long side capped at 2400 px) and returned in ``ocr_pages`` for the
-vision model. Rendering happens here because the worker already holds the
-file and the parent must never parse a PDF.
+cover at least half the page is a scan. Every scan is listed in
+``doc_meta["scanned_pages"]`` (the whole inventory, whatever is rendered),
+the pages with text of their own in ``doc_meta["text_pages"]``. Scans are
+rendered with pypdfium2 at 144 dpi (long side capped at 2400 px) and returned
+in ``ocr_pages`` for the vision model — a *batch* of them: at most
+``max_ocr_pages`` pages and ``max_ocr_mb`` of images per extraction, skipping
+the pages the engine already has a transcription for (``limits["ocr_skip"]``),
+so a long scan is transcribed batch after batch rather than its first 50
+pages over and over. A batch limit is not a partial extraction: the pages
+left for later are the engine's to track. Without pypdfium2 nothing is
+rendered and ``doc_meta["ocr_renderer_missing"]`` says why. Rendering happens
+here because the worker already holds the file and the parent must never
+parse a PDF.
 
 **Encryption.** pdfminer opens files protected by an owner password only
 (the empty user password) by itself. A file that needs a user password is
@@ -205,35 +214,57 @@ def _drop_running_lines(pages: list[tuple[int, list[_Line]]]) -> None:
         pages[index] = (number, kept)
 
 
+def _ocr_skip(ctx: Ctx) -> set[int]:
+    raw = ctx.limits.get("ocr_skip") or ()
+    out: set[int] = set()
+    for p in raw if isinstance(raw, (list, tuple, set)) else ():
+        try:
+            out.add(int(p))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _render_ocr(ctx: Ctx, numbers: list[int]) -> None:
     ctx.result.doc_meta["scanned_pages"] = numbers
+    wanted = [n for n in numbers if n not in _ocr_skip(ctx)]
+    if not wanted:
+        return
     try:
         import pypdfium2 as pdfium
     except ImportError:
-        return  # scanned_pages still tells the engine what it could not read
+        # scanned_pages still tells the engine what it could not read.
+        ctx.result.doc_meta["ocr_renderer_missing"] = True
+        return
     cap = ctx.limit("max_ocr_pages")
     budget = ctx.limit("max_ocr_mb") * 1024 * 1024
     used = 0
     source: Any = ctx.req.data if ctx.req.data is not None else ctx.req.path
     doc = pdfium.PdfDocument(source)
+    failed: list[int] = []
     try:
-        for number in numbers:
+        for number in wanted:
             if len(ctx.result.ocr_pages) >= cap or used >= budget:
-                ctx.mark_partial()
-                break
-            page = doc[number - 1]
+                break  # the rest is the next batch
             try:
-                width, height = page.get_size()
-                scale = min(_OCR_DPI / 72.0, _OCR_MAX_SIDE / max(width, height, 1.0))
-                bitmap = page.render(scale=scale)
+                page = doc[number - 1]
                 try:
-                    buf = io.BytesIO()
-                    bitmap.to_pil().save(buf, format="PNG")
-                    png = buf.getvalue()
+                    width, height = page.get_size()
+                    scale = min(_OCR_DPI / 72.0, _OCR_MAX_SIDE / max(width, height, 1.0))
+                    bitmap = page.render(scale=scale)
+                    try:
+                        buf = io.BytesIO()
+                        bitmap.to_pil().save(buf, format="PNG")
+                        png = buf.getvalue()
+                    finally:
+                        bitmap.close()
                 finally:
-                    bitmap.close()
-            finally:
-                page.close()
+                    page.close()
+            except MemoryError:
+                raise
+            except Exception:  # noqa: BLE001 - one page that will not render must not stall the batches
+                failed.append(number)
+                continue
             used += len(png)
             ctx.result.ocr_pages.append({
                 "page": number,
@@ -242,6 +273,10 @@ def _render_ocr(ctx: Ctx, numbers: list[int]) -> None:
             })
     finally:
         doc.close()
+    if failed:
+        # Listed, so the engine reports them failed rather than waiting for a
+        # batch that would try (and fail) again forever.
+        ctx.result.doc_meta["ocr_unrenderable"] = failed
 
 
 def _emit_page(ctx: Ctx, number: int, lines: list[_Line], rank: dict[float, int]) -> None:
@@ -303,7 +338,7 @@ def extract_pdf(ctx: Ctx) -> None:
         ctx.result.doc_meta["pages"] = len(all_pages)
         max_pages = ctx.limit("max_pages")
         if len(all_pages) > max_pages:
-            ctx.mark_partial()
+            ctx.mark_partial("max_pages")
         budget = ctx.budget_left
         broken: list[int] = []
         for page in all_pages[:max_pages]:
@@ -323,10 +358,14 @@ def extract_pdf(ctx: Ctx) -> None:
             if budget <= 0:
                 ctx.mark_partial()
                 break
+        ctx.result.doc_meta["read_pages"] = (pages[-1][0] if pages else 0) if budget <= 0 else min(
+            len(all_pages), max_pages)
         if broken:
             ctx.result.doc_meta["unreadable_pages"] = broken
             ctx.mark_partial("corrupt")
     if scanned:
         _render_ocr(ctx, scanned)
     _drop_running_lines(pages)
+    scanned_set = set(scanned)
+    ctx.result.doc_meta["text_pages"] = [n for n, lines in pages if lines and n not in scanned_set]
     _emit(ctx, pages)

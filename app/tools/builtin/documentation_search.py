@@ -140,7 +140,10 @@ _FILTER_FIELDS: Dict[str, Dict[str, Any]] = {
         "type": "array", "items": {"type": "string"},
         "description": "Glob over the path inside the indexed folder, e.g. \"Clients/*/2025/**\" or \"*.pdf\".",
     },
-    "name_query": {"type": "string", "description": "Words that must all appear in the file name."},
+    "name_query": {"type": "string",
+                   "description": "Words that must all appear in the FILE NAME (strict: \"Decree 165\" does not "
+                                  "match ND-165-2024-CP.pdf). For a document named by title or number, call "
+                                  "find_files with query and pass the ids it returns as file_ids."},
     "types": {
         "type": "array", "items": {"type": "string", "enum": list(TYPE_NAMES)},
         "description": "File types. 'document' = PDF, Word, text/Markdown, slides, e-books, e-mails.",
@@ -186,7 +189,9 @@ class DocumentsFindFilesTool(BuiltInTool):
     description: str = (
         "Find the user's own files, folders or project folders by name, type, date, folder or "
         "what they are about — e.g. last week's photos, the spreadsheets in MKT-report, "
-        "the Python robot project from last year (kind=project). Without a query it lists "
+        "the Python robot project from last year (kind=project). A document named by its number "
+        "(\"Decree 165\", \"165/2024/NĐ-CP\") is identified exactly and listed first with its "
+        "appendix — use those ids afterwards. Without a query it lists "
         "what the filters select (newest first); `aggregate` counts them by type, folder, "
         "month or extension. Returns [doc:…] tokens; photos come back as thumbnails."
     )
@@ -323,9 +328,11 @@ class DocumentsResearchTool(BuiltInTool):
     name: str = LEAF_RESEARCH
     description: str = (
         "Deep research over the user's own files, run as a background job. mode=analyze answers a "
-        "legal, financial or compliance question: reads the case files in full, finds the governing "
-        "provisions in the reference files from several angles, picks the edition of each law in force, "
-        "and verifies every quote. mode=compile reads EVERY file in scope and builds one table (with a "
+        "legal, financial or compliance question — rights, obligations, applicability, conflicting "
+        "provisions, editions: reads the case files in full, identifies documents named by number, finds "
+        "the governing provisions in the reference files from several angles, picks the edition of each "
+        "law in force, and verifies every quote. (To summarize what one document covers, find, search and "
+        "read it instead.) mode=compile reads EVERY file in scope and builds one table (with a "
         "CSV), conflicts kept side by side. Returns a dossier with coverage (what was read, what was not "
         "and why) and [doc:…] tokens. A job takes minutes: a PRELIMINARY result means call again with "
         "continue_job; a question for the user is answered with continue_job and answers."
@@ -342,9 +349,9 @@ class DocumentsResearchTool(BuiltInTool):
             "domain": {"type": "string", "enum": ["legal", "financial", "general"],
                        "description": "legal: choose law editions explicitly, cite articles/clauses. "
                                       "financial: figures and periods. general (default)."},
-            "scope": _scope_schema("The primary files. analyze: the case files, read in full (default: none — "
-                                   "the question is the case). compile: the folder to compile (default: every "
-                                   "indexed file)."),
+            "scope": _scope_schema("The primary files. analyze: the case records, read in full (default: none — "
+                                   "the question is the case); a document may be both case and authority. "
+                                   "compile: the folder to compile (default: every indexed file)."),
             "reference_scope": _scope_schema("analyze only: restrict the authorities — laws, policies, standards "
                                              "— to these files (e.g. {\"folder\": [\"Luat\"]}). Leave it out "
                                              "unless the user named where they are: by default the job finds "

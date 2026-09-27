@@ -65,6 +65,8 @@ import re
 from typing import Any
 
 from app.tools.builtin.external_content import wrap_document_content
+from app.documents import content as C
+from app.documents import identity as ID
 from app.documents import types as t
 from app.documents.chunking import extract_refs
 from app.documents.cite import TOKEN_RE, locator_label
@@ -90,12 +92,15 @@ from app.documents.research.types import (
     NEEDS_CLARIFICATION,
     NEEDS_CONFIRMATION,
     OUTCOME_BUDGET,
+    OUTCOME_CONTENT_UNAVAILABLE,
+    OUTCOME_DOCUMENT_CHANGED,
     OUTCOME_EMPTY_SCOPE,
     OUTCOME_EVIDENCED,
     OUTCOME_INSUFFICIENT,
     OUTCOME_MODEL_FAILED,
     OUTCOME_NO_CANDIDATES,
     OUTCOME_NO_FINDINGS,
+    OUTCOME_PARTLY_READABLE,
     OUTCOME_REJECTED,
     OUTCOME_RETRIEVAL_FAILED,
     OUTCOME_RUNNING,
@@ -130,7 +135,9 @@ STATE_KEY = "analyze"
 # The shape of ``ctx.state["analyze"]``. A checkpoint of an older version is
 # migrated before the job goes on (see :meth:`_Analyze.migrate`).
 # 2: authorities discovered by topic; continuation of long provisions.
-STATE_VERSION = 2
+# 3: documents named by number resolved before discovery; a case file may be
+#    an authority too; scans awaiting OCR are unreadable, not "not legal".
+STATE_VERSION = 3
 # Part of every cache key: bump when a prompt or a tool schema changes.
 PROMPT_VERSION = 2
 
@@ -197,6 +204,10 @@ _OLD_DISCOVERY_TEXT = (
     "No provision with verified evidence was found for the issue:",
     "No legal document matching the instruments named was found",
     "No reference scope was given: the authorities were found by searching",
+    "Candidate documents were found, but none",
+    "The searches found no candidate document",
+    "The question names ",
+    "Edition status (in force",
 )
 
 
@@ -542,6 +553,67 @@ def relevance(query: str | list[str], text: str | set[str]) -> float:
     return sum(1 for tok in toks if tok in words) / len(toks)
 
 
+def _partial_why(row: dict[str, Any]) -> str:
+    """Why a readable file is read only in part: a size or page limit, or
+    scanned pages still waiting for OCR."""
+    if (row.get("status_reason") or "").startswith("partial"):
+        return "too_large"
+    return "ocr_incomplete"
+
+
+_UNREAD_TEXT = {
+    "awaiting_ocr": "its scanned pages are waiting for OCR",
+    "not_indexed_yet": "it is still being indexed",
+    "encrypted": "it is password-protected",
+    "error": "its extraction failed",
+    "awaiting_extractor": "a reader for its format is not installed",
+    "gone": "it is no longer in the index",
+}
+
+
+def _unread_text(row: dict[str, Any] | None) -> str:
+    """Why a file's content cannot be read, in words — with the page count
+    and the reason when scanned pages wait for OCR."""
+    why = _readiness(row)
+    if row is not None and why == "awaiting_ocr":
+        note = C.content_note(row)
+        if note:
+            return note
+    return _UNREAD_TEXT.get(why, why.replace("_", " "))
+
+
+def _pick_group(res: ID.Resolution, answer: str) -> ID.Resolution | None:
+    """The instrument of an ambiguous resolution the user picked — by one of
+    its files' fid or by its full number."""
+    want = answer.strip().lower()
+    m = re.search(r"\[?(?:doc|ud):\s*([0-9a-z]{8})", want)
+    if m:
+        want = m.group(1)
+    for g in res.groups:
+        fids = {str(f.get("fid") or "").lower() for f in g.get("files") or []}
+        if want in fids or ID.norm_id(want) == ID.norm_id(g.get("number")):
+            keep = {int(f["file_id"]) for f in g.get("files") or []}
+            files = [f for f in res.files if f.file_id in keep]
+            out = ID.Resolution(ref=res.ref, status=ID.RESOLVED, files=files)
+            main = next((f for f in files if not f.appendix), files[0] if files else None)
+            if main is not None:
+                out.number = main.parts.display()
+                out.label = main.label()
+            return out
+    return None
+
+
+def _readiness(row: dict[str, Any] | None) -> str:
+    """``readable`` / ``partial`` / an unread reason — how research's trace
+    records what a candidate's content allowed."""
+    if row is None:
+        return "gone"
+    why = unread_reason(row)
+    if why is not None:
+        return why
+    return "partial" if is_partial(row) else "readable"
+
+
 async def _bounded(coros: list[Any]) -> None:
     """Run ``coros`` (each bounded by its own semaphore) and stop them all
     at the first failure, re-raising it — a TimeUp or a Cancelled must not
@@ -648,6 +720,11 @@ class _Analyze:
             self._chunk_by_id.pop(int(c["id"]), None)
         self._rows.pop(fid, None)
         self.totals.pop(fid, None)
+        # The query engine's row cache goes with it: search results must not
+        # hand back the row as it was before the re-index.
+        forget = getattr(self.ctx.engine, "forget", None)
+        if forget is not None:
+            forget([fid])
 
     async def row(self, file_id: int) -> dict[str, Any] | None:
         fid = int(file_id)
@@ -712,6 +789,9 @@ class _Analyze:
             ctx.phase("Reading the case files")
             await self.read_primary(primary)
         self.issue_specs()
+        if self.legal:
+            ctx.phase("Identifying the documents named")
+            await self.resolve_identities(primary, references)
 
         search: list[str] | None = None
         if self.legal:
@@ -720,6 +800,10 @@ class _Analyze:
                 references = await self.discover(primary)
             ctx.phase("Choosing editions")
             search = await self.choose_editions(references)
+            recovered = await self.recover(references)
+            if recovered:
+                references = recovered
+                search = await self.choose_editions(references)
         elif references is not None:
             search = [r["cite_id"] for r in references if unread_reason(r) is None]
             self._empty_scope = not search
@@ -729,10 +813,44 @@ class _Analyze:
 
         ctx.phase("Researching issues")
         stopped = await self.research(search)
+        await self.check_consistency()
         await self.update_coverage(primary, references)
         self.finish(stopped)
         await self.save()
         return self.d
+
+    async def check_consistency(self) -> None:
+        """Before the dossier is delivered: every document this job selected
+        or read is looked up again. One that went away (or can no longer be
+        read) is recorded as read earlier and unavailable now; one whose
+        passages changed has its evidence re-checked (:meth:`revalidate`),
+        so no finding rests on a passage the index no longer holds."""
+        la = self.st.get("legal") or {}
+        disc = la.get("discovery") if isinstance(la.get("discovery"), dict) else {}
+        revisions: dict[str, str] = dict(disc.get("revisions") or {})
+        ids = {int(k) for k in (self.st.get("read") or {})} | {int(i) for i in disc.get("selected") or []}
+        if not ids:
+            return
+
+        def look() -> tuple[dict[int, dict[str, Any]], dict[int, str]]:
+            rows = self.db.files_by_ids(sorted(ids))
+            return rows, {fid: C.file_revision(self.db, fid) for fid in rows}
+
+        rows, now = await self.ctx.io(look)
+        changed = False
+        for fid in sorted(ids):
+            row = rows.get(fid)
+            if row is None or unread_reason(row) is not None:
+                self.vanished(fid, _readiness(row), revisions.get(str(fid)))
+                changed = True
+                continue
+            before = revisions.get(str(fid))
+            if before and now.get(fid) != before:
+                changed = True
+                self.note(f"{row.get('rel_path')} was re-indexed while this job ran; the evidence taken from it "
+                          "was checked against its current text.")
+        if changed:
+            await self.revalidate(final=True)
 
     # ── checkpoints: versions and what still holds ────────────────────────
 
@@ -747,15 +865,21 @@ class _Analyze:
         if not self.st:
             self.st["version"] = STATE_VERSION
             return
-        if int(self.st.get("version") or 1) >= STATE_VERSION:
+        version = int(self.st.get("version") or 1)
+        if version >= STATE_VERSION:
             return
         la = self.st.get("legal")
         if isinstance(la, dict):
-            for key in ("found", "search", "chosen", "why", "docs", "discovery"):
+            for key in ("found", "search", "chosen", "why", "docs", "discovery", "identity", "unresolved",
+                        "recovery", "vanished"):
                 la.pop(key, None)
         titles_with_findings = {i.title for i in self.d.issues if i.findings}
         for spec in self.st.get("issues") or []:
-            if spec.get("done") and not spec.get("seen") and spec.get("title") not in titles_with_findings:
+            if spec.get("done") and spec.get("title") not in titles_with_findings and (
+                    not spec.get("seen") or version < 3):
+                # Version 2 could close an issue having read the case file
+                # but never the decree it was about (a case file was never an
+                # authority): it is researched again. Findings stay.
                 spec.update(done=False, round=0, pending=[], asked=[], open=[])
         self.d.gaps = [g for g in self.d.gaps if not g.startswith(_OLD_DISCOVERY_TEXT)]
         self.d.notes = [n for n in self.d.notes if not n.startswith(_OLD_DISCOVERY_TEXT)]
@@ -763,12 +887,14 @@ class _Analyze:
         self.st["version"] = STATE_VERSION
         logger.info(f"[documents] research {self.ctx.job_id}: checkpoint migrated to version {STATE_VERSION}")
 
-    async def revalidate(self) -> None:
+    async def revalidate(self, *, final: bool = False) -> None:
         """A resumed job keeps the findings and facts whose evidence still
         points at a passage the index holds. A file re-chunked meanwhile
         (a new chunker, an edit) may have moved its passages: evidence into a
         passage that is gone is dropped, a finding left with none is dropped,
-        and its issue — or the case file — is read again."""
+        and its issue — or the case file — is read again. ``final``: the
+        check before delivery (:meth:`check_consistency`) — what it drops is
+        not read again in this run."""
         tokens = {e.token for f in self.d.facts for e in f.evidence}
         tokens |= {e.token for i in self.d.issues for f in i.findings for e in f.evidence}
         if not tokens:
@@ -828,8 +954,12 @@ class _Analyze:
         if isinstance(read, dict):
             for fid in stale_files:
                 read.pop(str(fid), None)
-        self.note(f"{len(stale)} piece(s) of evidence pointed at passages that changed since they were read "
-                  "(the file was re-indexed); the affected parts were read again.")
+        if final:
+            self.note(f"{len(stale)} piece(s) of evidence pointed at passages that changed or left the index after "
+                      "they were read; the findings resting on them were dropped.")
+        else:
+            self.note(f"{len(stale)} piece(s) of evidence pointed at passages that changed since they were read "
+                      "(the file was re-indexed); the affected parts were read again.")
         logger.info(f"[documents] research {self.ctx.job_id}: {len(stale)} stale evidence token(s) in "
                     f"{len(stale_files)} file(s); re-reading them")
 
@@ -865,8 +995,9 @@ class _Analyze:
                 clar.answer_keys = {"reference_folder": "the folder path to use for the reference scope"}
                 await self.save()
                 raise NeedsInput(clar, NEEDS_CLARIFICATION)
-            pids = {int(r["id"]) for r in primary}
-            references = [r for r in res.files if int(r["id"]) not in pids]
+            # A file may be both: a decree given as the case to summarise is
+            # also the authority its provisions are read from.
+            references = list(res.files)
             said += [("note", f"Reference scope: {n}") for n in res.notes]
             if not references:
                 said.append(("gap", "The reference scope matched no files."))
@@ -883,6 +1014,9 @@ class _Analyze:
         for n in refreshed.notes:
             self.note(n)
         if refreshed.changed:
+            forget = getattr(ctx.engine, "forget", None)
+            if forget is not None:
+                forget()
             primary, references, said = await self.scopes()
         for kind, text in said:
             (self.note if kind == "note" else self.gap)(text)
@@ -891,7 +1025,13 @@ class _Analyze:
         await self.update_coverage(primary, references)
 
         blocked = [(r, ROLE_PRIMARY) for r in primary] + [(r, ROLE_REFERENCE) for r in references or []]
-        blocked = [(r, role, unread_reason(r) or "too_large") for r, role in blocked
+        seen_ids: set[int] = set()
+        unique = []
+        for r, role in blocked:
+            if int(r["id"]) not in seen_ids:
+                seen_ids.add(int(r["id"]))
+                unique.append((r, role))
+        blocked = [(r, role, unread_reason(r) or _partial_why(r)) for r, role in unique
                    if unread_reason(r) is not None or is_partial(r)]
         if blocked and not _truthy(ctx.answers.get("confirm")):
             await self.save()
@@ -1150,10 +1290,98 @@ class _Analyze:
 
     def named(self) -> list[L.Named]:
         """The instruments the question names — as instruments: a document
-        number, or a law/decree/regulation by name. Never a topic."""
+        number, or a law/decree/regulation by name. Never a topic.
+
+        A short number the index resolved to one document ("Nghị định 165"
+        → 165/2024/NĐ-CP, see :meth:`resolve_identities`) is completed to
+        that document's full number — a deterministic match against the
+        user's own files, never the model's knowledge of which decree was
+        meant."""
         q = self.ctx.spec.question or ""
-        return L.merge_named(L.named_from_plan(q, (self.st.get("plan") or {}).get("instruments")),
-                             L.named_from_text(q))
+        named = L.merge_named(L.named_from_plan(q, (self.st.get("plan") or {}).get("instruments")),
+                              L.named_from_text(q))
+        resolved = [r for r in ((self.st.get("legal") or {}).get("identity") or {}).values()
+                    if r.get("status") == ID.RESOLVED and r.get("number")]
+        out: list[L.Named] = []
+        for n in named:
+            for r in resolved:
+                ref = r.get("ref") or {}
+                if n.number and not ID.parse_complete(n.number) and str(ref.get("num")) == str(n.number).strip():
+                    n = L.Named(names=n.names, number=r["number"], year=n.year, requested=n.label)
+                    break
+            out.append(n)
+        # A document the question names by number that the planner left out.
+        for r in resolved:
+            ref = r.get("ref") or {}
+            if any(n.number and L.number_matches(n.number, r["number"]) for n in out):
+                continue
+            out.append(L.Named(names=[str(ref.get("raw") or r["number"])], number=r["number"],
+                               requested=str(ref.get("raw") or "")))
+        return out
+
+    async def resolve_identities(self, primary: list[dict[str, Any]],
+                                 references: list[dict[str, Any]] | None) -> None:
+        """Resolve the documents the question (and the case files) name by
+        number — "Nghị định 165", "Decree 165 of 2024", "165/2024/NĐ-CP" —
+        against the index, before any search or relevance judgement
+        (:mod:`app.documents.identity`). An explicit reference scope keeps the
+        resolution inside it. Several distinct documents under one number
+        stop the job to ask which (``answers["document"]``: a fid or the full
+        number)."""
+        la = self.st.setdefault("legal", {})
+        if "identity" in la:
+            return
+        refs = ID.parse_refs(self.ctx.spec.question or "")
+        for inst in (self.st.get("case") or {}).get("instruments") or []:
+            text = f"{inst.get('name') or ''} {inst.get('number') or ''}".strip()
+            refs += [r for r in ID.parse_refs(text) if r.complete]
+        uniq: dict[tuple[Any, ...], ID.DocRef] = {}
+        for r in refs:
+            uniq.setdefault((r.parts.num, r.parts.year, r.parts.issuer, r.parts.kind), r)
+        if not uniq:
+            la["identity"] = {}
+            return
+        scope_ids = None
+        if references is not None:
+            scope_ids = [int(r["id"]) for r in references] + [int(r["id"]) for r in primary]
+        from app.documents.query.filters import hidden_sources
+
+        def run() -> list[ID.Resolution]:
+            return ID.resolve(self.db, list(uniq.values()), file_ids=scope_ids, hidden=hidden_sources(self.db))
+
+        sid = self.ctx.step(f"Identifying {len(uniq)} document(s) named by number", kind="search")
+        resolutions = await self.ctx.io(run)
+        answer = str(self.ctx.answers.get("document") or "").strip()
+        out: dict[str, Any] = {}
+        for res in resolutions:
+            if res.status == ID.AMBIGUOUS and answer:
+                picked = _pick_group(res, answer)
+                if picked is not None:
+                    res = picked
+            if res.status == ID.AMBIGUOUS:
+                self.ctx.done_step(sid, suffix=" — several documents match")
+                await self.save()
+                raise NeedsInput(Clarification(
+                    kind="document",
+                    question=(f"{res.ref.label!r} matches {len(res.groups)} different documents among the indexed "
+                              "files. Which one does the question mean?"),
+                    candidates=[{"number": g["number"], "label": g["label"],
+                                 "files": [{"fid": f["fid"], "rel_path": f["rel_path"]} for f in g["files"]]}
+                                for g in res.groups],
+                    answer_keys={"document": "the fid or the full number of the document meant"},
+                ), NEEDS_CLARIFICATION)
+            out[res.ref.label] = res.to_dict()
+        la["identity"] = out
+        found = sum(1 for r in out.values() if r["status"] == ID.RESOLVED)
+        self.ctx.done_step(sid, suffix=f" — {found} of {len(out)} identified")
+        for label, r in out.items():
+            if r["status"] == ID.RESOLVED:
+                files = ", ".join(f["rel_path"] + (" (appendix)" if f.get("appendix") else "") for f in r["files"])
+                self.note(f"{label} was identified as {r['label']} by its document number: {files}.")
+        logger.info(f"[documents] research {self.ctx.job_id}: identity "
+                    + "; ".join(f"{k} -> {v['status']} {v.get('number') or ''} "
+                                f"{[f['fid'] for f in v['files']]}" for k, v in out.items()))
+        await self.save()
 
     def topical_queries(self) -> list[str]:
         """Discovery's topical searches: each issue's queries, interleaved
@@ -1182,7 +1410,10 @@ class _Analyze:
             if n.number:
                 out.append((n.number, n.label))
             for nm in n.names[:2]:
-                out.append((f"{nm} {n.number or ''}".strip(), n.label))
+                # "Nghị định 165" already says its number: never "… 165 165".
+                written = not n.number or n.requested or L._number_written(n.number, nm) or \
+                    L.norm_number(n.number) in L.norm_number(nm)
+                out.append((nm.strip() if written else f"{nm} {n.number}".strip(), n.label))
         for inst in (self.st.get("case") or {}).get("instruments") or []:
             name, num = str(inst.get("name") or "").strip(), str(inst.get("number") or "").strip()
             if L.is_explicit_instrument([name], num or None):
@@ -1210,8 +1441,17 @@ class _Analyze:
         la = self.st.setdefault("legal", {})
         disc = la.get("discovery")
         if isinstance(disc, dict) and disc.get("done"):
-            rows = await ctx.io(self.db.files_by_ids, [int(i) for i in disc.get("selected") or []])
-            rows = [r for r in rows.values() if r is not None and unread_reason(r) is None]
+            wanted = [int(i) for i in disc.get("selected") or []]
+            found = await ctx.io(self.db.files_by_ids, wanted)
+            rows = []
+            for fid in wanted:
+                row = found.get(fid)
+                if row is None or unread_reason(row) is not None:
+                    # Selected earlier in this job, unavailable now: said so,
+                    # never passed off as a document that was never indexed.
+                    self.vanished(fid, _readiness(row), (disc.get("revisions") or {}).get(str(fid)))
+                    continue
+                rows.append(row)
             self.remember(rows)
             await self.load_totals([int(r["id"]) for r in rows])
             return rows
@@ -1221,6 +1461,35 @@ class _Analyze:
         named = self.named_queries()
         plan = [("topic", q, "") for q in topics] + [("named", q, label) for q, label in named]
         cands: dict[int, dict[str, Any]] = {}
+
+        def cand(fid: int, row: dict[str, Any] | None, source: str) -> dict[str, Any]:
+            c = cands.setdefault(fid, {"row": row, "topics": [], "labels": [], "hits": [], "sources": []})
+            if c["row"] is None and row is not None:
+                c["row"] = row
+            if source not in c["sources"]:
+                c["sources"].append(source)
+            return c
+
+        # 1. The documents the question names by number, resolved before any
+        # search or relevance judgement: they are read whatever a topical
+        # screen would say of them.
+        identity = la.get("identity") or {}
+        named_ids: dict[int, str] = {}
+        for label, res in identity.items():
+            if res.get("status") != ID.RESOLVED:
+                continue
+            for f in res.get("files") or []:
+                named_ids.setdefault(int(f["file_id"]), label)
+        if named_ids:
+            rows_by_id = await ctx.io(self.db.files_by_ids, list(named_ids))
+            for fid, label in named_ids.items():
+                c = cand(fid, rows_by_id.get(fid), "identity")
+                if label not in c["labels"]:
+                    c["labels"].append(label)
+        # 2. The case files: a decree given as the case (to summarise, to
+        # apply) is also where its provisions are read from.
+        for r in primary:
+            cand(int(r["id"]), r, "case")
         trace_queries: list[dict[str, Any]] = []
         failures = 0
         ran = 0
@@ -1247,7 +1516,7 @@ class _Analyze:
                     continue
                 fid = int(f["id"])
                 found.append(str(f.get("cite_id") or ""))
-                c = cands.setdefault(fid, {"row": f, "topics": [], "labels": [], "hits": []})
+                c = cand(fid, f, kind)
                 if kind == "topic" and q not in c["topics"]:
                     c["topics"].append(q)
                 if kind == "named" and label not in c["labels"]:
@@ -1258,7 +1527,9 @@ class _Analyze:
             trace_queries.append({"q": q[:200], "kind": kind, "mode": out.mode, "found": found})
         ctx.done_step(sid, ok=ran > 0 or not plan, suffix=f" — {len(cands)} candidate(s)")
 
-        order = list(cands)
+        # Resolved documents first: the candidate limit never cuts them.
+        order = sorted(cands, key=lambda f: 0 if "identity" in cands[f]["sources"] else 1)
+        order = [f for f in order if cands[f]["row"] is not None]
         truncated = len(order) > MAX_CANDIDATES
         order = order[:MAX_CANDIDATES]
         rejected: dict[str, str] = {}
@@ -1267,39 +1538,42 @@ class _Analyze:
         unreadable = 0
         # What identifies an instrument named — in the question, or by the
         # case files: its number, or its title's words.
-        numbers = {L.norm_number(n.number) for n in self.named() if n.number}
+        numbers = [n.number for n in self.named() if n.number]
         named_keys = [(n.label, [L.family_key(nm)[0] for nm in n.names]) for n in self.named()]
         for inst in (self.st.get("case") or {}).get("instruments") or []:
             name, num = str(inst.get("name") or "").strip(), str(inst.get("number") or "").strip()
             if num:
-                numbers.add(L.norm_number(num))
+                numbers.append(num)
             if name and not L.is_generic_title(name) and L.is_explicit_instrument([name], None):
                 named_keys.append((name, [L.family_key(name)[0]]))
+        unavailable_named: list[str] = []
         for fid in order:
             c = cands[fid]
             row = c["row"]
             cite = str(row.get("cite_id") or "")
-            if fid in pids:
-                rejected[cite] = "case_file"
-                continue
             why = unread_reason(row)
             if why is not None:
                 unreadable += 1
                 rejected[cite] = f"unreadable:{why}"
+                if "identity" in c["sources"]:
+                    unavailable_named.append(fid)
+                continue
+            if "identity" in c["sources"]:
+                selected[fid] = "identity"
                 continue
             doc = L.doc_from_index(row, await self.chunks(fid))
             if not doc.legal:
                 rejected[cite] = "not_legal"
                 continue
             # The instrument a search named: its number, or its title's words.
-            hit_number = bool(doc.number) and L.norm_number(doc.number) in numbers
+            hit_number = bool(doc.number) and any(L.number_matches(n, doc.number) for n in numbers)
             hit_name = not L.is_identity_key(doc.family) and any(
                 L.overlap(doc.family, k) >= L.MATCH_MIN for _label, keys in named_keys for k in keys if k)
             if hit_number or hit_name:
                 selected[fid] = "named"
                 continue
             if not c["hits"] and not c["topics"]:
-                rejected[cite] = "no_body_match"
+                rejected[cite] = "case_file_not_matched" if fid in pids else "no_body_match"
                 continue
             to_screen.append((fid, doc))
 
@@ -1333,17 +1607,34 @@ class _Analyze:
         for fid in selected:
             for label in cands[fid]["labels"]:
                 by_label.setdefault(label, []).append(str(cands[fid]["row"].get("cite_id") or ""))
+        # What each selected document was when it was chosen: a later check
+        # tells a document that changed or went away from one never found.
+        revisions = await ctx.io(lambda: {str(fid): C.file_revision(self.db, fid) for fid in selected})
         trace = {
             "queries": trace_queries,
             "rejected": rejected,
             "selected": {str(cands[fid]["row"].get("cite_id") or ""): how_ for fid, how_ in selected.items()},
             "screen": how,
             "truncated": truncated,
+            "identity": {label: {"status": r.get("status"), "number": r.get("number"),
+                                 "files": [f.get("fid") for f in r.get("files") or []]}
+                         for label, r in identity.items()},
+            "candidates": {
+                str(cands[fid]["row"].get("cite_id") or ""): {
+                    "file_id": fid, "sources": cands[fid]["sources"], "readiness": _readiness(cands[fid]["row"]),
+                    **({"revision": revisions[str(fid)]} if str(fid) in revisions else {}),
+                } for fid in order
+            },
         }
         la["discovery"] = {
             "done": True, "selected": list(selected), "named": by_label, "queries": ran, "failed": failures,
             "candidates": len(cands), "unreadable": unreadable, "truncated": truncated, "trace": trace,
+            "revisions": revisions, "unavailable_named": [int(f) for f in unavailable_named],
         }
+        for fid in unavailable_named:
+            row = cands[fid]["row"]
+            self.gap(f"{row.get('rel_path')} is the document the question names ({', '.join(cands[fid]['labels'])}), "
+                     f"but its content cannot be read yet ({_unread_text(row)}); it was not read.")
         shown = "; ".join(q for _k, q, _l in plan) or "(nothing)"
         self.note(f"No reference scope was given: the authorities were found by searching all indexed documents "
                   f"({ran} search(es): {shown}) — {len(cands)} candidate document(s), {len(selected)} selected.")
@@ -1353,9 +1644,9 @@ class _Analyze:
         if not selected:
             if not cands:
                 self.gap("The searches found no candidate document for the question among the indexed documents.")
-            elif unreadable and unreadable == len([f for f in order if f not in pids]):
+            elif unreadable and unreadable == len(order):
                 self.gap("Candidate documents were found, but none of them could be read.")
-            else:
+            elif not unavailable_named:
                 self.gap("Candidate documents were found, but none was a relevant legal document.")
         reasons: dict[str, int] = {}
         for r in rejected.values():
@@ -1366,6 +1657,112 @@ class _Analyze:
         await self.load_totals([int(r["id"]) for r in rows])
         await self.save()
         return rows
+
+    def _found_unreadable(self, n: L.Named) -> bool:
+        """``n`` was identified in the index (by number), but none of its
+        files could be read (scanned pages awaiting OCR, still indexing)."""
+        la = self.st.get("legal") or {}
+        disc = la.get("discovery") if isinstance(la.get("discovery"), dict) else {}
+        blocked = {int(f) for f in disc.get("unavailable_named") or []}
+        for r in (la.get("identity") or {}).values():
+            if r.get("status") != ID.RESOLVED or not n.number or not L.number_matches(n.number, r.get("number")):
+                continue
+            ids = {int(f["file_id"]) for f in r.get("files") or []}
+            if ids and (ids <= blocked or not disc):
+                return True
+        return False
+
+    def vanished(self, file_id: int, readiness: str, revision: str | None) -> None:
+        """A document this job selected or read is no longer readable in the
+        index (removed, being re-indexed, emptied): recorded as such — in the
+        gaps and the trace — never as a document that was not found."""
+        la = self.st.setdefault("legal", {})
+        gone = la.setdefault("vanished", {})
+        key = str(int(file_id))
+        if key in gone:
+            return
+        row = self._rows.get(int(file_id)) or {}
+        name = row.get("rel_path") or f"file #{int(file_id)}"
+        gone[key] = {"rel_path": row.get("rel_path"), "fid": row.get("cite_id"), "readiness": readiness,
+                     "revision": revision}
+        what = "is being re-indexed" if readiness == "not_indexed_yet" else (
+            "is no longer in the index" if readiness == "gone" else f"can no longer be read ({readiness})")
+        self.gap(f"{name} was selected earlier in this job but {what}; it was not read again.")
+        logger.info(f"[documents] research {self.ctx.job_id}: selected file {file_id} unavailable now "
+                    f"({readiness}, revision {revision})")
+
+    async def recover(self, references: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """One bounded second chance for documents the question names that
+        no authority stands for yet: refresh what this run cached, resolve
+        their identity again from the index as it is now (within an explicit
+        reference scope), and hand back the references with any newly
+        readable match added — the caller then chooses editions again and
+        the normal research and findings verification follow. None when
+        there is nothing to recover (or it was tried already)."""
+        la = self.st.setdefault("legal", {})
+        unresolved = list(la.get("unresolved") or [])
+        disc = la.get("discovery") if isinstance(la.get("discovery"), dict) else {}
+        blocked = {int(f) for f in disc.get("unavailable_named") or []}
+        # Named documents found earlier whose content could not be read then
+        # (still indexing, say) get their second look too.
+        waiting = [label for label, r in (la.get("identity") or {}).items()
+                   if r.get("status") == ID.RESOLVED and blocked
+                   and {int(f["file_id"]) for f in r.get("files") or []} <= blocked]
+        targets = list(dict.fromkeys(unresolved + waiting))
+        if not targets or la.get("recovery"):
+            return None
+        la["recovery"] = {"tried": targets}
+        refs: list[ID.DocRef] = []
+        for label in targets:
+            refs += ID.parse_refs(label)
+        if not refs:
+            await self.save()
+            return None
+        for fid in list(self._rows):
+            self.forget(fid)
+        forget = getattr(self.ctx.engine, "forget", None)
+        if forget is not None:
+            forget()
+        scope_ids = [int(r["id"]) for r in references] if _has_filters(self.ctx.spec.reference_scope) and \
+            references is not None else None
+        from app.documents.query.filters import hidden_sources
+
+        resolutions = await self.ctx.io(
+            lambda: ID.resolve(self.db, refs, file_ids=scope_ids, hidden=hidden_sources(self.db)))
+        have = {int(r["id"]) for r in references or []}
+        added: list[dict[str, Any]] = []
+        for res in resolutions:
+            if res.status != ID.RESOLVED:
+                continue
+            rows = await self.ctx.io(self.db.files_by_ids, [f.file_id for f in res.files])
+            for f in res.files:
+                row = rows.get(f.file_id)
+                if row is None or f.file_id in have or unread_reason(row) is not None:
+                    continue
+                added.append(row)
+                have.add(f.file_id)
+            la.setdefault("identity", {})[res.ref.label] = res.to_dict()
+        la["recovery"]["added"] = [str(r.get("cite_id") or "") for r in added]
+        await self.save()
+        if not added:
+            return None
+        # Editions are chosen again with them: what the first choice said of
+        # the names it could not match — or of their content — no longer holds.
+        paths = [str(r.get("rel_path") or "") for r in added]
+        self.d.gaps = [g for g in self.d.gaps if not g.startswith("The question names ")
+                       and not ("cannot be read yet" in g and any(p and g.startswith(p) for p in paths))]
+        disc = la.get("discovery")
+        if isinstance(disc, dict):
+            got = {int(r["id"]) for r in added}
+            disc["unavailable_named"] = [f for f in disc.get("unavailable_named") or [] if int(f) not in got]
+            disc["selected"] = list(dict.fromkeys([*(disc.get("selected") or []), *sorted(got)]))
+            revs = await self.ctx.io(lambda: {str(f): C.file_revision(self.db, f) for f in got})
+            disc.setdefault("revisions", {}).update(revs)
+        self.note(f"A second look at the index found {len(added)} readable document(s) for what the question "
+                  "names; they were added to the authorities.")
+        self.remember(added)
+        await self.load_totals([int(r["id"]) for r in added])
+        return list(references or []) + added
 
     async def screen(self, items: list[tuple[int, L.LegalDoc]], cands: dict[int, dict[str, Any]],
                      topics: list[str]) -> tuple[dict[int, bool], str]:
@@ -1497,6 +1894,10 @@ class _Analyze:
         for n in named:
             lo = None if loose is None else loose.get(n.label, set())
             if L.match_family(n, fams, loose=lo) is None:
+                if self._found_unreadable(n):
+                    # Found — its content is what is missing, and the gaps
+                    # say so; it is not "not among the documents".
+                    continue
                 unresolved.append(n.label)
                 if not (n.year or n.number):
                     self.gap(f"The question names {n.label}, but no document of it was found among the indexed "
@@ -1956,13 +2357,23 @@ class _Analyze:
         prev = self.d.outcome
         out = Outcome(reason=reason or (prev.reason if prev else OUTCOME_RUNNING),
                       detail=detail if detail is not None else (prev.detail if prev else ""))
-        disc = (self.st.get("legal") or {}).get("discovery")
+        la = self.st.get("legal") or {}
+        disc = la.get("discovery")
+        trace: dict[str, Any] = {}
         if isinstance(disc, dict):
             out.queries = int(disc.get("queries") or 0)
             out.candidates = int(disc.get("candidates") or 0)
             out.selected = len(disc.get("selected") or [])
             out.stopped_early = bool(disc.get("truncated"))
-            out.trace = disc.get("trace")
+            trace.update(disc.get("trace") or {})
+        elif la.get("identity"):
+            trace["identity"] = {label: {"status": r.get("status"), "number": r.get("number"),
+                                         "files": [f.get("fid") for f in r.get("files") or []]}
+                                 for label, r in la["identity"].items()}
+        for key in ("vanished", "recovery"):
+            if la.get(key):
+                trace[key] = la[key]
+        out.trace = trace or None
         read = self.st.get("read") or {}
         primary_read = {int(w["file_id"]) for w in ((self.st.get("primary") or {}).get("windows") or {}).values()
                         if w.get("ok")}
@@ -1985,11 +2396,17 @@ class _Analyze:
         documents read yielded none."""
         la = self.st.get("legal") or {}
         disc = la.get("discovery")
+        read = {int(k) for k, v in (self.st.get("read") or {}).items() if v}
         if self._empty_scope:
             return OUTCOME_EMPTY_SCOPE
+        if la.get("vanished") and not (read - {int(k) for k in la["vanished"]}):
+            # What was selected (or read) went away: not "never found".
+            return OUTCOME_DOCUMENT_CHANGED
         if isinstance(disc, dict) and disc.get("done") and not disc.get("selected"):
             if not disc.get("queries") and disc.get("failed"):
                 return OUTCOME_RETRIEVAL_FAILED
+            if disc.get("unavailable_named"):
+                return OUTCOME_CONTENT_UNAVAILABLE
             if not disc.get("candidates"):
                 return OUTCOME_NO_CANDIDATES
             rejected = (disc.get("trace") or {}).get("rejected") or {}
@@ -1999,6 +2416,8 @@ class _Analyze:
             return OUTCOME_REJECTED
         if self._findings_failed and not self._findings_ok:
             return OUTCOME_MODEL_FAILED
+        if any(is_partial(self._rows[f]) for f in read if f in self._rows):
+            return OUTCOME_PARTLY_READABLE
         return OUTCOME_NO_FINDINGS
 
     def finish(self, stopped: str | None) -> None:

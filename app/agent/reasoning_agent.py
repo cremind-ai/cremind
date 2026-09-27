@@ -1209,10 +1209,13 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
     read = fn("read") if "read" in leaves else "the read function"
     if "research" in leaves:
         research = (
-            f"Legal, financial or compliance questions, and requests to compile everything in a "
-            f"folder, MUST go through {fn('research')} — never conclude from snippets; if it "
-            "reports status 'running', call it again with continue_job before answering. Leave "
-            "reference_scope out unless the user named the folder or file of the law: without it the "
+            f"Questions of rights, obligations, applicability, conflicting provisions or which edition "
+            f"applies — legal, financial or compliance — and requests to compile everything in a folder, "
+            f"MUST go through {fn('research')} — never conclude from snippets; if it reports status "
+            "'running', call it again with continue_job before answering. To summarize or explain what a "
+            f"document covers, find it, search and read it with {read} instead and answer with its "
+            "citations. In research, scope is the case records and reference_scope the governing laws; "
+            "leave reference_scope out unless the user named the folder or file of the law: without it the "
             "job finds the governing documents across their index itself. Answer only from its "
             "verified findings, and never tell the user an indexed document is missing or ask them to "
             "upload it again."
@@ -1236,8 +1239,11 @@ def _build_documentation_search_guidance(tools, disabled: Optional[Mapping[str, 
         "difference between them to the file it comes from, and say so when a relevant file could "
         "not be read; never state that a file does not cover something unless you read that part of "
         "it. When the user limits the question to one file or folder, put that in filters "
-        "— name_query or path_glob for a file they name, file_ids for one from earlier results, "
-        "folder for a folder — and stay within it. "
+        "— name_query or path_glob for a file they name by its file name, file_ids for one from "
+        "earlier results, folder for a folder — and stay within it. A document named by its title or "
+        f"number (\"Decree 165\") is identified with {fn('find_files') if has('find_files') else 'find_files'}"
+        " query first — it lists that document and its appendix — then pass their ids as file_ids; "
+        "name_query matches file names only. "
     )
     body = (
         "USER DOCUMENTS — THE USER'S OWN FILES: " + ", ".join(own) + " search and read the files "

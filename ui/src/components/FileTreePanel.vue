@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
+import { useIndexStatusStore } from '../stores/indexStatus';
 import {
   listDirectory,
   watchDirectory,
@@ -17,9 +18,54 @@ import {
 import FileTreeNode from './FileTreeNode.vue';
 import FileGridView from './FileGridView.vue';
 import CwdBreadcrumb from './CwdBreadcrumb.vue';
+import IndexedContentView from './documents/IndexedContentView.vue';
+import {
+  INDEXED_CONTENT_OPENER,
+  type IndexedContentTarget,
+} from './documents/indexedContentContext';
 
 const settings = useSettingsStore();
 const panel = useTerminalPanelStore();
+const indexStatus = useIndexStatusStore();
+
+// ---- "Indexed content" pane ----
+//
+// A file's index status button opens what the index holds for it here, in
+// place of the tree body. The tree stays mounted underneath (v-show), so Back
+// finds its expanded folders, selection and directory as they were; only the
+// scroll position is lost by hiding it, so it is kept and put back.
+const treeBodyEl = ref<HTMLElement | null>(null);
+const contentTarget = shallowRef<IndexedContentTarget | null>(null);
+let treeScrollTop = 0;
+
+function openIndexedContent(target: IndexedContentTarget) {
+  if (!contentTarget.value) treeScrollTop = treeBodyEl.value?.scrollTop ?? 0;
+  contentTarget.value = target;
+}
+
+async function closeIndexedContent() {
+  const origin = contentTarget.value?.originEl ?? null;
+  contentTarget.value = null;
+  await nextTick();
+  if (treeBodyEl.value) treeBodyEl.value.scrollTop = treeScrollTop;
+  if (origin && origin.isConnected) origin.focus();
+  else treeBodyEl.value?.focus();
+}
+
+provide(INDEXED_CONTENT_OPENER, { open: openIndexedContent });
+
+// Another profile: its files' content must not stay on screen.
+watch(
+  () => [settings.authToken, settings.profileId] as const,
+  () => {
+    contentTarget.value = null;
+    treeScrollTop = 0;
+  },
+);
+
+// The directory is part of the index lookups' session: answers for the one
+// the tree showed before are dropped.
+watch(() => panel.cwd, (cwd) => indexStatus.setDirectory(cwd), { immediate: true });
 
 const rootEntries = ref<DirectoryEntry[]>([]);
 const loading = ref(false);
@@ -139,6 +185,9 @@ function openWatch() {
       if (ev.type === 'ready') return;
       // Broadcast to subtree nodes; they decide whether to act.
       panel.pushFileEvent(ev);
+      // A file changed somewhere in the tree: its index status may follow
+      // (coalesced with every other reason to look again).
+      indexStatus.noteListingChanged();
       // Root-level relevance: event's parent matches the watched cwd.
       const parents: string[] = [parentDir(ev.path)];
       if (ev.type === 'moved' && ev.dest_path) parents.push(parentDir(ev.dest_path));
@@ -268,7 +317,7 @@ onBeforeUnmount(() => {
         <Icon :icon="panel.showHiddenFiles ? 'mdi:eye-outline' : 'mdi:eye-off-outline'" />
       </button>
     </div>
-    <div class="tree-body">
+    <div v-show="!contentTarget" ref="treeBodyEl" class="tree-body" tabindex="-1">
       <div v-if="loading && rootEntries.length === 0" class="tree-status">
         <Icon icon="mdi:loading" class="spinner" />
         <span>Loading…</span>
@@ -295,6 +344,12 @@ onBeforeUnmount(() => {
         </li>
       </ul>
     </div>
+    <IndexedContentView
+      v-if="contentTarget"
+      :key="contentTarget.path"
+      :target="contentTarget"
+      @back="closeIndexedContent"
+    />
     <div v-if="treeToast" class="tree-toast">{{ treeToast }}</div>
   </div>
 </template>
@@ -369,6 +424,9 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow: auto;
   padding: 4px 0;
+}
+.tree-body:focus {
+  outline: none;
 }
 .tree-root {
   list-style: none;

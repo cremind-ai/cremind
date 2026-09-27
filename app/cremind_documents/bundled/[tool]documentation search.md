@@ -1,5 +1,5 @@
 ---
-description: "The Documentation Search (documentation_search) built-in tool: how the agent searches the user's OWN files indexed by Documentation search — find_files (files, folders and code projects by name, type, date, folder; counts by type, folder, month or extension), search (passages by meaning and keyword, grouped by file or folder, with date relaxation), read (pages, lines, a section or legal article such as 'Điều 203', sheet, slide, or a passage token first), the automatic review that reads each of several relevant files before answering, and research (deep research as a background job: verified legal/financial/compliance analysis with law-edition selection, or compiling every file in a folder into one table; continue_job, PRELIMINARY results, clarifications, coverage, dossier pages) — the [doc:…] citation tokens every answer must copy, the search modes (hybrid, lexical_only, …), when the tool is hidden (channels and group rooms), the chat's per-conversation Search tools selector and source priority, and its DEFAULT_TOP_K, RESEARCH_MODEL_GROUP and RESEARCH_TOKEN_BUDGET variables. Formerly named user_documents. Not Cremind's own documentation (that is cremind_documentation_search)."
+description: "The Documentation Search (documentation_search) built-in tool: how the agent searches the user's OWN files indexed by Documentation search — find_files (files, folders and code projects by name, type, date, folder; a document named by number such as 'Decree 165' identified exactly with its appendix; counts by type, folder, month or extension), search (passages by meaning and keyword, grouped by file or folder, with date relaxation), read (pages, lines, a section or legal article such as 'Điều 203', sheet, slide, or a passage token first; scanned pages not yet transcribed), the automatic review that reads each of several relevant files before answering, and research (deep research as a background job, detailed in its own reference) — the filters (name_query matches file names only), the [doc:…] citation tokens every answer must copy, the search modes (hybrid, lexical_only, …), when the tool is hidden (channels and group rooms), the chat's per-conversation Search tools selector and source priority, and its DEFAULT_TOP_K, RESEARCH_MODEL_GROUP and RESEARCH_TOKEN_BUDGET variables. Formerly named user_documents. Not Cremind's own documentation (that is cremind_documentation_search)."
 ---
 
 # Documentation Search Tool (documentation_search)
@@ -58,8 +58,14 @@ Finds files, folders or code projects by what they are.
 - `aggregate` — also count every matching file `by_type`, `by_folder`,
   `by_month` or `by_extension`.
 
-Photos come back as thumbnail chips (at most 12). A photo that has no
-caption yet is found by its name, folder, date and camera, and says so.
+A query naming a document by **number** — "Decree 165", "nghi dinh 165",
+"165/2024/NĐ-CP" — identifies it exactly (legal metadata, title, header, file
+name; "165" never matches 1650/…) and lists it first with its appendix; the
+agent then passes those ids as `file_ids`. Several documents under one
+number are all listed first, and the agent asks which. Photos come back as
+thumbnail chips (at most 12). A photo with no caption yet is found by its
+name, folder, date and camera; a PDF whose scanned pages are not transcribed
+yet says so ("text not indexed yet: 8 of 8 scanned pages not transcribed").
 
 ## search — passages
 
@@ -110,7 +116,10 @@ the argument that reads it) and the parts matching `query`. A `section`
 matching no heading fails with `SectionNotFound`, listing the file's closest
 real headings (with pages): a title copied from a contents page ("Phần 9:
 Multi-Agent - …") is often not the indexed heading ("PHẦN 9"). A file changed
-since indexing is marked `stale: true` and re-indexed first.
+since indexing is marked `stale: true` and re-indexed first. A `Coverage:`
+line says when part of a file is not transcribed yet: what is missing cannot
+be read or cited, and the agent says so rather than concluding the document
+lacks it.
 
 `file="research:<job id>"` with `page` reads a page of a research dossier
 (see [research](#research--deep-research-as-a-background-job)).
@@ -135,85 +144,17 @@ The message records what was returned, examined and cited
 
 ## research — deep research as a background job
 
-The agent **must** use it for legal, financial or compliance questions over
-the user's files, and for "compile everything in folder X" requests —
-`search` and `read` alone would answer from a sample. A job reads in
-model-sized windows and checks every quote against the source: a wrong one
-(a swapped word, a dropped "not") is dropped and counted. It first
-brings the index up to date; a file not re-indexed in time is listed as
-"still being indexed", never read from its old text, and the job asks whether
-to go on without it.
-
-Two modes:
-
-- `analyze` (default) — answers a question: the primary files (the case) are
-  read in full, the issues searched in the reference files from several
-  angles (counter-evidence included), the provisions found read in full with
-  their cross-references. With `domain="legal"` the job picks the **edition**
-  of each law explicitly (judged from the indexed documents only), says which
-  and why, and asks when it cannot tell.
-- `compile` — reads **every** file in scope into one table, merged across
-  files, conflicting values side by side with their sources; also attached as
-  CSV and Markdown.
-
-Parameters:
-
-- `question` — the question or compile request (starts a new job); `mode` —
-  `compile` or `analyze`; `domain` — `legal`, `financial` or `general`
-  (default).
-- `scope` — the primary files, a [filters](#filters) object: `analyze`'s
-  case (default: none — the question is the case), `compile`'s folder
-  (default: every indexed file). `reference_scope` — `analyze` only:
-  restricts the laws or policies to these files; left out, the job finds the
-  governing documents across the whole index (by topic, and by any law or
-  number the question names).
-- `continue_job` — an earlier job's id: get its state, answer its question
-  (`answers`, keyed by the keys it printed: strings, booleans or numbers),
-  `cancel` it, or read a dossier `page`.
-
-One job runs per profile at a time; another start returns `ResearchBusy`
-naming the running job.
-
-### The continue_job protocol
-
-A job takes minutes. Each call waits up to about four minutes (less under a
-shorter tool-call timeout) and returns the job's state:
-
-- **running** (`queued`, `planning`, `running`) — phase, progress and latest
-  steps, ending `PRELIMINARY — do not conclude from this`. The agent must not
-  answer from it: it calls `documentation_search__research` again with
-  `continue_job=<id>`. If the turn ends first, the finished result arrives in
-  the conversation as a new turn.
-- **interrupted** — the server restarted; `continue_job=<id>` resumes it.
-- **needs_clarification / needs_confirmation** — the job asks: which edition
-  of a law applies, which of several folders named "ABC" was meant, whether
-  to go on without unreadable files, or whether to spend past the budget
-  estimate. The result shows the question, candidates (ids and `[doc:…]`
-  tokens) and the answer keys; the agent asks the user, then calls again with
-  `continue_job=<id>` and `answers` using exactly those keys, e.g.
-  `{"edition": "k7m2xq9a"}`, `{"scope_folder": "Clients/ABC"}`,
-  `{"reference_folder": "Law"}` or `{"confirm": true}`.
-- **complete** — every issue has verified findings. **partial** — its
-  outcome says why not: insufficient evidence, a named law not indexed, or
-  the budget or time limit. Answer only from verified findings; never tell
-  the user an indexed file is missing.
-- **failed / cancelled** — says so, with what the dossier held; not a
-  conclusion.
-
-### The dossier
-
-Page 1 opens with the status, the **outcome** (reason and counts) and the
-coverage totals, then: unread files and why (an answer must name them),
-**authorities** (number, dates, in force or not, edition used and why),
-**findings per issue** with verified quotes and `[doc:…]` tokens,
-cross-references, open questions, **gaps**; for `compile` the table's head
-and conflicts. Long tails are on later pages:
-`documentation_search__read(file='research:<id>', page=n)` or
-`continue_job=<id>` with `page=n`; each fits the tool-result budget, its
-tokens verify like any citation. Unseen pages with verified findings are read
-for the agent before it answers (labelled **automatic**): per response, up to
-40,000 tokens and a quarter of the model's context window. The chat's
-**Research activity** panel tracks a running job (with Cancel).
+The agent **must** use it for questions of rights, obligations,
+applicability, conflicting provisions or law editions (legal, financial,
+compliance) and for "compile everything in folder X"; to summarize what one
+document covers it finds, searches and reads it instead. `mode` is `analyze`
+(default: `scope` = the case records, `reference_scope` = the governing laws,
+found across the index when left out; documents named by number are
+identified first) or `compile` (every file in scope into one table). A job
+takes minutes: while it reports `running` the agent calls again with
+`continue_job=<id>`; questions it asks are answered with `answers`. Its
+outcomes, clarifications and dossier pages are described in **Documentation
+Search: research** (`[tool]documentation search research`).
 
 ## Filters
 
@@ -223,7 +164,7 @@ One `filters` object serves all three sub-tools.
 |--------|---------|
 | `folder` | Folder names or paths, loosely matched (case, accents, `-`/`_`, typos); includes subfolders. Several matches are all used and listed. |
 | `path_glob` | Globs over the path, e.g. `Clients/*/2025/**`, `*.pdf`. |
-| `name_query` | Words that must appear in the file name. |
+| `name_query` | Words that must appear in the **file name** (strict: "Decree 165" does not match `ND-165-2024-CP.pdf`). For a document named by title or number, use `find_files` `query`, then `file_ids`. |
 | `types` | `document`, `pdf`, `word`, `spreadsheet`, `presentation`, `text`, `code`, `image`, `audio`, `video`, `archive`, `executable`, `other`. |
 | `extensions` | E.g. `["pdf", ".docx"]`. |
 | `source` | `all`, `local`, `drive`. |

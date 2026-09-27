@@ -12,9 +12,14 @@
  * With Google Drive on, files come from two sources: a source filter and
  * column appear, and a Drive file links to its page in Drive (https links
  * only — the link is server-supplied).
+ *
+ * "Preview" opens what the index holds for a file (the same view as the file
+ * tree's "Indexed content" pane), and a status column line says when that is
+ * less than the whole file (partly indexed, metadata only, blocked).
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { ElButton, ElInput, ElOption, ElSelect, ElTable, ElTableColumn } from 'element-plus';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
+import { ElButton, ElDrawer, ElInput, ElOption, ElSelect, ElTable, ElTableColumn } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../../stores/settings';
 import {
@@ -23,6 +28,8 @@ import {
   type DocumentsFileRow,
   type DocumentsSourceKind,
 } from '../../services/documentsApi';
+import { describeSummary } from '../../utils/indexStatus';
+import IndexedContent from './IndexedContent.vue';
 import {
   STATUS_ORDER,
   captionStateLabel,
@@ -158,6 +165,54 @@ function showStatus(target: string) {
   status.value = target;
 }
 
+// ── what the index holds ──────────────────────────────────────────────────
+
+/** Content badges worth a line under the status: the file is in the index,
+ *  but not all of it is (the rest repeat the status itself). */
+const CONTENT_NOTE_BADGES = new Set(['partial', 'metadata_only', 'blocked', 'unknown']);
+
+/** The row's content line, as a list of none or one (for a `v-for`). */
+function contentNotes(row: Partial<DocumentsFileRow>) {
+  const view = describeSummary(row.content ?? null, row.fid ?? null);
+  return view && CONTENT_NOTE_BADGES.has(view.kind) ? [view] : [];
+}
+
+function canPreview(row: Partial<DocumentsFileRow>): boolean {
+  return !!row.fid && row.status !== 'missing' && row.status !== 'tombstone';
+}
+
+const router = useRouter();
+const previewRow = ref<{ fid: string; name: string } | null>(null);
+const previewOpen = ref(false);
+let previewOrigin: HTMLElement | null = null;
+
+function openPreview(row: Partial<DocumentsFileRow>, ev: MouseEvent) {
+  if (!canPreview(row)) return;
+  previewOrigin = ev.currentTarget instanceof HTMLElement ? ev.currentTarget : null;
+  previewRow.value = { fid: row.fid as string, name: row.name || row.rel_path || 'File' };
+  previewOpen.value = true;
+}
+
+function onPreviewClosed() {
+  previewRow.value = null;
+  if (previewOrigin?.isConnected) previewOrigin.focus();
+  previewOrigin = null;
+}
+
+/** A reason's fix: LLM Providers is another page; the image settings are on
+ *  this one, just above. */
+async function onPreviewNavigate(route: 'llm-settings' | 'documents-settings') {
+  previewOpen.value = false;
+  if (route === 'documents-settings') {
+    await nextTick();
+    document.getElementById('documents-captioning')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+  if (settingsStore.profileId) {
+    void router.push({ name: route, params: { profile: settingsStore.profileId } });
+  }
+}
+
 defineExpose({ showStatus, reload: () => load(true) });
 </script>
 
@@ -242,6 +297,16 @@ defineExpose({ showStatus, reload: () => load(true) });
           <div v-else-if="captionStateLabel(row.caption_state)" class="cell-reason">
             {{ captionStateLabel(row.caption_state) }}
           </div>
+          <div
+            v-for="note in contentNotes(row)"
+            :key="note.kind"
+            class="cell-content"
+            :class="`tone-${note.tone}`"
+            :title="note.detail"
+          >
+            <Icon :icon="note.icon" aria-hidden="true" />
+            <span>{{ note.label }}</span>
+          </div>
         </template>
       </ElTableColumn>
       <ElTableColumn label="Size" width="90" align="right">
@@ -253,9 +318,18 @@ defineExpose({ showStatus, reload: () => load(true) });
       <ElTableColumn label="Passages" width="84" align="right">
         <template #default="{ row }">{{ row.chunks ?? '' }}</template>
       </ElTableColumn>
-      <ElTableColumn :width="showSource ? 124 : 96" align="right">
+      <ElTableColumn :width="showSource ? 188 : 160" align="right">
         <template #default="{ row }">
           <div class="cell-actions">
+            <ElButton
+              size="small"
+              text
+              :disabled="!canPreview(row)"
+              title="See the text and details the index holds for this file"
+              @click="openPreview(row, $event)"
+            >
+              Preview
+            </ElButton>
             <a
               v-if="isDrive(row) && safeWebLink(row.web_link)"
               :href="safeWebLink(row.web_link) ?? undefined"
@@ -284,6 +358,22 @@ defineExpose({ showStatus, reload: () => load(true) });
     <div v-if="next && !note" class="more">
       <ElButton size="small" text :loading="loading" @click="load(false)">Load more</ElButton>
     </div>
+
+    <ElDrawer
+      v-model="previewOpen"
+      direction="rtl"
+      size="min(640px, 94vw)"
+      append-to-body
+      :title="previewRow ? `Indexed content — ${previewRow.name}` : 'Indexed content'"
+      @closed="onPreviewClosed"
+    >
+      <IndexedContent
+        v-if="previewRow"
+        :fid="previewRow.fid"
+        @navigate="onPreviewNavigate"
+        @reindexed="load(true)"
+      />
+    </ElDrawer>
   </div>
 </template>
 
@@ -316,6 +406,14 @@ defineExpose({ showStatus, reload: () => load(true) });
 }
 .cell-status { display: flex; align-items: center; gap: 6px; }
 .cell-reason { font-size: 0.75rem; color: var(--text-secondary); line-height: 1.35; }
+.cell-content {
+  --tone: var(--text-secondary);
+  display: flex; align-items: center; gap: 4px;
+  font-size: 0.75rem; line-height: 1.35; color: var(--tone);
+}
+.cell-content.tone-warn { --tone: var(--warning-color); }
+.cell-content.tone-danger { --tone: var(--danger-color); }
+.cell-content.tone-ok { --tone: var(--success-color); }
 .status-dot {
   --tone: var(--text-tertiary);
   width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--tone);

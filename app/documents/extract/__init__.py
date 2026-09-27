@@ -32,7 +32,20 @@ Two rules hold everywhere here:
   ``logs/app.log``.
 """
 
-# Stored on every indexed file. Bump it when extraction output changes for the
-# same input (a new format, a fixed parser): the engine then re-extracts files
-# indexed by an older version, lowest priority, without the user doing anything.
+# Stored on every indexed file (as the version of its kind, see
+# :func:`extractor_version`). Bump it when extraction output changes for the
+# same input of every kind (a fixed shared parser); bump one kind's entry in
+# ``_KIND_VERSIONS`` when only that kind changed. A file indexed by an older
+# version is re-extracted the next time it goes through the pipeline instead
+# of being taken as unchanged; a kind whose upgrade must reach every file at
+# once is also queued by the engine (``ProfileRuntime.queue_stale_extraction``).
 EXTRACTOR_VERSION = 1
+
+# 2 (pdf): the whole scanned-page inventory is recorded, OCR runs in batches
+# the engine resumes, and native text and transcriptions are chunked together.
+_KIND_VERSIONS = {"pdf": 2}
+
+
+def extractor_version(kind: str | None) -> int:
+    """The extractor version a file of ``kind`` is indexed with today."""
+    return _KIND_VERSIONS.get(kind or "", EXTRACTOR_VERSION)

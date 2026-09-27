@@ -952,8 +952,9 @@ function goBack() {
             />
           </section>
 
-          <!-- Photos and scans: the Specialized Vision Model -->
-          <section class="doc-card">
+          <!-- Photos and scans: the Specialized Vision Model (the file
+               preview's "Review image descriptions" scrolls here) -->
+          <section id="documents-captioning" class="doc-card doc-anchor">
             <h2>Photos and scanned pages</h2>
             <CaptioningSection
               ref="captioning"
@@ -1192,7 +1193,7 @@ function goBack() {
 
 /* The page's flex gap spaces it; the offset keeps a jump to it clear of the
    top edge. */
-.doc-admin { scroll-margin-top: 16px; }
+.doc-admin, .doc-anchor { scroll-margin-top: 16px; }
 
 .doc-folder {
   display: flex; gap: 8px; align-items: flex-start; margin: 0;

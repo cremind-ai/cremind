@@ -64,6 +64,13 @@ part of the embedded text and therefore of ``text_hash``. File names and
 paths are deliberately *not* in body chunks — they live in the file card —
 so a rename re-embeds one card, not the file.
 
+Provenance: a block whose locator says ``src: "ocr"`` is a vision model's
+transcription of a scanned page, merged into the document's native text in
+page order (so a scanned decree gets the same article structure as a native
+one). A chunk holding any such block is an ``ocr`` chunk — search and the
+preview tell machine-transcribed text apart — and ``src`` itself never
+reaches a chunk's locator.
+
 ``CHUNKER_VERSION``: bump it whenever the output for identical input blocks
 changes (boundaries, text, breadcrumb, hash, locator, refs, folded text).
 Files record the version they were chunked with and are re-chunked on
@@ -83,7 +90,11 @@ from typing import Any
 
 from app.documents import textnorm
 from app.documents.chunking import legal as _legal
-from app.documents.types import ANCHOR_HARD, ANCHOR_SOFT, CTYPE_BODY, Block, Chunk
+from app.documents.types import ANCHOR_HARD, ANCHOR_SOFT, CTYPE_BODY, CTYPE_OCR, Block, Chunk
+
+# ``Block.locator["src"]`` of a scanned page's transcription (see the module
+# docstring).
+SRC_OCR = "ocr"
 
 # 2: the legal overlay no longer reads a wrapped cross-reference ("Điều 23
 # Nghị định này.", "Article 23(2) of …") as a new article heading.
@@ -672,7 +683,7 @@ def _merge_locators(units: list[_Unit], core: list[_Unit], breadcrumb: list[str]
     locs = [u.locator for u in units]
     out: dict[str, Any] = {}
     handled = {"page", "page_end", "line_start", "line_end", "sheet", "range", "rows",
-               "para", "slide", "part", "heading", "article", "clause", "point"}
+               "para", "slide", "part", "heading", "article", "clause", "point", "src"}
     for loc in locs:  # unknown keys: first value wins
         for k, v in loc.items():
             if k not in handled and k not in out:
@@ -754,6 +765,8 @@ def _make_chunk(ordinal: int, units: list[_Unit], texts: list[str], ctype: str) 
     heading = _cap_breadcrumb(path)
     locator = _merge_locators(units, core, path)
     thash, refs, token_est, folded = _derived(heading, text)
+    if ctype == CTYPE_BODY and any(u.locator.get("src") == SRC_OCR for u in units):
+        ctype = CTYPE_OCR
     return Chunk(
         ordinal=ordinal,
         ctype=ctype,

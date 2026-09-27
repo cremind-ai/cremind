@@ -20,6 +20,7 @@ import FileContextMenu, {
   type FileContextAction,
   type FileContextMenuItem,
 } from './FileContextMenu.vue';
+import IndexStatusButton from './documents/IndexStatusButton.vue';
 
 const props = defineProps<{
   entry: DirectoryEntry;
@@ -271,7 +272,20 @@ function cancelRename() {
 
 const dropHover = ref(false);
 
+// The pointer went down on the row's index status button. A drag begins on
+// the draggable row, never on the button, so the row refuses it itself.
+let statusPressed = false;
+
+function onStatusPress() {
+  statusPressed = true;
+  window.addEventListener('pointerup', () => { statusPressed = false; }, { once: true });
+}
+
 function onDragStart(ev: DragEvent) {
+  if (statusPressed) {
+    ev.preventDefault();
+    return;
+  }
   if (!ev.dataTransfer) return;
   ev.dataTransfer.setData(INTERNAL_MIME, props.entry.path);
   ev.dataTransfer.effectAllowed = 'move';
@@ -401,6 +415,13 @@ async function onFileInputChange(ev: Event) {
         @blur="commitRename"
       />
       <span v-else class="name">{{ entry.name }}</span>
+      <IndexStatusButton
+        v-if="!entry.is_dir"
+        :path="entry.path"
+        :name="entry.name"
+        variant="row"
+        @press="onStatusPress"
+      />
     </div>
     <FileContextMenu
       v-if="activeMenu"
@@ -514,8 +535,14 @@ async function onFileInputChange(ev: Event) {
   flex-shrink: 0;
 }
 .name {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* The status button's own tone would vanish on the selection colour. */
+.tree-row.selected .index-status {
+  color: inherit;
 }
 .tree-children {
   list-style: none;

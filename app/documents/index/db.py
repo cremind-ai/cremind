@@ -1327,8 +1327,8 @@ class IndexDB:
         transaction: removed rows are deleted first and changing ``occ``
         values pass through a temporary negative value, so the
         UNIQUE(file_id, text_hash, occ) slots a kept or added chunk moves into
-        are always free. Kept chunks get only ordinal/occ/locator/section_key/
-        refs (and folder_id after a move) rewritten, and only when different:
+        are always free. Kept chunks get only ctype/ordinal/occ/locator/
+        section_key/refs (and folder_id after a move) rewritten, and only when different:
         their heading and text are part of the hash, so they cannot change,
         and the FTS trigger — which watches heading/text/folded only — never
         fires for them. Finally the file row gets its recounted
@@ -1373,7 +1373,7 @@ class IndexDB:
                 current: dict[int, sqlite3.Row] = {}
                 for batch in _batches([int(cid) for cid, _ in diff.keep]):
                     for r in conn.execute(
-                        "SELECT id, folder_id, ordinal, occ, locator, section_key, refs FROM chunks "
+                        "SELECT id, folder_id, ctype, ordinal, occ, locator, section_key, refs FROM chunks "
                         f"WHERE id IN ({_qmarks(len(batch))}) AND {owner_sql}",
                         [*batch, *owner_params],
                     ).fetchall():
@@ -1384,6 +1384,10 @@ class IndexDB:
                     if r is None:
                         raise LookupError(f"kept chunk {cid} is not a chunk of this file (stale diff)")
                     upd: dict[str, Any] = {}
+                    if ch.ctype and r["ctype"] != ch.ctype:
+                        # Same text, other provenance (a passage that was an
+                        # OCR page's own chunk is now part of the merged text).
+                        upd["ctype"] = ch.ctype
                     if r["ordinal"] != ch.ordinal:
                         upd["ordinal"] = ch.ordinal
                     if (r["occ"] or 0) != ch.occ:

@@ -495,6 +495,81 @@ export interface DocumentsControlResult {
   files?: number;
 }
 
+// ── what a file's index entry holds (app/documents/content.py) ────────────
+
+/** Where extraction left the file's content. */
+export type ContentState = 'complete' | 'partial' | 'metadata_only' | 'unavailable' | 'unknown';
+
+/** Where the file is in the pipeline. */
+export type ContentPhase = 'queued' | 'indexing' | 'indexed' | 'failed' | 'gone';
+
+/** One word per file for the file tree and the CLI. */
+export type ContentBadge =
+  | 'waiting'
+  | 'indexing'
+  | 'indexed'
+  | 'partial'
+  | 'metadata_only'
+  | 'blocked'
+  | 'failed'
+  | 'unknown'
+  | 'unavailable';
+
+/** Where a reason sends the user to fix it. */
+export type ContentReasonAction = 'vision_model' | 'vision_consent' | 'retry' | 'install' | 'wait';
+
+export interface ContentReason {
+  code: string;
+  /** One English sentence, ready to show. */
+  message: string;
+  action?: ContentReasonAction | string;
+  /** Pages the reason covers (OCR waits and failures). */
+  pages?: number;
+}
+
+/** A PDF's page coverage, from the extraction's coverage record. */
+export interface ContentPages {
+  total: number | null;
+  read: number | null;
+  /** Pages with native text. */
+  text: number;
+  scanned: number;
+  ocr_done: number;
+  blank: number;
+  truncated: number;
+  pending: number;
+  failed: number;
+  unreadable: number;
+}
+
+export type ContentSegmentType = 'text' | 'ocr' | 'image_description' | 'metadata';
+
+/**
+ * What the index holds for one file (the same answer the CLI, the search tools
+ * and research give). `readable` never counts the metadata card.
+ */
+export interface ContentSummary {
+  state: ContentState;
+  phase: ContentPhase;
+  badge: ContentBadge;
+  /** One English sentence, e.g. "Only file details were indexed. 8 pages are waiting for OCR: …". */
+  headline: string;
+  readable: { passages: number; chars: number };
+  segments: Record<ContentSegmentType, number>;
+  chars: Record<ContentSegmentType, number>;
+  /** Epoch ms. */
+  indexed_at: number | null;
+  pages: ContentPages | null;
+  reasons: ContentReason[];
+  embedding: { state: 'ready' | 'partial' | 'pending' | 'unavailable'; ready: number; total: number };
+  /** An update is queued or being indexed; the stored text is still shown. */
+  refresh_queued: boolean;
+  /** At least one chunk is stored (the file card included). */
+  previewable: boolean;
+  /** The content revision (detail and preview only). */
+  revision?: string;
+}
+
 export interface DocumentsFileRow {
   /** 8-character citation id — what Reindex/Retry target. */
   fid: string | null;
@@ -516,6 +591,8 @@ export interface DocumentsFileRow {
   /** Drive rows: the file's page in Google Drive. Put in an href only
    *  through `safeWebLink` (https only). */
   web_link: string | null;
+  /** What the index holds for it (servers before the content summary omit it). */
+  content?: ContentSummary | null;
 }
 
 export interface DocumentsFilesQuery {
@@ -541,6 +618,86 @@ export interface DocumentsFileDetail extends DocumentsFileRow {
   first_seen_at: number | null;
   taken_at: number | null;
   doc_created_at: number | null;
+}
+
+// ── the file tree's index lookup and the "Indexed content" preview ─────────
+
+/** The server takes at most this many paths per lookup. */
+export const LOOKUP_MAX_PATHS = 500;
+/** Passages per preview page: the server's default and its cap. */
+export const PREVIEW_DEFAULT_LIMIT = 30;
+export const PREVIEW_MAX_LIMIT = 60;
+
+/** Why a path is (or is not) in the index. */
+export type IndexLookupState = 'indexed' | 'outside' | 'excluded' | 'unmatched' | 'gone';
+
+export interface IndexLookupFound {
+  state: 'indexed';
+  fid: string;
+  name: string | null;
+  rel_path: string | null;
+  kind: string | null;
+  status: DocumentsFileStatus | string | null;
+  summary: ContentSummary | null;
+}
+
+export interface IndexLookupMissing {
+  state: Exclude<IndexLookupState, 'indexed'>;
+  /** outside: foreign | system | outside_root | not_absolute | root;
+   *  excluded: excluded; unmatched: not_indexed | root_unavailable | no_index;
+   *  gone: tombstone | missing. */
+  reason: string | null;
+}
+
+export type IndexLookupItem = IndexLookupFound | IndexLookupMissing;
+
+export interface IndexLookupResult {
+  /** The local folder source is on. Off: show no index status at all. */
+  enabled: boolean;
+  root: string | null;
+  /** False: the folder or the index cannot be read right now. */
+  available?: boolean;
+  /** Keyed by the path exactly as sent. */
+  items: Record<string, IndexLookupItem>;
+}
+
+/** One stored passage, in source order. */
+export interface PreviewSegment {
+  token: string;
+  /** Position among the file's passages (0-based); a split passage keeps it. */
+  index: number;
+  ordinal: number;
+  type: Exclude<ContentSegmentType, 'metadata'>;
+  heading: string;
+  locator: Record<string, any>;
+  /** "p. 3", "Điều 12, khoản 2", "lines 40–58"… Empty when there is none. */
+  locator_label: string;
+  text: string;
+  /** Present when a passage is split across pages: the characters shown. */
+  part?: { start: number; end: number; length: number };
+}
+
+export interface PreviewMetadata {
+  /** The file card's text ("File: x.pdf\nPath: …"), or null. */
+  card: string | null;
+  /** Document metadata: title, author, created, pages, legal {number, …}. */
+  document: Record<string, any>;
+}
+
+export interface FilePreviewPage {
+  fid: string;
+  name: string;
+  rel_path: string | null;
+  kind: string | null;
+  source: string | null;
+  status: string | null;
+  summary: ContentSummary;
+  metadata: PreviewMetadata;
+  revision: string;
+  total_segments: number;
+  start_index: number;
+  segments: PreviewSegment[];
+  next_cursor: string | null;
 }
 
 export interface DocumentsActivityEvent {
@@ -822,4 +979,71 @@ export function startDocumentsEstimate(
 
 export function getDocumentsStorage(agentUrl: string, token: string): Promise<DocumentsStorageInfo> {
   return request(agentUrl, token, '/api/documentation-search/storage');
+}
+
+/**
+ * Which of these absolute paths are in this profile's index and what each
+ * holds (`POST /files/lookup`, at most `LOOKUP_MAX_PATHS`). Only reads the
+ * index: nothing is extracted or re-read. Send files only — a directory
+ * simply comes back `unmatched`.
+ */
+export function lookupIndexedPaths(
+  agentUrl: string,
+  token: string,
+  paths: string[],
+): Promise<IndexLookupResult> {
+  if (paths.length > LOOKUP_MAX_PATHS) {
+    return Promise.reject(new RangeError(`At most ${LOOKUP_MAX_PATHS} paths per lookup.`));
+  }
+  return request(agentUrl, token, '/api/documentation-search/files/lookup', {
+    method: 'POST',
+    body: { paths },
+  });
+}
+
+/**
+ * The file was re-indexed since the preview cursor was handed out (409
+ * `StalePreview`): the caller starts again from the first page.
+ */
+export class StalePreviewError extends DocumentsApiError {
+  /** The file's content revision now. */
+  readonly revision: string | null;
+
+  constructor(status: number, body: Record<string, any>) {
+    super(status, body, 'The file was re-indexed; reload the preview.');
+    this.name = 'StalePreviewError';
+    this.revision = typeof body.revision === 'string' ? body.revision : null;
+  }
+}
+
+/**
+ * One page of a file's stored content, in source order (`GET
+ * /files/{fid}/preview`). Reads the index only — opening a preview never
+ * extracts, transcribes or calls a model. Throws `StalePreviewError` when
+ * `cursor` belongs to an earlier revision of the file, and `DocumentsApiError`
+ * (`NotFound`, `ValidationFailed`) otherwise.
+ */
+export async function getFilePreview(
+  agentUrl: string,
+  token: string,
+  fid: string,
+  cursor?: string | null,
+  limit?: number,
+): Promise<FilePreviewPage> {
+  const params = new URLSearchParams();
+  if (cursor) params.set('cursor', cursor);
+  if (limit) params.set('limit', String(Math.max(1, Math.min(PREVIEW_MAX_LIMIT, Math.round(limit)))));
+  const qs = params.toString();
+  try {
+    return await request<FilePreviewPage>(
+      agentUrl,
+      token,
+      `/api/documentation-search/files/${encodeURIComponent(fid)}/preview${qs ? `?${qs}` : ''}`,
+    );
+  } catch (e) {
+    if (e instanceof DocumentsApiError && e.status === 409 && e.code === 'StalePreview') {
+      throw new StalePreviewError(e.status, e.body);
+    }
+    throw e;
+  }
 }

@@ -17,6 +17,12 @@ profile's working directory: a settings PUT naming one is refused (400
 `query/{find|search|read}` run the agent's search leaves and answer with the
 text the agent would read; `citations/resolve` looks citation tokens up.
 
+`files/lookup` and `files/{fid}/preview` read what the index holds for a file
+(its content summary, and its stored passages a page at a time) — they never
+extract, transcribe or embed anything. A preview cursor is bound to the file's
+content revision: after a re-index it answers **409 StalePreview** and the
+caller starts again from the first page.
+
 `research` starts, follows, answers and cancels deep-research jobs. Every
 answer carries `job` (the job view) and `text` (what the agent would read);
 `wait` holds a request open up to the server's cap while the job runs, so
@@ -76,6 +82,33 @@ async def list_files(client: Client, **params: Any) -> dict[str, Any]:
 
 async def file_detail(client: Client, fid: str) -> dict[str, Any]:
     resp = await client.get_json(f"/api/documentation-search/files/{fid}")
+    return resp if isinstance(resp, dict) else {}
+
+
+async def lookup_paths(client: Client, paths: list[str]) -> dict[str, Any]:
+    """Which of these absolute paths are in the profile's index: ``{enabled,
+    root, items: {path: item}}``. An item is ``{state: "indexed", fid, name,
+    rel_path, kind, status, summary}`` or ``{state: outside | excluded |
+    unmatched | gone, reason}``; with the local folder off, ``enabled`` is
+    false and ``items`` empty."""
+    resp = await client.post_json("/api/documentation-search/files/lookup", {"paths": list(paths)})
+    return resp if isinstance(resp, dict) else {}
+
+
+async def file_preview(
+    client: Client, fid: str, *, cursor: Optional[str] = None, limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """One page of a file's stored passages in source order, with its content
+    ``summary``, ``metadata``, ``revision`` and ``next_cursor`` (None on the
+    last page). ``limit`` is passages per page (server default 30, max 60)."""
+    params: dict[str, Any] = {}
+    if cursor:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    resp = await client.get_json(
+        f"/api/documentation-search/files/{quote(fid, safe='')}/preview", params=params or None,
+    )
     return resp if isinstance(resp, dict) else {}
 
 

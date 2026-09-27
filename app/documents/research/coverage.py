@@ -125,9 +125,14 @@ async def resolve_scope(
 
 def unread_reason(row: dict[str, Any]) -> str | None:
     """Why this file's content cannot be read from the index, or None when
-    it can (fully or partly)."""
+    it can (fully or partly). Uses the same readiness rules as the content
+    summary (:mod:`app.documents.content`): a scanned PDF whose only chunk is
+    its file card is ``awaiting_ocr`` — found, not yet readable — never a
+    readable document (which discovery would then call "not legal")."""
     status = row.get("status") or ""
     reason = (row.get("status_reason") or "").strip()
+    if status in ("tombstone", "missing"):
+        return "gone"
     if status in ("dirty", "deferred"):
         return "not_indexed_yet"
     if status == "awaiting_extractor":
@@ -141,12 +146,36 @@ def unread_reason(row: dict[str, Any]) -> str | None:
     if row.get("kind") == t.KIND_IMAGE and row.get("caption_state") not in (None, "done"):
         state = row.get("caption_state")
         return state if state in ("awaiting_vision", "awaiting_consent", "over_cap") else "metadata_only"
+    if row.get("kind") == t.KIND_PDF and _scan_without_text(row):
+        return "awaiting_ocr"
     return None
 
 
+def _scan_without_text(row: dict[str, Any]) -> bool:
+    """A PDF with scanned pages and not a single page of text yet (native
+    or transcribed)."""
+    meta = row.get("doc_meta") if isinstance(row.get("doc_meta"), dict) else {}
+    rec = meta.get("extraction") if isinstance(meta.get("extraction"), dict) else None
+    if rec is not None:
+        ocr = rec.get("ocr") or {}
+        waiting = ocr.get("pending") or ocr.get("failed")
+        have = rec.get("text_pages") or ocr.get("done") or ocr.get("truncated")
+        return bool(waiting) and not have
+    # Written before coverage was recorded: pages waiting, and nothing but
+    # the file card stored.
+    return bool(meta.get("ocr_pending_pages")) and int(row.get("chunk_count") or 0) <= 1
+
+
 def is_partial(row: dict[str, Any]) -> bool:
-    """Indexed, but only in part (the head of a file over a size limit)."""
-    return (row.get("status_reason") or "").startswith("partial")
+    """Indexed, but only in part: the head of a file over a size limit, or
+    a PDF with scanned pages still waiting for (or failed) OCR."""
+    if (row.get("status_reason") or "").startswith("partial"):
+        return True
+    if row.get("kind") == t.KIND_PDF:
+        from app.documents.content import ocr_unfinished
+
+        return ocr_unfinished(row.get("doc_meta") if isinstance(row.get("doc_meta"), dict) else None)
+    return False
 
 
 def coverage_row(row: dict[str, Any], role: str = ROLE_PRIMARY, *, chunks_total: int = 0,
@@ -158,7 +187,7 @@ def coverage_row(row: dict[str, Any], role: str = ROLE_PRIMARY, *, chunks_total:
     if reason is None and chunks_total and chunks_read >= chunks_total:
         read = READ_PARTIAL if is_partial(row) else READ_FULL
         if is_partial(row):
-            reason = "too_large"
+            reason = "too_large" if (row.get("status_reason") or "").startswith("partial") else "ocr_incomplete"
     elif reason is None and chunks_read > 0:
         read = READ_PARTIAL
     else:

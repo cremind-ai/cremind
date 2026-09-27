@@ -363,6 +363,19 @@ class QueryEngine:
             self._folders = {int(r["id"]): r for r in self.db.folders_brief()}
         return self._folders
 
+    def forget(self, file_ids: Any = None) -> None:
+        """Drop cached rows — every one (``file_ids`` None: the folder list
+        too), or these files' — after the index changed under an engine that
+        lives long (a research job's): the next read sees the file as it is
+        now. Research drops its own caches of a file at the same time."""
+        if file_ids is None:
+            self._files.clear()
+            self._folders = None
+            self._cutoff = False
+            return
+        for i in file_ids:
+            self._files.pop(int(i), None)
+
     def file(self, file_id: int) -> dict[str, Any] | None:
         fid = int(file_id)
         if fid not in self._files:

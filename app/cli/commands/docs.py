@@ -8,8 +8,10 @@ for Google Drive files (documented in `[cli]cremind docs drive.md`). `admin`
 subcommands mirror the Administrator settings section of My Documents (the
 server-wide gate). `search`, `find`,
 `read` and `cite` query the index the way the agent does (documented
-separately, in `[cli]cremind docs search.md`), and `research` runs the
-agent's deep-research jobs (in `[cli]cremind docs research.md`).
+separately, in `[cli]cremind docs search.md`), `research` runs the
+agent's deep-research jobs (in `[cli]cremind docs research.md`), and
+`inspect` shows what the index holds for one file — readable text, OCR pages,
+why content is missing (in `[cli]cremind docs inspect.md`).
 
 Changes that would remove indexed content (accepting a moved working
 directory, adding excludes that drop files, deleting the index, turning Drive
@@ -21,6 +23,7 @@ shell) must pass it explicitly; nothing is ever deleted by default.
 from __future__ import annotations
 
 import json as _json
+import os
 import re
 import sys
 from typing import Any, Optional
@@ -807,6 +810,396 @@ def documents_storage(ctx: typer.Context) -> None:
     _print(ctx, asyncio.run(_run()))
 
 
+# ── inspect: what the index holds for one file ─────────────────────────────
+#
+# The terminal side of the file tree's index status and its "Indexed content"
+# view: one file's content summary (what search can actually read from it, and
+# why not the rest) and, with --text / --all, its stored passages in source
+# order. It only reads the index — nothing is extracted, transcribed or
+# embedded. The labels mirror the badges and lookup states of
+# app/documents/content.py and app/documents/inspect.py, which are not
+# imported: the CLI stays free of server modules.
+
+_INSPECT_BADGES = {
+    "waiting": "Waiting to be indexed",
+    "indexing": "Indexing…",
+    "indexed": "Indexed content",
+    "partial": "Partly indexed",
+    "metadata_only": "Metadata only",
+    "blocked": "Blocked",
+    "failed": "Failed",
+    "unknown": "Index status unknown",
+    "unavailable": "Not available",
+}
+_LOOKUP_LABELS = {
+    "outside": "Not in the indexed folder",
+    "excluded": "Excluded from indexing",
+    "unmatched": "Not indexed yet",
+    "gone": "Removed from the index",
+}
+_OUTSIDE_WHY = {
+    "outside_root": "it is not inside the indexed folder",
+    "foreign": "it is in another profile's working directory, which is never indexed for you",
+    "system": "it is inside Cremind's system folder, which is never indexed",
+    "root": "it is the indexed folder itself; inspect a file inside it",
+    "not_absolute": "the path is not absolute",
+}
+_UNMATCHED_WHY = {
+    "not_indexed": "it is not in the index yet (follow sync progress: cremind docs status -f)",
+    "root_unavailable": "the indexed folder is not available right now (cremind docs status says why)",
+    "no_index": "this profile has no index yet (cremind docs status says why)",
+}
+_SEGMENT_TAGS = {"ocr": "OCR", "image_description": "image description"}
+# Passages per preview page when reading the whole file (the server's maximum).
+_INSPECT_ALL_PAGE = 60
+# A file id: 8 characters of lowercase Crockford base32 (no i, l, o, u).
+_FID_SHAPE = re.compile(r"^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{8}$")
+
+
+class _StaleTwice(Exception):
+    """The file was re-indexed twice while --all was reading it."""
+
+
+def inspect_target(file: str) -> tuple[Optional[str], Optional[str]]:
+    """``(fid, None)`` for a file id or a citation token (``[doc:…]``, the
+    legacy ``[ud:…]``, with or without a ``#chunk`` part), else ``(None,
+    absolute path)``: a path relative to the current directory is made
+    absolute. A bare 8-character id that names an existing local file is
+    taken as that file's path."""
+    from app.documents.cite import parse_tokens
+
+    raw = file.strip()
+    wrapped = raw if raw.startswith(("[", "【")) else f"[{raw}]"
+    parsed = parse_tokens(wrapped)
+    if len(parsed) == 1 and parsed[0]["start"] == 0 and parsed[0]["end"] == len(wrapped):
+        return str(parsed[0]["cite_id"]).lower(), None
+    if _FID_SHAPE.match(raw) and not os.path.exists(raw):
+        return raw.lower(), None
+    return None, os.path.abspath(os.path.expanduser(raw))
+
+
+def lookup_outcome(out: dict[str, Any], path: str) -> tuple[Optional[str], dict[str, Any]]:
+    """``(fid, item)`` for an indexed path; ``(None, report)`` otherwise, the
+    report carrying ``state`` and a one-line ``message`` saying why."""
+    if not out.get("enabled"):
+        return None, {"path": path, "enabled": False, "state": "disabled",
+                      "message": "Search my documents is off for this profile (turn it on: cremind docs enable)."}
+    root = out.get("root")
+    item = (out.get("items") or {}).get(path)
+    if not isinstance(item, dict):
+        return None, {"path": path, "root": root, "state": "unknown",
+                      "message": f"The server did not report on {path}."}
+    state, reason = str(item.get("state") or ""), str(item.get("reason") or "")
+    if state == "indexed" and item.get("fid"):
+        return str(item["fid"]).lower(), item
+    if state == "outside":
+        why = _OUTSIDE_WHY.get(reason, "it is not inside the indexed folder")
+        if reason == "outside_root" and root:
+            why += f" ({root}, your working directory)"
+    elif state == "excluded":
+        why = "an exclude rule skips it (cremind docs excludes list; credential folders and secret-looking " \
+              "files are always excluded)"
+    elif state == "unmatched":
+        why = _UNMATCHED_WHY.get(reason, "it is not in the index")
+    elif state == "gone":
+        why = ("the file is no longer in the indexed folder" if reason == "tombstone"
+               else "the file disappeared from the folder; its entry is kept for now")
+    else:
+        why = reason or "it is not in the index"
+    label = _LOOKUP_LABELS.get(state, "Not in the index")
+    return None, {"path": path, "root": root, "state": state or "unknown", "reason": reason or None,
+                  "message": f"{label}: {path} — {why}."}
+
+
+def _action_hint(action: Any, fid: str) -> Optional[str]:
+    """Where to fix a reason, by its ``action`` (None: nothing to do but wait)."""
+    if action == "vision_model":
+        return ("choose a Specialized Vision Model in Settings → LLM Providers "
+                "(cremind llm model-groups set --vision PROVIDER/MODEL --vision-enabled)")
+    if action == "vision_consent":
+        return ("allow sending images and scanned pages to the vision model in Settings → My Documents "
+                "(cremind docs caption --consent-vision)")
+    if action == "retry":
+        return f"re-read it now: cremind docs reindex {fid}"
+    if action == "install":
+        return ("install the missing reader in Settings → My Documents (cremind features install "
+                f"documentation_search), then: cremind docs reindex {fid}")
+    return None
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n:,} {word}{'' if n == 1 else 's'}"
+
+
+def _pages_line(p: dict[str, Any]) -> str:
+    def n(key: str) -> int:
+        try:
+            return int(p.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    parts: list[str] = []
+    if p.get("total") is not None:
+        parts.append(f"{n('total')} total")
+    if p.get("read") is not None and p.get("read") != p.get("total"):
+        parts.append(f"{n('read')} read")
+    parts.append(f"{n('text')} native text")
+    if n("scanned"):
+        parts.append(f"{n('scanned')} scanned")
+    parts += [f"{n('ocr_done')} OCR done", f"{n('blank')} blank"]
+    if n("truncated"):
+        parts.append(f"{n('truncated')} OCR cut off")
+    parts += [f"{n('pending')} waiting for OCR", f"{n('failed')} OCR failed", f"{n('unreadable')} unreadable"]
+    return " · ".join(parts)
+
+
+def _embedding_line(e: dict[str, Any]) -> str:
+    state = str(e.get("state") or "unknown")
+    if state == "unavailable":
+        return "unavailable · no vector collection is active (keyword search still works)"
+    ready, total = int(e.get("ready") or 0), int(e.get("total") or 0)
+    line = f"{state} · {ready:,} of {_plural(total, 'chunk')} embedded"
+    if state in ("pending", "partial"):
+        line += " (the rest are being embedded; keyword search already finds them)"
+    return line
+
+
+def inspect_summary_lines(page: dict[str, Any], *, path: Optional[str] = None) -> list[str]:
+    """The human summary of a preview answer: what the index holds for the
+    file, each reason content is missing, and where to fix it."""
+    summary = page.get("summary") if isinstance(page.get("summary"), dict) else {}
+    fid = str(page.get("fid") or "")
+    name = page.get("name") or str(page.get("rel_path") or "").rsplit("/", 1)[-1] or fid
+    badge = str(summary.get("badge") or "unknown")
+    lines = [f"{name} · {_INSPECT_BADGES.get(badge, badge)}"]
+    if summary.get("headline"):
+        lines.append(f"  {summary['headline']}")
+    rows: list[tuple[str, str]] = []
+    if page.get("rel_path"):
+        where = " (Google Drive)" if page.get("source") == "drive" else ""
+        rows.append(("file", f"{page['rel_path']}{where}"))
+    if path:
+        rows.append(("path", path))
+    rows.append(("id", f"{fid} (cite it as [doc:{fid}])"))
+    kind = " · ".join(str(v) for v in (page.get("kind"), f"file status {page.get('status')}"
+                                         if page.get("status") else None) if v)
+    if kind:
+        rows.append(("kind", kind))
+    readable = summary.get("readable") or {}
+    rows.append(("readable", f"{_plural(int(readable.get('passages') or 0), 'passage')} · "
+                             f"{_plural(int(readable.get('chars') or 0), 'character')}"))
+    seg = summary.get("segments") or {}
+    rows.append(("segments", f"{int(seg.get('text') or 0):,} text · {int(seg.get('ocr') or 0):,} OCR · "
+                             f"{int(seg.get('image_description') or 0):,} image descriptions · "
+                             f"{int(seg.get('metadata') or 0):,} metadata"))
+    if isinstance(summary.get("pages"), dict):
+        rows.append(("pages", _pages_line(summary["pages"])))
+    if isinstance(summary.get("embedding"), dict):
+        rows.append(("embedding", _embedding_line(summary["embedding"])))
+    rows.append(("indexed", _when(summary.get("indexed_at")) or "not yet"))
+    revision = summary.get("revision") or page.get("revision")
+    if revision:
+        rows.append(("revision", str(revision)))
+    width = max(len(k) for k, _ in rows) + 1
+    lines += [f"  {k + ':':<{width}} {v}" for k, v in rows]
+    reasons = [r for r in summary.get("reasons") or [] if isinstance(r, dict)]
+    if reasons:
+        lines.append("  why:")
+        for r in reasons:
+            lines.append(f"    - {r.get('message') or r.get('code')}")
+            hint = _action_hint(r.get("action"), fid)
+            if hint:
+                lines.append(f"      fix: {hint}")
+    return lines
+
+
+def merge_parts(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join the pieces of a passage split across preview pages back into one
+    segment (a passage longer than a page continues on the next). A passage
+    still incomplete keeps its ``part``; a whole one loses it."""
+    out: list[dict[str, Any]] = []
+    for seg in segments:
+        part = seg.get("part") if isinstance(seg.get("part"), dict) else None
+        prev = out[-1] if out else None
+        if prev is not None and part and part.get("start") and prev.get("index") == seg.get("index"):
+            prev["text"] = str(prev.get("text") or "") + str(seg.get("text") or "")
+            joined = {**(prev.get("part") or {}), "end": part.get("end"), "length": part.get("length")}
+            if not joined.get("start") and joined.get("end") == joined.get("length"):
+                prev.pop("part", None)
+            else:
+                prev["part"] = joined
+            continue
+        out.append(dict(seg))
+    return out
+
+
+def inspect_text_lines(page: dict[str, Any], segments: list[dict[str, Any]], *, whole: bool) -> list[str]:
+    """Stored passages in source order, each under a header with its number,
+    locator, heading, type (OCR, image description) and citation token."""
+    fid = str(page.get("fid") or "")
+    total = int(page.get("total_segments") or 0)
+    merged = merge_parts(segments)
+    if not merged:
+        lines = ["", "── no stored passages ──"]
+        card = (page.get("metadata") or {}).get("card")
+        if card:
+            lines += ["Only the file's details are indexed:", str(card).rstrip("\n")]
+        return lines
+    first = int(merged[0].get("index") or 0) + 1
+    last = int(merged[-1].get("index") or 0) + 1
+    head = (f"all {_plural(total, 'passage')}" if whole
+            else f"passages {first}–{last} of {total:,}")
+    lines = ["", f"── stored text: {head} ──"]
+    for seg in merged:
+        label, heading = str(seg.get("locator_label") or ""), str(seg.get("heading") or "")
+        bits = [b for b in (label, heading if heading and heading not in label else "",
+                            _SEGMENT_TAGS.get(str(seg.get("type") or ""), ""), str(seg.get("token") or "")) if b]
+        lines += ["", f"[{int(seg.get('index') or 0) + 1}] " + " · ".join(bits), str(seg.get("text") or "").rstrip("\n")]
+        part = seg.get("part") if isinstance(seg.get("part"), dict) else None
+        if part and int(part.get("end") or 0) < int(part.get("length") or 0):
+            lines.append(f"(this passage continues: {int(part['length']) - int(part['end']):,} more characters)")
+    if not whole and page.get("next_cursor"):
+        rest = max(0, total - last)
+        more = f"{_plural(rest, 'more passage')}" if rest else "the rest of this passage"
+        lines += ["", f"── {more}: cremind docs inspect {fid} --all prints the whole file ──"]
+    return lines
+
+
+def inspect_json(
+    page: dict[str, Any], segments: list[dict[str, Any]], *, path: Optional[str], text: bool, whole: bool,
+    restarted: bool = False,
+) -> dict[str, Any]:
+    """What ``--json`` prints: the file, its summary and metadata, and with
+    --text / --all its passages (split pieces joined)."""
+    out: dict[str, Any] = {k: page.get(k) for k in ("fid", "name", "rel_path", "kind", "source", "status")}
+    if path:
+        out["path"] = path
+    out.update({k: page.get(k) for k in ("summary", "metadata", "revision", "total_segments")})
+    if text or whole:
+        out["segments"] = merge_parts(segments)
+        out["next_cursor"] = None if whole else page.get("next_cursor")
+        if whole:
+            out["restarted"] = restarted
+    return out
+
+
+async def _inspect_pages(
+    client: Any, fid: str, *, text: bool, whole: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """``(first page, passages, restarted)``. With ``whole``, follows
+    ``next_cursor`` to the end; a re-index meanwhile (409 StalePreview)
+    starts over once, then raises :class:`_StaleTwice`."""
+    from app.cli.client._base import APIError
+    from app.cli.client.docs import file_preview
+
+    restarted = False
+    while True:
+        limit = _INSPECT_ALL_PAGE if whole else (None if text else 1)
+        first = await file_preview(client, fid, limit=limit)
+        segments = list(first.get("segments") or []) if (text or whole) else []
+        if not whole:
+            return first, segments, restarted
+        cursor, seen = first.get("next_cursor"), set()
+        try:
+            while cursor:
+                if cursor in seen:  # a server that hands the same page back would loop forever
+                    break
+                seen.add(cursor)
+                page = await file_preview(client, fid, cursor=cursor, limit=_INSPECT_ALL_PAGE)
+                segments += page.get("segments") or []
+                cursor = page.get("next_cursor")
+        except APIError as e:
+            if e.status != 409 or (_api_detail(e) or {}).get("error") != "StalePreview":
+                raise
+            if restarted:
+                raise _StaleTwice() from e
+            restarted = True
+            sys.stderr.write("warning: the file was re-indexed while it was being read; "
+                             "starting again from the first passage.\n")
+            continue
+        return {**first, "next_cursor": None}, segments, restarted
+
+
+def _inspect_fail(ctx: typer.Context, report: dict[str, Any]) -> None:
+    """Report why there is nothing to inspect (JSON on stdout with --json,
+    else the message on stderr) and exit 1."""
+    from app.cli.output import OutputMode, print_json
+
+    mode: OutputMode = ctx.obj["mode"]
+    if mode.json:
+        print_json(report)
+    else:
+        sys.stderr.write(str(report.get("message") or "Nothing to inspect.") + "\n")
+    raise typer.Exit(code=1)
+
+
+@docs_app.command("inspect")
+@graceful_errors
+def documents_inspect(
+    ctx: typer.Context,
+    file: str = typer.Argument(
+        ..., help="A path (absolute, or relative to here), a file id, or a \\[doc:…] citation token."),
+    text: bool = typer.Option(
+        False, "--text", help="Also print the first page of stored passages, in source order."),
+    all_text: bool = typer.Option(
+        False, "--all", help="Print every stored passage (pages through the whole file)."),
+) -> None:
+    """Show what the index holds for one file: readable text, OCR pages, and why content is missing."""
+    import asyncio
+
+    from app.cli.client._base import APIError, Client
+    from app.cli.client.docs import lookup_paths
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+    fid, path = inspect_target(file)
+
+    if path is not None:
+        if os.path.isdir(path):
+            _inspect_fail(ctx, {"path": path, "state": "folder",
+                                "message": f"{path} is a folder; inspect one file at a time "
+                                           "(cremind docs files --query NAME lists indexed files)."})
+
+        async def _lookup() -> dict[str, Any]:
+            async with Client(cfg) as client:
+                return await lookup_paths(client, [path])
+
+        fid, item = lookup_outcome(asyncio.run(_lookup()), path)
+        if fid is None:
+            _inspect_fail(ctx, item)
+            return
+
+    async def _read() -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+        async with Client(cfg) as client:
+            return await _inspect_pages(client, fid, text=text, whole=all_text)
+
+    try:
+        page, segments, restarted = asyncio.run(_read())
+    except _StaleTwice:
+        _inspect_fail(ctx, {"fid": fid, "error": "StalePreview",
+                            "message": "The file was re-indexed twice while it was being read; try again once "
+                                       "indexing settles (cremind docs status -f)."})
+        return
+    except APIError as e:
+        detail = _api_detail(e) or {}
+        if e.status == 404 or detail.get("message"):
+            message = detail.get("message") or "No such file."
+            _inspect_fail(ctx, {"fid": fid, "error": detail.get("error") or "NotFound",
+                                "message": f"{fid}: {message}"})
+        raise
+
+    if mode.json:
+        print_json(inspect_json(page, segments, path=path, text=text, whole=all_text, restarted=restarted))
+        return
+    lines = inspect_summary_lines(page, path=path)
+    if text or all_text:
+        lines += inspect_text_lines(page, segments, whole=all_text)
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
 # ── search / find / read / cite ────────────────────────────────────────────
 #
 # The same leaves the agent calls (`documentation_search__search` / `__find_files` /
@@ -1502,7 +1895,8 @@ _RESEARCH_DONE = frozenset({"complete", "partial"})
 # evidenced answer — as opposed to a job a limit stopped (budget, time).
 _RESEARCH_INSUFFICIENT = frozenset({
     "insufficient_evidence", "unresolved_instrument", "no_candidates", "candidates_unreadable",
-    "candidates_rejected", "empty_scope", "no_verified_findings",
+    "candidates_rejected", "empty_scope", "no_verified_findings", "content_unavailable",
+    "partly_readable", "document_changed",
 })
 # Seconds each --follow poll asks the server to hold the request open (the
 # server caps it), and the least time between polls, so a server that

@@ -22,6 +22,20 @@ What a citation chip opens:
   user's photos leaves no copies of them behind. Drive images are fetched the
   same way as ``raw``.
 
+What the file tree's index status and the "Indexed content" view read (see
+:mod:`app.documents.inspect`; neither ever extracts, transcribes or calls a
+model):
+
+- ``POST /api/documentation-search/files/lookup`` — ``{paths: [...]}`` (at most
+  500 absolute paths the tree shows) → ``{enabled, root, items: {path: item}}``:
+  the file id and content summary of each indexed file, or why a path is not
+  in the index (``outside``, ``excluded``, ``unmatched``, ``gone``).
+- ``GET /api/documentation-search/files/{fid}/preview?cursor=&limit=30`` — the
+  file's content summary, its metadata and one page of its stored passages in
+  source order (at most 60 passages / 120,000 characters a page). The cursor
+  is bound to the file's content revision; after a re-index it answers ``409
+  StalePreview`` and the caller starts again.
+
 The profile is always the caller's own (``request.user.username``). A ``fid``
 is looked up in the caller's own index only, so another profile's ids are
 simply unknown here — 404, indistinguishable from an id that never existed.
@@ -367,6 +381,26 @@ def _file_text(
     }
 
 
+def _preview(profile: str, fid: str, cursor: Optional[str], limit: int) -> Dict[str, Any]:
+    from app.documents import content as C
+    from app.documents.inspect import file_preview
+
+    try:
+        return file_preview(profile, fid, cursor=cursor, limit=limit)
+    except LookupError as exc:
+        raise _Fail(404, "NotFound", str(exc) or "No such file.") from None
+    except C.StalePreview as exc:
+        raise _Fail(409, "StalePreview", str(exc), revision=exc.revision) from None
+    except C.BadCursor as exc:
+        raise _Fail(400, "ValidationFailed", str(exc), details={"cursor": str(exc)}) from None
+
+
+def _lookup(profile: str, paths: List[str]) -> Dict[str, Any]:
+    from app.documents.inspect import lookup_paths
+
+    return lookup_paths(profile, paths)
+
+
 def _raw_target(profile: str, fid: str) -> Tuple[Union[str, bytes], str, str]:
     """``(path or bytes, name, mime)``: a path for a local file, the bytes
     themselves for a Drive file."""
@@ -542,6 +576,47 @@ def get_documents_files_routes() -> List[Route]:
         result = await _run(_file_text, _profile(request), fid, c8, pages, lines, context)
         return result if isinstance(result, Response) else JSONResponse(result)
 
+    async def handle_preview(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        from app.documents.content import PREVIEW_DEFAULT_SEGMENTS, PREVIEW_MAX_SEGMENTS
+
+        q = request.query_params
+        try:
+            fid = _fid(request)
+            try:
+                limit = int(q.get("limit") or PREVIEW_DEFAULT_SEGMENTS)
+            except ValueError:
+                raise _Fail(400, "ValidationFailed", "limit must be a number.", details={"limit": q.get("limit")})
+            limit = max(1, min(PREVIEW_MAX_SEGMENTS, limit))
+            cursor = (q.get("cursor") or "").strip() or None
+            if cursor is not None and len(cursor) > 512:
+                raise _Fail(400, "ValidationFailed", "cursor is too long.", details={"cursor": "too long"})
+        except _Fail as exc:
+            return JSONResponse(exc.payload, status_code=exc.status)
+        result = await _run(_preview, _profile(request), fid, cursor, limit)
+        return result if isinstance(result, Response) else JSONResponse(result)
+
+    async def handle_lookup(request: Request) -> JSONResponse:
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        from app.documents.inspect import MAX_LOOKUP_PATHS
+
+        body = await _json_body(request)
+        paths = body.get("paths")
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            return JSONResponse(
+                {"error": "ValidationFailed", "details": {"paths": "must be a list of strings"}}, status_code=400,
+            )
+        if len(paths) > MAX_LOOKUP_PATHS:
+            return JSONResponse(
+                {"error": "ValidationFailed", "details": {"paths": f"at most {MAX_LOOKUP_PATHS}"}}, status_code=400,
+            )
+        result = await _run(_lookup, _profile(request), [p[:4096] for p in paths])
+        return result if isinstance(result, Response) else JSONResponse(result)
+
     async def handle_raw(request: Request) -> Response:
         denied = require_auth(request)
         if denied is not None:
@@ -594,6 +669,9 @@ def get_documents_files_routes() -> List[Route]:
 
     return [
         Route("/api/documentation-search/citations/resolve", handle_resolve, methods=["POST"]),
+        # Static before the ``files/{fid}`` routes (here and in documents.py).
+        Route("/api/documentation-search/files/lookup", handle_lookup, methods=["POST"]),
+        Route("/api/documentation-search/files/{fid}/preview", handle_preview, methods=["GET"]),
         Route("/api/documentation-search/files/{fid}/text", handle_text, methods=["GET"]),
         Route("/api/documentation-search/files/{fid}/raw", handle_raw, methods=["GET"]),
         Route("/api/documentation-search/files/{fid}/thumbnail", handle_thumbnail, methods=["GET"]),

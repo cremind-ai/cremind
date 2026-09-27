@@ -54,8 +54,28 @@ _OCR_SYSTEM = (
     "You transcribe scanned document pages. Return the page's text exactly as written, "
     "in reading order, preserving headings, numbered articles and clauses, and line "
     "breaks between paragraphs. Do not translate, summarise or add anything. If the "
-    "page has no text, return an empty string."
+    "page has no text at all, answer exactly: [BLANK PAGE]"
 )
+# The most a page transcription may take; an answer that reaches it was cut.
+OCR_MAX_TOKENS = 4096
+# What the OCR prompt answers for a page with no text. An empty answer is
+# not a blank page: it is a call that returned nothing, and is retried.
+BLANK_PAGE = "[BLANK PAGE]"
+_BLANK_RE = re.compile(r"^\W*blank(?:\s+page)?\W*$", re.IGNORECASE)
+
+
+def ocr_outcome(text: str | None, tokens_out: int = 0) -> str:
+    """What a page transcription amounts to: ``blank`` (the model confirmed
+    the page has no text), ``empty`` (it returned nothing — a failure),
+    ``truncated`` (it stopped at the output limit) or ``text``."""
+    s = (text or "").strip()
+    if not s:
+        return "empty"
+    if _BLANK_RE.match(s):
+        return "blank"
+    if tokens_out and tokens_out >= OCR_MAX_TOKENS - 8:
+        return "truncated"
+    return "text"
 
 
 @dataclass
@@ -266,7 +286,7 @@ def run_vision(
     on a private event loop. Raises on a failed call; the caller refunds the
     quota slot."""
     if mode == "ocr":
-        system, max_tokens, label = _OCR_SYSTEM, 4096, "Document indexing: page OCR"
+        system, max_tokens, label = _OCR_SYSTEM, OCR_MAX_TOKENS, "Document indexing: page OCR"
         user_text = "Transcribe this page."
     else:
         lang = language_hint(profile) or "English"

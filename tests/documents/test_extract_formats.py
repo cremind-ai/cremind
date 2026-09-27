@@ -376,17 +376,40 @@ def test_pdf_scanned_page_is_rendered_for_ocr() -> None:
         assert im.size == (1224, 1584)  # 612x792 pt at 144 dpi
 
 
-def test_pdf_ocr_cap_marks_partial() -> None:
+def test_pdf_ocr_cap_is_a_batch_not_a_partial_extraction() -> None:
+    # The render cap bounds one batch; the inventory lists every scan, and the
+    # next batch skips the pages the engine already has a transcription for.
     pdf = make_pdf([[], [], []], scanned=frozenset({1, 2, 3}))
     r = run("scan.pdf", "pdf", pdf, max_ocr_pages=2)
-    assert len(r.ocr_pages) == 2 and r.status == EXTRACT_PARTIAL
+    assert [p["page"] for p in r.ocr_pages] == [1, 2] and r.status == EXTRACT_OK
+    assert r.doc_meta["scanned_pages"] == [1, 2, 3] and r.doc_meta["text_pages"] == []
+    nxt = run("scan.pdf", "pdf", pdf, max_ocr_pages=2, ocr_skip=[1, 2])
+    assert [p["page"] for p in nxt.ocr_pages] == [3]
+    done = run("scan.pdf", "pdf", pdf, ocr_skip=[1, 2, 3])
+    assert done.ocr_pages == [] and done.doc_meta["scanned_pages"] == [1, 2, 3]
+
+
+def test_pdf_without_a_renderer_says_so(monkeypatch) -> None:
+    import builtins
+
+    real = builtins.__import__
+
+    def no_pdfium(name, *a, **k):
+        if name == "pypdfium2":
+            raise ImportError("no pypdfium2")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_pdfium)
+    r = run("scan.pdf", "pdf", make_pdf([[(11, 72, 700, "Text page")], []], scanned=frozenset({2})))
+    assert r.ocr_pages == [] and r.doc_meta["ocr_renderer_missing"] is True
+    assert r.doc_meta["scanned_pages"] == [2] and r.doc_meta["text_pages"] == [1]
 
 
 def test_pdf_page_cap() -> None:
     r = run("p.pdf", "pdf", make_pdf([[(11, 72, 700, f"page {n}")] for n in range(1, 6)]), max_pages=2)
-    assert r.status == EXTRACT_PARTIAL and r.reason == "too_large"
+    assert r.status == EXTRACT_PARTIAL and r.reason == "max_pages"
     assert texts(r) == ["page 1", "page 2"]
-    assert r.doc_meta["pages"] == 5
+    assert r.doc_meta["pages"] == 5 and r.doc_meta["read_pages"] == 2
 
 
 def test_pdf_damaged_page_keeps_the_others(monkeypatch) -> None:

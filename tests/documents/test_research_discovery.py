@@ -186,7 +186,12 @@ def test_a_bare_number_is_looked_up_as_a_number(alice):
     trace = _trace(d)
     assert {"q": "12/2030/GOV", "kind": "named"}.items() <= next(
         x for x in trace["queries"] if x["q"] == "12/2030/GOV").items()
-    assert trace["selected"] == {alice.fid(DECREE): "named"}
+    # A complete number is resolved to its document before any search ranks
+    # it (app.documents.identity), and the decree is read whatever a screen
+    # would say of it.
+    assert trace["selected"] == {alice.fid(DECREE): "identity"}
+    assert trace["identity"]["12/2030/GOV"]["status"] == "resolved"
+    assert trace["candidates"][alice.fid(DECREE)]["sources"][0] == "identity"
     assert d.outcome.findings > 0
 
 

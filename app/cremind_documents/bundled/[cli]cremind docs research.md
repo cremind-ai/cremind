@@ -88,6 +88,7 @@ the question, the candidates and the answer keys; `continue` takes each as
 |--------|------------|--------|
 | `needs_clarification` | a folder name matches several folders, or none | `--answer scope_folder=<folder path>` (the case/compile folder) or `--answer reference_folder=<folder path>` (the law/policy folder) — the question says which |
 | `needs_clarification` | the edition of a law is ambiguous (legal) | `--answer edition=<fid>` |
+| `needs_clarification` | a document named by number ("Decree 165") matches several documents | `--answer document=<fid or full number>` |
 | `needs_confirmation` | files in scope cannot be read (encrypted, photos awaiting the vision model, not indexed yet, …) | `--answer confirm=true` to go on without them (listed as gaps); `false` stops |
 | `needs_confirmation` | the estimate exceeds the token budget | `--answer confirm_budget=true` (stops at the budget, `partial`), or raise this job's budget: `--answer budget=600000` |
 | `interrupted` | the server restarted mid-job | `continue JOB` with no answer resumes from the checkpoint |
@@ -99,15 +100,21 @@ the question, the candidates and the answer keys; `continue` takes each as
 - **Outcome** — why the job ended as it did: `evidenced` (the only reason a
   job is `complete`: every issue has verified findings), or, for `partial`,
   `insufficient_evidence`, `unresolved_instrument` (a law the question names
-  is not indexed), `no_candidates`, `candidates_rejected`,
-  `candidates_unreadable`, `no_verified_findings`, `empty_scope`, `budget`,
+  is not indexed), `content_unavailable` (the named document was found but
+  cannot be read yet — e.g. scanned pages awaiting OCR), `partly_readable`,
+  `document_changed` (a document changed or left the index while the job
+  ran), `no_candidates`, `candidates_rejected`, `candidates_unreadable`,
+  `no_verified_findings` (read, nothing verified), `empty_scope`, `budget`,
   `time`; with the searches run, candidates found and selected, files and
   provisions read, verified findings and unresolved issues. Page 1 opens
-  with it.
+  with it. A document named by number is identified before any search
+  ("Decree 165" → 165/2024/NĐ-CP, never 1650) and read whatever a relevance
+  check says of it.
 - **Coverage** — every file in scope, `read`, `partial` or `unread`, with the
-  reason (`encrypted`, `legacy_format`, `awaiting_vision`, `too_large`,
-  `not_indexed_yet`, `budget`, `time`, …). A conclusion is only as good as the
-  files actually read.
+  reason (`encrypted`, `awaiting_ocr`, `ocr_incomplete`, `awaiting_vision`,
+  `too_large`, `not_indexed_yet`, `budget`, `time`, …). A conclusion is only
+  as good as the files actually read (`cremind docs inspect FILE` shows what
+  a file's index entry holds).
 - **Authorities and the edition used** (legal), with why.
 - **Findings per issue** — each with its provision and verified quotes, every
   quote followed by its `[doc:…]` citation token. Quotes that did not match

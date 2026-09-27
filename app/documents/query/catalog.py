@@ -78,6 +78,8 @@ class FindOutcome:
     tz_name: str
     tz: Any = None
     date_filtered: bool = False
+    # Documents the query named by number, as resolved (identity.Resolution.to_dict()).
+    identity: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _name_ranked(rows: list[dict[str, Any]], tokens: tuple[str, ...]) -> list[int]:
@@ -467,6 +469,9 @@ def find(
                                f"no name or keyword match in {first}, even with wider dates; "
                                "showing the closest matches in that window")
     notes += scope.notes
+    identity: list[dict[str, Any]] = []
+    if query and kind == "file" and not scope.unresolved:
+        items, identity = _identified_first(engine, query, scope, items, notes)
 
     agg = _aggregate(engine, scope, aggregate) if aggregate and kind == "file" else None
     if aggregate and kind != "file":
@@ -486,8 +491,58 @@ def find(
         query=query, kind=kind, mode=mode, mode_reason=reason, overview=engine.overview(),
         filters=f.describe(engine.tz_name), relaxed=relaxed, notes=notes, items=shown,
         total=total, page=page, limit=limit, sort=sort, aggregate=agg, tz_name=engine.tz_name, tz=engine.tz,
-        date_filtered=scope.window is not None,
+        date_filtered=scope.window is not None, identity=identity,
     )
+
+
+def _identified_first(engine: Any, query: str, scope: F.Scope, items: list[FindItem],
+                      notes: list[str]) -> tuple[list[FindItem], list[dict[str, Any]]]:
+    """A query that names a document by number ("Decree 165",
+    "165/2024/NĐ-CP") resolves it deterministically
+    (:mod:`app.documents.identity`) — within the filters' scope — and lists
+    the document and its appendices first, each saying which instrument it
+    is. Several distinct documents under that number are all listed first
+    and the note says to ask which one was meant."""
+    from app.documents import identity as ID
+
+    refs = ID.parse_refs(query)
+    if not refs:
+        return items, []
+    try:
+        resolutions = ID.resolve(engine.db, refs, file_ids=scope.file_ids, hidden=scope.hidden_sources)
+    except Exception:  # noqa: BLE001 — identity is a bonus on top of the ranking
+        return items, []
+    by_id = {int(it.row["id"]): it for it in items if it.kind == "file"}
+    first: list[FindItem] = []
+    placed: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for res in resolutions:
+        out.append(res.to_dict())
+        if res.status == ID.NOT_FOUND:
+            notes.append(f"No indexed document is numbered as {res.ref.label!r} names it.")
+            continue
+        if res.status == ID.AMBIGUOUS:
+            notes.append(f"{res.ref.label!r} matches {len(res.groups)} different documents (listed first): ask "
+                         "the user which one they mean, or add its year or full number.")
+        else:
+            notes.append(f"{res.ref.label!r} was identified by its document number (listed first, with any "
+                         "appendix): pass these file ids on (filters.file_ids / research scope).")
+        rows = engine.files([f.file_id for f in res.files if f.file_id not in placed])
+        for ident in res.files:
+            row = rows.get(ident.file_id)
+            if ident.file_id in placed or row is None or not scope.accepts_file(row):
+                continue
+            it = by_id.get(ident.file_id) or FindItem("file", row)
+            role = "appendix of" if ident.appendix else "identified as"
+            label = res.label if res.status == ID.RESOLVED else ident.label()
+            it.reasons = [f"{role} {label}"] + [r for r in it.reasons if not r.startswith(("identified as",
+                                                                                              "appendix of"))]
+            first.append(it)
+            placed.add(ident.file_id)
+    if not first:
+        return items, out
+    rest = [it for it in items if not (it.kind == "file" and int(it.row["id"]) in placed)]
+    return first + rest, out
 
 
 __all__ = ["AGGREGATES", "FindItem", "FindOutcome", "KINDS", "SORTS", "find"]

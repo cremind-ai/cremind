@@ -18,6 +18,7 @@ import FileContextMenu, {
   type FileContextAction,
   type FileContextMenuItem,
 } from './FileContextMenu.vue';
+import IndexStatusButton from './documents/IndexStatusButton.vue';
 
 const props = defineProps<{
   entries: DirectoryEntry[];
@@ -220,7 +221,20 @@ interface DragState {
 }
 const drag = ref<DragState>({ hoverPath: null });
 
+// The tile whose index status button the pointer went down on. A drag begins
+// on the draggable tile, never on the button, so the tile refuses it itself.
+let statusPressedPath: string | null = null;
+
+function onStatusPress(entry: DirectoryEntry) {
+  statusPressedPath = entry.path;
+  window.addEventListener('pointerup', () => { statusPressedPath = null; }, { once: true });
+}
+
 function onDragStart(ev: DragEvent, entry: DirectoryEntry) {
+  if (statusPressedPath === entry.path) {
+    ev.preventDefault();
+    return;
+  }
   if (!ev.dataTransfer) return;
   ev.dataTransfer.setData(INTERNAL_MIME, entry.path);
   ev.dataTransfer.effectAllowed = 'move';
@@ -376,6 +390,13 @@ watch(() => panel.viewMode, () => {
       @drop="onDropOnFolder($event, entry)"
     >
       <Icon class="tile-icon" :icon="iconFor(entry, false)" />
+      <IndexStatusButton
+        v-if="!entry.is_dir"
+        :path="entry.path"
+        :name="entry.name"
+        variant="tile"
+        @press="onStatusPress(entry)"
+      />
       <input
         v-if="renamingPath === entry.path"
         ref="renameInputRef"
@@ -419,6 +440,7 @@ watch(() => panel.viewMode, () => {
   min-height: 100%;
 }
 .grid-tile {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -441,8 +463,7 @@ watch(() => panel.viewMode, () => {
 .grid-tile.drop-hover {
   outline: 1px dashed var(--primary-light);
   background: rgba(59, 130, 246, 0.15);
-}
-.tile-icon {
+}.tile-icon {
   font-size: 36px;
   flex-shrink: 0;
 }

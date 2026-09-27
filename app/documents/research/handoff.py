@@ -41,8 +41,12 @@ from app.documents.research.types import (
     FINAL,
     MODE_ANALYZE,
     OUTCOME_BUDGET,
+    OUTCOME_CONTENT_UNAVAILABLE,
+    OUTCOME_DOCUMENT_CHANGED,
     OUTCOME_MODEL_FAILED,
     OUTCOME_NO_CANDIDATES,
+    OUTCOME_NO_FINDINGS,
+    OUTCOME_PARTLY_READABLE,
     OUTCOME_RETRIEVAL_FAILED,
     OUTCOME_TIME,
     OUTCOME_UNREADABLE,
@@ -197,6 +201,16 @@ _NEXT_EN = {
     OUTCOME_RETRIEVAL_FAILED: "The document search failed; ask again to retry.",
     OUTCOME_UNRESOLVED_INSTRUMENT: "Name the document that holds the law you mean (its number helps), or point me "
                                    "at the folder it is in.",
+    OUTCOME_CONTENT_UNAVAILABLE: "The document you named was found, but its text is not readable yet (see the gaps "
+                                 "above — e.g. its scanned pages are waiting for OCR). Fix what the gap names (choose "
+                                 "a vision model, allow sending pages to it) or wait for indexing to finish, then ask "
+                                 "me to continue the research.",
+    OUTCOME_PARTLY_READABLE: "Only part of the document could be read (see the gaps above), and that part did not "
+                             "answer the question. Once the rest is transcribed, ask me to continue the research.",
+    OUTCOME_DOCUMENT_CHANGED: "A document the research was reading changed or left your documents while it ran. Ask "
+                              "again to research the current version.",
+    OUTCOME_NO_FINDINGS: "The documents were read, but none of their provisions could be verified as answering the "
+                         "question — they may not address it. Name the provision to rely on, or narrow the question.",
 }
 _NEXT_EN_DEFAULT = ("The documents found did not yield a provision that could be verified. Name the specific "
                     "provision or document to rely on, narrow the question, or point me at the folder to use, "
@@ -214,6 +228,15 @@ _NEXT_VI = {
     OUTCOME_RETRIEVAL_FAILED: "Tìm kiếm tài liệu gặp lỗi; hãy hỏi lại để thử lại.",
     OUTCOME_UNRESOLVED_INSTRUMENT: "Hãy nêu văn bản chứa quy định bạn muốn dùng (kèm số hiệu), hoặc chỉ thư mục "
                                    "chứa văn bản đó.",
+    OUTCOME_CONTENT_UNAVAILABLE: "Đã tìm thấy văn bản bạn nêu, nhưng nội dung chưa đọc được (xem phần thiếu sót ở "
+                                 "trên — ví dụ các trang scan đang chờ OCR). Hãy khắc phục điều được nêu (chọn mô "
+                                 "hình thị giác, cho phép gửi trang) hoặc chờ lập chỉ mục xong, rồi yêu cầu tiếp tục.",
+    OUTCOME_PARTLY_READABLE: "Chỉ đọc được một phần văn bản (xem phần thiếu sót ở trên) và phần đó không trả lời câu "
+                             "hỏi. Khi phần còn lại được OCR xong, hãy yêu cầu tiếp tục nghiên cứu.",
+    OUTCOME_DOCUMENT_CHANGED: "Một văn bản đang được nghiên cứu đã thay đổi hoặc bị xóa khỏi tài liệu trong lúc chạy. "
+                              "Hãy hỏi lại để nghiên cứu phiên bản hiện tại.",
+    OUTCOME_NO_FINDINGS: "Đã đọc các văn bản nhưng không điều khoản nào được kiểm chứng là trả lời câu hỏi — có thể "
+                         "chúng không đề cập vấn đề này. Hãy nêu điều khoản cần dựa vào, hoặc thu hẹp câu hỏi.",
 }
 _NEXT_VI_DEFAULT = ("Các tài liệu tìm được không cho ra điều khoản nào kiểm chứng được. Hãy nêu cụ thể điều "
                     "khoản hoặc văn bản cần dựa vào, thu hẹp câu hỏi, hoặc chỉ thư mục cần dùng, rồi hỏi lại.")

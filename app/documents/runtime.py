@@ -32,7 +32,9 @@ here is either the index (which serialises its own writes) or guarded by
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Iterable
@@ -363,6 +365,10 @@ class ProfileRuntime:
             self.queue_stale_chunking(SOURCE)
         except Exception:  # noqa: BLE001 — an upgrade sweep must never stop the folder from syncing
             logger.exception(f"[documents] {self.profile}: queueing files for the new chunker failed")
+        try:
+            self.queue_stale_extraction(SOURCE)
+        except Exception:  # noqa: BLE001 — same
+            logger.exception(f"[documents] {self.profile}: queueing files for the new extractor failed")
         self.request_scan("configure")
 
     def _configure_drive(self, row: dict[str, Any], ok: bool) -> None:
@@ -851,6 +857,40 @@ class ProfileRuntime:
         self.service.wake()
         return len(ids)
 
+    def queue_stale_extraction(self, source: str) -> int:
+        """Queue, once, the files of ``source`` whose kind's extractor changed
+        since they were read (see :func:`app.documents.extract.extractor_version`)
+        — today the PDFs read before scanned pages were inventoried, resumed
+        in batches and chunked with the native text: a scanned decree that
+        got only its file card, and no legal metadata, is read again. Like
+        :meth:`queue_stale_chunking`: rows at rest only (``indexed`` or
+        ``metadata_only``; a waiting file keeps its place, a failed one its
+        backoff), at upgrade priority, citation ids kept by the chunk diff.
+        Returns how many were queued."""
+        from app.documents.extract import _KIND_VERSIONS
+
+        db = self.db
+        if db is None or not _KIND_VERSIONS:
+            return 0
+        ids: list[int] = []
+        for kind, version in sorted(_KIND_VERSIONS.items()):
+            rows = db.read_sql(
+                "SELECT id FROM files WHERE source = ? AND kind = ? AND status IN ('indexed', 'metadata_only') "
+                "AND (extractor_version IS NULL OR extractor_version < ?) ORDER BY id",
+                (source, kind, int(version)),
+            )
+            ids += [int(r["id"]) for r in rows]
+        if not ids:
+            return 0
+        db.mark_dirty(ids, priority=P_UPGRADE)
+        db.add_activity("upgrade", f"{len(ids)} document(s) queued to be re-read by the updated extractor (scanned "
+                        "pages are inventoried and transcribed in batches); their citations stay valid.",
+                        source=source, detail={"files": len(ids)})
+        logger.info(f"[documents] {self.profile}: {len(ids)} {source} file(s) queued for the updated extractor")
+        self.note_queued(len(ids), "upgrade")
+        self.service.wake()
+        return len(ids)
+
     def run_scan(self) -> None:
         """A full reconcile of the folder against the index (scan executor)."""
         from app.documents.discovery.guard import RootGuard
@@ -1122,9 +1162,10 @@ class ProfileRuntime:
     def _process(self, row: dict[str, Any]) -> tuple[str, str, str | None]:
         from app.documents import governor as gov
         from app.documents.chunking import CHUNKER_VERSION
+        from app.documents.content import ocr_unfinished
         from app.documents.discovery.hashing import QUICK_HASH_MIN_SIZE, fs_path, is_placeholder, quick_hash, sha256_file
         from app.documents.discovery.ignore import METADATA_ONLY, SKIP
-        from app.documents.extract import EXTRACTOR_VERSION
+        from app.documents.extract import extractor_version
         from app.documents.kinds import guess_kind
 
         db = self.db
@@ -1182,12 +1223,15 @@ class ProfileRuntime:
                 return "skipped", f"{name}: stopped", None
 
         versions_current = (
-            row.get("extractor_version") == EXTRACTOR_VERSION and row.get("chunker_version") == CHUNKER_VERSION
+            row.get("extractor_version") == extractor_version(kind) and row.get("chunker_version") == CHUNKER_VERSION
         )
         existing = db.get_chunks(fid)
+        # Scanned pages still waiting for (or failed) OCR are unfinished
+        # work, whatever the bytes say: never taken as up to date.
         content_unchanged = bool(
             sha and sha == row.get("sha256") and versions_current
             and row.get("status") in ("indexed", "metadata_only") and existing
+            and not ocr_unfinished(row.get("doc_meta"))
         )
 
         doc_meta: dict[str, Any] = dict(row.get("doc_meta") or {}) if content_unchanged else {}
@@ -1214,11 +1258,15 @@ class ProfileRuntime:
                 db.update_file(fid, if_queued_at=row.get("queued_at"), status="deferred",
                                status_reason=str(self.level), **fingerprint)
                 return "skipped", f"{name}: waiting for storage space", "deferred"
+            # An identical file indexed by today's extractor and chunker
+            # lends its chunks — but only a complete one: a copy of a scan
+            # whose OCR is unfinished does that work itself.
             twin = next(
                 (f for f in (db.files_by_sha(sha) if sha else [])
                  if int(f["id"]) != fid and f.get("status") == "indexed"
-                 and f.get("extractor_version") == EXTRACTOR_VERSION
-                 and f.get("chunker_version") == CHUNKER_VERSION),
+                 and f.get("extractor_version") == extractor_version(kind)
+                 and f.get("chunker_version") == CHUNKER_VERSION
+                 and not ocr_unfinished(f.get("doc_meta"))),
                 None,
             )
             if twin is not None:
@@ -1229,9 +1277,9 @@ class ProfileRuntime:
                 caption_state = twin.get("caption_state")
             else:
                 self.progress.file_stage(fid, "extract")
+                limits = {**(self.service.extract_limits() or {}), **self.ocr_limits(row, sha, kind)}
                 result = self.service.extract(t.ExtractRequest(
-                    name=name, kind=kind, path=fs_path(abs_path),
-                    limits=self.service.extract_limits(),
+                    name=name, kind=kind, path=fs_path(abs_path), limits=limits,
                 ), size=int(st.st_size))
                 doc_meta = dict(result.doc_meta or {})
                 exif = result.exif
@@ -1242,7 +1290,7 @@ class ProfileRuntime:
                     # about this one.
                     caption_state = None
                 if status == "indexed":
-                    body, caption_state = self._body_from_result(fid, result, doc_meta, caption_state)
+                    body, caption_state = self._body_from_result(fid, result, doc_meta, caption_state, sha=sha)
 
         return self._write_file(
             row=row, name=name, rel=rel, kind=kind, mime=mime, sha=sha, hash_kind=hash_kind,
@@ -1281,7 +1329,7 @@ class ProfileRuntime:
         caption_state = row.get("caption_state") if (sha and sha == row.get("sha256")) else None
         body: list[t.Chunk] = []
         if result is not None and status == "indexed":
-            body, caption_state = self._body_from_result(fid, result, doc_meta, caption_state)
+            body, caption_state = self._body_from_result(fid, result, doc_meta, caption_state, sha=sha)
         fields = dict(drive_fields or {})
         fields["size"] = int(size or 0)
         return self._write_file(
@@ -1294,29 +1342,61 @@ class ProfileRuntime:
 
     def _body_from_result(
         self, fid: int, result: t.ExtractResult, doc_meta: dict[str, Any], caption_state: str | None,
+        *, sha: str | None = None,
     ) -> tuple[list[t.Chunk], str | None]:
-        """The body chunks of a successful extraction: chunked text (legal
-        documents by article), then the transcribed scanned pages. Fills
-        ``doc_meta`` in place; returns (body, caption state)."""
+        """The body chunks of a successful extraction. Fills ``doc_meta`` in
+        place; returns (body, caption state).
+
+        A PDF's scanned pages are transcribed first (what is cached, then
+        what the vision gate and quota allow) and merged with its native text
+        in page order; legal detection, the legal metadata and the chunking
+        then run over the whole document, so a scanned decree is cut by
+        article like a native one and a mixed PDF reads in page order. The
+        coverage record (``doc_meta["extraction"]``, see
+        :func:`app.documents.content.coverage_record`) says what every page
+        became and why any still waits."""
+        from app.documents import content as C
         from app.documents.chunking import chunk_blocks, detect_legal_meta, looks_legal
 
+        blocks = list(result.blocks)
+        pdf = result.kind == t.KIND_PDF
+        scanned = sorted({int(p) for p in doc_meta.get("scanned_pages") or []}
+                         | {int(p.get("page") or 0) for p in result.ocr_pages if p.get("page")})
+        outcome = None
+        if scanned:
+            self.progress.file_stage(fid, "ocr", {"done": 0, "total": len(scanned)})
+            outcome = self._ocr_pages(result.ocr_pages, scanned=scanned, file_sha=sha,
+                                      renderer_missing=bool(doc_meta.get("ocr_renderer_missing")),
+                                      unrenderable=doc_meta.get("ocr_unrenderable") or ())
+            blocks = merge_ocr_blocks(blocks, outcome.texts)
         self.progress.file_stage(fid, "chunk")
-        legal = looks_legal(result.blocks)
-        body = chunk_blocks(result.blocks, legal=legal)
+        legal = looks_legal(blocks)
+        body = chunk_blocks(blocks, legal=legal)
+        doc_meta.pop("legal", None)
         if legal:
-            meta = detect_legal_meta(result.blocks)
+            meta = detect_legal_meta(blocks)
             if meta:
                 doc_meta["legal"] = meta
-        if result.ocr_pages:
-            doc_meta["scanned_pages"] = [p.get("page") for p in result.ocr_pages]
-            ocr_chunks, pending, ocr_state = self._ocr_pages(result.ocr_pages, start_ordinal=len(body))
-            body += ocr_chunks
-            if pending:
-                doc_meta["ocr_pending_pages"] = pending
-                caption_state = ocr_state
-            else:
-                doc_meta.pop("ocr_pending_pages", None)
-                caption_state = "done" if ocr_chunks else caption_state
+        if pdf:
+            limit = None
+            if result.status == t.EXTRACT_PARTIAL and result.reason in ("too_large", "max_pages"):
+                limit = result.reason
+            doc_meta["extraction"] = C.coverage_record(
+                pages=doc_meta.get("pages"), read_pages=doc_meta.get("read_pages"),
+                text_pages=doc_meta.get("text_pages") or (),
+                scanned=scanned, ocr=outcome.states if outcome else None,
+                ocr_reason=outcome.reason if outcome else None,
+                unreadable=doc_meta.get("unreadable_pages") or (),
+                renderer_missing=bool(doc_meta.get("ocr_renderer_missing")) and bool(
+                    outcome and any(s == C.OCR_PENDING for s in outcome.states.values())),
+                limit=limit,
+            )
+            # The record carries all of it now.
+            for key in ("scanned_pages", "ocr_pending_pages", "text_pages", "read_pages", "ocr_renderer_missing",
+                        "ocr_unrenderable"):
+                doc_meta.pop(key, None)
+        if outcome is not None:
+            caption_state = outcome.caption_state()
         return body, caption_state
 
     def _write_file(
@@ -1330,7 +1410,7 @@ class ProfileRuntime:
     ) -> tuple[str, str, str | None]:
         """Caption, card, chunk diff, row: the end of every file's indexing."""
         from app.documents.chunking import CHUNKER_VERSION, diff_chunks, make_file_card
-        from app.documents.extract import EXTRACTOR_VERSION
+        from app.documents.extract import extractor_version
 
         db = self.db
         if db is None:
@@ -1371,7 +1451,7 @@ class ProfileRuntime:
             "doc_meta": doc_meta or None, "exif": exif,
             "is_camera_photo": 1 if (image or {}).get("is_camera_photo") or (camera and taken_ts) else 0,
             "taken_at": taken_ts, "doc_created_at": created_ts,
-            "extractor_version": EXTRACTOR_VERSION, "chunker_version": CHUNKER_VERSION,
+            "extractor_version": extractor_version(kind), "chunker_version": CHUNKER_VERSION,
             "caption_state": caption_state,
             **file_fields,
         }
@@ -1484,67 +1564,115 @@ class ProfileRuntime:
             )
         return "done", make_caption_chunk(out.text)
 
+    def ocr_limits(self, row: dict[str, Any], sha: str | None, kind: str) -> dict[str, Any]:
+        """Extraction hints for a PDF: the scanned pages whose transcription
+        of these very bytes is already stored (``ocr_skip``), so the
+        extractor renders the next batch of the rest instead of the first
+        pages again."""
+        if kind != t.KIND_PDF or not sha:
+            return {}
+        meta = row.get("doc_meta") if isinstance(row.get("doc_meta"), dict) else {}
+        rec = meta.get("extraction") if isinstance(meta.get("extraction"), dict) else {}
+        pages = [int(p) for p in (rec.get("scanned") or meta.get("scanned_pages") or [])]
+        if not pages or row.get("sha256") != sha:
+            return {}
+        from app.storage.documents_storage import get_documents_storage
+
+        storage = get_documents_storage()
+        skip = [p for p in pages if _cached_ocr(storage, self.profile, ocr_page_key(sha, p)) is not None]
+        return {"ocr_skip": skip} if skip else {}
+
     def _ocr_pages(
-        self, pages: list[dict[str, Any]], *, start_ordinal: int,
-    ) -> tuple[list[t.Chunk], list[int], str | None]:
-        """Transcribe scanned PDF pages with the vision model. Returns (chunks,
-        page numbers still waiting, why they wait)."""
+        self, rendered: list[dict[str, Any]], *, scanned: list[int], file_sha: str | None,
+        renderer_missing: bool = False, unrenderable: Iterable[int] = (),
+    ) -> "OcrOutcome":
+        """Transcribe a PDF's scanned pages with the vision model, page by
+        page: a transcription stored for these bytes (or for the page image)
+        is reused; a rendered page is sent when the vision gate is open and
+        today's quota allows; a page not rendered in this batch waits for the
+        next. Only a successful call is stored: an empty answer is a failure
+        (retried), ``[BLANK PAGE]`` a confirmed blank page."""
         import base64
 
+        from app.documents import content as C
         from app.storage.documents_storage import get_documents_storage
-        from app.documents.chunking import make_ocr_chunks
         from app.documents.vision import captioner, resolver
 
         storage = get_documents_storage()
-        chunks: list[t.Chunk] = []
-        pending: list[int] = []
-        state: str | None = None
+        out = OcrOutcome()
+        by_page = {int(p.get("page") or 0): p for p in rendered if p.get("page")}
         res, blocked = self.vision_gate()
         llm = None
         day = captioner.local_day(self.profile)
-        for page in sorted(pages, key=lambda p: int(p.get("page") or 0)):
-            num = int(page.get("page") or 0)
-            key = str(page.get("sha256") or "")
-            cached = storage.get_caption(self.profile, key) if key else None
-            text = cached.get("caption_text") if cached else None
-            if text is None:
-                if blocked:
-                    pending.append(num)
-                    state = blocked
-                    continue
-                if not storage.reserve_vision(self.profile, day, self.caption_cap(), ocr=True):
-                    pending.append(num)
-                    state = "over_cap"
-                    continue
-                try:
-                    png = base64.b64decode(page.get("png_b64") or "")
-                    jpeg = captioner.prepare_jpeg(data=png, max_side=captioner.OCR_MAX_SIDE)
-                    llm = llm or resolver.build_vision_llm(self.profile, res)
-                    out = captioner.run_vision(llm, self.profile, jpeg, mode="ocr")
-                except Exception as exc:  # noqa: BLE001
-                    storage.refund_vision(self.profile, day, ocr=True)
-                    logger.warning(f"[documents] {self.profile}: OCR of page {num} failed: {exc}")
-                    pending.append(num)
-                    state = "failed"
-                    continue
-                text = out.text
-                storage.add_vision_tokens(self.profile, day, out.tokens_in + out.tokens_out)
+        reasons: list[str] = []
+        broken = {int(p) for p in unrenderable}
+        for num in sorted(set(scanned) | set(by_page)):
+            page = by_page.get(num)
+            page_key = ocr_page_key(file_sha, num) if file_sha else None
+            cached = _cached_ocr(storage, self.profile, page_key) if page_key else None
+            if cached is None and page is not None and page.get("sha256"):
+                cached = _cached_ocr(storage, self.profile, str(page["sha256"]))
+                if cached is not None and page_key:
+                    _store_ocr(storage, self.profile, page_key, cached[1], cached[0], None, page=num)
+            if cached is not None:
+                state, text = cached
+                out.record(num, state, text)
+                continue
+            if num in broken:
+                # The page would not render: a failure (retried by "Retry"),
+                # never a page waiting for a batch that cannot come.
+                out.states[num] = C.OCR_FAILED
+                continue
+            if page is None:
+                out.states[num] = C.OCR_PENDING
+                reasons.append("renderer_missing" if renderer_missing else "next_batch")
+                continue
+            if blocked:
+                out.states[num] = C.OCR_PENDING
+                reasons.append(blocked)
+                continue
+            if not storage.reserve_vision(self.profile, day, self.caption_cap(), ocr=True):
+                out.states[num] = C.OCR_PENDING
+                reasons.append("over_cap")
+                continue
+            try:
+                png = base64.b64decode(page.get("png_b64") or "")
+                jpeg = captioner.prepare_jpeg(data=png, max_side=captioner.OCR_MAX_SIDE)
+                llm = llm or resolver.build_vision_llm(self.profile, res)
+                result = captioner.run_vision(llm, self.profile, jpeg, mode="ocr")
+            except Exception as exc:  # noqa: BLE001 — a failed call must not eat the quota
+                storage.refund_vision(self.profile, day, ocr=True)
+                logger.warning(f"[documents] {self.profile}: OCR of page {num} failed: {exc}")
+                out.states[num] = C.OCR_FAILED
+                continue
+            storage.add_vision_tokens(self.profile, day, result.tokens_in + result.tokens_out)
+            kind = captioner.ocr_outcome(result.text, result.tokens_out)
+            if kind == "empty":
+                # Nothing came back: not a blank page, a call to try again.
+                storage.refund_vision(self.profile, day, ocr=True)
+                logger.warning(f"[documents] {self.profile}: OCR of page {num} returned nothing")
+                out.states[num] = C.OCR_FAILED
+                continue
+            state = {"blank": C.OCR_BLANK, "truncated": C.OCR_TRUNCATED}.get(kind, C.OCR_DONE)
+            text = "" if state == C.OCR_BLANK else result.text
+            for key in (page_key, str(page.get("sha256") or "")):
                 if key:
-                    storage.put_caption(self.profile, key, variant="ocr", caption_text=text, provider=out.provider,
-                                        model=out.model, prompt_version=captioner.PROMPT_VERSION,
-                                        tokens_in=out.tokens_in, tokens_out=out.tokens_out)
-            if text and text.strip():
-                made = make_ocr_chunks(num, text, start_ordinal + len(chunks))
-                chunks += made
-        return chunks, pending, state
+                    _store_ocr(storage, self.profile, key, text, state, result, page=num)
+            out.record(num, state, text)
+        # The first reason in fix order says why the waiting pages wait.
+        out.reason = next((r for r in C.OCR_WAIT_REASONS if r in reasons), None)
+        return out
 
     def requeue_waiting_vision(self) -> int:
         """Re-queue images (and scanned PDFs) that are waiting for a vision
-        model, consent or tomorrow's quota, once what they wait for is there.
-        Called by the service's housekeeping; cheap when nothing waits.
-        Covers the folder and Drive alike (a Drive image is downloaded again
-        for its caption); the caption options are the profile's, on the
-        local row."""
+        model, consent, tomorrow's quota or their next OCR batch, once what
+        they wait for is there. Called by the service's housekeeping; cheap
+        when nothing waits. Covers the folder and Drive alike (a Drive image
+        is downloaded again for its caption); the caption options are the
+        profile's, on the local row. A scanned PDF waits on the vision gate
+        and quota only — the image-description switch is for images."""
+        import importlib.util
+
         from app.storage.documents_storage import get_documents_storage
         from app.documents.vision import captioner
 
@@ -1552,30 +1680,43 @@ class ProfileRuntime:
         if self.db is None or not sources or self.paused_user:
             return 0
         opts = uds.normalize_options(self.settings.get("options"))
-        if not (opts.get("caption") or {}).get("enabled", True):
-            self.progress.set_vision(ready=False, reason="captions_off", waiting=0)
-            return 0
-        # Images indexed while descriptions were off wait too, once they are on.
+        captions_on = bool((opts.get("caption") or {}).get("enabled", True))
+        states = ["awaiting_vision", "awaiting_consent", "over_cap", "next_batch"]
+        if importlib.util.find_spec("pypdfium2") is not None:
+            states.append("renderer_missing")
+        if captions_on:
+            # Images indexed while descriptions were off wait too, once they are on.
+            states.append("captions_off")
         waiting = self.db.read_sql(
-            f"SELECT id, kind FROM files WHERE source IN ({', '.join('?' * len(sources))}) AND caption_state IN "
-            "('awaiting_vision', 'awaiting_consent', 'over_cap', 'captions_off') "
+            f"SELECT id, kind, caption_state FROM files WHERE source IN ({', '.join('?' * len(sources))}) "
+            f"AND caption_state IN ({', '.join('?' * len(states))}) "
             "AND status = 'indexed' ORDER BY COALESCE(taken_at, mtime) DESC LIMIT 5000",
-            tuple(sources),
+            (*sources, *states),
         )
+        if not captions_on:
+            waiting = [r for r in waiting if r.get("kind") != t.KIND_IMAGE]
+            self.progress.set_vision(ready=False, reason="captions_off", waiting=len(waiting))
+            if not waiting:
+                return 0
         _res, blocked = self.vision_gate()
         usage = get_documents_storage().vision_usage(self.profile, captioner.local_day(self.profile))
         cap = self.caption_cap()
-        self.progress.set_vision(
-            ready=blocked is None, reason=blocked, waiting=len(waiting),
-            quota={"used": usage["captions"], "cap": cap},
-        )
-        if not waiting or blocked:
+        if captions_on:
+            self.progress.set_vision(
+                ready=blocked is None, reason=blocked, waiting=len(waiting),
+                quota={"used": usage["captions"], "cap": cap},
+            )
+        # A missing renderer waits on nothing but the install.
+        waiting = [r for r in waiting if r.get("caption_state") == "renderer_missing" or not blocked]
+        if not waiting:
             return 0
         room = max(0, cap - int(usage["captions"]))
-        if room <= 0:
+        pick = [r for r in waiting if r.get("caption_state") == "renderer_missing"]
+        pick += [r for r in waiting if r.get("caption_state") != "renderer_missing"][:room]
+        if not pick:
             return 0
-        ids = [int(r["id"]) for r in waiting[:room]]
-        for r in waiting[:room]:
+        ids = [int(r["id"]) for r in pick]
+        for r in pick:
             if r.get("kind") != t.KIND_IMAGE:
                 # Scanned pages need their page images again: re-extract.
                 self.db.update_file(int(r["id"]), extractor_version=None)
@@ -1880,6 +2021,132 @@ def _read_head(path: str, limit: int = 2000) -> str | None:
         return read_text_head(path, limit)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── scanned pages ──────────────────────────────────────────────────────────
+
+
+class OcrOutcome:
+    """What became of a PDF's scanned pages in one pipeline run: the text of
+    each transcribed page, every page's state (see
+    :data:`app.documents.content.OCR_DONE` …) and why the waiting ones wait."""
+
+    def __init__(self) -> None:
+        self.texts: dict[int, str] = {}
+        self.states: dict[int, str] = {}
+        self.reason: str | None = None
+
+    def record(self, page: int, state: str, text: str) -> None:
+        self.states[int(page)] = state
+        if text and text.strip():
+            self.texts[int(page)] = text
+
+    def caption_state(self) -> str | None:
+        """The file's ``caption_state``: ``done`` once every page has a
+        transcription (or is confirmed blank), else why pages wait — which
+        is what :meth:`ProfileRuntime.requeue_waiting_vision` and the
+        retry action look for — or ``failed`` when only failures remain."""
+        from app.documents import content as C
+
+        states = set(self.states.values())
+        if C.OCR_PENDING in states:
+            return self.reason or "next_batch"
+        if C.OCR_FAILED in states:
+            return "failed"
+        return "done" if states else None
+
+
+def ocr_page_key(file_sha: str, page: int) -> str:
+    """The caption-cache key of page ``page``'s transcription of the file
+    whose bytes hash to ``file_sha``: what lets a later batch skip rendering
+    pages it already has, and a retry reuse every page that succeeded."""
+    return hashlib.sha256(f"ocr-page:1:{file_sha}:{int(page)}".encode("utf-8")).hexdigest()
+
+
+def _cached_ocr(storage: Any, profile: str, key: str | None) -> tuple[str, str] | None:
+    """``(state, text)`` of a stored transcription, or None. An entry an
+    older build stored empty is not a confirmed blank page (the model may
+    simply have returned nothing): it is transcribed again."""
+    from app.documents import content as C
+    from app.documents.vision import captioner
+
+    if not key:
+        return None
+    try:
+        cached = storage.get_caption(profile, key)
+    except Exception:  # noqa: BLE001 — no cache is a cache miss
+        return None
+    if not cached:
+        return None
+    data = cached.get("caption_json") if isinstance(cached.get("caption_json"), dict) else {}
+    text = str(cached.get("caption_text") or "")
+    state = data.get("state")
+    if state in (C.OCR_DONE, C.OCR_BLANK, C.OCR_TRUNCATED):
+        return state, ("" if state == C.OCR_BLANK else text)
+    kind = captioner.ocr_outcome(text)
+    if kind == "empty":
+        return None
+    if kind == "blank":
+        return C.OCR_BLANK, ""
+    return C.OCR_DONE, text
+
+
+def _store_ocr(storage: Any, profile: str, key: str, text: str, state: str, result: Any, *, page: int) -> None:
+    from app.documents.vision import captioner
+
+    try:
+        storage.put_caption(
+            profile, key, variant="ocr", caption_text=text or "", caption_json={"state": state, "page": int(page)},
+            provider=getattr(result, "provider", None), model=getattr(result, "model", None),
+            prompt_version=captioner.PROMPT_VERSION, tokens_in=int(getattr(result, "tokens_in", 0) or 0),
+            tokens_out=int(getattr(result, "tokens_out", 0) or 0),
+        )
+    except Exception as exc:  # noqa: BLE001 — a cache write never fails indexing
+        logger.debug(f"[documents] {profile}: storing the OCR of page {page} failed: {exc}")
+
+
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n")
+
+
+def merge_ocr_blocks(blocks: list[t.Block], texts: dict[int, str]) -> list[t.Block]:
+    """A PDF's native blocks and its pages' transcriptions in one list, in
+    page order (a page's own text first, then its transcription). Each
+    transcribed paragraph is a block located at its page and marked
+    ``src: "ocr"`` (see :mod:`app.documents.chunking.chunker`); a page break
+    is a soft anchor as it is for native pages, and a switch between native
+    text and a transcription is a hard one, so a chunk holds one kind of
+    text wherever the structure allows."""
+    from app.documents.chunking.chunker import SRC_OCR
+
+    if not texts:
+        return list(blocks)
+    by_page: dict[int, list[t.Block]] = {}
+    loose: list[t.Block] = []
+    for b in blocks:
+        p = (b.locator or {}).get("page")
+        if isinstance(p, int):
+            by_page.setdefault(p, []).append(b)
+        else:
+            loose.append(b)
+    out: list[t.Block] = list(loose)
+    prev_src: str | None = None
+    for page in sorted(set(by_page) | set(texts)):
+        for b in by_page.get(page, []):
+            if prev_src == SRC_OCR:
+                b = t.Block(text=b.text, anchor=t.ANCHOR_HARD, level=b.level, role=b.role, locator=dict(b.locator))
+            out.append(b)
+            prev_src = "native"
+        text = texts.get(page)
+        if not text:
+            continue
+        paras = [p for p in _PARA_SPLIT_RE.split(text.replace("\r\n", "\n")) if p.strip()]
+        for i, para in enumerate(paras):
+            anchor = t.ANCHOR_NONE
+            if i == 0:
+                anchor = t.ANCHOR_HARD if prev_src == "native" else (t.ANCHOR_SOFT if out else t.ANCHOR_NONE)
+            out.append(t.Block(text=para, anchor=anchor, locator={"page": int(page), "src": SRC_OCR}))
+            prev_src = SRC_OCR
+    return out
 
 
 def _vector_backend() -> str:

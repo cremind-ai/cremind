@@ -463,6 +463,15 @@ _REVIEWED_PLANNING_FLAGS: dict = {
     "--show-hidden": (
         "`cremind files list --show-hidden` widens a listing and nothing else."
     ),
+    "--text": (
+        "`cremind docs inspect --text` prints the stored text of a file's index "
+        "entry; the preview it pages through never extracts, transcribes or "
+        "calls a model."
+    ),
+    "--all": (
+        "`cremind docs inspect --all` pages through the same read-only preview "
+        "to its end."
+    ),
 }
 
 
