@@ -3,8 +3,9 @@
  * One tag's delivery history, newest first, in pages of 20 ("Load older" asks
  * for the page before the oldest row shown). When `refreshKey` changes (the
  * page's poll saw the tag move) the newest page is fetched again and merged
- * in, so rows already paged in stay. A row opens the detail drawer; a
- * delivery still on its way can be cancelled.
+ * in, so rows already paged in stay. A row opens the detail drawer; any
+ * delivery that has not finished can be cancelled — also after the companion
+ * fetched it (Cremind then sends it a `resolved` job to drop the card).
  */
 import { onMounted, ref, watch } from 'vue';
 import {
@@ -15,7 +16,9 @@ import { useTagsStore } from '../../stores/tags';
 import { TagsApiError, type TagDelivery } from '../../services/tagsApi';
 import { formatTimestamp } from '../../utils/usageFormat';
 import { formatRelativeTime } from '../../utils/relativeTime';
-import { cardIconGlyph, kindLabel, stageLabel, stagePillType } from '../../utils/tagsFormat';
+import {
+  cancelPrompt, cancelledMessage, cardIconGlyph, kindLabel, stageLabel, stagePillType,
+} from '../../utils/tagsFormat';
 
 const PAGE = 20;
 
@@ -70,17 +73,14 @@ async function loadOlder() {
 
 async function cancel(row: TagDelivery) {
   try {
-    await ElMessageBox.confirm(
-      `Cancel "${row.card?.title || kindLabel(row.kind)}"? It will not be shown on the tag.`,
-      'Cancel delivery',
-      { type: 'warning', confirmButtonText: 'Cancel delivery', cancelButtonText: 'Keep it' },
-    );
+    await ElMessageBox.confirm(cancelPrompt(row), 'Cancel delivery',
+      { type: 'warning', confirmButtonText: 'Cancel delivery', cancelButtonText: 'Keep it' });
   } catch { return; }
   cancelling.value = row.id;
   try {
-    const updated = await store.cancelDelivery(row.id);
-    merge([updated]);
-    ElMessage.success('Delivery cancelled');
+    const res = await store.cancelDelivery(row.id);
+    merge([res.delivery]);
+    ElMessage.success(cancelledMessage(res));
     emit('changed');
   } catch (e) {
     if (e instanceof TagsApiError && e.code === 'already_terminal') {

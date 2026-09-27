@@ -6,6 +6,10 @@
  * owner's first card. The bridge may be left to the server when the tag
  * already has one or the companion has only one; otherwise it answers 409
  * `bridge_required`, shown on the bridge field.
+ *
+ * A claim starts the tag clean (name, previews, revisions): the name field is
+ * prefilled only when re-claiming for the SAME owner (e.g. to retry a failed
+ * clear) and is then sent explicitly; a new owner never inherits the old name.
  */
 import { computed, ref, watch } from 'vue';
 import { ElButton, ElDialog, ElInput, ElMessage, ElOption, ElSelect } from 'element-plus';
@@ -36,12 +40,21 @@ const autoBridge = computed(() => {
   return '';
 });
 
+const sameOwner = computed(() => !!props.tag?.owner_profile && owner.value === props.tag.owner_profile);
+
 watch(() => props.modelValue, (open) => {
   if (!open || !props.tag) return;
   owner.value = props.tag.owner_profile ?? '';
   bridgeId.value = '';
-  name.value = props.tag.name ?? '';
+  name.value = props.tag.owner_profile ? (props.tag.name ?? '') : '';
   fieldError.value = null;
+});
+
+// Picking another owner drops the previous owner's name for the tag.
+watch(owner, (next, prev) => {
+  if (!props.tag || next === prev) return;
+  if (next === props.tag.owner_profile) name.value = props.tag.name ?? '';
+  else if (name.value === (props.tag.name ?? '')) name.value = '';
 });
 
 function close() { emit('update:modelValue', false); }
@@ -54,7 +67,7 @@ async function submit() {
   try {
     const body: { owner: string; bridge_id?: string; name?: string } = { owner: owner.value };
     if (bridgeId.value) body.bridge_id = bridgeId.value;
-    if (name.value.trim() && name.value.trim() !== (tag.name ?? '')) body.name = name.value.trim();
+    if (name.value.trim()) body.name = name.value.trim();
     await store.claim(tag.id, body);
     ElMessage.success(`${deviceTitle(tag)} now belongs to ${owner.value} — its screen is cleared first`);
     emit('done');
@@ -106,6 +119,7 @@ async function submit() {
     <div class="field">
       <label class="field-label">Name <span class="optional">(optional)</span></label>
       <ElInput v-model="name" maxlength="128" :placeholder="tag?.hw_id" />
+      <p v-if="!sameOwner" class="field-hint">A new owner starts with a clean tag: no name unless you give one.</p>
       <p v-if="fieldError?.field === 'name'" class="field-error">{{ fieldError.message }}</p>
     </div>
     <p class="note">

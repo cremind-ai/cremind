@@ -21,6 +21,8 @@ import {
   listContentCredentials,
   listTagCompanions,
   listTagDeliveries,
+  patchTagDefaults,
+  patchTagSettings,
   queueTagCommand,
   refreshTag,
   registerTagCompanion,
@@ -29,8 +31,6 @@ import {
   renameTagDevice,
   revokeContentCredential,
   rotateTagCompanion,
-  saveTagDefaults,
-  saveTagSettings,
   type DeliveryQuery,
   type DisplayNotePayload,
   type TagCommand,
@@ -38,7 +38,7 @@ import {
   type TagCredential,
   type TagDelivery,
   type TagHardware,
-  type TagOptions,
+  type TagOptionsPatch,
   type TagOverview,
   type TagSettings,
 } from '../services/tagsApi';
@@ -56,8 +56,6 @@ export const useTagsStore = defineStore('tags', () => {
   const token = () => settingsStore.authToken;
 
   const overview = ref<TagOverview | null>(null);
-  /** device id → deliveries still on their way to that tag. */
-  const pendingByDevice = ref<Record<string, number>>({});
   const settings = ref<TagSettings | null>(null);
   const companions = ref<TagCompanionSummary[]>([]);
   const credentials = ref<TagCredential[]>([]);
@@ -70,7 +68,6 @@ export const useTagsStore = defineStore('tags', () => {
     if (loadedFor.value === profile) return;
     loadedFor.value = profile;
     overview.value = null;
-    pendingByDevice.value = {};
     settings.value = null;
     companions.value = [];
     credentials.value = [];
@@ -79,19 +76,10 @@ export const useTagsStore = defineStore('tags', () => {
 
   // ── overview ──
 
+  /** One request: each device carries its own `pending_count`. */
   async function loadOverview(): Promise<TagOverview> {
-    const [ov, active] = await Promise.all([
-      getTagsOverview(url(), token()),
-      listTagDeliveries(url(), token(), { state: 'active', limit: 200 })
-        .catch(() => null),
-    ]);
-    overview.value = ov;
-    if (active) {
-      const counts: Record<string, number> = {};
-      for (const d of active.deliveries) counts[d.device_id] = (counts[d.device_id] ?? 0) + 1;
-      pendingByDevice.value = counts;
-    }
-    return ov;
+    overview.value = await getTagsOverview(url(), token());
+    return overview.value;
   }
 
   function patchDevice(device: { id: string } & Record<string, any>) {
@@ -145,8 +133,9 @@ export const useTagsStore = defineStore('tags', () => {
     return settings.value;
   }
 
-  async function saveSettings(body: { enabled?: boolean; options?: TagOptions }): Promise<TagSettings> {
-    const saved = await saveTagSettings(url(), token(), body);
+  /** PATCH: only the keys given change (`null` inherits again). */
+  async function saveSettings(body: { enabled?: boolean; options?: TagOptionsPatch }): Promise<TagSettings> {
+    const saved = await patchTagSettings(url(), token(), body);
     settings.value = saved;
     if (overview.value && body.enabled !== undefined) overview.value.enabled = saved.enabled;
     return saved;
@@ -216,13 +205,13 @@ export const useTagsStore = defineStore('tags', () => {
   function defaults() {
     return getTagDefaults(url(), token());
   }
-  function saveDefaults(value: TagOptions) {
-    return saveTagDefaults(url(), token(), value);
+  /** PATCH: only the keys given change (`null` removes a default). */
+  function saveDefaults(patch: TagOptionsPatch) {
+    return patchTagDefaults(url(), token(), patch);
   }
 
   return {
     overview,
-    pendingByDevice,
     settings,
     companions,
     credentials,

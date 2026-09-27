@@ -3,8 +3,8 @@
  * One delivery in full: the card it carries, how far it got (stage timeline
  * from `stage_times`), how long the hop took (the companion's `timing`), and
  * the receipt fields (status code, revision, digest). Loaded fresh from
- * GET /api/tags/deliveries/{id} each time it opens; a delivery still on its
- * way can be cancelled from here.
+ * GET /api/tags/deliveries/{id} each time it opens; a delivery that has not
+ * finished can be cancelled from here, even one the companion already holds.
  */
 import { computed, ref, watch } from 'vue';
 import { ElButton, ElDrawer, ElMessage, ElMessageBox, ElTag } from 'element-plus';
@@ -13,7 +13,8 @@ import { useTagsStore } from '../../stores/tags';
 import { TagsApiError, type TagDelivery } from '../../services/tagsApi';
 import { formatTimestamp } from '../../utils/usageFormat';
 import {
-  TIMING_PARTS, cardIconGlyph, formatMs, kindLabel, stageLabel, stagePillType, stageTimeline,
+  TIMING_PARTS, cancelPrompt, cancelledMessage, cardIconGlyph, formatMs, kindLabel, stageLabel,
+  stagePillType, stageTimeline,
 } from '../../utils/tagsFormat';
 
 const props = defineProps<{ deliveryId: number | null; tagName?: string }>();
@@ -72,17 +73,15 @@ async function cancel() {
   const d = delivery.value;
   if (!d) return;
   try {
-    await ElMessageBox.confirm(
-      `Cancel "${d.card?.title || kindLabel(d.kind)}"? It will not be shown on the tag.`,
-      'Cancel delivery',
-      { type: 'warning', confirmButtonText: 'Cancel delivery', cancelButtonText: 'Keep it' },
-    );
+    await ElMessageBox.confirm(cancelPrompt(d), 'Cancel delivery',
+      { type: 'warning', confirmButtonText: 'Cancel delivery', cancelButtonText: 'Keep it' });
   } catch { return; }
   cancelling.value = true;
   try {
-    delivery.value = await store.cancelDelivery(d.id);
-    emit('changed', delivery.value);
-    ElMessage.success('Delivery cancelled');
+    const res = await store.cancelDelivery(d.id);
+    delivery.value = res.delivery;
+    emit('changed', res.delivery);
+    ElMessage.success(cancelledMessage(res));
   } catch (e) {
     if (e instanceof TagsApiError && e.code === 'already_terminal') {
       if (e.body?.delivery) {

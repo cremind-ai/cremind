@@ -5,10 +5,14 @@
  * (422 `otp_refused`) — shown here in the dialog, next to the text, so the
  * user can edit and resend. `clear_pending` (409) means the screen is still
  * being blanked after a change of owner.
+ *
+ * Each note is a card of its own unless "Replace the previous note" is
+ * ticked (`replace: true`): then it takes the tag's one replaceable slot and
+ * retires the note last sent that way.
  */
 import { computed, ref, watch } from 'vue';
 import {
-  ElButton, ElDialog, ElInput, ElMessage, ElOption, ElSelect, ElTooltip,
+  ElButton, ElCheckbox, ElDialog, ElInput, ElMessage, ElOption, ElSelect, ElTooltip,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useTagsStore } from '../../stores/tags';
@@ -41,6 +45,7 @@ const title = ref('');
 const body = ref('');
 const icon = ref('push_pin');
 const ttl = ref(86400);
+const replace = ref(false);
 const sending = ref(false);
 /** A refusal to show inside the dialog: { code, message }. */
 const problem = ref<{ code: string; message: string } | null>(null);
@@ -53,6 +58,7 @@ watch(() => props.modelValue, (open) => {
   body.value = '';
   icon.value = iconChoices.value.includes('push_pin') ? 'push_pin' : iconChoices.value[0];
   ttl.value = 86400;
+  replace.value = false;
   problem.value = null;
 });
 
@@ -76,6 +82,7 @@ async function send() {
       ...(body.value.trim() ? { body: body.value.trim() } : {}),
       icon: icon.value,
       ttl_s: ttl.value,
+      replace: replace.value,
     });
     ElMessage.success(`Note queued for ${deviceTitle(device)}`);
     emit('sent', delivery);
@@ -162,6 +169,13 @@ async function send() {
         </ElSelect>
         <p class="field-hint">After that the note drops off the screen at the next redraw.</p>
       </div>
+      <div class="field">
+        <ElCheckbox v-model="replace" class="replace-check">Replace the previous note</ElCheckbox>
+        <p class="field-hint">
+          Off: this note is a card of its own, next to any others. On: it takes the place of the
+          last note you sent with this box ticked.
+        </p>
+      </div>
 
       <div v-if="problem" class="callout callout-danger" role="alert">
         <Icon :icon="problem.code === 'otp_refused' ? 'mdi:shield-key-outline' : 'mdi:alert-circle-outline'" class="callout-icon" />
@@ -187,6 +201,8 @@ async function send() {
 .optional { font-weight: 400; color: var(--text-tertiary); }
 .field-hint { margin: 6px 0 0; font-size: 0.78rem; color: var(--text-tertiary); }
 .ttl-select { width: 200px; }
+.replace-check :deep(.el-checkbox__label) { color: var(--text-primary); font-weight: 500; }
+.replace-check + .field-hint { margin-top: 2px; }
 .icon-grid { display: flex; flex-wrap: wrap; gap: 6px; }
 .icon-choice {
   width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;

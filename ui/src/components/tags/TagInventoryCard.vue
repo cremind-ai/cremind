@@ -5,6 +5,10 @@
  * bridge, release); bridges the mesh maintenance commands (configure,
  * identify, install the font pack, remove); every device can be renamed or
  * forgotten. Everything here acts at once and queues work on the companion.
+ *
+ * A tag reading `clear_failed` (its clear failed or expired 3 times) is
+ * stuck until it is claimed again (the same owner is fine: a new epoch and a
+ * fresh clear) or released; its row says so and offers "Claim again".
  */
 import { computed, ref } from 'vue';
 import {
@@ -26,6 +30,8 @@ const props = defineProps<{
   companions: TagCompanion[];
   profiles: string[];
   now: number;
+  /** A tag to point at (`?tag=<id>` from the Tags page). */
+  highlightId?: string | null;
 }>();
 const emit = defineEmits<{ (e: 'changed'): void }>();
 
@@ -41,6 +47,11 @@ const assigning = ref(false);
 const gateways = computed(() => props.devices.filter((d) => d.kind === 'gateway'));
 const bridges = computed(() => props.devices.filter((d) => d.kind === 'bridge'));
 const tags = computed(() => props.devices.filter((d) => d.kind === 'tag'));
+const clearFailed = computed(() => tags.value.filter((t) => t.status === 'clear_failed'));
+const tagRowClass = ({ row }: { row: TagDevice }) => [
+  row.status === 'clear_failed' ? 'row-clear-failed' : '',
+  row.id === props.highlightId ? 'row-highlight' : '',
+].join(' ');
 const multiCompanion = computed(() => props.companions.length > 1);
 
 const byId = computed(() => new Map(props.devices.map((d) => [d.id, d])));
@@ -218,10 +229,20 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
       </div>
     </template>
 
+    <div v-if="clearFailed.length" class="callout callout-danger" role="alert">
+      <Icon icon="mdi:alert-octagon-outline" class="callout-icon" />
+      <span>
+        <strong>{{ clearFailed.length === 1 ? '1 tag' : `${clearFailed.length} tags` }} could not clear
+        {{ clearFailed.length === 1 ? 'its' : 'their' }} screen</strong> after a change of owner: three
+        tries failed or ran out of time. Claim it again (the same owner is fine; that starts a fresh
+        clear) or release it. Check that the tag is in range of its bridge first.
+      </span>
+    </div>
+
     <h4 class="group-title">
       <Icon icon="mdi:tablet-dashboard" /> Tags <span class="count">{{ tags.length }}</span>
     </h4>
-    <ElTable :data="tags" size="small" row-key="id" empty-text="No tags reported yet" class="inv-table">
+    <ElTable :data="tags" size="small" row-key="id" empty-text="No tags reported yet" class="inv-table" :row-class-name="tagRowClass">
       <ElTableColumn label="Tag" min-width="170">
         <template #default="{ row }">
           <div class="strong">{{ deviceTitle(row as TagDevice) }}</div>
@@ -248,8 +269,9 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
         <template #default="{ row }">
           <div class="pills">
             <ElTag :type="deviceStatusPill(row.status).type" size="small" effect="plain">{{ deviceStatusPill(row.status).label }}</ElTag>
-            <ElTag v-if="row.clear_required" type="warning" size="small" effect="plain">clearing</ElTag>
+            <ElTag v-if="row.clear_required && row.status !== 'clear_failed'" type="warning" size="small" effect="plain">clearing</ElTag>
           </div>
+          <div v-if="row.status === 'clear_failed'" class="hint-danger">claim or release again</div>
         </template>
       </ElTableColumn>
       <ElTableColumn label="Battery" width="84">
@@ -272,8 +294,13 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
       <ElTableColumn label="" width="170" align="right">
         <template #default="{ row }">
           <div class="row-actions">
-            <ElButton size="small" :type="row.owner_profile ? 'default' : 'primary'" :loading="busy === row.id" @click="openClaim(row as TagDevice)">
-              {{ row.owner_profile ? 'Owner…' : 'Claim' }}
+            <ElButton
+              size="small"
+              :type="row.status === 'clear_failed' ? 'danger' : row.owner_profile ? 'default' : 'primary'"
+              :loading="busy === row.id"
+              @click="openClaim(row as TagDevice)"
+            >
+              {{ row.status === 'clear_failed' ? 'Claim again…' : row.owner_profile ? 'Owner…' : 'Claim' }}
             </ElButton>
             <ElDropdown trigger="click" @command="(c: string) => onTagCommand(row as TagDevice, c)">
               <ElButton size="small" :aria-label="`More actions for ${deviceTitle(row as TagDevice)}`">
@@ -445,6 +472,23 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
 .num { font-variant-numeric: tabular-nums; }
 .danger { color: var(--el-color-danger); }
 .pills { display: flex; flex-wrap: wrap; gap: 4px; }
+.hint-danger { margin-top: 3px; font-size: 0.72rem; color: var(--el-color-danger); line-height: 1.3; }
+.callout {
+  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 14px;
+  padding: 10px 12px; border-radius: 8px; font-size: 0.85rem; line-height: 1.45;
+  color: var(--text-primary);
+}
+.callout-danger {
+  border: 1px solid color-mix(in srgb, var(--el-color-danger) 55%, transparent);
+  background: color-mix(in srgb, var(--el-color-danger) 12%, var(--surface-color));
+}
+.callout-icon { flex-shrink: 0; font-size: 1.1rem; margin-top: 1px; color: var(--el-color-danger); }
+.inv-table :deep(.row-clear-failed > td.el-table__cell) {
+  background: color-mix(in srgb, var(--el-color-danger) 6%, transparent);
+}
+.inv-table :deep(.row-highlight > td.el-table__cell) {
+  box-shadow: inset 0 1px 0 var(--primary-color), inset 0 -1px 0 var(--primary-color);
+}
 .row-actions { display: inline-flex; gap: 6px; align-items: center; }
 .row-actions .el-button + .el-button { margin-left: 0; }
 .field-label { display: block; margin-bottom: 6px; font-size: 0.82rem; font-weight: 600; color: var(--text-secondary); }

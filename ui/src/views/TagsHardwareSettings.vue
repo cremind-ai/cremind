@@ -11,7 +11,7 @@
  * CLI counterpart: `cremind tags hardware …`.
  */
 import { computed, onMounted, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { ElCard, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useTagsStore } from '../stores/tags';
@@ -27,12 +27,12 @@ import TagInventoryCard from '../components/tags/TagInventoryCard.vue';
 import TagOperationsCard from '../components/tags/TagOperationsCard.vue';
 import TagOptionsForm from '../components/tags/TagOptionsForm.vue';
 import {
-  TAG_BUILTIN_DEFAULTS, draftFromOptions, draftProblem, isCommandActive, optionsFromDraft,
-  type TagOptionsDraft,
+  draftFromOptions, draftPatch, draftProblem, isCommandActive, type TagOptionsDraft,
 } from '../utils/tagsFormat';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
+const route = useRoute();
 const store = useTagsStore();
 const settingsStore = useSettingsStore();
 const { now } = useNow();
@@ -42,9 +42,10 @@ store.reset(props.profile);
 const loading = ref(false);
 const loadError = ref('');
 const profiles = ref<string[]>([]);
-const builtin = ref<TagEffectiveOptions>(TAG_BUILTIN_DEFAULTS);
-const kinds = ref<string[]>(Object.keys(TAG_BUILTIN_DEFAULTS.routes));
-const layouts = ref<string[]>([TAG_BUILTIN_DEFAULTS.layout]);
+// The built-in layer comes from the server (GET …/defaults); the form waits for it.
+const builtin = ref<TagEffectiveOptions | null>(null);
+const kinds = ref<string[]>([]);
+const layouts = ref<string[]>([]);
 const defaultsLoaded = ref(false);
 const saving = ref(false);
 
@@ -57,6 +58,7 @@ const hardware = computed(() => store.hardware);
 const companions = computed(() => hardware.value?.companions ?? []);
 const devices = computed(() => hardware.value?.devices ?? []);
 const commands = computed(() => hardware.value?.commands ?? []);
+const highlightId = computed(() => (typeof route.query.tag === 'string' ? route.query.tag : null));
 const anyActive = computed(() => commands.value.some((c) => isCommandActive(c.status)));
 const deviceCount = computed(() => {
   const out: Record<string, number> = {};
@@ -83,10 +85,8 @@ async function loadDefaults() {
   try {
     const [res, own] = await Promise.all([store.defaults(), store.loadSettings().catch(() => null)]);
     builtin.value = res.builtin;
-    if (own) {
-      kinds.value = own.routable_kinds;
-      layouts.value = own.layouts;
-    }
+    kinds.value = own?.routable_kinds ?? Object.keys(res.builtin.routes);
+    layouts.value = own?.layouts ?? [res.builtin.layout];
     form.value = draftFromOptions(res.defaults, kinds.value);
     snapshot.commit();
     defaultsLoaded.value = true;
@@ -99,7 +99,7 @@ async function saveDefaults() {
   if (!dirty.value || problem.value) return;
   saving.value = true;
   try {
-    const res = await store.saveDefaults(optionsFromDraft(form.value));
+    const res = await store.saveDefaults(draftPatch(snapshot.saved(), form.value));
     builtin.value = res.builtin;
     form.value = draftFromOptions(res.defaults, kinds.value);
     snapshot.commit();
@@ -153,6 +153,7 @@ watch(() => settingsStore.authToken, (t, prev) => { if (t && !prev) void loadAll
           :companions="companions"
           :profiles="profiles"
           :now="now"
+          :highlight-id="highlightId"
           @changed="poll.trigger()"
         />
         <TagOperationsCard
@@ -164,7 +165,7 @@ watch(() => settingsStore.authToken, (t, prev) => { if (t && !prev) void loadAll
         />
       </template>
 
-      <ElCard v-if="defaultsLoaded" shadow="never" class="section-card">
+      <ElCard v-if="defaultsLoaded && builtin" shadow="never" class="section-card">
         <template #header>
           <div>
             <span class="section-title">Defaults for every profile</span>

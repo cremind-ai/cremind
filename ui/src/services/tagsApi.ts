@@ -27,7 +27,9 @@ function authHeaders(authToken: string): Record<string, string> {
 // ── shapes ─────────────────────────────────────────────────────────────────
 
 export type TagDeviceKind = 'gateway' | 'bridge' | 'tag';
-/** `unclaimed` | `assigning` | `ok` | `pending` | `offline` | `error` (open set). */
+/** `unclaimed` | `assigning` | `ok` | `pending` | `offline` | `error` |
+ *  `clear_failed` (its clear failed or expired 3 times: an admin must claim or
+ *  release it again) — an open set. */
 export type TagDeviceStatus = string;
 
 export interface TagDevice {
@@ -58,8 +60,11 @@ export interface TagDevice {
   claimed_at: number | null;
   created_at: number;
   updated_at: number;
-  /** Overview / detail only: the revision of the stored preview per kind. */
+  /** Overview / detail only: the revision of the stored preview per kind.
+   *  A change of owner drops them (and resets the name and revisions). */
   previews?: { desired: number | null; displayed: number | null };
+  /** Overview only: deliveries still on their way to this tag. */
+  pending_count?: number;
   /** Overview only. */
   companion_name?: string | null;
   companion_online?: boolean;
@@ -191,6 +196,12 @@ export interface TagEffectiveOptions {
   routes: Record<string, TagRoute>;
 }
 
+/** A partial options write (PATCH): a key given replaces, `null` inherits
+ *  again; `routes` merges per card kind the same way. */
+export type TagOptionsPatch = {
+  [K in Exclude<keyof TagOptions, 'routes'>]?: TagOptions[K] | null;
+} & { routes?: Record<string, TagRoute | null> | null };
+
 export interface TagSettings {
   profile: string;
   enabled: boolean;
@@ -198,8 +209,10 @@ export interface TagSettings {
   options: TagOptions;
   /** The admin's defaults (only the keys the admin set). */
   defaults: TagOptions;
+  /** The built-in layer under the admin defaults. */
+  builtin: TagEffectiveOptions;
   effective: TagEffectiveOptions;
-  /** The timezone the companion renders times in (resolved). */
+  /** The IANA timezone the companion renders times in (resolved). */
   timezone: string;
   updated_at: number | null;
   routable_kinds: string[];
@@ -241,6 +254,9 @@ export interface DisplayNotePayload {
   body?: string;
   icon?: string;
   ttl_s?: number;
+  /** false (default): the note is a card of its own. true: it takes the tag's
+   *  one replaceable note slot, retiring the previous replace-note. */
+  replace?: boolean;
 }
 
 export interface DeliveryQuery {
@@ -258,8 +274,7 @@ export interface DeliveryPage {
 
 export interface TagPreview {
   blob: Blob;
-  /** From `X-Tag-Revision`; null when the header is not readable (a
-   *  cross-origin UI without exposed headers). */
+  /** From `X-Tag-Revision` (CORS-exposed); null if a proxy strips it. */
   revision: number | null;
 }
 
@@ -335,8 +350,18 @@ export function getTagSettings(agentUrl: string, token: string): Promise<TagSett
   return request(agentUrl, token, '/api/tags/settings');
 }
 
-/** `options` REPLACES the profile's own overrides (omit it to leave them);
- *  a key left out (or null) inherits the admin default. */
+/** PATCH: merge `options` into the profile's own overrides (`null` inherits
+ *  again); `enabled` alone flips the switch. */
+export function patchTagSettings(
+  agentUrl: string,
+  token: string,
+  body: { enabled?: boolean; options?: TagOptionsPatch },
+): Promise<TagSettings> {
+  return request(agentUrl, token, '/api/tags/settings', { method: 'PATCH', body });
+}
+
+/** PUT: `options` REPLACES the profile's own overrides (omit it to leave them);
+ *  a key left out inherits the admin default. */
 export function saveTagSettings(
   agentUrl: string,
   token: string,
@@ -435,13 +460,14 @@ export async function getTagDelivery(
   return res.delivery;
 }
 
-/** 409 `already_terminal` when it finished meanwhile. */
-export async function cancelTagDelivery(
+/** Cancel a card that has not finished — also after the companion fetched
+ *  it: `resolved` is the job that tells the companion to drop it (null when
+ *  the tag has changed hands). 409 `already_terminal` once it finished. */
+export function cancelTagDelivery(
   agentUrl: string, token: string, deliveryId: number,
-): Promise<TagDelivery> {
-  const res = await request<{ delivery: TagDelivery }>(agentUrl, token,
+): Promise<{ delivery: TagDelivery; resolved: Record<string, any> | null }> {
+  return request(agentUrl, token,
     `/api/tags/deliveries/${enc(String(deliveryId))}/cancel`, { method: 'POST', body: {} });
-  return res.delivery;
 }
 
 export async function listTagCompanions(
@@ -571,6 +597,15 @@ export function getTagDefaults(
   agentUrl: string, token: string,
 ): Promise<{ defaults: TagOptions; builtin: TagEffectiveOptions }> {
   return request(agentUrl, token, '/api/tags/hardware/defaults');
+}
+
+/** Merge into the admin defaults (`null` removes a default). */
+export function patchTagDefaults(
+  agentUrl: string, token: string, defaults: TagOptionsPatch,
+): Promise<{ defaults: TagOptions; builtin: TagEffectiveOptions }> {
+  return request(agentUrl, token, '/api/tags/hardware/defaults', {
+    method: 'PATCH', body: { defaults },
+  });
 }
 
 /** Replaces the whole admin defaults object. */

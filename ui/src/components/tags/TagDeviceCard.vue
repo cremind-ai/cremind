@@ -6,6 +6,7 @@
  * refresh, identify, rename), and its delivery history on demand.
  */
 import { computed, ref } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import {
   ElButton, ElCard, ElMessage, ElMessageBox, ElTag, ElTooltip,
 } from 'element-plus';
@@ -20,7 +21,7 @@ import {
   BATTERY_LOW_MV, batteryIcon, deviceStatusPill, deviceTitle, formatBattery, formatRssi, panelLabel,
 } from '../../utils/tagsFormat';
 
-const props = defineProps<{ device: TagDevice; pending: number; now: number }>();
+const props = defineProps<{ device: TagDevice; pending: number; now: number; isAdmin?: boolean }>();
 const emit = defineEmits<{
   (e: 'display', device: TagDevice): void;
   (e: 'open-delivery', delivery: TagDelivery): void;
@@ -28,6 +29,8 @@ const emit = defineEmits<{
 }>();
 
 const store = useTagsStore();
+const router = useRouter();
+const route = useRoute();
 const historyOpen = ref(false);
 const busy = ref<string | null>(null);
 const history = ref<InstanceType<typeof TagDeliveryHistory> | null>(null);
@@ -35,6 +38,8 @@ const history = ref<InstanceType<typeof TagDeliveryHistory> | null>(null);
 const d = computed(() => props.device);
 const status = computed(() => deviceStatusPill(d.value.status));
 const title = computed(() => deviceTitle(d.value));
+/** The clear after a change of owner failed or expired 3 times. */
+const clearFailed = computed(() => d.value.status === 'clear_failed');
 const lowBattery = computed(() => d.value.battery_mv != null && d.value.battery_mv < BATTERY_LOW_MV);
 const behind = computed(() => d.value.desired_revision > d.value.displayed_revision);
 // What the history should re-read on: anything the poll sees move on this tag.
@@ -139,7 +144,7 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
         </div>
       </div>
       <div class="tag-actions">
-        <ElButton type="primary" size="small" :disabled="d.clear_required" @click="emit('display', d)">
+        <ElButton type="primary" size="small" :disabled="d.clear_required || clearFailed" @click="emit('display', d)">
           <Icon icon="mdi:note-edit-outline" class="btn-icon" /> Display note
         </ElButton>
         <ElButton size="small" :loading="busy === 'clear'" @click="clearScreen">
@@ -163,7 +168,18 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
       </div>
     </div>
 
-    <div v-if="d.clear_required" class="callout callout-warning" role="status">
+    <div v-if="clearFailed" class="callout callout-danger" role="alert">
+      <Icon icon="mdi:alert-octagon-outline" class="callout-icon danger" />
+      <span class="callout-text">
+        The tag could not clear its screen after a change of owner — three tries failed or ran
+        out of time. Nothing can be shown on it until an admin claims or releases it again.
+      </span>
+      <ElButton
+        v-if="isAdmin" size="small"
+        @click="router.push({ path: `/${route.params.profile}/settings/tags/hardware`, query: { tag: d.id } })"
+      >Open Hardware</ElButton>
+    </div>
+    <div v-else-if="d.clear_required" class="callout callout-warning" role="status">
       <Icon icon="mdi:progress-clock" class="callout-icon" />
       <span>
         Clearing the screen after a change of owner. Notes can be sent once the tag
@@ -201,11 +217,11 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
 
     <div class="previews">
       <TagPreviewImage
-        :device-id="d.id" kind="displayed" label="On the tag now"
+        :device-id="d.id" kind="displayed" label="On the tag now" :epoch="d.epoch"
         :revision="d.previews?.displayed ?? null" :width="d.width" :height="d.height"
       />
       <TagPreviewImage
-        :device-id="d.id" kind="desired" label="Next screen"
+        :device-id="d.id" kind="desired" label="Next screen" :epoch="d.epoch"
         :revision="d.previews?.desired ?? null" :width="d.width" :height="d.height"
       />
     </div>
@@ -257,7 +273,14 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
   border: 1px solid color-mix(in srgb, var(--el-color-warning) 55%, transparent);
   background: color-mix(in srgb, var(--el-color-warning) 12%, var(--surface-color));
 }
+.callout-danger {
+  border: 1px solid color-mix(in srgb, var(--el-color-danger) 55%, transparent);
+  background: color-mix(in srgb, var(--el-color-danger) 12%, var(--surface-color));
+  align-items: center; flex-wrap: wrap;
+}
+.callout-text { flex: 1; min-width: 220px; }
 .callout-icon { flex-shrink: 0; font-size: 1.1rem; margin-top: 1px; color: var(--el-color-warning); }
+.callout-icon.danger { color: var(--el-color-danger); }
 
 .facts {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));

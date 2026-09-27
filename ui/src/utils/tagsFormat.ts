@@ -1,7 +1,9 @@
 // Pure helpers for the Cremind Tag pages: labels, pill colours, icon names and
 // the settings form's inherit/override model. No Vue, no fetch — so they are
 // cheap to reuse from every tags component and to test under node:test.
-import type { TagDelivery, TagEffectiveOptions, TagOptions, TagRoute } from '../services/tagsApi';
+import type {
+  TagDelivery, TagEffectiveOptions, TagOptions, TagOptionsPatch, TagRoute,
+} from '../services/tagsApi';
 
 export type PillType = 'primary' | 'success' | 'info' | 'warning' | 'danger';
 
@@ -13,6 +15,8 @@ const DEVICE_STATUS: Record<string, { label: string; type: PillType }> = {
   assigning: { label: 'assigning', type: 'warning' },
   offline: { label: 'offline', type: 'info' },
   error: { label: 'error', type: 'danger' },
+  // Its screen clear failed or expired 3 times; an admin must claim or release it again.
+  clear_failed: { label: 'clear failed', type: 'danger' },
   unclaimed: { label: 'unclaimed', type: 'info' },
 };
 
@@ -114,6 +118,20 @@ export function stageTimeline(d: Pick<TagDelivery, 'stage' | 'stage_times' | 'cr
     rows.push({ stage: d.stage, at: times[d.stage] ?? null, reached: true, current: true });
   }
   return rows;
+}
+
+/** The confirm text for cancelling a delivery that has not finished. Past
+ *  `queued` the companion already holds the card; cancelling still works —
+ *  Cremind tells it to drop the card. */
+export function cancelPrompt(d: Pick<TagDelivery, 'stage' | 'kind' | 'card'>): string {
+  const what = `"${d.card?.title || kindLabel(d.kind)}"`;
+  if (d.stage === 'queued') return `Cancel ${what}? It has not left Cremind yet, so it will not reach the tag.`;
+  return `Cancel ${what}? The companion already has it; Cremind tells it to drop the card. `
+    + 'If the tag is already redrawing with it, the card goes at the next redraw.';
+}
+
+export function cancelledMessage(res: { resolved: unknown }): string {
+  return res.resolved ? 'Cancelled — the companion was told to drop the card' : 'Delivery cancelled';
 }
 
 export const TIMING_PARTS = [
@@ -263,23 +281,6 @@ export function kindHint(kind: string): string {
 
 // ── settings form (inherit / override) ─────────────────────────────────────
 
-/** Mirrors ``app/tags/routing.py`` ``BUILTIN_DEFAULTS`` — the last layer under
- *  the admin defaults. ``GET /api/tags/settings`` does not carry it, so a
- *  profile page needs this copy to name what an unset admin default means. */
-export const TAG_BUILTIN_DEFAULTS: TagEffectiveOptions = {
-  layout: 'status',
-  show_excerpts: false,
-  qr_links: false,
-  progress_cadence_s: 300,
-  language: 'en',
-  timezone: '',
-  routes: {
-    notification: 'all', task_outcome: 'all', needs_input: 'all', excerpt: 'all',
-    progress: 'all', health: 'all', indexing_problem: 'all', calendar: 'all',
-    automation: 'all', usage: 'none', tag_diagnostics: 'all',
-  },
-};
-
 export type ScalarOptionKey = 'layout' | 'show_excerpts' | 'qr_links' | 'progress_cadence_s' | 'language' | 'timezone';
 export const SCALAR_OPTION_KEYS: ScalarOptionKey[] = [
   'layout', 'show_excerpts', 'qr_links', 'progress_cadence_s', 'language', 'timezone',
@@ -298,9 +299,9 @@ export interface TagOptionsDraft {
 
 /** What a key inherits when this layer does not set it: ``lower`` (the admin
  *  defaults, for a profile; nothing, for the defaults themselves) over the
- *  built-ins. */
+ *  server's ``builtin`` layer (from GET /api/tags/settings or …/defaults). */
 export function inheritedOptions(lower: TagOptions | null | undefined,
-  builtin: TagEffectiveOptions = TAG_BUILTIN_DEFAULTS): TagEffectiveOptions {
+  builtin: TagEffectiveOptions): TagEffectiveOptions {
   const base = lower || {};
   return {
     layout: base.layout ?? builtin.layout,
@@ -341,6 +342,29 @@ export function optionsFromDraft(draft: TagOptionsDraft): TagOptions {
   const routes: Record<string, TagRoute> = {};
   for (const [kind, route] of Object.entries(draft.routes)) {
     if (route !== null && route !== undefined) routes[kind] = Array.isArray(route) ? [...route] : route;
+  }
+  if (Object.keys(routes).length) out.routes = routes;
+  return out;
+}
+
+/** The PATCH for what changed between two drafts of the same layer: a
+ *  changed key carries its new value, or ``null`` when it went back to
+ *  inheriting; ``routes`` only the kinds that changed. Keys nobody touched are
+ *  left out, so a concurrent edit elsewhere (the CLI) is not overwritten. */
+export function draftPatch(saved: TagOptionsDraft, current: TagOptionsDraft): TagOptionsPatch {
+  const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  const before = optionsFromDraft(saved);
+  const after = optionsFromDraft(current);
+  const out: TagOptionsPatch = {};
+  for (const key of SCALAR_OPTION_KEYS) {
+    if (!same(before[key], after[key])) (out as any)[key] = after[key] ?? null;
+  }
+  const kinds = new Set([...Object.keys(before.routes || {}), ...Object.keys(after.routes || {})]);
+  const routes: Record<string, TagRoute | null> = {};
+  for (const kind of kinds) {
+    const a = before.routes?.[kind];
+    const b = after.routes?.[kind];
+    if (!same(a, b)) routes[kind] = b ?? null;
   }
   if (Object.keys(routes).length) out.routes = routes;
   return out;

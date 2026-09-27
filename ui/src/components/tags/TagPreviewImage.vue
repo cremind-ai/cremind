@@ -4,7 +4,9 @@
  * revision). The endpoint needs the Bearer header, so the PNG is fetched as a
  * blob and shown through an object URL, revoked when the revision changes or
  * the component unmounts. `revision` is what the overview says is stored:
- * null means nothing has been sent yet, and no request is made.
+ * null means nothing has been sent yet, and no request is made. `epoch` is
+ * part of the key too: a change of owner drops the previews and restarts the
+ * revisions, so a new owner's "revision 1" is never the old owner's image.
  */
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
@@ -14,6 +16,7 @@ const props = defineProps<{
   deviceId: string;
   kind: 'desired' | 'displayed';
   revision: number | null | undefined;
+  epoch?: number;
   label: string;
   width?: number | null;
   height?: number | null;
@@ -22,6 +25,8 @@ const props = defineProps<{
 const store = useTagsStore();
 const src = ref<string | null>(null);
 const state = ref<'idle' | 'loading' | 'none' | 'failed' | 'ready'>('idle');
+/** The revision the server says the loaded PNG is (X-Tag-Revision). */
+const shownRevision = ref<number | null>(null);
 let owned: string | null = null;
 let generation = 0;
 
@@ -35,6 +40,7 @@ async function load() {
   if (props.revision == null) {
     release();
     src.value = null;
+    shownRevision.value = null;
     state.value = 'none';
     return;
   }
@@ -51,6 +57,7 @@ async function load() {
     }
     owned = URL.createObjectURL(preview.blob);
     src.value = owned;
+    shownRevision.value = preview.revision ?? props.revision ?? null;
     state.value = 'ready';
   } catch {
     if (gen !== generation) return;
@@ -60,7 +67,11 @@ async function load() {
   }
 }
 
-watch(() => [props.deviceId, props.kind, props.revision], load, { immediate: true });
+watch(() => [props.deviceId, props.kind, props.revision, props.epoch], (next, prev) => {
+  // A new owner (epoch) never keeps the previous owner's image up while loading.
+  if (prev && next[3] !== prev[3]) { release(); src.value = null; }
+  void load();
+}, { immediate: true });
 onBeforeUnmount(() => { generation += 1; release(); });
 
 const aspect = computed(() =>
@@ -71,10 +82,10 @@ const aspect = computed(() =>
   <figure class="tag-preview">
     <figcaption class="tag-preview-caption">
       <span class="tag-preview-label">{{ label }}</span>
-      <span v-if="revision != null" class="tag-preview-rev">rev {{ revision }}</span>
+      <span v-if="(shownRevision ?? revision) != null" class="tag-preview-rev">rev {{ shownRevision ?? revision }}</span>
     </figcaption>
     <div class="tag-preview-frame" :style="{ aspectRatio: aspect }">
-      <img v-if="src" :src="src" :alt="`${label} (revision ${revision})`" class="tag-preview-img" />
+      <img v-if="src" :src="src" :alt="`${label} (revision ${shownRevision ?? revision})`" class="tag-preview-img" />
       <div v-else class="tag-preview-empty">
         <Icon
           :icon="state === 'failed' ? 'mdi:image-broken-variant' : state === 'loading' ? 'mdi:loading' : 'mdi:image-off-outline'"

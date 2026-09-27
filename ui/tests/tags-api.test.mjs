@@ -46,11 +46,13 @@ function refusal(status, error, message, extra = {}) {
   return json({ error, message, detail: message, ...extra }, status)
 }
 
-test('the overview is a GET with the Bearer token', async () => {
+test('the overview is a GET with the Bearer token; devices carry pending_count', async () => {
   env = installBrowser()
-  env.route('/api/tags', () => json({ profile: 'ann', enabled: true, devices: [DEVICE], counts: { devices: 1 } }))
+  env.route('/api/tags', () => json({ profile: 'ann', enabled: true, devices: [{ ...DEVICE, pending_count: 2 }], counts: { devices: 1 } }))
   const ov = await api.getTagsOverview(URL_, TOKEN)
   assert.equal(ov.devices[0].id, 'dev-1')
+  assert.equal(ov.devices[0].pending_count, 2)
+  assert.equal(env.calls.length, 1, 'the overview is one request')
   const call = only('/api/tags')
   assert.equal(call.url, `${URL_}/api/tags`)
   assert.equal(call.init.method, 'GET')
@@ -78,6 +80,27 @@ test('settings: the switch sends only `enabled`, the form sends only `options`',
   ])
 })
 
+test('settings carry the server builtin; the form saves with PATCH (null = inherit again)', async () => {
+  env = installBrowser()
+  const builtin = { layout: 'status', show_excerpts: false, qr_links: false, progress_cadence_s: 300,
+    language: 'en', timezone: '', routes: { usage: 'none' } }
+  env.route('/api/tags/settings', (_url, init) => json({
+    profile: 'ann', enabled: true, options: {}, defaults: {}, builtin, timezone: 'Asia/Ho_Chi_Minh',
+    ...(init.body ? { echo: JSON.parse(init.body) } : {}),
+  }))
+  const got = await api.getTagSettings(URL_, TOKEN)
+  assert.deepEqual(got.builtin, builtin)
+  assert.equal(got.timezone, 'Asia/Ho_Chi_Minh')
+  await api.patchTagSettings(URL_, TOKEN, { options: { language: null, routes: { usage: 'all', calendar: null } } })
+  await api.patchTagSettings(URL_, TOKEN, { enabled: false })
+  const writes = env.callsTo('/api/tags/settings').filter((c) => c.init.method !== 'GET')
+  assert.deepEqual(writes.map((c) => c.init.method), ['PATCH', 'PATCH'])
+  assert.deepEqual(writes.map(bodyOf), [
+    { options: { language: null, routes: { usage: 'all', calendar: null } } },
+    { enabled: false },
+  ])
+})
+
 test('invalid_settings keeps the field details', async () => {
   env = installBrowser()
   env.route('/api/tags/settings', () => refusal(422, 'invalid_settings',
@@ -96,7 +119,7 @@ test('invalid_settings keeps the field details', async () => {
 test('display posts the note and returns the delivery', async () => {
   env = installBrowser()
   env.route('/api/tags/devices/dev-1/display', () => json({ delivery: DELIVERY }, 201))
-  const note = { title: 'Back at 3', body: 'Coffee', icon: 'push_pin', ttl_s: 3600 }
+  const note = { title: 'Back at 3', body: 'Coffee', icon: 'push_pin', ttl_s: 3600, replace: true }
   const delivery = await api.displayOnTag(URL_, TOKEN, 'dev-1', note)
   assert.equal(delivery.id, 501)
   const call = only('/api/tags/devices/dev-1/display')
@@ -168,6 +191,16 @@ test('delivery history pages with device/state/limit/before and omits what is un
     `${URL_}/api/tags/deliveries?device=dev-1`,
     `${URL_}/api/tags/deliveries`,
   ])
+})
+
+test('cancel returns the delivery and the resolved job sent to the companion', async () => {
+  env = installBrowser()
+  const cancelled = { ...DELIVERY, stage: 'cancelled', terminal: true, outcome: 'cancelled' }
+  env.route('/api/tags/deliveries/502/cancel', () => json({ delivery: cancelled, resolved: { delivery_id: 900, kind: 'resolved' } }))
+  const res = await api.cancelTagDelivery(URL_, TOKEN, 502)
+  assert.equal(res.delivery.stage, 'cancelled')
+  assert.equal(res.resolved.kind, 'resolved')
+  assert.equal(only('/api/tags/deliveries/502/cancel').init.method, 'POST')
 })
 
 test('cancel: 409 already_terminal keeps the finished delivery in the body', async () => {
@@ -314,7 +347,7 @@ test('admin: assign, release, rename, forget (409 tag_owned) and commands', asyn
   assert.equal(cmdCalls[1].url, `${URL_}/api/tags/hardware/commands/cmd-1`)
 })
 
-test('admin: register / rotate / delete companions, and the defaults are PUT whole', async () => {
+test('admin: register / rotate / delete companions; defaults PUT whole or PATCH a merge', async () => {
   env = installBrowser()
   env.route('/api/tags/hardware/companions', () => json({
     companion: { id: 'comp-2', name: 'Lab' },
@@ -336,6 +369,8 @@ test('admin: register / rotate / delete companions, and the defaults are PUT who
   await api.deleteTagCompanion(URL_, TOKEN, 'comp-2')
   const saved = await api.saveTagDefaults(URL_, TOKEN, { language: 'vi', routes: { usage: 'all' } })
   assert.deepEqual(saved.defaults, { language: 'vi', routes: { usage: 'all' } })
+  const patched = await api.patchTagDefaults(URL_, TOKEN, { language: null, qr_links: true })
+  assert.equal(patched.builtin.layout, 'status')
   await api.getTagDefaults(URL_, TOKEN)
 
   assert.deepEqual(bodyOf(env.callsTo('/api/tags/hardware/companions')[0]), { name: 'Lab' })
@@ -343,8 +378,9 @@ test('admin: register / rotate / delete companions, and the defaults are PUT who
   const del = env.calls.find((c) => c.init.method === 'DELETE')
   assert.equal(del.url, `${URL_}/api/tags/hardware/companions/comp-2`)
   const defaults = env.callsTo('/api/tags/hardware/defaults')
-  assert.deepEqual(defaults.map((c) => c.init.method), ['PUT', 'GET'])
+  assert.deepEqual(defaults.map((c) => c.init.method), ['PUT', 'PATCH', 'GET'])
   assert.deepEqual(bodyOf(defaults[0]), { defaults: { language: 'vi', routes: { usage: 'all' } } })
+  assert.deepEqual(bodyOf(defaults[1]), { defaults: { language: null, qr_links: true } })
 })
 
 test('a 403 from a hardware route for a non-admin keeps its status', async () => {

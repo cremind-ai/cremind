@@ -1,25 +1,27 @@
 // The Tags pages' pure helpers: the settings form's inherit/override model,
-// the stage timeline, and the few constants copied from the server.
+// the save PATCH, the stage timeline, pills and cancel wording.
 //
-// The form holds every key, with `null` meaning "inherit the layer below"; a
-// save must send only the keys this layer overrides (PUT options REPLACES the
-// profile's own overrides), and an inherited value shown greyed must be the
-// admin default when there is one, else the built-in. The built-ins and the
-// low-battery threshold are copies of app/tags — pinned here against the
-// Python source so a server change cannot leave the UI naming stale defaults.
+// The form holds every key, with `null` meaning "inherit the layer below". A
+// save PATCHes only what changed (`null` = inherit again), so an edit made
+// meanwhile from the CLI survives. An inherited value shown greyed is the
+// admin default when there is one, else the server's `builtin` layer — the UI
+// keeps no copy of the built-ins; it renders whatever the server sends.
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
 
 import { installBrowser, load } from './harness.mjs'
 
 installBrowser()
 const fmt = await load('src/utils/tagsFormat.ts')
 
-const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-const KINDS = Object.keys(fmt.TAG_BUILTIN_DEFAULTS.routes)
+// Shaped like GET /api/tags/settings `builtin` (values deliberately not the
+// real built-ins: whatever the server sends is what the form must show).
+const BUILTIN = {
+  layout: 'status', show_excerpts: false, qr_links: true, progress_cadence_s: 600,
+  language: 'fr', timezone: '',
+  routes: { notification: 'all', needs_input: 'all', calendar: 'all', usage: 'none' },
+}
+const KINDS = Object.keys(BUILTIN.routes)
 
 test('a draft round-trips to only the keys it overrides', () => {
   const own = { show_excerpts: true, timezone: '', routes: { usage: 'all', needs_input: ['dev-1'] } }
@@ -43,13 +45,37 @@ test('the draft copies arrays, so editing it never edits the loaded settings', (
   assert.deepEqual(own.routes.needs_input, ['dev-1'])
 })
 
-test('inherited values: the admin default where set, else the built-in, routes per kind', () => {
-  const inherited = fmt.inheritedOptions({ language: 'vi', routes: { usage: 'all' } })
+test('inherited values: the admin default where set, else the server-sent builtin', () => {
+  const inherited = fmt.inheritedOptions({ language: 'vi', routes: { usage: 'all' } }, BUILTIN)
   assert.equal(inherited.language, 'vi')
-  assert.equal(inherited.progress_cadence_s, 300)
+  assert.equal(inherited.progress_cadence_s, 600, 'the builtin the server sent, not a UI copy')
+  assert.equal(inherited.qr_links, true)
   assert.equal(inherited.routes.usage, 'all')
   assert.equal(inherited.routes.notification, 'all')
-  assert.equal(fmt.inheritedOptions(null).routes.usage, 'none')
+  const bare = fmt.inheritedOptions(null, BUILTIN)
+  assert.equal(bare.routes.usage, 'none')
+  assert.equal(bare.language, 'fr')
+  assert.equal(fmt.TAG_BUILTIN_DEFAULTS, undefined, 'no client-side copy of the built-ins')
+})
+
+test('a save PATCHes only what changed; back to inherit is null', () => {
+  const saved = fmt.draftFromOptions({ language: 'vi', show_excerpts: true, routes: { usage: 'all', calendar: ['a'] } }, KINDS)
+  const current = structuredClone(saved)
+  assert.deepEqual(fmt.draftPatch(saved, current), {}, 'nothing touched, nothing sent')
+
+  current.language = null // back to "Use admin default"
+  current.qr_links = true // a new override
+  current.routes.usage = null
+  current.routes.calendar = ['a', 'b']
+  current.routes.needs_input = 'none'
+  assert.deepEqual(fmt.draftPatch(saved, current), {
+    language: null, qr_links: true,
+    routes: { usage: null, calendar: ['a', 'b'], needs_input: 'none' },
+  })
+
+  const typed = structuredClone(saved)
+  typed.language = '  en '
+  assert.deepEqual(fmt.draftPatch(saved, typed), { language: 'en' }, 'trimmed like the server')
 })
 
 test('the form refuses what the server would', () => {
@@ -76,12 +102,24 @@ test('the stage timeline walks every forward stage and appends a terminal outcom
   assert.equal(shown.at(-1).current, true)
 })
 
-test('pill types never use a light-9 tag for an in-flight stage', () => {
+test('pill types: stages, commands, and clear_failed as danger', () => {
   assert.equal(fmt.stagePillType('displayed'), 'success')
   assert.equal(fmt.stagePillType('failed'), 'danger')
   assert.equal(fmt.stagePillType('transferring'), 'primary')
   assert.equal(fmt.commandStatusPill('claimed').label, 'running')
   assert.equal(fmt.deviceStatusPill(null).label, 'unclaimed')
+  assert.deepEqual(fmt.deviceStatusPill('clear_failed'), { label: 'clear failed', type: 'danger' })
+})
+
+test('cancel wording: a card the companion holds can still be cancelled', () => {
+  const queued = fmt.cancelPrompt({ stage: 'queued', kind: 'pinned_note', card: { title: 'Lunch' } })
+  assert.match(queued, /"Lunch"/)
+  assert.match(queued, /has not left Cremind/)
+  const held = fmt.cancelPrompt({ stage: 'transferring', kind: 'notification', card: null })
+  assert.match(held, /"Notifications"/)
+  assert.match(held, /companion already has it; Cremind tells it to drop the card/)
+  assert.match(fmt.cancelledMessage({ resolved: { kind: 'resolved' } }), /told to drop the card/)
+  assert.equal(fmt.cancelledMessage({ resolved: null }), 'Delivery cancelled')
 })
 
 test('scan results accept the likely result shapes', () => {
@@ -92,19 +130,4 @@ test('scan results accept the likely result shapes', () => {
   assert.deepEqual(fmt.scanResults(['u3', ' ']).map((r) => r.uuid), ['u3'])
   assert.deepEqual(fmt.scanResults({ unprovisioned: ['u4'] }).map((r) => r.uuid), ['u4'])
   assert.deepEqual(fmt.scanResults(null), [])
-})
-
-test('the built-in defaults and battery threshold match app/tags', () => {
-  const routing = readFileSync(path.join(repo, 'app/tags/routing.py'), 'utf8')
-  const kinds = routing.match(/ROUTABLE_KINDS = \(([\s\S]*?)\)/)[1].match(/"([a-z_]+)"/g).map((k) => k.slice(1, -1))
-  assert.deepEqual(KINDS, kinds)
-  const builtin = routing.match(/BUILTIN_DEFAULTS[^=]*= \{([\s\S]*?)\n\}/)[1]
-  assert.match(builtin, /"progress_cadence_s": 300/)
-  assert.match(builtin, /"language": "en"/)
-  assert.match(builtin, /"none" if kind == "usage" else "all"/)
-  assert.equal(fmt.TAG_BUILTIN_DEFAULTS.progress_cadence_s, 300)
-  assert.equal(fmt.TAG_BUILTIN_DEFAULTS.language, 'en')
-
-  const projection = readFileSync(path.join(repo, 'app/tags/projection.py'), 'utf8')
-  assert.equal(Number(projection.match(/BATTERY_LOW_MV = (\d+)/)[1]), fmt.BATTERY_LOW_MV)
 })

@@ -4,10 +4,10 @@
  * tags get which kinds of card, how cards look, and the content credentials a
  * companion uses to fetch them.
  *
- * The on/off switch acts at once (PUT {enabled}); the routing and look form
- * saves from the bar (PUT {options}, which replaces the profile's own
- * overrides — a field left on "Use admin default" is simply not sent).
- * Credentials are created and revoked immediately.
+ * The on/off switch acts at once (PATCH {enabled}); the routing and look form
+ * saves from the bar as a PATCH of only the keys that changed (`null` for one
+ * put back on "Use admin default"), so an edit made elsewhere meanwhile — the
+ * CLI — is not overwritten. Credentials are created and revoked immediately.
  *
  * CLI counterpart: `cremind tags settings` / `cremind tags configure` /
  * `cremind tags credentials …`.
@@ -24,7 +24,7 @@ import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 import TagOptionsForm from '../components/tags/TagOptionsForm.vue';
 import TagContentCredentials from '../components/tags/TagContentCredentials.vue';
 import {
-  draftFromOptions, draftProblem, inheritedOptions, optionsFromDraft, type TagOptionsDraft,
+  draftFromOptions, draftPatch, draftProblem, inheritedOptions, type TagOptionsDraft,
 } from '../utils/tagsFormat';
 
 const props = defineProps<{ profile: string }>();
@@ -47,7 +47,9 @@ const snapshot = useSavedSnapshot(() => form.value);
 const dirty = computed(() => !!settings.value && snapshot.dirty.value);
 const problem = computed(() => draftProblem(form.value));
 
-const inherited = computed(() => inheritedOptions(settings.value?.defaults));
+const inherited = computed(() => (settings.value
+  ? inheritedOptions(settings.value.defaults, settings.value.builtin)
+  : null));
 const ownTimezoneHint = computed(() => {
   const s = settings.value;
   // With no override anywhere, the resolved timezone IS the profile's own.
@@ -99,7 +101,7 @@ async function save() {
   if (!dirty.value || problem.value) return;
   saving.value = true;
   try {
-    await store.saveSettings({ options: optionsFromDraft(form.value) });
+    await store.saveSettings({ options: draftPatch(snapshot.saved(), form.value) });
     hydrate();
     ElMessage.success('Tags settings saved');
   } catch (e) {
@@ -169,6 +171,7 @@ watch(() => settingsStore.authToken, (t, prev) => { if (t && !prev) void load();
         <ElCard shadow="never" class="section-card">
           <template #header><span class="section-title">Cards</span></template>
           <TagOptionsForm
+            v-if="inherited"
             v-model="form"
             :inherited="inherited"
             :kinds="kinds"
