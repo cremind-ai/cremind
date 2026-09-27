@@ -13,7 +13,7 @@ import test from 'node:test'
 import { load } from './harness.mjs'
 
 const { createChatMarked } = await load('src/utils/markdown.ts')
-const { citationMarkedExtension, toPlainFootnotes, normalizeCitationsMeta } =
+const { citationMarkedExtension, toPlainFootnotes, normalizeCitationsMeta, groupCitationSources } =
   await load('src/utils/citations.ts')
 
 const A = '[doc:k7m2xq9a#3f9c2e1b]'
@@ -147,4 +147,36 @@ test('copy of a source that never resolved still keeps its number', () => {
 
 test('copy of a message without citations is the message', () => {
   assert.equal(toPlainFootnotes('plain [doc:<x>] text', ITEMS), 'plain [doc:<x>] text')
+})
+
+// ── the Sources list ────────────────────────────────────────────────────────
+
+const A2 = '[doc:k7m2xq9a#0a1b2c3d]'
+const A_FILE = '[doc:k7m2xq9a]'
+
+test('the Sources list shows each cited file once, holding all of its citations', () => {
+  // Three passages of one file are one entry, not three entries that read as
+  // three documents; entries keep the order of their first citation.
+  const groups = groupCitationSources([
+    { token: A, n: 1, item: ITEMS[0] },
+    { token: B, n: 2, item: ITEMS[1] },
+    { token: A2, n: 3 },
+    { token: A_FILE, n: 4 },
+  ])
+  assert.deepEqual(
+    groups.map(g => [g.citeId, g.sources.map(s => s.n), g.file?.name]),
+    [['k7m2xq9a', [1, 3, 4], 'report.pdf'], ['p4r8st0v', [2], 'Plan']],
+  )
+})
+
+test('a file is grouped by its cite id before any item arrives, and named by the first that knows it', () => {
+  const pending = groupCitationSources([{ token: A2, n: 2 }, { token: C, n: 3 }, { token: A, n: 1 }])
+  assert.deepEqual(pending.map(g => [g.citeId, g.sources.map(s => s.n), g.file]), [
+    ['k7m2xq9a', [1, 2], null],
+    ['cccccccc', [3], null],
+  ])
+  // An invalid passage carries no file; the file still comes from a sibling.
+  const invalid = { ...ITEMS[0], token: A2, status: 'invalid', file: null }
+  const [group] = groupCitationSources([{ token: A2, n: 1, item: invalid }, { token: A, n: 2, item: ITEMS[0] }])
+  assert.equal(group.file?.rel_path, 'Finance/2024/report.pdf')
 })

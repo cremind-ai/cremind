@@ -68,6 +68,17 @@ export interface CitationSource {
   item?: CitationItem;
 }
 
+/** Every citation of one file (or folder) in a bubble, as its Sources list
+ *  shows them: under the file, once. */
+export interface CitationSourceGroup {
+  /** The cite id the group's tokens share — the file's `fid`. */
+  citeId: string;
+  /** The file as the first verified item of the group describes it. */
+  file: CitationFile | null;
+  /** In number order. */
+  sources: CitationSource[];
+}
+
 export interface CitationsMeta {
   v: number;
   items: CitationItem[];
@@ -230,6 +241,28 @@ export function numberTokens(text: string): Map<string, number> {
 /** Whether a message is worth rendering through the citation-aware parser. */
 export function mentionsCitations(text: string | null | undefined): boolean {
   return !!text && /(?:doc|ud)\s*[:：]/i.test(text);
+}
+
+/**
+ * A bubble's sources by the file they cite, in order of each file's first
+ * citation: three passages of one contract are one entry holding [1], [3] and
+ * [4], not three entries that read as three documents. Keyed by the token's
+ * cite id, which is the file's fid, so an entry is where it will stay while
+ * its items are still being verified.
+ */
+export function groupCitationSources(sources: Iterable<CitationSource>): CitationSourceGroup[] {
+  const groups = new Map<string, CitationSourceGroup>();
+  for (const source of [...sources].sort((a, b) => a.n - b.n)) {
+    const citeId = tokenParts(source.token)?.citeId ?? source.token;
+    let group = groups.get(citeId);
+    if (!group) {
+      group = { citeId, file: null, sources: [] };
+      groups.set(citeId, group);
+    }
+    group.sources.push(source);
+    group.file ??= source.item?.file ?? null;
+  }
+  return [...groups.values()];
 }
 
 // ── normalising what the server sends ─────────────────────────────────────────
