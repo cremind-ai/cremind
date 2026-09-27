@@ -119,15 +119,17 @@ The same page carries the editor sections matching this command group —
 **Agent name** (a single-line input matching `cremind profile agent-name
 set`), **PERSONA.md** (a Markdown editor matching `cremind profile persona
 set`), and **INSTRUCTIONS.md** directly below it (matching `cremind
-profile instructions set`). Anything you change here is immediately
-visible to `cremind profile get`.
+profile instructions set`). They are saved together from the save bar
+pinned to the bottom of the page (**Save changes** / **Discard**), and
+once saved are immediately visible to `cremind profile get`.
 
 Deleting the profile you are signed in as logs you out on the spot — its
 token dies with it, so the UI drops you back on the profile selector.
 
 Signed in as `admin`, each row also has a **Working directory** field
-(empty = the default, shown as the placeholder; **Save** runs the same
-check as `cremind profile working-dir` and shows its refusal), and the
+(empty = the default, shown as the placeholder; the save bar's **Save
+changes** runs the same check as `cremind profile working-dir` and shows
+its refusal under the row), and the
 delete dialog asks whether to **keep the profile's folder** (the default —
 moved to `<workspaces>/.deleted/`) or **delete it with its files**, like
 `--delete-working-dir`. Everyone else sees their own folder, read-only,

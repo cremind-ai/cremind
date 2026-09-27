@@ -25,6 +25,8 @@ import {
 } from '../services/processApi';
 import { openSettingsStateStream, type SettingsStateStreamHandle } from '../services/settingsStateStream';
 import { useServerRestart } from '../composables/useServerRestart';
+import { stableStringify } from '../composables/useUnsavedChanges';
+import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 
 import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
@@ -76,8 +78,13 @@ interface UnifiedItem {
   argumentsSchema: JsonSchema | null;
   argValues: Record<string, ProfileValue>;
 
+  /** The variables as the server last returned (or as last saved): the save
+   *  bar's baseline, and how a rebuild tells an edit from a stale value. */
+  savedVars: Record<string, string>;
+  /** MCP servers only: the description as saved. */
+  savedDescription: string;
+
   expanded: boolean;
-  saving: boolean;
   /** Built-in tools only: false until a child LLM is bound (post-setup). */
   llmBound: boolean;
   /** Built-in tools only: true when the enable/disable toggle is locked on
@@ -226,6 +233,8 @@ function openLiveSettingsStream() {
     settingsStore.agentUrl, settingsStore.authToken, settingsStore.profileId,
     () => {
       if (firstPing) { firstPing = false; return; }
+      // The save bar's own saves ping too; it reloads once they are all done.
+      if (savingAll.value) return;
       reloadAll();
     },
   );
@@ -309,6 +318,10 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
     const isSkill = tool.tool_type === 'skill';
     const metaCfg = (tool.config?.meta ?? {}) as Record<string, string>;
     const schema = (tool.arguments_schema as JsonSchema | null) ?? null;
+    const vars = initVarValues(tool.required_fields, tool.config?.variables);
+    // Skills surface their real SKILL.md description; built-in/MCP tools use
+    // this as the user-editable description override.
+    const description = isSkill ? (tool.description || '') : (metaCfg.description || '');
 
     result.push({
       name: tool.tool_id,
@@ -316,12 +329,10 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       kind: isSkill ? 'skill' : 'builtin',
       toolName: tool.tool_id,
       toolConfigFields: { ...(tool.required_fields ?? {}) },
-      toolConfigValues: initVarValues(tool.required_fields, tool.config?.variables),
+      toolConfigValues: vars,
       toolConfigured: tool.configured,
       agentName: tool.tool_id,
-      // Skills surface their real SKILL.md description; built-in/MCP tools use
-      // this as the user-editable description override.
-      description: isSkill ? (tool.description || '') : (metaCfg.description || ''),
+      description,
       url: tool.url || '',
       enabled: tool.enabled,
       connectionError: tool.connection_error ?? null,
@@ -333,8 +344,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       statusText: '',
       argumentsSchema: schema,
       argValues: initArgValues(schema, tool.config?.arguments),
+      savedVars: { ...vars },
+      savedDescription: description,
       expanded: false,
-      saving: false,
       // Skills don't have a child LLM; treat them as bound.
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
       toggleLocked: !!tool.toggle_locked,
@@ -380,8 +392,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       statusText: agent.status_text,
       argumentsSchema: schema,
       argValues: initArgValues(schema),
+      savedVars: {},
+      savedDescription: agent.description || '',
       expanded: false,
-      saving: false,
       llmBound: true,
       toggleLocked: false,
       isBuiltinSkill: false,
@@ -401,7 +414,42 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
     });
   }
 
+  // A rebuild follows every settings-state ping — any switch flipped here or
+  // in another tab — so it must not throw away what the page is showing: open
+  // cards, their lazily-loaded lists, and fields edited but not saved yet.
+  const previous = new Map(items.value.map(item => [item.name, item]));
+  for (const item of result) {
+    const old = previous.get(item.name);
+    if (old) carryOver(item, old);
+  }
   items.value = result;
+  for (const item of result) {
+    if (item.expanded) loadExpandedData(item);
+  }
+}
+
+/** Move what the page holds of a card from its old row onto the rebuilt one.
+ *  An edited field keeps the edit; every other field takes the server's value,
+ *  so a variable saved elsewhere meanwhile (a sign-in's token) is not undone. */
+function carryOver(fresh: UnifiedItem, old: UnifiedItem) {
+  fresh.expanded = old.expanded;
+  fresh.registering = old.registering;
+  fresh.lastRegisteredProcess = old.lastRegisteredProcess;
+  if (old.leavesLoaded) {
+    fresh.leaves = old.leaves;
+    fresh.leavesLoaded = true;
+    fresh.leavesDisconnected = old.leavesDisconnected;
+    // A built-in's flag comes with its row; an MCP server's from its leaf list.
+    if (fresh.kind === 'mcp-remote') fresh.supportsLeafToggle = old.supportsLeafToggle;
+  }
+  if (old.dynamicOptionsLoaded) {
+    fresh.dynamicOptions = old.dynamicOptions;
+    fresh.dynamicOptionsLoaded = true;
+  }
+  for (const [key, value] of Object.entries(old.toolConfigValues)) {
+    if (value !== old.savedVars[key]) fresh.toolConfigValues[key] = value;
+  }
+  if (old.description !== old.savedDescription) fresh.description = old.description;
 }
 
 // ── Status tag helpers ──
@@ -420,29 +468,66 @@ function getRemoteStatusTag(item: UnifiedItem) {
   return { label: item.statusText, type };
 }
 
-// ── Actions ──
-async function saveItemConfig(item: UnifiedItem) {
-  item.saving = true;
+// ── The save bar: every card's edited fields, saved together ──
+// The enable switches, sub-tool switches and card actions (sign in, remove,
+// register) still act at once; the bar is for variables and descriptions.
+// (An MCP server's tool arguments are not saved by any endpoint yet, so they
+// are not counted as a change.)
+
+function itemDirty(item: UnifiedItem): boolean {
+  return stableStringify(item.toolConfigValues) !== stableStringify(item.savedVars)
+    || (item.kind === 'mcp-remote' && item.description !== item.savedDescription);
+}
+
+const dirtyItems = computed(() => items.value.filter(itemDirty));
+const savingAll = ref(false);
+
+async function persistItem(item: UnifiedItem) {
+  // What is sent is what is marked saved: typing on while it saves stays a change.
+  const vars = { ...item.toolConfigValues };
+  const description = item.description;
+  // Built-in / skill tools only persist their variables (secrets / required
+  // config) now — the per-tool LLM/arguments options were removed.
+  if (item.toolName && Object.keys(vars).length > 0) {
+    await updateToolConfig(settingsStore.agentUrl, settingsStore.authToken, item.toolName, vars);
+  }
+  // MCP remote servers keep their own description on the agent config endpoint.
+  if (item.kind === 'mcp-remote' && item.hasAgent) {
+    await updateAgentConfig(settingsStore.agentUrl, settingsStore.authToken, item.agentName, {
+      description: description || null,
+    });
+  }
+  // The row may have been rebuilt meanwhile; mark the current one.
+  const current = items.value.find(i => i.name === item.name) ?? item;
+  current.savedVars = vars;
+  current.savedDescription = description;
+}
+
+async function saveAll() {
+  if (!dirtyItems.value.length || savingAll.value) return;
+  savingAll.value = true;
+  const failed: string[] = [];
   try {
-    // Built-in / skill tools only persist their variables (secrets / required
-    // config) now — the per-tool LLM/arguments options were removed.
-    if (item.toolName && Object.keys(item.toolConfigValues).length > 0) {
-      await updateToolConfig(settingsStore.agentUrl, settingsStore.authToken, item.toolName, item.toolConfigValues);
-    }
-
-    // MCP remote servers keep their own description on the agent config endpoint.
-    if (item.kind === 'mcp-remote' && item.hasAgent) {
-      await updateAgentConfig(settingsStore.agentUrl, settingsStore.authToken, item.agentName, {
-        description: item.description || null,
-      });
-    }
-
-    ElMessage.success(`${item.displayName} configuration saved`);
-    await reloadAll();
-  } catch (e) {
-    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
+    await Promise.all(dirtyItems.value.map(async (item) => {
+      try {
+        await persistItem(item);
+      } catch (e) {
+        failed.push(`${item.displayName} (${e instanceof Error ? e.message : 'failed'})`);
+      }
+    }));
   } finally {
-    item.saving = false;
+    savingAll.value = false;
+  }
+  if (failed.length) ElMessage.error(`Not saved: ${failed.join('; ')}`);
+  else ElMessage.success('Changes saved');
+  // Status tags (Needs Config → Active) and masked secrets come from the server.
+  await reloadAll();
+}
+
+function discardAll() {
+  for (const item of dirtyItems.value) {
+    item.toolConfigValues = { ...item.savedVars };
+    item.description = item.savedDescription;
   }
 }
 
@@ -485,14 +570,20 @@ async function toggleItemEnabled(item: UnifiedItem, value: boolean) {
  *  built-in group or MCP server card is opened. */
 function toggleExpand(item: UnifiedItem) {
   item.expanded = !item.expanded;
-  if (item.expanded && !item.leavesLoaded && (item.kind === 'builtin' || item.kind === 'mcp-remote')) {
+  if (item.expanded) loadExpandedData(item);
+}
+
+/** What an open card shows and loads on demand: its sub-tools, and the live
+ *  option lists of its variables. */
+function loadExpandedData(item: UnifiedItem) {
+  if (!item.leavesLoaded && !item.leavesLoading && (item.kind === 'builtin' || item.kind === 'mcp-remote')) {
     void loadLeaves(item);
   }
   // A load already in flight is left to finish: `dynamicOptionsLoaded` is also
   // false while a post-sign-in refresh runs, and a second, non-refresh fetch
   // started by re-expanding would supersede it with a possibly cached list.
   if (
-    item.expanded && !item.dynamicOptionsLoaded && !item.dynamicOptionsLoading
+    !item.dynamicOptionsLoaded && !item.dynamicOptionsLoading
     && item.kind === 'builtin' && hasDynamicOptions(item)
   ) {
     void loadDynamicOptions(item);
@@ -1255,16 +1346,6 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                   />
                 </div>
 
-                <div v-if="Object.keys(row.item.toolConfigFields).length > 0"
-                     style="display: flex; align-items: center; gap: 8px;">
-                  <ElButton
-                    type="primary"
-                    size="small"
-                    :loading="row.item.saving"
-                    @click="saveItemConfig(row.item)"
-                  >Save</ElButton>
-                </div>
-
                 <LeafToggleSection
                   v-if="row.item.supportsLeafToggle || row.item.leavesLoading"
                   :leaves="row.item.leaves"
@@ -1317,11 +1398,6 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                   :dynamic-loading="item.dynamicOptionsLoading"
                   @update:values="item.toolConfigValues = $event"
                 />
-              </div>
-
-              <div v-if="Object.keys(item.toolConfigFields).length > 0"
-                   style="display: flex; align-items: center; gap: 8px;">
-                <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
               </div>
 
               <LeafToggleSection
@@ -1396,7 +1472,6 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                   :values="item.toolConfigValues"
                   @update:values="item.toolConfigValues = $event"
                 />
-                <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
               </div>
 
               <div
@@ -1491,7 +1566,6 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                 </div>
 
                 <div style="display: flex; align-items: center; gap: 8px;">
-                  <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
                   <ElButton size="small" @click="resetLLMDefaults(item)">Reset to Default</ElButton>
                 </div>
 
@@ -1512,6 +1586,13 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
             <Icon icon="mdi:plus" /> Add MCP Server
           </ElButton>
         </div>
+
+        <SettingsSaveBar
+          :dirty="dirtyItems.length > 0"
+          :saving="savingAll"
+          @save="saveAll"
+          @discard="discardAll"
+        />
       </template>
     </div>
 

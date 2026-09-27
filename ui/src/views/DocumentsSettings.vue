@@ -37,6 +37,12 @@
  * A profile may use either or both, so "on" for the live panels means the
  * local folder or Drive; the per-profile options (captions, identity, where
  * the agent may use it) stay on the local source's row either way.
+ *
+ * Switches act at once (search on/off, Drive, image descriptions, where the
+ * agent may use it). The fields — exclusions, caption limits, identity and the
+ * administrator settings — are saved together from the page's save bar: the
+ * profile's own in one settings PUT (one confirmation, when an exclusion
+ * would remove indexed files), the server-wide gate through its own route.
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
@@ -55,12 +61,12 @@ import {
   DocumentsApiError,
   type ChangePlan,
   type ConfirmOutcome,
-  type ExcludeRule,
   type DocumentsControlAction,
   type DocumentsControlRequest,
   type DocumentsControlResult,
   type DocumentsFeatureMissing,
   type DocumentsOptions,
+  type DocumentsOptionsPatch,
   type DocumentsSettings,
   type DocumentsSettingsPatch,
   type DocumentsSettingsSaved,
@@ -83,6 +89,7 @@ import DeletionsConfirmDialog from '../components/documents/DeletionsConfirmDial
 import CaptioningSection from '../components/documents/CaptioningSection.vue';
 import IdentitySection from '../components/documents/IdentitySection.vue';
 import ChannelAccessSection from '../components/documents/ChannelAccessSection.vue';
+import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -99,7 +106,7 @@ const storageDetail = ref<DocumentsStorageInfo | null>(null);
 
 /** One action at a time: every button that sends something disables meanwhile. */
 const acting = ref(false);
-const savingExcludes = ref(false);
+/** An option switch (image descriptions, where the agent may use it) is saving. */
 const savingOptions = ref(false);
 const togglingEnabled = ref(false);
 
@@ -390,18 +397,9 @@ async function confirmDisable() {
   }
 }
 
-async function onSaveExcludes(rules: ExcludeRule[]) {
-  savingExcludes.value = true;
-  try {
-    const ok = await saveLocal({ excludes: rules }, 'Apply these exclusions?', 'Apply');
-    if (ok) ElMessage.success('Exclusions saved.');
-  } finally {
-    savingExcludes.value = false;
-  }
-}
-
-// Captions, identity and channel access are plain option saves: none of them
-// removes indexed content, so none needs a confirmation.
+// The option switches (image descriptions, where the agent may use it) save at
+// once: plain option saves, none removes indexed content, so none needs a
+// confirmation.
 async function saveOptions(options: DocumentsSettingsPatch['options'], done: string) {
   savingOptions.value = true;
   try {
@@ -411,19 +409,59 @@ async function saveOptions(options: DocumentsSettingsPatch['options'], done: str
   }
 }
 
-function onSaveCaption(patch: Partial<DocumentsOptions['caption']>) {
-  const msg = patch.enabled === undefined
-    ? 'Limits saved.'
-    : patch.enabled ? 'Image descriptions are on.' : 'Image descriptions are off. Existing descriptions stay searchable.';
-  void saveOptions({ caption: patch }, msg);
-}
-
-function onSaveIdentity(identity: DocumentsOptions['identity']) {
-  void saveOptions({ identity }, 'Saved.');
+function onSaveCaption(patch: Pick<DocumentsOptions['caption'], 'enabled'>) {
+  void saveOptions(
+    { caption: patch },
+    patch.enabled ? 'Image descriptions are on.' : 'Image descriptions are off. Existing descriptions stay searchable.',
+  );
 }
 
 function onSaveAllowIn(patch: Partial<DocumentsOptions['allow_in']>) {
   void saveOptions({ allow_in: patch }, 'Saved. It applies from the next message.');
+}
+
+// ── the save bar ──────────────────────────────────────────────────────────
+
+const excludesEditor = ref<InstanceType<typeof ExcludeRulesEditor> | null>(null);
+const captioning = ref<InstanceType<typeof CaptioningSection> | null>(null);
+const identitySection = ref<InstanceType<typeof IdentitySection> | null>(null);
+const savingAll = ref(false);
+
+const localDirty = computed(() =>
+  !!(excludesEditor.value?.dirty || captioning.value?.dirty || identitySection.value?.dirty));
+const adminDirty = computed(() => !!adminGate.value?.dirty);
+const hasChanges = computed(() => localDirty.value || adminDirty.value);
+
+async function saveAll() {
+  if (!hasChanges.value || savingAll.value) return;
+  savingAll.value = true;
+  try {
+    if (localDirty.value) {
+      const patch: Omit<DocumentsSettingsPatch, 'kind'> = {};
+      const options: DocumentsOptionsPatch = {};
+      if (excludesEditor.value?.dirty) patch.excludes = excludesEditor.value.edited();
+      if (captioning.value?.dirty) options.caption = captioning.value.edited();
+      if (identitySection.value?.dirty) options.identity = identitySection.value.edited();
+      if (Object.keys(options).length) patch.options = options;
+      // A new exclusion can remove indexed files: the server shows how many first.
+      const ok = patch.excludes
+        ? await saveLocal(patch, 'Apply these exclusions?', 'Apply')
+        : await saveLocal(patch, 'Save?', 'Save');
+      if (ok) ElMessage.success('Changes saved.');
+    }
+    // Server-wide, on its own route; it reports its own outcome (and hands a
+    // missing-readers answer to the install dialog, which saves it again).
+    if (adminDirty.value) await adminGate.value?.save();
+  } finally {
+    savingAll.value = false;
+  }
+}
+
+function discardAll() {
+  excludesEditor.value?.reset();
+  captioning.value?.reset();
+  identitySection.value?.reset();
+  adminGate.value?.discard();
 }
 
 async function onConsentVision(model: string) {
@@ -891,10 +929,9 @@ function goBack() {
           <section ref="excludesSection" class="doc-card">
             <h2>Exclusions</h2>
             <ExcludeRulesEditor
+              ref="excludesEditor"
               :rules="local.excludes"
-              :saving="savingExcludes"
-              :disabled="savingExcludes"
-              @save="onSaveExcludes"
+              :disabled="savingAll"
             />
           </section>
 
@@ -919,11 +956,12 @@ function goBack() {
           <section class="doc-card">
             <h2>Photos and scanned pages</h2>
             <CaptioningSection
+              ref="captioning"
               :caption="local.options.caption"
               :vision="settings.vision"
               :default-cap="policy.vision_daily_cap_default"
               :waiting="visionWaiting"
-              :saving="savingOptions"
+              :saving="savingOptions || savingAll"
               :busy="acting"
               @save="onSaveCaption"
               @consent="onConsentVision"
@@ -937,9 +975,9 @@ function goBack() {
             <h2>You</h2>
             <p class="doc-muted">So "the report I wrote" and "photos I took" find your own files first.</p>
             <IdentitySection
+              ref="identitySection"
               :identity="local.options.identity"
-              :saving="savingOptions"
-              @save="onSaveIdentity"
+              :saving="savingAll"
             />
           </section>
 
@@ -1029,6 +1067,16 @@ function goBack() {
             @install-readers="onAdminInstallReaders"
           />
         </div>
+
+        <!-- Only where there is something to edit: a profile the admin has
+             not allowed sees neither the sections nor the gate. -->
+        <SettingsSaveBar
+          v-if="policy.allowed || isAdmin"
+          :dirty="hasChanges"
+          :saving="savingAll"
+          @save="saveAll"
+          @discard="discardAll"
+        />
       </template>
     </div>
 

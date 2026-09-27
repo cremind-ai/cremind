@@ -9,9 +9,9 @@
  * profiles use it. Each profile then turns it on for itself on its own My
  * Documents page. The page itself only exists while Vector Embedding is on —
  * the feature rides the server-wide embedding model and vector store — so
- * this section never has to explain an embedding that is off. It saves on its
- * own (`PUT /api/documentation-search/admin`), apart from the page's
- * per-profile settings.
+ * this section never has to explain an embedding that is off. The page's save
+ * bar saves it (`save()`, `PUT /api/documentation-search/admin`) apart from
+ * the page's per-profile settings, reading `dirty` like any other section.
  *
  * Allowing it when the document readers (PDF, Office, images) are not
  * installed answers `409 FeatureNotInstalled`; that is handed to the page's
@@ -198,7 +198,7 @@ function discard() {
 
 onMounted(reload);
 
-defineExpose({ save, reload });
+defineExpose({ save, reload, dirty, discard });
 </script>
 
 <template>
@@ -265,13 +265,6 @@ defineExpose({ save, reload });
         </p>
       </div>
 
-      <div class="gate-actions">
-        <ElButton type="primary" :loading="saving" :disabled="!dirty" @click="save">
-          Save administrator settings
-        </ElButton>
-        <ElButton v-if="dirty" :disabled="saving" @click="discard">Discard</ElButton>
-      </div>
-
       <div v-if="view.profiles.length" class="gate-profiles">
         <h5>Profiles using it</h5>
         <ElTable :data="view.profiles" size="small" class="gate-table">
@@ -330,8 +323,6 @@ defineExpose({ save, reload });
 .gate-grid :deep(.el-input-number) { width: 100%; }
 .field-hint { margin: 0; font-size: 0.775rem; color: var(--text-secondary); line-height: 1.4; }
 .field-error { margin: 0; font-size: 0.75rem; color: var(--danger-color); }
-.gate-actions { display: flex; gap: 8px; margin-top: 12px; }
-.gate-actions :deep(.el-button + .el-button) { margin-left: 0; }
 .gate-profiles { margin-top: 16px; }
 .gate-profiles h5 {
   margin: 0 0 6px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;

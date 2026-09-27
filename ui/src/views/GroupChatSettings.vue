@@ -3,8 +3,9 @@
 // ChannelsSettings so the two operator-facing pages read the same way.
 //
 // The settings blob is replaced whole on every save (the backend normalises it
-// strictly and answers 400 on anything malformed), so each card sends the full
-// blob it built from the current form — never a partial patch.
+// strictly and answers 400 on anything malformed), so a save sends the full
+// blob it built from the current form — never a partial patch. General and
+// Members save together, from the save bar.
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
@@ -15,7 +16,9 @@ import { Icon } from '@iconify/vue';
 import { useGroupChatStore } from '../stores/groupChat';
 import { useSettingsStore } from '../stores/settings';
 import { listProfiles } from '../services/configApi';
-import type { GroupChat, GroupSettings } from '../services/groupChatApi';
+import { useSavedSnapshot } from '../composables/useUnsavedChanges';
+import type { GroupChat, GroupSettings, UpdateGroupPayload } from '../services/groupChatApi';
+import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 
 const props = defineProps<{ profile: string; groupId: string }>();
 
@@ -24,8 +27,7 @@ const store = useGroupChatStore();
 const settingsStore = useSettingsStore();
 
 const loading = ref(false);
-const savingGeneral = ref(false);
-const savingMembers = ref(false);
+const saving = ref(false);
 const profiles = ref<string[]>([]);
 
 const group = computed<GroupChat | null>(
@@ -40,6 +42,14 @@ const form = ref({
   smart_routing: true,
 });
 const members = ref<string[]>([]);
+
+// What the room held when last loaded or saved. Members compare as a set: the
+// picker lists them in the order they were picked.
+const general = useSavedSnapshot(() => form.value);
+const seats = useSavedSnapshot(() => [...members.value].sort());
+let savedMemberOrder: string[] = [];
+const hasChanges = computed(() => general.dirty.value || seats.dirty.value);
+const saveBlocker = computed(() => (form.value.name.trim() ? '' : 'Enter a name for the group to save.'));
 
 // Every profile can hold a seat, ``admin`` included — its agent answers in a
 // room exactly like any other member's.
@@ -60,6 +70,9 @@ function hydrate(row: GroupChat) {
     smart_routing: row.settings.smart_routing !== false,
   };
   members.value = [...row.members];
+  savedMemberOrder = [...row.members];
+  general.commit();
+  seats.commit();
 }
 
 function buildSettings(): GroupSettings {
@@ -93,35 +106,30 @@ async function loadAll() {
   }
 }
 
-async function saveGeneral() {
-  savingGeneral.value = true;
+/** One PATCH for whatever changed: the server checks every part before it
+ *  writes any, so a rejected member list does not leave a half-saved room. */
+async function saveAll() {
+  if (!hasChanges.value || saveBlocker.value) return;
+  const payload: UpdateGroupPayload = {};
+  if (general.dirty.value) {
+    payload.name = form.value.name.trim();
+    payload.settings = buildSettings();
+  }
+  if (seats.dirty.value) payload.members = [...members.value];
+  saving.value = true;
   try {
-    const updated = await store.updateGroup(props.groupId, {
-      name: form.value.name.trim(),
-      settings: buildSettings(),
-    });
-    hydrate(updated);
+    hydrate(await store.updateGroup(props.groupId, payload));
     ElMessage.success('Group updated');
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to save');
   } finally {
-    savingGeneral.value = false;
+    saving.value = false;
   }
 }
 
-async function saveMembers() {
-  savingMembers.value = true;
-  try {
-    const updated = await store.updateGroup(props.groupId, {
-      members: [...members.value],
-    });
-    hydrate(updated);
-    ElMessage.success('Members updated');
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : 'Failed to save members');
-  } finally {
-    savingMembers.value = false;
-  }
+function discardAll() {
+  form.value = general.saved();
+  members.value = [...savedMemberOrder];
 }
 
 // ── danger zone ──
@@ -137,6 +145,8 @@ async function removeGroup() {
   try {
     await store.deleteGroup(props.groupId);
     ElMessage.success('Group deleted');
+    // Nothing is left to save edits to: leave without the unsaved-changes guard.
+    discardAll();
     router.replace({ name: 'group-chat', params: { profile: props.profile } });
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to delete the group');
@@ -210,11 +220,6 @@ onMounted(loadAll);
               </p>
             </div>
           </div>
-          <div class="section-actions">
-            <ElButton type="primary" :loading="savingGeneral" @click="saveGeneral">
-              Save
-            </ElButton>
-          </div>
         </ElCard>
 
         <ElCard shadow="never" class="section-card">
@@ -237,11 +242,6 @@ onMounted(loadAll);
               :value="opt.value"
             />
           </ElSelect>
-          <div class="section-actions">
-            <ElButton type="primary" :loading="savingMembers" @click="saveMembers">
-              Save members
-            </ElButton>
-          </div>
         </ElCard>
 
         <ElCard shadow="never" class="section-card danger-card">
@@ -256,6 +256,15 @@ onMounted(loadAll);
             <ElButton type="danger" plain @click="removeGroup">Delete group</ElButton>
           </div>
         </ElCard>
+
+        <SettingsSaveBar
+          :dirty="hasChanges"
+          :saving="saving"
+          :disabled="!!saveBlocker"
+          :hint="hasChanges ? saveBlocker : ''"
+          @save="saveAll"
+          @discard="discardAll"
+        />
       </template>
     </div>
 
@@ -285,7 +294,6 @@ onMounted(loadAll);
 .section-header-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
 }
-.section-actions { margin-top: 16px; display: flex; justify-content: flex-end; }
 
 .field { margin-bottom: 16px; }
 .field-inline { display: flex; align-items: flex-start; gap: 12px; }

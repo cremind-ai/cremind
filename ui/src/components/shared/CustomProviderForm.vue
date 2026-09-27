@@ -6,14 +6,16 @@ import {
 import { Icon } from '@iconify/vue';
 import type { ProviderWithState } from './ProviderConfigFields.vue';
 import type { CustomProviderModel } from '../../services/configApi';
+import { stableStringify } from '../../composables/useUnsavedChanges';
 
 /**
  * Create/edit form for a user-defined OpenAI-API-compatible "custom provider":
  * a display name, an API Base URL, an API key, and a manually-entered model
  * list. Used inline on the LLM Providers page for both creating a new provider
  * and editing an existing one (base URL + models + key are editable; delete is
- * offered in edit mode). Emits `submit` with the assembled payload — the parent
- * owns the actual API call, validation messaging, and reload.
+ * offered in edit mode). It has no Save of its own: the page's save bar reads
+ * `dirty` / `canSubmit` and takes the assembled `payload()` — the parent owns
+ * the actual API call, validation messaging, and reload.
  *
  * Per model the user declares the capabilities the app can't infer for an
  * arbitrary endpoint: whether it accepts images (Vision), whether it accepts
@@ -30,8 +32,14 @@ const props = withDefaults(defineProps<{
   saving: false,
 });
 
+export interface CustomProviderPayload {
+  display_name: string;
+  base_url: string;
+  api_key?: string;
+  models: CustomProviderModel[];
+}
+
 const emit = defineEmits<{
-  (e: 'submit', payload: { display_name: string; base_url: string; api_key?: string; models: CustomProviderModel[] }): void;
   (e: 'delete'): void;
   (e: 'cancel'): void;
 }>();
@@ -40,6 +48,11 @@ const displayName = ref('');
 const baseUrl = ref('');
 const apiKey = ref('');
 const models = ref<CustomProviderModel[]>([]);
+
+// The form as loaded (or last saved): what an edit is a change from.
+const loaded = ref('');
+const current = () => stableStringify([displayName.value, baseUrl.value, apiKey.value, models.value]);
+const dirty = computed(() => current() !== loaded.value);
 
 function emptyModel(): CustomProviderModel {
   return {
@@ -75,6 +88,7 @@ function loadFromProvider() {
     models.value = [];
   }
   if (models.value.length === 0) models.value = [emptyModel()];
+  loaded.value = current();
 }
 
 // Reload when the target provider changes (switching between custom providers)
@@ -98,7 +112,7 @@ const canSubmit = computed(() =>
   models.value.some(m => m.id.trim().length > 0),
 );
 
-function submit() {
+function payload(): CustomProviderPayload {
   const cleanModels = models.value
     .map(m => ({
       id: m.id.trim(),
@@ -112,13 +126,23 @@ function submit() {
       cache_write_price_per_1m: m.cache_write_price_per_1m,
     }))
     .filter(m => m.id.length > 0);
-  emit('submit', {
+  return {
     display_name: displayName.value.trim(),
     base_url: baseUrl.value.trim(),
     api_key: apiKey.value ? apiKey.value : undefined,
     models: cleanModels,
-  });
+  };
 }
+
+defineExpose({
+  dirty,
+  canSubmit,
+  payload,
+  /** What the form holds is saved now. */
+  markSaved: () => { loaded.value = current(); },
+  /** Back to the provider as loaded (Discard). */
+  reset: loadFromProvider,
+});
 </script>
 
 <template>
@@ -204,10 +228,8 @@ function submit() {
         </ElButton>
       </ElFormItem>
 
+      <!-- Saved (or created) from the page's save bar. -->
       <div class="form-actions">
-        <ElButton type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">
-          {{ mode === 'create' ? 'Create Provider' : 'Save Changes' }}
-        </ElButton>
         <ElButton v-if="mode === 'create'" :disabled="saving" @click="emit('cancel')">Cancel</ElButton>
         <ElButton v-if="mode === 'edit'" type="danger" plain :disabled="saving" @click="emit('delete')">
           Delete Provider

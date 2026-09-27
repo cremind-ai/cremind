@@ -5,10 +5,11 @@
  * phones (EXIF make/model) the user shoots with. Search treats a match as a
  * boost, never a filter — a file without an author or EXIF is not excluded.
  *
- * Each list is edited as comma-separated text and saved together.
+ * Each list is edited as comma-separated text; the page's save bar saves the
+ * three together (`dirty`, `edited()`).
  */
 import { computed, ref, watch } from 'vue';
-import { ElButton, ElInput } from 'element-plus';
+import { ElInput } from 'element-plus';
 import type { DocumentsOptions } from '../../services/documentsApi';
 
 type Identity = DocumentsOptions['identity'];
@@ -17,8 +18,6 @@ const props = withDefaults(defineProps<{
   identity: Identity;
   saving?: boolean;
 }>(), { saving: false });
-
-const emit = defineEmits<{ save: [identity: Identity] }>();
 
 function join(list: string[]): string {
   return list.join(', ');
@@ -61,9 +60,7 @@ function reset() {
 
 watch(() => props.identity, () => { if (!dirty.value) reset(); }, { deep: true });
 
-function save() {
-  if (dirty.value) emit('save', edited.value);
-}
+defineExpose({ dirty, edited: () => edited.value, reset });
 </script>
 
 <template>
@@ -85,10 +82,6 @@ function save() {
       other files) and "photos I took" (the camera recorded in the photo). A match ranks a file higher;
       files without this information are still found.
     </p>
-    <div v-if="dirty" class="ident-actions">
-      <ElButton size="small" type="primary" :loading="saving" @click="save">Save</ElButton>
-      <ElButton size="small" :disabled="saving" @click="reset">Cancel</ElButton>
-    </div>
   </div>
 </template>
 
@@ -96,6 +89,4 @@ function save() {
 .ident { display: flex; flex-direction: column; gap: 10px; }
 .ident-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.8rem; color: var(--text-secondary); }
 .hint { margin: 0; font-size: 0.8rem; color: var(--text-secondary); line-height: 1.45; }
-.ident-actions { display: flex; gap: 8px; }
-.ident-actions :deep(.el-button + .el-button) { margin-left: 0; }
 </style>

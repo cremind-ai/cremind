@@ -15,10 +15,12 @@ export interface ProviderWithState extends LLMProvider {
   authFieldValues: Record<string, string>;
 }
 
+// Typed credentials are saved by the host (Settings: its save bar; the setup
+// wizard: its final submit) — the card itself only has the sign-in flows and,
+// where credentials persist, Remove Configuration.
 const props = withDefaults(defineProps<{
   provider: ProviderWithState;
   showConfiguredBadge?: boolean;
-  showSaveButtons?: boolean;
   saving?: boolean;
   // Browser-OAuth methods ("Sign in with ChatGPT") capture tokens server-side,
   // which needs an existing profile — so the flow is offered only from Settings,
@@ -37,16 +39,12 @@ const props = withDefaults(defineProps<{
   persistCredentials?: boolean;
 }>(), {
   showConfiguredBadge: false,
-  showSaveButtons: false,
   saving: false,
   allowBrowserOauth: false,
   persistCredentials: false,
 });
 
 const emit = defineEmits<{
-  'save-key': [];
-  'save-config': [];
-  'save-provider': [];
   'remove-config': [];
   // The selected auth method moved (radio click, or the reset below). Some
   // providers serve a *different model set* per method — OpenAI's Codex OAuth
@@ -524,18 +522,17 @@ async function pollForToken(deviceCode: string, interval: number) {
               :model-value="provider.authFieldValues[key]"
               @update:model-value="provider.authFieldValues[key] = $event"
               type="textarea"
-              :rows="showSaveButtons ? 4 : 3"
+              :rows="persistCredentials ? 4 : 3"
               :placeholder="showConfiguredBadge && field.configured ? '(already set — paste new value to replace)' : `Paste ${field.description}`"
             />
-            <div v-else-if="field.secret" :class="showSaveButtons ? 'key-input-row' : ''">
-              <ElInput
-                :model-value="provider.authFieldValues[key]"
-                @update:model-value="provider.authFieldValues[key] = $event"
-                type="password"
-                show-password
-                :placeholder="showConfiguredBadge && field.configured ? '(already set)' : `Enter ${field.description}`"
-              />
-            </div>
+            <ElInput
+              v-else-if="field.secret"
+              :model-value="provider.authFieldValues[key]"
+              @update:model-value="provider.authFieldValues[key] = $event"
+              type="password"
+              show-password
+              :placeholder="showConfiguredBadge && field.configured ? '(already set)' : `Enter ${field.description}`"
+            />
             <ElInput
               v-else
               :model-value="provider.authFieldValues[key]"
@@ -543,7 +540,6 @@ async function pollForToken(deviceCode: string, interval: number) {
               :placeholder="field.default ? `Default: ${field.default}` : `Enter ${field.description}`"
             />
           </ElFormItem>
-          <ElButton v-if="showSaveButtons" type="primary" :loading="saving" @click="emit('save-provider')" size="small">Save</ElButton>
         </ElForm>
       </template>
 
@@ -556,16 +552,13 @@ async function pollForToken(deviceCode: string, interval: number) {
     <template v-else>
       <ElForm v-if="provider.requires_api_key" label-position="top" size="small" class="key-form">
         <ElFormItem label="API Key">
-          <div :class="showSaveButtons ? 'key-input-row' : ''">
-            <ElInput
-              :model-value="provider.apiKey"
-              @update:model-value="provider.apiKey = $event"
-              type="password"
-              show-password
-              :placeholder="`Enter ${provider.display_name} API key`"
-            />
-            <ElButton v-if="showSaveButtons" type="primary" :loading="saving" @click="emit('save-key')" size="small">Save</ElButton>
-          </div>
+          <ElInput
+            :model-value="provider.apiKey"
+            @update:model-value="provider.apiKey = $event"
+            type="password"
+            show-password
+            :placeholder="`Enter ${provider.display_name} API key`"
+          />
         </ElFormItem>
       </ElForm>
 
@@ -585,7 +578,7 @@ async function pollForToken(deviceCode: string, interval: number) {
               :model-value="provider.configValues[key]"
               @update:model-value="provider.configValues[key] = $event"
               type="textarea"
-              :rows="showSaveButtons ? 4 : 3"
+              :rows="persistCredentials ? 4 : 3"
               :placeholder="showConfiguredBadge && field.configured ? '(already set — paste new JSON to replace)' : `Paste ${field.description}`"
             />
             <ElInput
@@ -603,18 +596,17 @@ async function pollForToken(deviceCode: string, interval: number) {
               :placeholder="field.default ? `Default: ${field.default}` : `Enter ${field.description}`"
             />
           </ElFormItem>
-          <ElButton v-if="showSaveButtons" type="primary" :loading="saving" @click="emit('save-config')" size="small">Save Configuration</ElButton>
         </ElForm>
       </template>
     </template>
 
-    <div v-if="showSaveButtons && provider.configured" class="remove-config-row">
+    <div v-if="persistCredentials && provider.configured" class="remove-config-row">
       <ElButton type="danger" plain size="small" :loading="saving" @click="emit('remove-config')">
         Remove Configuration
       </ElButton>
     </div>
 
-    <div v-if="!showSaveButtons && provider.models.length > 0" class="model-count">
+    <div v-if="!persistCredentials && provider.models.length > 0" class="model-count">
       {{ provider.models.length }} model(s) available
     </div>
   </div>
@@ -639,8 +631,6 @@ async function pollForToken(deviceCode: string, interval: number) {
 }
 
 .key-form { max-width: 100%; }
-.key-input-row { display: flex; gap: 8px; width: 100%; }
-.key-input-row .el-input { flex: 1; }
 
 .config-fields-form { max-width: 100%; margin-top: 8px; }
 

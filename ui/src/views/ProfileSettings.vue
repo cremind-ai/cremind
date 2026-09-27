@@ -6,6 +6,7 @@ import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import ConfigExportCard from '../components/profile/ConfigExportCard.vue';
+import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 import {
   listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getInstructions, updateInstructions,
   getAgentName, setAgentName, getProfileWorkingDir, setProfileWorkingDir, type RetiredWorkingDir,
@@ -31,7 +32,6 @@ interface WorkingDirRow {
   defaultPath: string;
   isDefault: boolean;
   draft: string;
-  saving: boolean;
   error: string;
 }
 const workingDirs = ref<Record<string, WorkingDirRow>>({});
@@ -63,43 +63,29 @@ const isAdmin = computed(() => settingsStore.profileId === 'admin');
 
 // Agent name (loaded from backend)
 const agentName = ref('');
+const savedAgentName = ref('');
 const loadingAgentName = ref(false);
-const savingAgentName = ref(false);
 
 // PERSONA.md content (loaded from backend)
 const personaContent = ref('');
+const savedPersona = ref('');
 const loadingPersona = ref(false);
-const savingPersona = ref(false);
 
 // INSTRUCTIONS.md content (loaded from backend)
 const instructionsContent = ref('');
+const savedInstructions = ref('');
 const loadingInstructions = ref(false);
-const savingInstructions = ref(false);
 
 async function loadAgentName() {
   loadingAgentName.value = true;
   try {
     const res = await getAgentName(settingsStore.agentUrl, settingsStore.authToken, props.profile);
     agentName.value = res.name;
+    savedAgentName.value = res.name;
   } catch {
     ElMessage.error('Failed to load agent name');
   } finally {
     loadingAgentName.value = false;
-  }
-}
-
-async function saveAgentName() {
-  const name = agentName.value.trim();
-  if (!name) { ElMessage.error('Agent name is required'); return; }
-  savingAgentName.value = true;
-  try {
-    await setAgentName(settingsStore.agentUrl, settingsStore.authToken, props.profile, name);
-    agentName.value = name;
-    ElMessage.success('Agent name saved');
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : 'Failed to save agent name');
-  } finally {
-    savingAgentName.value = false;
   }
 }
 
@@ -108,22 +94,11 @@ async function loadPersona() {
   try {
     const res = await getPersona(settingsStore.agentUrl, settingsStore.authToken, props.profile);
     personaContent.value = res.content;
+    savedPersona.value = res.content;
   } catch {
     ElMessage.error('Failed to load PERSONA.md');
   } finally {
     loadingPersona.value = false;
-  }
-}
-
-async function savePersona() {
-  savingPersona.value = true;
-  try {
-    await updatePersona(settingsStore.agentUrl, settingsStore.authToken, props.profile, personaContent.value);
-    ElMessage.success('PERSONA.md saved');
-  } catch {
-    ElMessage.error('Failed to save PERSONA.md');
-  } finally {
-    savingPersona.value = false;
   }
 }
 
@@ -132,6 +107,7 @@ async function loadInstructions() {
   try {
     const res = await getInstructions(settingsStore.agentUrl, settingsStore.authToken, props.profile);
     instructionsContent.value = res.content;
+    savedInstructions.value = res.content;
   } catch {
     ElMessage.error('Failed to load INSTRUCTIONS.md');
   } finally {
@@ -139,15 +115,76 @@ async function loadInstructions() {
   }
 }
 
-async function saveInstructions() {
-  savingInstructions.value = true;
-  try {
-    await updateInstructions(settingsStore.agentUrl, settingsStore.authToken, props.profile, instructionsContent.value);
-    ElMessage.success('INSTRUCTIONS.md saved');
-  } catch {
-    ElMessage.error('Failed to save INSTRUCTIONS.md');
-  } finally {
-    savingInstructions.value = false;
+// ── The save bar: every field above and each working directory, saved together ──
+
+const saving = ref(false);
+const agentNameChanged = computed(() => agentName.value.trim() !== savedAgentName.value);
+const personaChanged = computed(() => personaContent.value !== savedPersona.value);
+const instructionsChanged = computed(() => instructionsContent.value !== savedInstructions.value);
+/** A row's draft as saved: blank stands for the default folder. */
+const savedDraft = (row: WorkingDirRow) => (row.isDefault ? '' : row.path);
+const changedWorkingDirs = computed(() =>
+  Object.keys(workingDirs.value).filter(name => {
+    const row = workingDirs.value[name];
+    return row.draft.trim() !== savedDraft(row);
+  }));
+const hasChanges = computed(() =>
+  agentNameChanged.value || personaChanged.value || instructionsChanged.value
+  || changedWorkingDirs.value.length > 0);
+const saveBlocker = computed(() =>
+  (agentNameChanged.value && !agentName.value.trim() ? 'Enter an agent name to save.' : ''));
+
+async function saveAll() {
+  if (!hasChanges.value || saveBlocker.value || saving.value) return;
+  saving.value = true;
+  const failed: string[] = [];
+  const attempt = async (what: string, run: () => Promise<void>) => {
+    try {
+      await run();
+    } catch (e) {
+      failed.push(`${what} (${e instanceof Error ? e.message : 'failed'})`);
+    }
+  };
+  // What is sent is what is marked saved: typing on while it saves stays a change.
+  const tasks: Promise<void>[] = [];
+  if (agentNameChanged.value) {
+    const name = agentName.value.trim();
+    tasks.push(attempt('agent name', async () => {
+      await setAgentName(settingsStore.agentUrl, settingsStore.authToken, props.profile, name);
+      savedAgentName.value = name;
+      if (agentName.value.trim() === name) agentName.value = name;
+    }));
+  }
+  if (personaChanged.value) {
+    const content = personaContent.value;
+    tasks.push(attempt('PERSONA.md', async () => {
+      await updatePersona(settingsStore.agentUrl, settingsStore.authToken, props.profile, content);
+      savedPersona.value = content;
+    }));
+  }
+  if (instructionsChanged.value) {
+    const content = instructionsContent.value;
+    tasks.push(attempt('INSTRUCTIONS.md', async () => {
+      await updateInstructions(settingsStore.agentUrl, settingsStore.authToken, props.profile, content);
+      savedInstructions.value = content;
+    }));
+  }
+  for (const name of changedWorkingDirs.value) {
+    tasks.push(attempt(`working directory of '${name}'`, () => saveWorkingDir(name)));
+  }
+  await Promise.all(tasks);
+  saving.value = false;
+  if (failed.length) ElMessage.error(`Not saved: ${failed.join('; ')}`);
+  else ElMessage.success('Changes saved');
+}
+
+function discardAll() {
+  agentName.value = savedAgentName.value;
+  personaContent.value = savedPersona.value;
+  instructionsContent.value = savedInstructions.value;
+  for (const row of Object.values(workingDirs.value)) {
+    row.draft = savedDraft(row);
+    row.error = '';
   }
 }
 
@@ -178,7 +215,6 @@ function toRow(wd: { path: string; default_path: string; is_default: boolean }):
     defaultPath: wd.default_path,
     isDefault: wd.is_default,
     draft: wd.is_default ? '' : wd.path,
-    saving: false,
     error: '',
   };
 }
@@ -192,6 +228,11 @@ async function loadWorkingDirs() {
       rows[name] = toRow(await getProfileWorkingDir(settingsStore.agentUrl, settingsStore.authToken, name));
     } catch { /* leave the row blank; the rest of the page still works */ }
   }));
+  // A reload (after a delete) keeps a draft nobody has saved yet.
+  for (const [name, row] of Object.entries(rows)) {
+    const prev = workingDirs.value[name];
+    if (prev && prev.draft.trim() !== savedDraft(prev)) row.draft = prev.draft;
+  }
   workingDirs.value = rows;
 }
 
@@ -199,22 +240,24 @@ const ownWorkingDir = computed(
   () => workingDirs.value[settingsStore.profileId]?.path || settingsStore.workingDir,
 );
 
+/** Saves one row's draft; the error is also shown under the row. */
 async function saveWorkingDir(name: string) {
   const row = workingDirs.value[name];
   if (!row) return;
-  row.saving = true;
   row.error = '';
+  const draft = row.draft;
   try {
-    const wd = await setProfileWorkingDir(settingsStore.agentUrl, settingsStore.authToken, name, row.draft);
-    workingDirs.value[name] = toRow(wd);
-    ElMessage.success(`Working directory of '${name}': ${wd.path}`);
+    const wd = await setProfileWorkingDir(settingsStore.agentUrl, settingsStore.authToken, name, draft);
+    const saved = toRow(wd);
+    // Typing on while it saved stays a change.
+    if (workingDirs.value[name]?.draft !== draft) saved.draft = workingDirs.value[name].draft;
+    workingDirs.value[name] = saved;
     // The admin moved its own folder: this session's file panel (and the
     // settings copy) still point at the old one. A no-op for any other profile.
     void terminalPanel.workingDirChanged(name);
   } catch (e) {
     row.error = e instanceof Error ? e.message : 'Failed to save the working directory';
-  } finally {
-    row.saving = false;
+    throw new Error(row.error);
   }
 }
 
@@ -393,9 +436,6 @@ function goBack() { router.push(`/${props.profile}/settings`); }
               maxlength="128"
             />
           </div>
-          <ElButton type="primary" :loading="savingAgentName" :disabled="!agentName.trim()" @click="saveAgentName">
-            <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
-          </ElButton>
         </div>
       </div>
 
@@ -417,9 +457,6 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           placeholder="You are a personal AI assistant..."
           style="font-family: monospace;"
         />
-        <ElButton type="primary" :loading="savingPersona" @click="savePersona" style="margin-top: 12px;">
-          <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
-        </ElButton>
       </div>
 
       <!-- INSTRUCTIONS.md -->
@@ -442,9 +479,6 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           placeholder="Each time a new user messages a channel, check the 'Active-User' sheet..."
           style="font-family: monospace;"
         />
-        <ElButton type="primary" :loading="savingInstructions" @click="saveInstructions" style="margin-top: 12px;">
-          <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
-        </ElButton>
       </div>
 
       <!-- Configuration File — the signed-in profile's own file. The JWT inside
@@ -530,23 +564,13 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           <ElTableColumn v-if="isAdmin" label="Working directory">
             <template #default="{ row }">
               <div v-if="workingDirs[row.name]" class="working-dir-cell">
-                <div class="working-dir-edit">
-                  <ElInput
-                    v-model="workingDirs[row.name].draft"
-                    size="small"
-                    :placeholder="workingDirs[row.name].defaultPath"
-                    @input="workingDirs[row.name].error = ''"
-                    @keyup.enter="saveWorkingDir(row.name)"
-                  />
-                  <ElButton
-                    size="small"
-                    :loading="workingDirs[row.name].saving"
-                    :disabled="workingDirs[row.name].draft.trim() === (workingDirs[row.name].isDefault ? '' : workingDirs[row.name].path)"
-                    @click="saveWorkingDir(row.name)"
-                  >
-                    Save
-                  </ElButton>
-                </div>
+                <ElInput
+                  v-model="workingDirs[row.name].draft"
+                  size="small"
+                  :placeholder="workingDirs[row.name].defaultPath"
+                  @input="workingDirs[row.name].error = ''"
+                  @keyup.enter="saveAll"
+                />
                 <p v-if="workingDirs[row.name].error" class="name-error">{{ workingDirs[row.name].error }}</p>
               </div>
               <span v-else class="muted">—</span>
@@ -629,6 +653,17 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           </p>
         </template>
       </div>
+
+      <!-- Saves the agent name, PERSONA.md, INSTRUCTIONS.md and the working
+           directories; the sections below them act through their own buttons. -->
+      <SettingsSaveBar
+        :dirty="hasChanges"
+        :saving="saving"
+        :disabled="!!saveBlocker"
+        :hint="saveBlocker"
+        @save="saveAll"
+        @discard="discardAll"
+      />
     </div>
 
     <!-- Delete profile: what happens to its working directory. Only a folder
@@ -748,7 +783,6 @@ function goBack() { router.push(`/${props.profile}/settings`); }
 .profile-input { width: 100%; }
 .name-error { color: var(--el-color-danger); font-size: 0.75rem; margin: 4px 0 0 0; }
 .working-dir-cell { min-width: 0; }
-.working-dir-edit { display: flex; gap: 6px; align-items: center; }
 .muted { color: var(--text-secondary); }
 .delete-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 

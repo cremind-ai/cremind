@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue';
+import { ref, computed, nextTick, onMounted, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRouter } from 'vue-router';
-import { ElButton, ElMessage, ElMessageBox } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
@@ -16,8 +16,10 @@ import {
   type ServiceCapabilitiesResponse,
 } from '../services/configApi';
 import { fetchInstallCatalog, type InstallCatalog } from '../services/installCatalogApi';
+import { useSavedSnapshot } from '../composables/useUnsavedChanges';
 import EmbeddingConfigForm from '../components/shared/EmbeddingConfigForm.vue';
 import FeatureInstallDialog from '../components/shared/FeatureInstallDialog.vue';
+import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -47,8 +49,19 @@ const form = ref<EmbeddingConfig>({
   },
 });
 
+// What was last loaded or applied: edits are changes from this.
+const { dirty: formDirty, commit: commitForm, saved: savedForm } = useSavedSnapshot(() => form.value);
+
 const serviceCapabilities = ref<ServiceCapabilitiesResponse | null>(null);
 const installCatalog = ref<InstallCatalog | null>(null);
+
+// A failed apply can be retried with nothing changed.
+const applyFailed = computed(() => status.value === 'failed');
+const saveBarHint = computed(() => {
+  if (isBusy.value) return 'Applying — the embedding rebuild is still running.';
+  if (applyFailed.value && !formDirty.value) return 'The last apply failed. Apply again to retry.';
+  return '';
+});
 
 const phaseLabel = computed(() => {
   if (!phase.value) return '';
@@ -109,6 +122,15 @@ async function loadConfig() {
   } finally {
     loading.value = false;
   }
+  // The form mounts now and hands back its normalized copy of the config
+  // (defaults filled, modes clamped): that is the saved state, not the raw
+  // response — else the page would open with unsaved changes.
+  await nextTick();
+  commitForm();
+}
+
+function discardChanges() {
+  form.value = savedForm();
 }
 
 // Detect a busy→ready transition so we can confirm to the user that
@@ -158,6 +180,7 @@ function openFeatureInstallDialog(detail: EmbeddingFeaturesNotInstalledDetail) {
             form.value,
             { deferApply: true },
           );
+          commitForm();
         } catch (e) {
           throw new Error(e instanceof Error ? e.message : 'Failed to save embedding config');
         }
@@ -179,6 +202,8 @@ async function runApply() {
   saving.value = true;
   try {
     const res = await applyEmbeddingConfig(settingsStore.agentUrl, settingsStore.authToken, form.value);
+    // Saved, whatever the apply then does: a failure is retried from the bar.
+    commitForm();
     // Surface the immediate POST response, but the source of truth is
     // the SSE stream — the store will reflect subsequent transitions
     // automatically.
@@ -292,19 +317,17 @@ onMounted(() => {
         </EmbeddingConfigForm>
 
         <!-- Outside the shared form on purpose: the form owns the fields, not
-             the save. The button used to sit inside the ElForm and inherit its
-             ``disabled``; ``:loading`` covers the same ground here, since a
-             loading ElButton is already unclickable. -->
-        <div class="actions">
-          <ElButton
-            type="primary"
-            :loading="saving || isBusy"
-            :disabled="isBusy"
-            @click="applyChanges"
-          >
-            {{ isBusy ? 'Waiting…' : 'Apply Changes' }}
-          </ElButton>
-        </div>
+             the save. While a rebuild runs the bar shows it loading, which
+             keeps it unclickable. -->
+        <SettingsSaveBar
+          :dirty="formDirty"
+          :saving="saving || isBusy"
+          :hint="saveBarHint"
+          :save-label="isBusy ? 'Waiting…' : 'Apply changes'"
+          :save-when-clean="applyFailed"
+          @save="applyChanges"
+          @discard="discardChanges"
+        />
       </template>
     </div>
 
@@ -354,5 +377,4 @@ onMounted(() => {
    component's scope, so the shared form's own ``.field-hint`` rule can't
    reach them. */
 .field-hint { margin-top: 4px; font-size: 0.775rem; color: var(--text-secondary); line-height: 1.4; }
-.actions { margin-top: 24px; }
 </style>

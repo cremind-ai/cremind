@@ -4,10 +4,11 @@
  * entirely (`skip`), or keeps findable by name, date and folder without
  * reading the content (`metadata_only` — for folders of private scans, say).
  *
- * Edits stay local until Save. Saving emits the whole list; the page sends it
- * through the confirm flow, because a new rule that matches files already in
- * the index removes them from it — the server answers with the count first.
- * `.gitignore`-style ignore files inside the folder apply on top of these.
+ * Edits stay local until the page's save bar saves them: it reads `dirty` and
+ * sends the whole `edited()` list through the confirm flow, because a new rule
+ * that matches files already in the index removes them from it — the server
+ * answers with the count first. `.gitignore`-style ignore files inside the
+ * folder apply on top of these.
  */
 import { computed, ref, watch } from 'vue';
 import {
@@ -19,10 +20,7 @@ import type { ExcludeMode, ExcludeRule, ExcludeType } from '../../services/docum
 const props = withDefaults(defineProps<{
   rules: ExcludeRule[];
   disabled?: boolean;
-  saving?: boolean;
-}>(), { disabled: false, saving: false });
-
-const emit = defineEmits<{ save: [rules: ExcludeRule[]] }>();
+}>(), { disabled: false });
 
 interface Row extends ExcludeRule { key: number }
 
@@ -82,10 +80,7 @@ function reset() {
   rows.value = toRows(props.rules);
 }
 
-function save() {
-  if (!dirty.value) return;
-  emit('save', cleaned(rows.value));
-}
+defineExpose({ dirty, edited: () => cleaned(rows.value), reset });
 </script>
 
 <template>
@@ -148,12 +143,6 @@ function save() {
       <ElButton size="small" :disabled="disabled" @click="addRule">
         <Icon icon="mdi:plus" class="btn-icon" /> Add rule
       </ElButton>
-      <template v-if="dirty">
-        <ElButton size="small" type="primary" :loading="saving" :disabled="disabled" @click="save">
-          Save rules
-        </ElButton>
-        <ElButton size="small" :disabled="saving" @click="reset">Cancel</ElButton>
-      </template>
     </div>
   </div>
 </template>
@@ -168,7 +157,6 @@ function save() {
 }
 .hint strong { color: var(--text-primary); font-weight: 600; }
 .excludes-actions { display: flex; gap: 8px; }
-.excludes-actions :deep(.el-button + .el-button) { margin-left: 0; }
 .btn-icon { margin-right: 4px; }
 .remove {
   border: none; background: none; cursor: pointer; padding: 4px; line-height: 1;

@@ -60,8 +60,10 @@ Inside each card, every row shows the field's label, a one-line
 description, the current default, and a type-appropriate input — a
 number spinner that enforces the min/max, or a toggle. When a value
 differs from its default, a **Reset** button appears next to the row to
-revert just that key. Edits are batched: a **Save changes** button at
-the top of the page commits all pending edits in one go. The per-group
+revert just that key. Edits are batched: the save bar pinned to the
+bottom of the page lights up as soon as a value changes, and its **Save
+changes** commits all pending edits in one go (**Discard** drops them);
+leaving the page with edits still pending asks first. The per-group
 tables below list the exact UI label for every key so you can match it
 to the row you see in the card.
 

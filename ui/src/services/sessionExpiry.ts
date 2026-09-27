@@ -82,6 +82,13 @@ export function shouldHandle401(url: URL): boolean {
   return p === '/' || p.startsWith('/api') || p.startsWith('/.well-known/');
 }
 
+/** Whether an expired session is being sent to the login page right now — a
+ *  page's "unsaved changes" guard must not hold that navigation: nothing on it
+ *  can be saved without a session. */
+export function isSessionExpiring(): boolean {
+  return redirecting;
+}
+
 export function handleUnauthorized(): void {
   if (redirecting || onAuthRoute()) return;
   try {

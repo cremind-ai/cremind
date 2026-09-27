@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { ElForm, ElFormItem, ElSelect, ElOption, ElButton, ElSwitch, ElMessage } from 'element-plus';
+import { ElForm, ElFormItem, ElSelect, ElOption, ElSwitch, ElMessage, ElMessageBox } from 'element-plus';
 import {
   listLLMProviders,
   getProviderModels,
@@ -11,12 +11,13 @@ import {
   updateModelGroups,
   type LLMProvider,
   type LLMModel,
-  type CustomProviderModel,
 } from '../../services/configApi';
 import { useLLMModels } from '../../composables/useLLMModels';
+import { stableStringify } from '../../composables/useUnsavedChanges';
 import ProviderConfigFields, { type ProviderWithState } from './ProviderConfigFields.vue';
 import CustomProviderForm from './CustomProviderForm.vue';
 import ModelGroupFields from './ModelGroupFields.vue';
+import SettingsSaveBar from './SettingsSaveBar.vue';
 
 /**
  * The single LLM-configuration surface: provider credentials + every model
@@ -24,8 +25,9 @@ import ModelGroupFields from './ModelGroupFields.vue';
  * tweak, or a new auth flow) can never drift between them again:
  *
  *  - Settings → LLM Providers (`LLMSettings.vue`) mounts it `self-saving`, so
- *    it talks to the REST API itself (per-provider Save, model-groups Save,
- *    custom providers, browser OAuth).
+ *    it talks to the REST API itself: one save bar for every typed credential,
+ *    the model roles and the custom provider being edited, plus the sign-in
+ *    flows and Remove/Delete, which act at once.
  *  - The Setup Wizard's LLM step (`StepLLMConfig.vue`) mounts it *controlled*:
  *    nothing is saved here, the whole configuration is emitted as one flat
  *    record that the wizard bundles into `POST /api/config/setup`.
@@ -286,7 +288,10 @@ const reasoningEfforts = ref<Record<string, string | null>>(seedReasoningEfforts
 const optionalEnabled = ref<Record<string, boolean>>(seedOptionalEnabled());
 const apiKeyProvider = ref('');
 const loading = ref(false);
+/** The save bar's save is running. */
 const saving = ref(false);
+/** A Remove Configuration / Delete Provider is running. */
+const acting = ref(false);
 
 const selectedApiKeyProvider = computed(() =>
   providers.value.find(p => p.name === apiKeyProvider.value) || null,
@@ -434,9 +439,24 @@ async function fetchProvidersWithModels(): Promise<ProviderWithState[]> {
   return list;
 }
 
-/** Reload the provider list + flattened model options; optionally reselect one. */
+/** Reload the provider list + flattened model options; optionally reselect one.
+ *  Credentials typed into other cards and not saved yet survive it. */
 async function reloadProviders(selectName?: string) {
-  providers.value = await fetchProvidersWithModels();
+  const pending = new Map(dirtyProviders.value.map(p => [p.name, p]));
+  const fresh = await fetchProvidersWithModels();
+  for (const p of fresh) {
+    commitCredentials(p);
+    const draft = pending.get(p.name);
+    if (!draft) continue;
+    p.authFieldValues = { ...draft.authFieldValues };
+    p.apiKey = draft.apiKey;
+    p.configValues = { ...draft.configValues };
+    if (p.selectedAuthMethod !== draft.selectedAuthMethod) {
+      p.selectedAuthMethod = draft.selectedAuthMethod;
+      await loadModelsFor(p);
+    }
+  }
+  providers.value = fresh;
   rebuildModelLists();
   if (selectName !== undefined) apiKeyProvider.value = selectName;
 }
@@ -492,6 +512,9 @@ onMounted(async () => {
         if (role.showReasoning) efforts[role.key] = null;
       }
       reasoningEfforts.value = { ...efforts, ...(groupRes.reasoning_efforts || {}) };
+      // What the save bar compares edits with.
+      for (const p of providers.value) commitCredentials(p);
+      commitRoles();
     } else {
       providers.value = await fetchProvidersWithModels();
       rebuildModelLists();
@@ -535,6 +558,8 @@ async function handleOauthComplete(providerName: string) {
   const provider = providers.value.find(p => p.name === providerName);
   if (!provider) return;
   provider.configured = true;
+  // The sign-in saved its method: switching away from it is a change now.
+  commitCredentials(provider);
   await refreshProviderModels(provider);
 }
 
@@ -651,53 +676,248 @@ watch([modelGroups, roleProviders, reasoningEfforts, optionalEnabled], emitConfi
 // ever emits — triggering a fetch from here would loop back through itself.
 watch(providers, emitConfig, { deep: true });
 
-// ── Self-saving mode: REST actions ──────────────────────────────────────────
+// ── Self-saving mode: the save bar ──────────────────────────────────────────
+//
+// Settings saves the page from one bar: the credentials typed into any
+// provider's card (each card keeps its draft while the dropdown shows another),
+// the model roles, and the custom provider being created or edited. The
+// sign-in flows (device code, ChatGPT) save themselves when they complete, and
+// Remove Configuration / Delete Provider act at once.
 
-type CustomFormPayload = {
-  display_name: string;
-  base_url: string;
-  api_key?: string;
-  models: CustomProviderModel[];
-};
+/** Each provider's credentials as saved (a stable string), by provider name. */
+const savedCredentials = ref<Record<string, string>>({});
+/** The model roles as saved. */
+const savedRoles = ref('');
+let savedRoleProviders: Record<string, string> = {};
+const customForm = ref<InstanceType<typeof CustomProviderForm> | null>(null);
 
-async function handleCreateCustom(payload: CustomFormPayload) {
-  saving.value = true;
-  try {
-    const res = await createCustomProvider(props.agentUrl, props.token, payload);
-    ElMessage.success(`${payload.display_name} created`);
-    await reloadProviders(res.name);
-  } catch (e) {
-    ElMessage.error(`Failed to create: ${e instanceof Error ? e.message : 'Unknown error'}`);
-  } finally {
-    saving.value = false;
-  }
+function filled(values: Record<string, string>, keys: string[] = Object.keys(values)): Record<string, string> {
+  return Object.fromEntries(keys.filter(k => values[k]).map(k => [k, values[k]]));
 }
 
-async function handleUpdateCustom(payload: CustomFormPayload) {
+function activeMethodOf(p: ProviderWithState) {
+  return (p.auth_methods || []).find(m => m.id === p.selectedAuthMethod);
+}
+
+type CredentialDraft =
+  | { method: string; fields: Record<string, string> }
+  | { apiKey: string; config: Record<string, string> };
+
+/** What a save sends for this provider: the selected method and its filled
+ *  fields, or (legacy providers) the API key and config fields. */
+function credentialDraft(p: ProviderWithState): CredentialDraft {
+  if (p.auth_methods && p.auth_methods.length > 0) {
+    const active = activeMethodOf(p);
+    return { method: p.selectedAuthMethod, fields: active ? filled(p.authFieldValues, Object.keys(active.fields)) : {} };
+  }
+  return { apiKey: p.apiKey || '', config: filled(p.configValues) };
+}
+
+function commitCredentials(p: ProviderWithState) {
+  savedCredentials.value = { ...savedCredentials.value, [p.name]: stableStringify(credentialDraft(p)) };
+}
+
+function credentialsDirty(p: ProviderWithState): boolean {
+  // A custom provider is edited in its own form. A sign-in flow (browser
+  // OAuth, device code) saves its method when it completes: saving the bare
+  // method before that would switch the provider to a not-signed-in state.
+  if (p.is_custom) return false;
+  const kind = activeMethodOf(p)?.kind;
+  if (kind === 'oauth' || kind === 'device_code') return false;
+  const saved = savedCredentials.value[p.name];
+  return saved !== undefined && stableStringify(credentialDraft(p)) !== saved;
+}
+
+function rolesDraft() {
+  // Only the reasoning-capable roles carry an effort; the opt-in roles would
+  // otherwise ship stray nulls that ModelGroupFields writes on provider change.
+  const efforts: Record<string, string | null> = {};
+  for (const role of MODEL_ROLES) {
+    if (role.showReasoning) efforts[role.key] = reasoningEfforts.value[role.key] ?? null;
+  }
+  return {
+    groups: { ...modelGroups.value },
+    // Derive default_provider from the main model's provider.
+    defaultProvider: roleProviders.value.high || '',
+    efforts,
+    vision: !!optionalEnabled.value.vision,
+    audio: !!optionalEnabled.value.audio,
+  };
+}
+
+function commitRoles() {
+  savedRoles.value = stableStringify(rolesDraft());
+  savedRoleProviders = { ...roleProviders.value };
+}
+
+const rolesDirty = computed(() => props.selfSaving && stableStringify(rolesDraft()) !== savedRoles.value);
+const dirtyProviders = computed(() => (props.selfSaving ? providers.value.filter(credentialsDirty) : []));
+const customDirty = computed(() => !!customForm.value?.dirty);
+const hasChanges = computed(() => rolesDirty.value || dirtyProviders.value.length > 0 || customDirty.value);
+
+/** The first JSON field of a provider's credentials that does not parse. */
+function invalidJsonField(p: ProviderWithState): string | null {
+  const active = activeMethodOf(p);
+  const fields: Record<string, { type?: string; description?: string }> = active ? active.fields : (p.config_fields || {});
+  const values = active ? p.authFieldValues : p.configValues;
+  for (const [key, field] of Object.entries(fields)) {
+    const value = values[key];
+    if (!value || field.type !== 'json') continue;
+    try {
+      JSON.parse(value);
+    } catch {
+      return field.description || key;
+    }
+  }
+  return null;
+}
+
+/** Why the bar cannot save yet, said next to its button. */
+const saveBlocker = computed(() => {
+  // Everything falls back to the main model, so saving a blank one leaves the
+  // profile unable to answer at all — and it is easy to do by accident,
+  // because changing a section's Provider clears its Model. The backend
+  // refuses this too.
+  if (rolesDirty.value && !modelGroups.value.high) {
+    return 'Choose a Model before saving — the assistant needs one to answer.';
+  }
+  for (const p of dirtyProviders.value) {
+    const field = invalidJsonField(p);
+    if (field) return `${p.display_name}: ${field} is not valid JSON.`;
+  }
+  if (customDirty.value && !customForm.value?.canSubmit) {
+    return 'The custom provider needs a name, an API base URL and at least one model ID.';
+  }
+  return '';
+});
+
+async function persistCredentials(p: ProviderWithState): Promise<void> {
+  // What is sent is what is marked saved: typing on while it saves stays a change.
+  const draft = credentialDraft(p);
+  const saved = JSON.parse(savedCredentials.value[p.name] || '{}');
+  if ('method' in draft) {
+    const active = activeMethodOf(p);
+    await updateProvider(props.agentUrl, props.token, p.name, { auth_method: draft.method, ...draft.fields });
+    for (const key of Object.keys(draft.fields)) {
+      if (active?.fields[key]) active.fields[key].configured = true;
+    }
+  } else {
+    if (draft.apiKey && draft.apiKey !== saved.apiKey) {
+      await updateProvider(props.agentUrl, props.token, p.name, { api_key: draft.apiKey });
+    }
+    if (Object.keys(draft.config).length && stableStringify(draft.config) !== stableStringify(saved.config ?? {})) {
+      await updateProvider(props.agentUrl, props.token, p.name, draft.config);
+      for (const key of Object.keys(draft.config)) {
+        if (p.config_fields?.[key]) p.config_fields[key].configured = true;
+      }
+    }
+  }
+  p.configured = true;
+  savedCredentials.value = { ...savedCredentials.value, [p.name]: stableStringify(draft) };
+}
+
+async function persistRoles(): Promise<void> {
+  const draft = rolesDraft();
+  const providersNow = { ...roleProviders.value };
+  await updateModelGroups(
+    props.agentUrl, props.token, draft.groups, draft.defaultProvider, draft.efforts, draft.vision, draft.audio,
+  );
+  savedRoles.value = stableStringify(draft);
+  savedRoleProviders = providersNow;
+}
+
+/** Create the custom provider being drafted, or update the one being edited.
+ *  Reloads the provider list, so it runs after everything else is saved. */
+async function persistCustom(): Promise<void> {
+  const form = customForm.value;
+  if (!form) return;
+  const payload = form.payload();
+  if (addingCustomProvider.value) {
+    const res = await createCustomProvider(props.agentUrl, props.token, payload);
+    // The dropdown moves to the new provider, whose edit form loads from it.
+    await reloadProviders(res.name);
+    return;
+  }
   const name = apiKeyProvider.value;
+  const body: Record<string, unknown> = {
+    display_name: payload.display_name,
+    base_url: payload.base_url,
+    models: payload.models,
+  };
+  if (payload.api_key) body.api_key = payload.api_key;
+  await updateProvider(props.agentUrl, props.token, name, body);
+  form.markSaved();
+  await reloadProviders(name);
+}
+
+async function saveAll() {
+  if (!hasChanges.value || saveBlocker.value || saving.value) return;
   saving.value = true;
+  const failed: string[] = [];
+  const attempt = async (what: string, run: () => Promise<void>) => {
+    try {
+      await run();
+    } catch (e) {
+      failed.push(`${what} (${e instanceof Error ? e.message : 'failed'})`);
+    }
+  };
   try {
-    const body: Record<string, unknown> = {
-      display_name: payload.display_name,
-      base_url: payload.base_url,
-      models: payload.models,
-    };
-    if (payload.api_key) body.api_key = payload.api_key;
-    await updateProvider(props.agentUrl, props.token, name, body);
-    ElMessage.success('Custom provider updated');
-    await reloadProviders(name);
-  } catch (e) {
-    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
+    await Promise.all(dirtyProviders.value.map(p => attempt(p.display_name, () => persistCredentials(p))));
+    if (rolesDirty.value) await attempt('model roles', persistRoles);
+    if (customDirty.value) await attempt('custom provider', persistCustom);
   } finally {
     saving.value = false;
   }
+  if (failed.length) ElMessage.error(`Not saved: ${failed.join('; ')}`);
+  else ElMessage.success('LLM settings saved');
+}
+
+function discardAll() {
+  for (const p of dirtyProviders.value) {
+    const saved = JSON.parse(savedCredentials.value[p.name]) as CredentialDraft;
+    if ('method' in saved) {
+      const methodChanged = p.selectedAuthMethod !== saved.method;
+      p.selectedAuthMethod = saved.method;
+      p.authFieldValues = { ...saved.fields };
+      if (methodChanged) void refreshProviderModels(p);
+    } else {
+      p.apiKey = saved.apiKey;
+      p.configValues = { ...saved.config };
+    }
+  }
+  if (rolesDirty.value) {
+    const saved = JSON.parse(savedRoles.value) as ReturnType<typeof rolesDraft>;
+    modelGroups.value = { ...saved.groups };
+    roleProviders.value = { ...savedRoleProviders };
+    reasoningEfforts.value = { ...reasoningEfforts.value, ...saved.efforts };
+    optionalEnabled.value = { ...optionalEnabled.value, vision: saved.vision, audio: saved.audio };
+  }
+  customForm.value?.reset();
+}
+
+/** The Provider dropdown. Built-in cards keep their drafts across a switch;
+ *  the custom provider form does not, so leaving it unsaved asks first. */
+async function selectProvider(name: string) {
+  if (name === apiKeyProvider.value) return;
+  if (customDirty.value) {
+    try {
+      await ElMessageBox.confirm(
+        'Your changes to this custom provider are not saved. Discard them?',
+        'Unsaved changes',
+        { type: 'warning', confirmButtonText: 'Discard changes', cancelButtonText: 'Keep editing' },
+      );
+    } catch {
+      return;
+    }
+  }
+  apiKeyProvider.value = name;
 }
 
 async function handleDeleteCustom() {
   const name = apiKeyProvider.value;
   const display = selectedApiKeyProvider.value?.display_name || 'this provider';
   if (!confirm(`Delete custom provider "${display}"? This removes its models and stored API key.`)) return;
-  saving.value = true;
+  acting.value = true;
   try {
     await deleteProviderConfig(props.agentUrl, props.token, name);
     ElMessage.success('Custom provider deleted');
@@ -705,119 +925,13 @@ async function handleDeleteCustom() {
   } catch (e) {
     ElMessage.error(`Failed to delete: ${e instanceof Error ? e.message : 'Unknown error'}`);
   } finally {
-    saving.value = false;
-  }
-}
-
-/** Save provider credentials using the new auth_methods flow. */
-async function saveProvider(provider: ProviderWithState) {
-  const config: Record<string, string> = {};
-
-  // If using auth_methods (new flow)
-  if (provider.auth_methods && provider.auth_methods.length > 0) {
-    const activeMethod = provider.auth_methods.find(m => m.id === provider.selectedAuthMethod);
-    // Browser-OAuth methods ("Sign in with ChatGPT") persist their auth_method
-    // server-side only when the flow completes and tokens are captured. Saving a
-    // bare auth_method here would flip the active method to a not-yet-signed-in
-    // state, so skip the PUT entirely for oauth methods.
-    if (activeMethod?.kind === 'oauth') return;
-    config.auth_method = provider.selectedAuthMethod;
-    // Include field values for the selected auth method
-    if (activeMethod) {
-      for (const [key, value] of Object.entries(provider.authFieldValues)) {
-        if (value && key in activeMethod.fields) {
-          config[key] = value;
-        }
-      }
-    }
-  }
-
-  if (Object.keys(config).length <= 1 && !config.auth_method) return;
-  // Validate JSON fields
-  if (provider.auth_methods) {
-    const activeMethod = provider.auth_methods.find(m => m.id === provider.selectedAuthMethod);
-    if (activeMethod) {
-      for (const [key, value] of Object.entries(provider.authFieldValues)) {
-        if (value && activeMethod.fields[key]?.type === 'json') {
-          try {
-            JSON.parse(value);
-          } catch {
-            ElMessage.error(`Invalid JSON for ${activeMethod.fields[key].description || key}`);
-            return;
-          }
-        }
-      }
-    }
-  }
-
-  saving.value = true;
-  try {
-    await updateProvider(props.agentUrl, props.token, provider.name, config);
-    provider.configured = true;
-    ElMessage.success(`${provider.display_name} configuration saved`);
-  } catch (e) {
-    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
-  } finally {
-    saving.value = false;
-  }
-}
-
-/** Legacy: save API key only. */
-async function saveProviderKey(provider: ProviderWithState) {
-  if (!provider.apiKey) return;
-  saving.value = true;
-  try {
-    await updateProvider(props.agentUrl, props.token, provider.name, {
-      api_key: provider.apiKey,
-    });
-    provider.configured = true;
-    ElMessage.success(`${provider.display_name} API key saved`);
-  } catch (e) {
-    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
-  } finally {
-    saving.value = false;
-  }
-}
-
-/** Legacy: save config fields. */
-async function saveProviderConfig(provider: ProviderWithState) {
-  const config: Record<string, string> = {};
-  for (const [key, value] of Object.entries(provider.configValues)) {
-    if (value) config[key] = value;
-  }
-  if (Object.keys(config).length === 0) return;
-
-  for (const [key, value] of Object.entries(config)) {
-    if (provider.config_fields?.[key]?.type === 'json') {
-      try {
-        JSON.parse(value);
-      } catch {
-        ElMessage.error(`Invalid JSON for ${provider.config_fields[key].description || key}`);
-        return;
-      }
-    }
-  }
-
-  saving.value = true;
-  try {
-    await updateProvider(props.agentUrl, props.token, provider.name, config);
-    for (const key of Object.keys(config)) {
-      if (provider.config_fields?.[key]) {
-        provider.config_fields[key].configured = true;
-      }
-    }
-    provider.configured = true;
-    ElMessage.success(`${provider.display_name} configuration saved`);
-  } catch (e) {
-    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
-  } finally {
-    saving.value = false;
+    acting.value = false;
   }
 }
 
 async function removeProviderConfiguration(provider: ProviderWithState) {
   if (!confirm(`Remove all stored credentials for ${provider.display_name}?`)) return;
-  saving.value = true;
+  acting.value = true;
   try {
     await deleteProviderConfig(props.agentUrl, props.token, provider.name);
     provider.configured = false;
@@ -837,46 +951,12 @@ async function removeProviderConfiguration(provider: ProviderWithState) {
         field.configured = false;
       }
     }
+    commitCredentials(provider);
     ElMessage.success(`${provider.display_name} configuration removed`);
   } catch (e) {
     ElMessage.error(`Failed to remove: ${e instanceof Error ? e.message : 'Unknown error'}`);
   } finally {
-    saving.value = false;
-  }
-}
-
-async function saveModelGroups() {
-  // Everything falls back to the main model, so saving a blank one leaves the
-  // profile unable to answer at all — and it is easy to do by accident,
-  // because changing a section's Provider clears its Model. The backend
-  // refuses this too; catching it here keeps the message next to the field.
-  if (!modelGroups.value.high) {
-    ElMessage.error('Choose a Model before saving — the assistant needs one to answer.');
-    return;
-  }
-  saving.value = true;
-  try {
-    // Only the reasoning-capable roles carry an effort; the opt-in roles would
-    // otherwise ship stray nulls that ModelGroupFields writes on provider change.
-    const efforts: Record<string, string | null> = {};
-    for (const role of MODEL_ROLES) {
-      if (role.showReasoning) efforts[role.key] = reasoningEfforts.value[role.key] ?? null;
-    }
-    await updateModelGroups(
-      props.agentUrl,
-      props.token,
-      { ...modelGroups.value },
-      // Derive default_provider from the main model's provider.
-      roleProviders.value.high || '',
-      efforts,
-      !!optionalEnabled.value.vision,
-      !!optionalEnabled.value.audio,
-    );
-    ElMessage.success('Model groups updated');
-  } catch {
-    ElMessage.error('Failed to save model groups');
-  } finally {
-    saving.value = false;
+    acting.value = false;
   }
 }
 </script>
@@ -896,29 +976,33 @@ async function saveModelGroups() {
 
         <ElForm label-position="top" class="groups-form">
           <ElFormItem label="Provider">
-            <ElSelect v-model="apiKeyProvider" placeholder="Select a provider to configure">
+            <ElSelect
+              :model-value="apiKeyProvider"
+              placeholder="Select a provider to configure"
+              @update:model-value="selectProvider"
+            >
               <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
               <ElOption v-if="allowCustomProviders" :value="ADD_CUSTOM" label="➕ Add custom provider" />
             </ElSelect>
           </ElFormItem>
 
-          <!-- Create a new custom provider -->
+          <!-- Create a new custom provider (created from the save bar) -->
           <div v-if="addingCustomProvider" class="provider-config-inline">
             <CustomProviderForm
+              ref="customForm"
               mode="create"
-              :saving="saving"
-              @submit="handleCreateCustom"
+              :saving="saving || acting"
               @cancel="apiKeyProvider = ''"
             />
           </div>
 
-          <!-- Edit an existing custom provider -->
+          <!-- Edit an existing custom provider (saved from the save bar) -->
           <div v-else-if="editingCustomProvider && selectedApiKeyProvider" class="provider-config-inline">
             <CustomProviderForm
+              ref="customForm"
               mode="edit"
               :provider="selectedApiKeyProvider"
-              :saving="saving"
-              @submit="handleUpdateCustom"
+              :saving="saving || acting"
               @delete="handleDeleteCustom"
             />
           </div>
@@ -933,13 +1017,9 @@ async function saveModelGroups() {
               :key="selectedApiKeyProvider!.name"
               :provider="selectedApiKeyProvider"
               :show-configured-badge="showConfiguredBadge"
-              :show-save-buttons="selfSaving"
               :persist-credentials="selfSaving"
-              :saving="saving"
+              :saving="saving || acting"
               :allow-browser-oauth="allowBrowserOauth"
-              @save-provider="saveProvider(selectedApiKeyProvider!)"
-              @save-key="saveProviderKey(selectedApiKeyProvider!)"
-              @save-config="saveProviderConfig(selectedApiKeyProvider!)"
               @remove-config="removeProviderConfiguration(selectedApiKeyProvider!)"
               @auth-method-change="refreshProviderModels(selectedApiKeyProvider!)"
               @oauth-complete="handleOauthComplete($event)"
@@ -977,7 +1057,15 @@ async function saveModelGroups() {
         />
       </div>
 
-      <ElButton v-if="selfSaving" type="primary" :loading="saving" @click="saveModelGroups">Save</ElButton>
+      <SettingsSaveBar
+        v-if="selfSaving"
+        :dirty="hasChanges"
+        :saving="saving"
+        :disabled="!!saveBlocker || acting"
+        :hint="hasChanges ? saveBlocker : ''"
+        @save="saveAll"
+        @discard="discardAll"
+      />
     </template>
   </div>
 </template>

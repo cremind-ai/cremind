@@ -59,9 +59,10 @@ Each server renders as a card. Its header shows, as applicable, **Auth**
 (matching `auth-url`), **Unlink** (`unlink`), **Reconnect** (`reconnect`), and
 **Remove** (`delete`) buttons plus an enable/disable switch (`enable` /
 `disable`). Expanding a card reveals an inline **Description** field with
-**Save** / **Reset to Default** (matching `config get` / `config set`) and a
-sub-tools enable/disable list. There is no separate "Agents" page and no
-OAuth/Config tabs.
+**Reset to Default** (matching `config get` / `config set`; the edit is saved
+from the page's save bar, pinned to the bottom) and a sub-tools
+enable/disable list, whose switches apply at once. There is no separate
+"Agents" page and no OAuth/Config tabs.
 
 ## Global flags
 

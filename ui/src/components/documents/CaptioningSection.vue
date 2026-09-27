@@ -11,8 +11,9 @@
  * no longer the model (VisionModelChanged), so a switch between reading and
  * clicking can't slip through.
  *
- * The limits (daily cap, smallest image) are edited locally and saved
- * together; turning descriptions on or off saves at once.
+ * The limits (daily cap, smallest image) are edited locally and saved by the
+ * page's save bar (`dirty`, `edited()`); turning descriptions on or off saves
+ * at once.
  */
 import { computed, ref, watch } from 'vue';
 import { ElButton, ElInputNumber, ElSwitch } from 'element-plus';
@@ -34,7 +35,8 @@ const props = withDefaults(defineProps<{
 }>(), { waiting: null, saving: false, busy: false });
 
 const emit = defineEmits<{
-  save: [patch: Partial<CaptionOptions>];
+  /** The on/off switch, saved at once. */
+  save: [patch: Pick<CaptionOptions, 'enabled'>];
   consent: [model: string];
   revoke: [];
   'open-llm': [];
@@ -72,21 +74,25 @@ function reset() {
   minKb.value = props.caption.min_kb;
 }
 
-// Saved values coming back replace the local copy unless there are edits.
-watch(() => props.caption, () => { if (!dirty.value) reset(); }, { deep: true });
+// Saved values coming back replace the local copy unless there are edits —
+// and turning descriptions off drops those too: the limits are hidden then,
+// and the save bar must not hold changes nobody can see.
+watch(() => props.caption, (caption) => { if (!dirty.value || !caption.enabled) reset(); }, { deep: true });
 
-function save() {
-  if (!dirty.value) return;
-  emit('save', {
+/** The limits as the save bar sends them. */
+function edited(): Partial<CaptionOptions> {
+  return {
     daily_cap: useDefaultCap.value ? null : Math.max(0, Math.round(cap.value ?? 0)),
     min_px: Math.round(minPx.value ?? 256),
     min_kb: Math.round(minKb.value ?? 20),
-  });
+  };
 }
 
 function toggle(next: string | number | boolean) {
   emit('save', { enabled: !!next });
 }
+
+defineExpose({ dirty, edited, reset });
 </script>
 
 <template>
@@ -189,10 +195,6 @@ function toggle(next: string | number | boolean) {
         </div>
       </label>
       <p class="hint">Icons and thumbnails below these sizes are never sent.</p>
-      <div v-if="dirty" class="cap-save">
-        <ElButton size="small" type="primary" :loading="saving" @click="save">Save limits</ElButton>
-        <ElButton size="small" :disabled="saving" @click="reset">Cancel</ElButton>
-      </div>
     </div>
   </div>
 </template>
@@ -235,6 +237,4 @@ function toggle(next: string | number | boolean) {
 .cap-field-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cap-default { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); cursor: pointer; }
 .unit { color: var(--text-secondary); }
-.cap-save { display: flex; gap: 8px; }
-.cap-save :deep(.el-button + .el-button) { margin-left: 0; }
 </style>

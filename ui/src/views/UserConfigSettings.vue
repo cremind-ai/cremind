@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, nextTick, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { ElButton, ElMessage, ElMessageBox } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 import { useSettingsStore } from '../stores/settings';
@@ -12,7 +12,9 @@ import {
   resetUserConfigKey,
   type UserConfigSchema,
 } from '../services/configApi';
+import { stableStringify } from '../composables/useUnsavedChanges';
 import ConfigGroupCard from '../components/config/ConfigGroupCard.vue';
+import SettingsSaveBar from '../components/shared/SettingsSaveBar.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -45,12 +47,24 @@ async function scrollToSection(section: string | null) {
 const schema = ref<UserConfigSchema | null>(null);
 const values = ref<Record<string, unknown>>({});
 const defaults = ref<Record<string, unknown>>({});
-/** Pending edits (full key → new value). Cleared after a successful save. */
-const dirty = ref<Record<string, unknown>>({});
+/** The values as last loaded (or reset): what an edit is a change from. */
+const savedValues = ref<Record<string, unknown>>({});
 const loading = ref(false);
 const saving = ref(false);
 
-const hasChanges = computed(() => Object.keys(dirty.value).length > 0);
+/** What a field shows: its override, or the default without one. */
+function effective(source: Record<string, unknown>, key: string): unknown {
+  const v = source[key];
+  return v === null || v === undefined ? defaults.value[key] : v;
+}
+
+/** Keys whose shown value differs from the saved one — a value typed back
+ *  (the default included) is not a change. */
+const changedKeys = computed(() =>
+  Object.keys(values.value).filter(
+    key => stableStringify(effective(values.value, key)) !== stableStringify(effective(savedValues.value, key)),
+  ));
+const hasChanges = computed(() => changedKeys.value.length > 0);
 
 async function loadAll() {
   loading.value = true;
@@ -61,8 +75,8 @@ async function loadAll() {
     ]);
     schema.value = schemaRes;
     values.value = valuesRes.values;
+    savedValues.value = { ...valuesRes.values };
     defaults.value = valuesRes.defaults;
-    dirty.value = {};
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to load configuration');
   } finally {
@@ -71,9 +85,12 @@ async function loadAll() {
 }
 
 function handleUpdate(key: string, value: unknown) {
-  // Track the change locally so users can review and Save in one batch.
-  dirty.value = { ...dirty.value, [key]: value };
+  // Held locally until the save bar sends every change in one batch.
   values.value = { ...values.value, [key]: value };
+}
+
+function handleDiscard() {
+  values.value = { ...savedValues.value };
 }
 
 async function handleReset(key: string) {
@@ -92,11 +109,10 @@ async function handleReset(key: string) {
       settingsStore.authToken,
       key,
     );
-    // Clear local override and any pending edit for this key.
-    const next = { ...dirty.value };
-    delete next[key];
-    dirty.value = next;
+    // The reset is saved already: clear the override and any pending edit of
+    // this key, keeping the other pending edits.
     values.value = { ...values.value, [key]: null };
+    savedValues.value = { ...savedValues.value, [key]: null };
     ElMessage.success('Reset to default');
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to reset value');
@@ -110,10 +126,10 @@ async function handleSave() {
     await updateUserConfig(
       settingsStore.agentUrl,
       settingsStore.authToken,
-      dirty.value,
+      Object.fromEntries(changedKeys.value.map(key => [key, values.value[key]])),
     );
     ElMessage.success('Configuration saved');
-    dirty.value = {};
+    savedValues.value = { ...values.value };
     await loadAll();
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to save configuration');
@@ -150,24 +166,10 @@ watch(() => route.query.section, (s) => {
           <Icon icon="mdi:arrow-left" />
           Back to Settings
         </button>
-        <div class="header-row">
-          <div>
-            <h1 class="config-title">Config</h1>
-            <p class="config-subtitle">
-              Per-profile runtime tuning · Profile <strong>{{ profile }}</strong>
-            </p>
-          </div>
-          <ElButton
-            type="primary"
-            size="default"
-            :disabled="!hasChanges"
-            :loading="saving"
-            @click="handleSave"
-          >
-            <Icon icon="mdi:content-save" style="margin-right: 6px" />
-            Save changes
-          </ElButton>
-        </div>
+        <h1 class="config-title">Config</h1>
+        <p class="config-subtitle">
+          Per-profile runtime tuning · Profile <strong>{{ profile }}</strong>
+        </p>
       </div>
 
       <div v-if="loading" class="loading">Loading…</div>
@@ -188,6 +190,12 @@ watch(() => route.query.section, (s) => {
             @reset="handleReset"
           />
         </div>
+        <SettingsSaveBar
+          :dirty="hasChanges"
+          :saving="saving"
+          @save="handleSave"
+          @discard="handleDiscard"
+        />
       </div>
     </div>
   </div>
@@ -210,7 +218,6 @@ watch(() => route.query.section, (s) => {
   font-size: 0.875rem; padding: 4px 0; margin-bottom: 16px; transition: color 0.2s;
 }
 .back-btn:hover { color: var(--primary-color); }
-.header-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .config-title { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); margin: 0 0 4px 0; }
 .config-subtitle { color: var(--text-secondary); font-size: 0.875rem; margin: 0; }
 .loading {

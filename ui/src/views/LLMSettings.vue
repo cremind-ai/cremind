@@ -11,7 +11,7 @@ import LLMConfigForm from '../components/shared/LLMConfigForm.vue';
  * credentials, custom providers, browser OAuth and all five model roles — is
  * the shared `<LLMConfigForm>`, which the Setup Wizard's LLM step renders too
  * (there in controlled mode). Mounted `self-saving` here, so the form owns its
- * own PUTs (per-provider Save, model-groups Save, custom-provider CRUD).
+ * own PUTs — one save bar for credentials, model roles and custom providers.
  */
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
