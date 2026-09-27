@@ -368,6 +368,37 @@ def test_display_sends_the_note_with_a_body_file(api, tmp_path):
     assert "delivery 501" in result.output and "cremind tags deliveries show 501" in result.output
 
 
+def test_display_replace_is_opt_in(api):
+    plain = _run("tags", "display", DESK, "In a meeting")
+    assert plain.exit_code == 0, plain.output
+    replaced = _run("tags", "display", DESK, "Back at 3", "--replace")
+    assert replaced.exit_code == 0, replaced.output
+    [(first, _), (second, _)] = _calls(api, "display")
+    assert first[1] == {"title": "In a meeting"}
+    assert second[1] == {"title": "Back at 3", "replace": True}
+    assert "replaces the previous --replace note" in replaced.output
+
+
+def test_pending_and_clear_failed_are_shown_with_a_hint(api):
+    api["responses"]["overview"]["devices"][0].update(pending_count=3, status="clear_failed")
+    listed = _run("tags", "list")
+    assert listed.exit_code == 0, listed.output
+    assert "PENDING" in listed.output and "clear_failed" in listed.output
+    assert "cremind tags hardware claim|release" in listed.output
+    api["responses"]["get_device"]["device"].update(pending_count=2, status="clear_failed")
+    shown = _run("tags", "show", DESK)
+    assert shown.exit_code == 0, shown.output
+    assert "pending" in shown.output and "clear_failed" in shown.output and "claim or release" in shown.output
+    api["responses"]["overview"]["devices"][0].update(status="ok")
+    calm = _run("tags", "list")
+    assert "clear_failed:" not in calm.output
+    api["responses"]["hardware_inventory"]["devices"][0].update(pending_count=4, status="clear_failed")
+    inventory = _run("tags", "hardware", "list")
+    assert inventory.exit_code == 0, inventory.output
+    assert "PENDING" in inventory.output and "clear_failed" in inventory.output
+    assert "cremind tags hardware claim <tag> --owner <profile>" in inventory.output
+
+
 def test_display_reads_the_body_from_stdin(api):
     result = _run("tags", "display", DESK, "Standup", "--body-file", "-", input="line one\nline two\n")
     assert result.exit_code == 0, result.output
@@ -487,6 +518,12 @@ def test_deliveries_cancel_and_the_already_finished_case(api):
     ok = _run("tags", "deliveries", "cancel", "501")
     assert ok.exit_code == 0, ok.output
     assert "cancelled delivery 501" in ok.output
+    assert "nothing was sent to it" in ok.output  # the fake answers without a resolved job
+    api["responses"]["cancel_delivery"]["resolved"] = _delivery(733, kind="resolved", replace_key=None,
+                                                                resolves="delivery:501")
+    sent = _run("tags", "deliveries", "cancel", "501")
+    assert sent.exit_code == 0, sent.output
+    assert "resolved job 733" in sent.output and "drops the card" in sent.output
     api["raise"]["cancel_delivery"] = _tag_error(409, "already_terminal", "The delivery already finished (displayed).",
                                                  delivery=_delivery(stage="displayed"))
     done = _run("tags", "deliveries", "cancel", "501")

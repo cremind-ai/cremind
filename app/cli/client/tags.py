@@ -56,7 +56,8 @@ async def rename_device(client, device_id: str, name: str) -> dict[str, Any]:
 
 
 async def display(client, device_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Pin a note: `{title, body?, icon?, ttl_s?}` -> `{delivery}`."""
+    """Pin a note: `{title, body?, icon?, ttl_s?, replace?}` -> `{delivery}`.
+    `replace: true` takes the tag's one replaceable note slot."""
     return _obj(await client.post_json(f"/api/tags/devices/{_seg(device_id)}/display", body))
 
 
@@ -120,6 +121,8 @@ async def get_delivery(client, delivery_id: int | str) -> dict[str, Any]:
 
 
 async def cancel_delivery(client, delivery_id: int | str) -> dict[str, Any]:
+    """`{delivery, resolved}` — `resolved` is the job that tells the companion to
+    drop the card (null when the tag has changed hands)."""
     return _obj(await client.post_json(f"/api/tags/deliveries/{_seg(delivery_id)}/cancel", {}))
 
 

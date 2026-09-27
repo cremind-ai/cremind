@@ -6,6 +6,8 @@ owns which tag. Timestamps are epoch milliseconds; errors are ``{"error",
 "message", "detail"}``. Secrets appear only in the create / rotate responses.
 
 - ``GET    /api/tags/hardware``                             ``{companions, devices, commands}``
+  (each tag carries ``pending_count``; a tag whose clear failed 3 times reads
+  status ``clear_failed`` — claim or release it again to retry)
 - ``POST   /api/tags/hardware/companions``                  ``{name}`` -> 201 ``{companion, credential, secret, authorization}``
 - ``POST   /api/tags/hardware/companions/{id}/rotate``      -> ``{credential, secret, authorization, revoked}``
 - ``DELETE /api/tags/hardware/companions/{id}``             -> ``{deleted: true}``
@@ -61,6 +63,10 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         for c in companions:
             c["credentials"] = [h for h in hardware if h["companion_id"] == c["id"]]
         devices = await s.list_devices()
+        pending = await s.pending_counts([d["id"] for d in devices if d["kind"] == "tag"])
+        for d in devices:
+            if d["kind"] == "tag":
+                d["pending_count"] = pending.get(d["id"], 0)
         active = await s.list_commands(statuses=COMMAND_ACTIVE, limit=200)
         recent = await s.list_commands(limit=50)
         seen = {c["id"] for c in active}

@@ -680,6 +680,39 @@ def test_request_notifications_mask_the_sender() -> None:
     assert "Family" not in json.dumps(group.payload) and "Mom" not in json.dumps(group.payload)
 
 
+# ── a final receipt near the deadline wins over the expiry sweep ────────────
+
+
+def test_in_flight_deliveries_get_a_grace_period_before_expiry(tagenv) -> None:
+    from app.tags.projection import IN_FLIGHT_GRACE_MS
+
+    hw = hardware(tagenv, tags=("T1",))
+    tag = hw["tags"]["T1"]
+    claim(tagenv, tag, "p1")
+    auth = _content(tagenv, "p1", hw)
+    notes = [run(service.display("p1", tag, {"title": t})) for t in ("queued", "accepted", "radio", "late")]
+    connector("accepted", "POST", auth, body={"delivery_ids": [n["id"] for n in notes[1:]]})
+    connector("receipts", "POST", auth, body={"receipts": [
+        {"delivery_id": notes[2]["id"], "stage": "transferring"},
+        {"delivery_id": notes[3]["id"], "stage": "gateway_received"},
+    ]})
+    now = time.time() * 1000
+    with tagenv.engine.begin() as c:
+        for n in notes[:3]:
+            c.execute(text("UPDATE tag_deliveries SET expires_at=:t WHERE id=:i"), {"t": now - 60_000, "i": n["id"]})
+        c.execute(text("UPDATE tag_deliveries SET expires_at=:t WHERE id=:i"),
+                  {"t": now - IN_FLIGHT_GRACE_MS - 1000, "i": notes[3]["id"]})
+    run(TagProjectionWorker(tagenv.store).expire(now))
+    stage = lambda n: scalar(tagenv, "SELECT stage FROM tag_deliveries WHERE id=:i", i=n["id"])  # noqa: E731
+    assert [stage(n) for n in notes] == ["expired", "expired", "transferring", "expired"]
+    # The companion's "state unknown" report inside the grace is final.
+    out = body_of(connector("receipts", "POST", auth, body={"receipts": [
+        {"delivery_id": notes[2]["id"], "stage": "refreshing", "outcome": "uncertain"}]}))
+    assert out == {"applied": 1, "rejected": []}
+    run(TagProjectionWorker(tagenv.store).expire(now + IN_FLIGHT_GRACE_MS))
+    assert stage(notes[2]) == "uncertain"
+
+
 # ── [medium] an errored reply shows no text unless excerpts are on ──────────
 
 
@@ -705,6 +738,13 @@ def test_overview_pending_count_and_settings_builtin(tagenv) -> None:
     run(service.display("p1", hw["tags"]["T1"], {"title": "b"}))
     devices = {d["hw_id"]: d for d in body_of(call("/api/tags", "GET", "p1"))["devices"]}
     assert devices["T1"]["pending_count"] == 2 and devices["T2"]["pending_count"] == 0
+    detail = body_of(call("/api/tags/devices/{device_id}", "GET", "p1", path={"device_id": hw["tags"]["T1"]}))
+    assert detail["device"]["pending_count"] == 2
+    from app.api.tags_hardware import get_tags_hardware_routes
+
+    inventory = body_of(call("/api/tags/hardware", "GET", "admin", routes=get_tags_hardware_routes()))
+    by_hw = {d["hw_id"]: d for d in inventory["devices"]}
+    assert by_hw["T1"]["pending_count"] == 2 and "pending_count" not in by_hw["B1"]
     settings = body_of(call("/api/tags/settings", "GET", "p1"))
     assert settings["builtin"] == routing.BUILTIN_DEFAULTS
 

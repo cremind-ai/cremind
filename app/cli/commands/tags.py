@@ -86,6 +86,17 @@ _ADMIN_HINTS = {
                        "identify, refresh_tag, install_fontpack, collect_diagnostics.",
 }
 
+CLEAR_FAILED = "clear_failed"
+_CLEAR_FAILED_HINT = (
+    "clear_failed: the tag could not be blanked after it changed owner (3 attempts). "
+    "Ask the admin to claim or release it again (cremind tags hardware claim|release <tag>)."
+)
+_CLEAR_FAILED_ADMIN_HINT = (
+    "clear_failed: the tag could not be blanked after a change of owner (3 attempts). Retry by claiming "
+    "it again (cremind tags hardware claim <tag> --owner <profile>) or releasing it "
+    "(cremind tags hardware release <tag>)."
+)
+
 _ADMIN_REQUIRED = (
     "This needs the admin profile: `cremind tags hardware` manages hardware shared by every profile.\n"
     "Run it as admin, e.g. `cremind -p admin tags hardware list`."
@@ -474,20 +485,32 @@ def _render_settings(mode: Any, out: dict[str, Any]) -> None:
         sys.stdout.write(f"\nicons (for `display --icon`): {', '.join(str(i) for i in icons)}\n")
 
 
+def _pending(device: dict[str, Any]) -> str:
+    """Active deliveries on their way to the tag (blank when the server did not say)."""
+    value = device.get("pending_count")
+    return "" if value is None else str(value)
+
+
+def _clear_failed_hint(devices: list[dict[str, Any]], *, admin: bool) -> None:
+    if any(d.get("status") == CLEAR_FAILED for d in devices):
+        sys.stdout.write("\n" + (_CLEAR_FAILED_ADMIN_HINT if admin else _CLEAR_FAILED_HINT) + "\n")
+
+
 def _device_table(mode: Any, devices: list[dict[str, Any]]) -> None:
     from app.cli.output import Table
 
-    table = Table(mode, "ID", "NAME", "STATUS", "BATTERY", "LAST CONTACT", "SCREEN", "COMPANION")
+    table = Table(mode, "ID", "NAME", "STATUS", "PENDING", "BATTERY", "LAST CONTACT", "SCREEN", "COMPANION")
     for d in devices:
         companion = d.get("companion_name") or d.get("companion_id") or ""
         if d.get("companion_name") and d.get("companion_online") is False:
             companion = f"{companion} (offline)"
         table.add_row(
             str(d.get("id") or ""), _cell(mode, d.get("name") or d.get("hw_id")),
-            str(d.get("status") or ""), _battery(d.get("battery_mv")),
+            str(d.get("status") or ""), _pending(d), _battery(d.get("battery_mv")),
             _fmt_ts(d.get("last_contact_at")), _screen(d), _cell(mode, companion),
         )
     table.render()
+    _clear_failed_hint(devices, admin=False)
 
 
 def _card_title(delivery: dict[str, Any]) -> str:
@@ -576,6 +599,7 @@ def tags_show(
         ("name", str(d.get("name") or "")),
         ("hw_id", str(d.get("hw_id") or "")),
         ("status", str(d.get("status") or "")),
+        ("pending", _pending(d)),
         ("battery", _battery(d.get("battery_mv"))),
         ("rssi", "" if d.get("rssi") is None else f"{d.get('rssi')} dBm"),
         ("last contact", _fmt_ts(d.get("last_contact_at"))),
@@ -589,6 +613,7 @@ def tags_show(
         ("claimed", _fmt_ts(d.get("claimed_at"))),
         ("previews", f"desired rev {previews.get('desired') or '-'}, displayed rev {previews.get('displayed') or '-'}"),
     ])
+    _clear_failed_hint([d], admin=False)
     rows = _rows(out.get("deliveries"))
     if rows:
         sys.stdout.write("\nrecent deliveries\n")
@@ -698,8 +723,14 @@ def tags_display(
                                             help="Read the body from this file ('-' = stdin)."),
     icon: Optional[str] = typer.Option(None, "--icon", help="Icon name (default push_pin; `cremind tags settings` lists them)."),
     ttl: Optional[str] = typer.Option(None, "--ttl", help="How long the note stays: 90, 30m, 2h, 7d (1 min - 7 days; default 1 day)."),
+    replace: bool = typer.Option(False, "--replace",
+                                 help="Replace the tag's previous --replace note instead of adding a card."),
 ) -> None:
-    """Pin a note on one of your tags. Text that looks like a one-time code is refused."""
+    """Pin a note on one of your tags. Text that looks like a one-time code is refused.
+
+    Every note is its own card; with --replace it takes the tag's one
+    replaceable slot, replacing the previous note that was also sent with
+    --replace."""
     from app.cli.client import tags as api
     from app.cli.output import print_json
 
@@ -714,6 +745,8 @@ def tags_display(
         payload["icon"] = icon
     if ttl is not None:
         payload["ttl_s"] = _parse_duration(ttl, "--ttl")
+    if replace:
+        payload["replace"] = True
     found: dict[str, Any] = {}
 
     async def go(client: Any) -> dict[str, Any]:
@@ -727,7 +760,8 @@ def tags_display(
     delivery = out.get("delivery") if isinstance(out.get("delivery"), dict) else {}
     sys.stdout.write(
         f"pinned '{title}' on {_label(found)}: delivery {delivery.get('id', '')} "
-        f"({delivery.get('stage', '')}), until {_fmt_ts(delivery.get('expires_at'))}\n"
+        f"({delivery.get('stage', '')}), until {_fmt_ts(delivery.get('expires_at'))}"
+        f"{' — replaces the previous --replace note' if replace else ''}\n"
         f"follow it: cremind tags deliveries show {delivery.get('id', '')}\n"
     )
 
@@ -946,7 +980,7 @@ def deliveries_cancel(
     ctx: typer.Context,
     delivery_id: int = typer.Argument(..., help="Delivery id (from `deliveries list`)."),
 ) -> None:
-    """Cancel a delivery that has not reached its tag yet."""
+    """Cancel a delivery that is not finished yet — also one the companion already fetched."""
     from app.cli.client import tags as api
     from app.cli.output import print_json
 
@@ -956,7 +990,14 @@ def deliveries_cancel(
         print_json(out)
         return
     d = out.get("delivery") if isinstance(out.get("delivery"), dict) else {}
-    sys.stdout.write(f"cancelled delivery {d.get('id', delivery_id)}\n")
+    resolved = out.get("resolved") if isinstance(out.get("resolved"), dict) else None
+    line = f"cancelled delivery {d.get('id', delivery_id)}"
+    if resolved:
+        line += (f"; the companion was sent resolved job {resolved.get('id', '')} "
+                 "so the tag drops the card if it already has it")
+    else:
+        line += " (the tag has changed hands, so nothing was sent to it)"
+    sys.stdout.write(line + "\n")
 
 
 # ── profile: content credentials ───────────────────────────────────────────
@@ -1063,13 +1104,15 @@ def hardware_list(ctx: typer.Context) -> None:
     devices = _rows(out.get("devices"))
     sys.stdout.write("\ndevices\n")
     if devices:
-        table = Table(mode, "ID", "KIND", "HW ID", "NAME", "OWNER", "STATUS", "BATTERY", "LAST CONTACT", "COMPANION")
+        table = Table(mode, "ID", "KIND", "HW ID", "NAME", "OWNER", "STATUS", "PENDING", "BATTERY",
+                      "LAST CONTACT", "COMPANION")
         for d in devices:
             table.add_row(str(d.get("id") or ""), str(d.get("kind") or ""), _cell(mode, d.get("hw_id")),
                           _cell(mode, d.get("name")), str(d.get("owner_profile") or ""), str(d.get("status") or ""),
-                          _battery(d.get("battery_mv")), _fmt_ts(d.get("last_contact_at")),
+                          _pending(d), _battery(d.get("battery_mv")), _fmt_ts(d.get("last_contact_at")),
                           _cell(mode, names.get(str(d.get("companion_id"))) or d.get("companion_id")))
         table.render()
+        _clear_failed_hint(devices, admin=True)
     else:
         sys.stdout.write("none reported yet — the companion sends its inventory once it is connected.\n")
     commands = _rows(out.get("commands"))

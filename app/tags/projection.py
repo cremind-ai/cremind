@@ -20,8 +20,10 @@ stopped in ``_do_shutdown``.
    when the clear succeeds — and insert the deliveries, retiring older active
    ones with the same ``(tag, replace_key)``.
 
-**Maintenance** (every minute) — expire deliveries past ``expires_at`` and
-commands (a claimed one only an hour after its deadline; an expired
+**Maintenance** (every minute) — expire deliveries past ``expires_at`` (one
+already on its way over the radio — ``gateway_received`` or later — only 10
+minutes after, so the companion's final receipt wins) and commands (a
+claimed one only an hour after its deadline; an expired
 ``clear_tag`` is re-queued, see ``storage.requeue_clear``); prune terminal
 deliveries and projected events older than 30 days (recording the
 pruned-through delivery seq, which makes an older connector cursor answer
@@ -45,7 +47,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 
 from app.tags import journal, routing
 from app.tags.cards import NON_CONTENT_KINDS, cards_for_event
@@ -69,6 +71,11 @@ OFFLINE_AFTER_MS = 2 * 3600 * 1000.0
 # Periodic and diagnostics cards live 24 h: a condition that still holds is
 # journalled again after half of that.
 REFRESH_AFTER_MS = 12 * 3600 * 1000.0
+# Expiry: a card still with Cremind or the companion expires on time; one on
+# its way over the radio waits this long for the companion's final receipt.
+QUEUE_STAGES = ("queued", "companion_accepted")
+IN_FLIGHT_STAGES = tuple(s for s in ACTIVE_STAGES if s not in QUEUE_STAGES)
+IN_FLIGHT_GRACE_MS = 10 * 60 * 1000.0
 
 
 def _hash(payload: Any) -> str:
@@ -256,10 +263,17 @@ class TagProjectionWorker:
             logger.exception("TagProjectionWorker: progress sampling failed")
 
     async def expire(self, now: float) -> int:
+        """Expire deliveries past ``expires_at``. One the radio path already
+        holds (``gateway_received`` or later) gets :data:`IN_FLIGHT_GRACE_MS`
+        more: the companion reports its real outcome — ``uncertain`` when the
+        refresh state is unknown — right around the deadline, and that receipt
+        must win over this sweep, not race it."""
         async with self.storage.engine.begin() as conn:
-            result = await conn.execute(update(DELIVERIES).where(
-                DELIVERIES.c.stage.in_(ACTIVE_STAGES), DELIVERIES.c.expires_at <= now,
-            ).values(stage="expired", outcome="expired", finished_at=now, updated_at=now))
+            result = await conn.execute(update(DELIVERIES).where(or_(
+                DELIVERIES.c.stage.in_(QUEUE_STAGES) & (DELIVERIES.c.expires_at <= now),
+                DELIVERIES.c.stage.in_(IN_FLIGHT_STAGES)
+                & (DELIVERIES.c.expires_at + IN_FLIGHT_GRACE_MS <= now),
+            )).values(stage="expired", outcome="expired", finished_at=now, updated_at=now))
         await self.storage.expire_commands(now)
         return int(result.rowcount or 0)
 

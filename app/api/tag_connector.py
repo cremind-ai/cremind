@@ -65,7 +65,10 @@ Content credential (one profile + one companion):
 - ``POST receipts`` ``{receipts: [...]}`` -> ``{applied, rejected: [{delivery_id, reason}]}``
   (idempotent, monotonic, compare-and-set). ``reason`` ∈ ``invalid`` /
   ``unknown`` / ``not_owned`` / ``epoch_mismatch`` / ``terminal``; a repeat of a
-  receipt already applied is neither applied nor rejected.
+  receipt already applied is neither applied nor rejected. A job that reached
+  ``gateway_received`` or later is not expired until 10 minutes after its
+  ``expires_at``, so a final receipt (``uncertain`` included) sent around the
+  deadline is applied rather than lost to the expiry sweep.
 - ``POST previews`` ``{tag_id, revision, kind, png_base64, delivery_ids, epoch?}`` -> ``{stored}``
   (1-bit PNG, ≤ 64 KiB decoded). ``epoch`` (the tag epoch it was rendered
   for) is refused with 409 ``epoch_mismatch`` when it is not the current one;

@@ -39,10 +39,12 @@ cremind tags list
 ```
 
 Prints whether Tags is `enabled`, the counts (`active deliveries`, `needs
-input`, `failed (24 h)`), then `ID / NAME / STATUS / BATTERY / LAST CONTACT /
-SCREEN / COMPANION`. SCREEN `rev 17 (18 pending)` means the tag shows screen
-revision 17 and 18 is on its way; `clearing` means it is being blanked after a
-change of owner.
+input`, `failed (24 h)`), then `ID / NAME / STATUS / PENDING / BATTERY / LAST
+CONTACT / SCREEN / COMPANION`. PENDING is how many cards are still on their way
+to that tag. SCREEN `rev 17 (18 pending)` means the tag shows screen revision
+17 and 18 is on its way; `clearing` means it is being blanked after a change of
+owner. STATUS `clear_failed` means that blanking failed three times (see
+Troubleshooting).
 
 ### `cremind tags show`
 
@@ -50,8 +52,8 @@ change of owner.
 cremind tags show <tag>
 ```
 
-Every field of one tag (battery, signal, panel size, firmware, bridge,
-preview revisions) and its 20 latest deliveries.
+Every field of one tag (battery, signal, pending cards, panel size, firmware,
+bridge, preview revisions) and its 20 latest deliveries.
 
 ### `cremind tags rename`
 
@@ -66,7 +68,7 @@ The name is 1–128 characters; a blank one is refused (`422 invalid_name`).
 Pin a note on a tag.
 
 ```bash
-cremind tags display <tag> <title> [--body <text> | --body-file <path>] [--icon <name>] [--ttl <duration>]
+cremind tags display <tag> <title> [--body <text> | --body-file <path>] [--icon <name>] [--ttl <duration>] [--replace]
 ```
 
 | Flag | Default | Meaning |
@@ -75,6 +77,11 @@ cremind tags display <tag> <title> [--body <text> | --body-file <path>] [--icon 
 | `--body-file`, `-f` | none | Read the body from a file; `-` reads stdin. Prefer it on PowerShell. |
 | `--icon` | `push_pin` | An icon name; `cremind tags settings` lists them. |
 | `--ttl` | 1 day | How long the note stays: seconds, or `30m`, `2h`, `7d` (1 minute to 7 days). |
+| `--replace` | off | Replace the previous note that was also sent with `--replace`, instead of adding a card. |
+
+Each note is its own card, so several can show at once. A note sent with
+`--replace` takes the tag's one replaceable slot: use it for a status line you
+keep updating ("In a meeting" → "Back at 3").
 
 The title is at most 120 characters. Text that looks like a one-time code (4–8
 digits near a word such as "code", "OTP", "PIN", "passcode" or "verification")
@@ -189,8 +196,11 @@ reached.
 cremind tags deliveries cancel <id>
 ```
 
-Works until the card is displayed; after that it answers `409
-already_terminal`.
+Works on any card that is not finished yet — also one the companion has
+already fetched: the cancel is sent on to the companion as a `resolved` job
+(the command prints its id), so the tag drops the card if it has it. Only a
+finished card (displayed, expired, cancelled …) answers `409
+already_terminal`. When the tag has changed hands meanwhile, nothing is sent.
 
 ## Content credentials
 
@@ -264,6 +274,10 @@ cremind --json tags deliveries list --state failed | jq '.deliveries[] | {id, de
 - **`422 otp_refused`** — the text looks like a one-time code. Remove it.
 - **`409 clear_pending`** — the tag is still being blanked after a change of
   owner. Try again in a minute.
+- **STATUS `clear_failed`** — blanking the tag after a change of owner failed
+  three times (it was asleep or out of range), so nothing is shown on it. Ask
+  the admin to claim it for you again (`cremind tags hardware claim`) or to
+  release it; either starts a fresh clear.
 - **`422 invalid_title`, `invalid_body`, `invalid_icon`, `invalid_ttl`** — see
   the limits under `display`.
 - **`422 invalid_settings`** — one line per rejected field follows (an

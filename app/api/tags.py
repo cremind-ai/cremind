@@ -14,7 +14,8 @@ the connector's error shape work too).
 - ``PUT    /api/tags/settings``                 ``{enabled?, options?}`` (options replace own overrides)
 - ``PATCH  /api/tags/settings``                 ``{enabled?, options?}`` (options merge: ``null`` =
   inherit again; ``routes`` merges per kind)
-- ``GET    /api/tags/devices/{id}``             ``{device, deliveries}`` (20 latest)
+- ``GET    /api/tags/devices/{id}``             ``{device, deliveries}`` (20 latest; ``device``
+  carries ``previews`` and ``pending_count``)
 - ``PATCH  /api/tags/devices/{id}``             ``{name}`` (1..128 once stripped) -> ``{device}``
 - ``POST   /api/tags/devices/{id}/display``     ``{title, body?, icon?, ttl_s?, replace?}`` -> 201
   ``{delivery}`` (title one line; body keeps its line breaks, blank-line runs
@@ -220,6 +221,7 @@ def get_tags_routes() -> list[Route]:
             return tag_error_response(exc)
         revs = (await store().preview_revisions([device["id"]])).get(device["id"], {})
         device["previews"] = {"desired": revs.get("desired"), "displayed": revs.get("displayed")}
+        device["pending_count"] = (await store().pending_counts([device["id"]])).get(device["id"], 0)
         deliveries = await store().list_deliveries(profile, device_id=device["id"], limit=20)
         return JSONResponse({"device": device, "deliveries": deliveries})
 

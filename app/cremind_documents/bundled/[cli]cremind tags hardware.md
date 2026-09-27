@@ -37,7 +37,9 @@ cremind tags hardware list
 
 Three tables: companions (`ONLINE` = heard from in the last 2 minutes, active
 credentials), devices (`KIND` gateway / bridge / tag, `HW ID`, `OWNER`,
-`STATUS`, battery), and the pending plus recent commands.
+`STATUS`, `PENDING` cards on their way to a tag, battery), and the pending plus
+recent commands. A tag with STATUS `clear_failed` could not be blanked after a
+change of owner (see Troubleshooting).
 
 ### `cremind tags hardware status`
 
@@ -121,8 +123,11 @@ cremind tags hardware claim <tag> --owner <profile> [--bridge <bridge>] [--name 
 | `--name` | Rename the tag at the same time. |
 
 The previous owner's pending cards are cancelled and the screen is blanked
-before the new owner's cards appear (`clear_required` until then). Queues
-`assign_tag` and `clear_tag`.
+before the new owner's cards appear (`clear_required` until then; what arrives
+meanwhile is delivered once the clear succeeds). The tag starts clean: its name
+is `--name` or empty, and the previous owner's screen previews are deleted.
+Queues `assign_tag` and `clear_tag`. A clear that fails or expires is retried,
+three attempts in all.
 
 ### `cremind tags hardware assign`
 
@@ -222,6 +227,11 @@ cremind --json tags hardware list | jq '.devices[] | select(.kind == "tag" and .
 - **`422 unknown_profile`** — no such profile (`cremind profile list`).
 - **`422 use_tag_endpoint`** — use `claim`, `assign` or `release`.
 - **`409 tag_owned`** on `forget` — a profile owns the tag; `release` it first.
+- **STATUS `clear_failed`** — the tag's clear failed three times (asleep, out
+  of range, flat battery), so no content reaches it. Check the tag and its
+  companion, then retry: `cremind tags hardware claim <tag> --owner <profile>`
+  (same owner is fine) or `cremind tags hardware release <tag>`; either queues a
+  fresh clear.
 - **`422 invalid_name`** — a name must be 1–128 characters.
 - **`422 unknown_command` / `invalid_args`** — see the kinds table under `run`.
 - **A command stays `queued`** — the companion is offline or not connected;
