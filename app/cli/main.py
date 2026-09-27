@@ -59,6 +59,7 @@ from app.cli.commands.server import server_app
 from app.cli.commands.setup import setup_app
 from app.cli.commands.skill_events import skill_events_app
 from app.cli.commands.skills import skills_app
+from app.cli.commands.tags import tags_app
 from app.cli.commands.tls import tls_app
 from app.cli.commands.tools import tools_app
 from app.cli.commands.upgrade import upgrade_app
@@ -255,6 +256,7 @@ app.add_typer(channels_app, name="channels")
 app.add_typer(clean_app, name="clean")
 app.add_typer(files_app, name="files")
 app.add_typer(calendar_app, name="calendar")
+app.add_typer(tags_app, name="tags")
 app.add_typer(drive_app, name="drive")
 app.add_typer(google_app, name="google")
 app.add_typer(file_watchers_app, name="file-watchers")

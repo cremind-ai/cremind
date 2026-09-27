@@ -1365,6 +1365,15 @@ _PLAN_READONLY_CLI_GROUPS: Dict[str, frozenset] = {
     # a token — the very thing plan mode promises not to do while planning.
     "profile wizard": frozenset({"status"}),
     "setup server-config": frozenset({"get"}),
+    # Cremind Tag. ``credentials list`` prints metadata only (a secret exists
+    # only in the create response); ``deliveries list/show`` is the delivery
+    # history; ``hardware list/status`` is the admin's inventory and one queued
+    # operation (403 for anyone else). Every sibling writes: ``deliveries
+    # cancel``, ``credentials create/revoke``, and the hardware verbs register,
+    # rotate, remove, run, claim, assign, release, rename, forget, set-defaults.
+    "tags credentials": frozenset({"list"}),
+    "tags deliveries": frozenset({"list", "show"}),
+    "tags hardware": frozenset({"list", "status"}),
 }
 
 # ``cremind profile working-dir`` is its own reader AND setter, decided by its

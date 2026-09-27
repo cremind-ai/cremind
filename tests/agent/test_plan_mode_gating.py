@@ -243,6 +243,16 @@ _ALLOWED_CREMIND_COMMANDS = [
     "cremind profile persona get",
     "cremind setup server-config get",
     "cremind agents config get",
+    # Cremind Tag: the profile's tags, settings and history, its credentials'
+    # metadata, and (admin) the hardware inventory and one command's status.
+    "cremind tags list",
+    "cremind tags show desk",
+    "cremind tags settings",
+    "cremind --json tags deliveries list --state active --limit 20",
+    "cremind tags deliveries show 501",
+    "cremind tags credentials list",
+    "cremind tags hardware list",
+    "cremind tags hardware status 5d0c",
     # The reading forms of a leaf that also writes: no PATH, no --default.
     "cremind profile working-dir",
     "cremind profile working-dir bob",
@@ -293,6 +303,28 @@ _BLOCKED_CREMIND_COMMANDS = [
     # over — pinned here because both halves are easy to undo by accident.
     "cremind config export",
     "cremind config export --out x",
+    # Every Cremind Tag writer sits on a verb that is not a reader — the
+    # settings setter is `set`, never `settings --x` — and the depth-3 pairs
+    # name only their readers.
+    "cremind tags set --enable",
+    "cremind tags display desk hello",
+    "cremind tags clear desk",
+    "cremind tags refresh desk",
+    "cremind tags identify desk",
+    "cremind tags preview desk",
+    "cremind tags rename desk kitchen",
+    "cremind tags deliveries cancel 501",
+    "cremind tags credentials create",
+    "cremind tags credentials revoke tagc_x",
+    "cremind tags hardware register desk-pc",
+    "cremind tags hardware rotate desk-pc",
+    "cremind tags hardware remove desk-pc --yes",
+    "cremind tags hardware run scan_unprovisioned",
+    "cremind tags hardware claim 1A2B3C4D --owner bob",
+    "cremind tags hardware assign 1A2B3C4D --bridge br1",
+    "cremind tags hardware release 1A2B3C4D",
+    "cremind tags hardware forget 1A2B3C4D --yes",
+    "cremind tags hardware set-defaults --language vi",
     # An unknown flag's VALUE must not be mistaken for the command word — this
     # is `cremind tools delete abc` wearing a read-only verb as camouflage.
     "cremind tools --opt list delete abc",
