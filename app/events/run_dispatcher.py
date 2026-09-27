@@ -272,8 +272,9 @@ async def _execute(job: Dict[str, Any]) -> None:
             profile=profile, title=_run_title(label, profile), kind="event_run",
         )
         conversation_id = conv["id"]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("[event_run] failed to create run conversation")
+        _journal_dispatch_failure(profile, source_kind, subscription_id, label, exc)
         _revert_task_claim(is_task, source_kind, subscription_id)
         return
 
@@ -298,8 +299,9 @@ async def _execute(job: Dict[str, Any]) -> None:
             origin_conversation_id=origin_conversation_id,
             deliver_to_origin=deliver_to_origin,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("[event_run] failed to create run row")
+        _journal_dispatch_failure(profile, source_kind, subscription_id, label, exc)
         await _discard_conversation(conversation_id)
         _revert_task_claim(is_task, source_kind, subscription_id)
         return
@@ -355,7 +357,7 @@ async def _execute(job: Dict[str, Any]) -> None:
         try:
             await store.update_status(
                 event_run_id, status="failed",
-                error="Run failed to start", mark_finished=True,
+                error="Run failed to start", mark_finished=True, profile=profile,
             )
         except Exception:  # noqa: BLE001
             logger.exception("[event_run] failed to mark run failed")
@@ -459,6 +461,23 @@ def _revert_task_claim(is_task: bool, source_kind: str, subscription_id: str) ->
         storage.revert_task_claim(subscription_id)
     except Exception:  # noqa: BLE001
         logger.exception(f"[event_run] failed to re-arm task {subscription_id}")
+
+
+def _journal_dispatch_failure(
+    profile: str, source_kind: str, subscription_id: str, label: str, exc: BaseException,
+) -> None:
+    """Cremind Tag: a trigger that could not even become a run leaves no row,
+    so its failure is journalled on its own (``automation.failed``)."""
+    try:
+        from app.tags import journal
+        from app.tags.sanitize import automation_failed_entry
+
+        journal.submit_standalone(profile, [automation_failed_entry(
+            automation_kind=source_kind, name=label, error=str(exc) or type(exc).__name__,
+            source_id=subscription_id,
+        )])
+    except Exception:  # noqa: BLE001
+        logger.debug("[event_run] could not journal a dispatch failure", exc_info=True)
 
 
 def _run_title(label: str, profile: Optional[str] = None) -> str:

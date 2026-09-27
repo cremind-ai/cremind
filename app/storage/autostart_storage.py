@@ -125,18 +125,47 @@ class AutostartStorage(SyncStorageBase):
             )
             return cur.rowcount > 0
 
-    def set_error(self, id: str, error: Optional[str]) -> None:
+    def set_error(self, id: str, error: Optional[str], *, profile: Optional[str] = None) -> None:
+        """Record (or clear) a registration's last start error.
+
+        A recorded error is journalled for Cremind Tag (``automation.failed``)
+        on this same connection. ``profile`` is the row's profile when the
+        caller has it: a profile without Tags then costs only the cached check.
+        """
+        from app.tags import journal
+
+        engine = self._engine
+        if not error:
+            maybe = False
+        elif profile:
+            maybe = journal.is_enabled_sync(engine, profile)
+        else:
+            maybe = bool(journal.enabled_profiles_sync(engine))
+        journalled = False
         try:
-            with self._engine.begin() as conn:
-                conn.execute(
-                    text(
-                        "UPDATE autostart_processes "
-                        "SET last_error = :error, last_attempted_at = :now WHERE id = :id"
-                    ),
-                    {"error": error, "now": time.time(), "id": id},
+            with engine.begin() as conn:
+                params = {"error": error, "now": time.time(), "id": id}
+                sql = (
+                    "UPDATE autostart_processes "
+                    "SET last_error = :error, last_attempted_at = :now WHERE id = :id"
                 )
+                if not maybe:
+                    conn.execute(text(sql), params)
+                else:
+                    row = conn.execute(text(sql + " RETURNING profile, command"), params).first()
+                    if row is not None and journal.is_enabled_sync(engine, row.profile):
+                        from app.tags.sanitize import automation_failed_entry
+
+                        command = (row.command or "").strip()
+                        journal.append_sync(conn, row.profile, [automation_failed_entry(
+                            automation_kind="autostart", name=command[:60] or "Autostart process",
+                            error=error, source_id=id,
+                        )])
+                        journalled = True
         except Exception as exc:  # noqa: BLE001
             logger.error(f"AutostartStorage.set_error({id}): {exc}")
+        if journalled:
+            journal.wake()
 
     def clear_error(self, id: str) -> None:
         self.set_error(id, None)

@@ -528,7 +528,7 @@ def get_process_routes() -> list:
             publish_process_list_changed(profile)
             return JSONResponse({"ok": True, "already_running": True})
         if error:
-            storage.set_error(autostart_id, error)
+            storage.set_error(autostart_id, error, profile=profile)
             publish_process_list_changed(profile)
             return JSONResponse(
                 {"error": "spawn_failed", "message": error}, status_code=400,

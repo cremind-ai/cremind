@@ -573,9 +573,15 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             if auto_disable:
                 update_kwargs["enabled"] = False
             try:
-                updated = await self.storage.update_channel(
-                    self.channel_id, **update_kwargs,
-                )
+                from app.tags import journal
+                from app.tags.sanitize import channel_entry
+
+                with journal.intent(self.profile, [channel_entry(
+                    "channel.unlinked", channel=self.channel, error=detail or reason,
+                )]):
+                    updated = await self.storage.update_channel(
+                        self.channel_id, **update_kwargs,
+                    )
                 if updated is not None:
                     self.channel = updated
             except Exception:  # noqa: BLE001
@@ -610,7 +616,11 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         state.pop("unlinked_at", None)
         state.pop("unlinked_reason", None)
         try:
-            updated = await self.storage.update_channel(self.channel_id, state=state)
+            from app.tags import journal
+            from app.tags.sanitize import channel_entry
+
+            with journal.intent(self.profile, [channel_entry("channel.recovered", channel=self.channel)]):
+                updated = await self.storage.update_channel(self.channel_id, state=state)
             if updated is not None:
                 self.channel = updated
         except Exception:  # noqa: BLE001
@@ -1313,12 +1323,19 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         expires_at = sender.get("pending_otp_expires_at") or 0
 
         if pending and expires_at > now and text == pending:
-            await self.storage.update_sender(
-                sender["id"],
-                authenticated=True,
-                pending_otp=None,
-                pending_otp_expires_at=None,
-            )
+            from app.tags import journal
+            from app.tags.sanitize import access_change_entries
+
+            with journal.intent(self.profile, access_change_entries(
+                channel_id=self.channel_id, channel_type=self.channel_type,
+                sender=sender, subscribed=True,
+            )):
+                await self.storage.update_sender(
+                    sender["id"],
+                    authenticated=True,
+                    pending_otp=None,
+                    pending_otp_expires_at=None,
+                )
             await self.send(sender["sender_id"], "Authenticated. You can chat now.")
             return
 
@@ -1378,7 +1395,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         config = self.channel.get("config") or {}
         passcode = config.get("subscribe_passcode") or config.get("password")
         if passcode and text.strip() == str(passcode):
-            await self.storage.update_sender(sender["id"], authenticated=True)
+            from app.tags import journal
+            from app.tags.sanitize import access_change_entries
+
+            with journal.intent(self.profile, access_change_entries(
+                channel_id=self.channel_id, channel_type=self.channel_type,
+                sender=sender, subscribed=True,
+            )):
+                await self.storage.update_sender(sender["id"], authenticated=True)
             await self.send(sender["sender_id"], "Authenticated. You can chat now.")
             return
         await self.send(

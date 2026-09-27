@@ -37,6 +37,26 @@ _BATCH_ROWS = 500
 # ``table -> {key-column value, ...}`` for key/value tables.
 _EXCLUDE_ROWS: dict[str, set[str]] = {"server_config": {"jwt_secret"}}
 
+# Tables never written to the portable dump at all.
+# - ``tag_credentials``: Cremind Tag connector credentials are installation-
+#   local secrets like the JWT key — an archive must not carry a credential
+#   that works against another host. A restore re-pins this install's own
+#   (app/backup/engine.py::_capture_tag_credentials).
+# - ``tag_counters``: the delivery-id allocator. The migration seeds its row,
+#   so a dumped copy would collide with it on restore; the restore close-out
+#   sets it past every restored id instead.
+_EXCLUDE_TABLES: frozenset[str] = frozenset({"tag_credentials", "tag_counters"})
+
+
+def _ordered_select(table: Table):
+    """``SELECT`` for one table, ordered where rows reference rows of the SAME
+    table (restore inserts in file order with FKs on): tags point at their
+    bridge, so rows without a bridge come first."""
+    stmt = table.select()
+    if table.name == "tag_devices" and "bridge_device_id" in table.c:
+        stmt = stmt.order_by(table.c.bridge_device_id.isnot(None))
+    return stmt
+
 
 @dataclass
 class DumpStats:
@@ -62,7 +82,10 @@ def _collect_live_tables(engine: Engine) -> tuple[list[Table], str | None]:
 
     inspector = inspect(engine)
     present = set(inspector.get_table_names())
-    live = [t for t in Base.metadata.sorted_tables if t.name in present]
+    live = [
+        t for t in Base.metadata.sorted_tables
+        if t.name in present and t.name not in _EXCLUDE_TABLES
+    ]
 
     revision: str | None = None
     if "alembic_version" in present:
@@ -118,7 +141,7 @@ def dump_logical(engine: Engine, fileobj: BinaryIO) -> DumpStats:
                 col_names = [c.name for c in table.columns]
                 excluded_keys = _EXCLUDE_ROWS.get(table.name)
                 count = 0
-                result = conn.execute(table.select())
+                result = conn.execute(_ordered_select(table))
                 for row in result.mappings():
                     if excluded_keys and row.get("key") in excluded_keys:
                         continue  # installation-local (e.g. jwt_secret) — never dumped
@@ -214,9 +237,10 @@ def load_logical(
                 table_name = record.get("table")
                 if "row" not in record or not table_name:
                     continue
-                if table_name not in available:
+                if table_name not in available or table_name in _EXCLUDE_TABLES:
                     # Table not created at this revision (e.g. an a2a table a
-                    # future source produced). Tolerate — skip its rows.
+                    # future source produced), or one never restored from an
+                    # archive (connector credentials). Tolerate — skip its rows.
                     if pending_name != f"__skip__{table_name}":
                         logger.warning(f"[backup:restore] skipping rows for unknown table {table_name!r}")
                         pending_name = f"__skip__{table_name}"

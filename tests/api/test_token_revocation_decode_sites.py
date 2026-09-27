@@ -137,6 +137,44 @@ def test_another_profile_is_unaffected(env, label, check):
     assert check(bobs) == "accepted"
 
 
+def test_a_cremind_tag_credential_is_rejected_at_every_header_site(env):
+    """A Cremind Tag connector credential — a real, unrevoked one — is not a
+    session token anywhere: every site that reads ``Authorization`` itself
+    refuses the ``CremindTag`` scheme (the WebSocket handshake never reads the
+    header). ``TagConnectorGuard`` 401s it even earlier; this is the backstop."""
+    from app.api.system_vars import list_system_vars
+    from app.api.tokens import get_me
+    from app.config.settings import BaseConfig
+    from app.server import JWTAuthBackend, JWTCallContextBuilder
+    from app.tags import credentials as creds
+
+    cred_id, secret = creds.new_credential_id(), creds.new_secret()
+    with env.sync_engine().begin() as c:
+        c.execute(text("INSERT INTO tag_companions (id, name, created_at, updated_at) VALUES ('c1','pc',0,0)"))
+        c.execute(
+            text(
+                "INSERT INTO tag_credentials (id, companion_id, kind, secret_sha256, created_at) "
+                "VALUES (:i, 'c1', 'hardware', :h, 0)"
+            ),
+            {"i": cred_id, "h": creds.hash_secret(secret)},
+        )
+
+    def conn(path):
+        return SimpleNamespace(
+            headers={"Authorization": creds.authorization_value(cred_id, secret)},
+            url=SimpleNamespace(path=path),
+            user=SimpleNamespace(is_authenticated=True, username="admin"),
+            query_params={},
+        )
+
+    backend = JWTAuthBackend(secret_provider=BaseConfig.get_jwt_secret)
+    assert asyncio.run(backend.authenticate(conn("/api/conversations"))) is None
+    builder = JWTCallContextBuilder(secret_provider=BaseConfig.get_jwt_secret)
+    assert not builder.build(conn("/")).state.get("profile")
+    assert asyncio.run(get_me(conn("/api/me"))).status_code == 401
+    assert asyncio.run(list_system_vars(conn("/api/system-vars"))).status_code == 401
+
+
 def test_terminals_shares_the_websocket_decoder(env):
     """`app/api/terminals.py` imports this private — it must not fork."""
     import app.api.processes as processes

@@ -463,6 +463,8 @@ class CremindAgentExecutor(AgentExecutor):
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Citation check failed for conversation {conversation_id}")
 
+                from app.tags.journal import TurnContext
+
                 await self.conversation_storage.add_message(
                     conversation_id=conversation_id,
                     role="agent",
@@ -472,6 +474,11 @@ class CremindAgentExecutor(AgentExecutor):
                     llm_messages=collected_llm_messages,
                     token_usage=token_usage_data,
                     metadata=agent_metadata,
+                    turn=TurnContext(
+                        profile=profile,
+                        conversation_kind=conv.get("kind") or "chat",
+                        conversation_title=conv.get("title") or "",
+                    ),
                 )
 
                 # Update conversation title from first user message if still default

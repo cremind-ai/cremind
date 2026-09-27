@@ -372,7 +372,7 @@ async def _spawn_one(storage: AutostartStorage, row: Dict[str, Any]) -> None:
             # stale error so the row doesn't keep showing as failed.
             storage.clear_error(row["id"])
         elif error:
-            storage.set_error(row["id"], error)
+            storage.set_error(row["id"], error, profile=row.get("profile") or None)
             # Spawn failed at boot — the row will surface in list_processes
             # as ``failed_to_autostart``; push the change so the UI lights it
             # up without waiting for any other event.

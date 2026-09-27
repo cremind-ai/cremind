@@ -556,6 +556,7 @@ async def run_agent_to_bus(
             from app.storage import get_event_run_storage
             await get_event_run_storage().update_status(
                 event_run_id, status="running", run_id=run_id, clear_pending=True,
+                profile=profile,
             )
         except Exception:  # noqa: BLE001
             logger.exception(f"stream_runner: failed to mark event run running for {event_run_id}")
@@ -1294,6 +1295,13 @@ async def run_agent_to_bus(
 
         assistant_msg_id: Optional[str] = None
         try:
+            from app.tags.journal import TurnContext
+
+            # The title step 6 is about to give a new chat, so its first reply
+            # is not announced as "Untitled Chat".
+            tag_title = title
+            if update_title_from_query and title == "Untitled Chat" and query.strip():
+                tag_title = query.strip()[:40] + ("..." if len(query.strip()) > 40 else "")
             assistant_msg = await conversation_storage.add_message(
                 conversation_id=conversation_id,
                 role="agent",
@@ -1303,6 +1311,19 @@ async def run_agent_to_bus(
                 llm_messages=collected_llm_messages,
                 token_usage=token_usage_data,
                 metadata=agent_message_metadata,
+                # Cremind Tag: journalled with the row, for chat conversations
+                # only (a run reports through its status, a seat through its
+                # room, a platform group's replies are the group's business).
+                turn=TurnContext(
+                    profile=profile,
+                    conversation_kind=(
+                        "channel_group" if is_channel_group
+                        else (conv or {}).get("kind") or "chat"
+                    ),
+                    conversation_title=tag_title,
+                    errored=errored,
+                    cancelled=cancelled,
+                ),
             )
             assistant_msg_id = (
                 assistant_msg.get("id") if isinstance(assistant_msg, dict) else None
@@ -1489,6 +1510,7 @@ async def run_agent_to_bus(
                     clear_pending=is_terminal,
                     increment_turn=True,
                     mark_finished=is_terminal,
+                    profile=profile,
                 )
                 # ``run_row`` was read before the write above, so its
                 # pending_question is stale; sync it so the pending notification

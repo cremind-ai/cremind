@@ -318,9 +318,14 @@ class ChannelRegistry:
         ``_run`` done-callback.
         """
         state = {**(channel.get("state") or {}), "last_error": reason}
-        await self.storage.update_channel(
-            channel["id"], enabled=False, state=state,
-        )
+        from app.tags import journal
+        from app.tags.sanitize import channel_entry
+
+        with journal.intent(channel.get("profile"),
+                            [channel_entry("channel.failed", channel=channel, error=reason)]):
+            await self.storage.update_channel(
+                channel["id"], enabled=False, state=state,
+            )
         channel["enabled"] = False
         channel["state"] = state
         logger.warning(

@@ -461,7 +461,7 @@ def get_event_routes() -> list[Route]:
                 {"ok": True, "already_running": True, "autostart_id": row["id"]}
             )
         if error:
-            autostart_storage.set_error(row["id"], error)
+            autostart_storage.set_error(row["id"], error, profile=profile)
             publish_process_list_changed(profile)
             publish_skill_events_admin_changed(profile)
             return JSONResponse(

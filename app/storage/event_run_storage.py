@@ -35,6 +35,14 @@ TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 # the user's reply and must remain answerable).
 ACTIVE_STATUSES = ("running", "pending")
 
+
+def _tags_journal():
+    """:mod:`app.tags.journal`, imported on first use (import-cycle safe)."""
+    from app.tags import journal
+
+    return journal
+
+
 # When a run's result actually became available. The inbox is ordered by this
 # rather than by ``created_at`` (fire time) because a run that parked ``pending``
 # on a question for hours finishes AFTER runs that fired later — and the
@@ -58,6 +66,11 @@ class EventRunStorage:
             self._engine = self.provider.async_engine()
             self._session_maker = async_sessionmaker(self._engine, expire_on_commit=False)
         return self._session_maker
+
+    @property
+    def engine(self) -> AsyncEngine:
+        _ = self.async_session_maker
+        return self._engine  # type: ignore[return-value]
 
     # ── writes ────────────────────────────────────────────────────────────
 
@@ -93,9 +106,15 @@ class EventRunStorage:
         ``status``/``error``/``finished`` default to a live ``running`` run;
         they exist so a task that times out before ever firing can be recorded
         as an already-terminal run and ride the same delivery path.
+
+        For a profile with Cremind Tag enabled, ``run.started`` (or
+        ``run.failed`` for an already-failed run) is journalled in this same
+        transaction.
         """
         now = time.time() * 1000
         rid = str(uuid.uuid4())
+        tj = _tags_journal()
+        emit = await tj.is_enabled_async(self.engine, profile)
         row = EventRunModel(
             id=rid,
             profile=profile,
@@ -146,7 +165,29 @@ class EventRunStorage:
                     await session.execute(
                         delete(EventRunModel).where(EventRunModel.id.in_(doomed_ids))
                     )
+            entries = self._journal_entries(
+                tj, run_id=rid, label=label, prior=None, status=status, error=error,
+            ) if emit else []
+            if entries:
+                await tj.append_async(session, profile, entries)
+        if entries:
+            tj.wake()
         return {"run": self._row_to_dict(row), "pruned_conversation_ids": pruned}
+
+    @staticmethod
+    def _journal_entries(tj, **kwargs) -> list:
+        """Build the run's journal entries; a payload bug never fails the write."""
+        try:
+            from app.tags.sanitize import run_entries
+
+            return run_entries(
+                run_id=kwargs["run_id"], label=kwargs.get("label") or "",
+                prior_status=kwargs.get("prior"), new_status=kwargs.get("status"),
+                pending_question=kwargs.get("pending_question"), error=kwargs.get("error"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[tags] could not build event-run journal entries")
+            return []
 
     async def update_status(
         self,
@@ -159,13 +200,29 @@ class EventRunStorage:
         clear_pending: bool = False,
         increment_turn: bool = False,
         mark_finished: bool = False,
+        profile: str | None = None,
     ) -> None:
         """Patch a run row (status/pending/error/turn/finished_at).
 
         ``clear_pending`` nulls ``pending_question`` (used when a reply resumes a
         pending run). ``mark_finished`` stamps ``finished_at`` (terminal states).
+
+        A status change is journalled for Cremind Tag in this same transaction
+        (``run.started`` / ``run.resumed`` / ``run.needs_input`` /
+        ``run.completed`` / ``run.failed``). ``profile`` is the run's profile
+        when the caller knows it: a profile without Tags then costs only the
+        cached enabled check. The prior status comes from a first ``UPDATE …
+        RETURNING`` that takes the row lock before anything is read.
         """
         values: dict[str, Any] = {"updated_at": time.time() * 1000}
+        tj = _tags_journal()
+        if status is None:
+            maybe = False
+        elif profile:
+            maybe = await tj.is_enabled_async(self.engine, profile)
+        else:
+            maybe = bool(await tj.enabled_profiles_async(self.engine))
+        entries: list = []
         if status is not None:
             values["status"] = status
         if run_id is not None:
@@ -179,11 +236,27 @@ class EventRunStorage:
         if mark_finished:
             values["finished_at"] = time.time() * 1000
         async with self.async_session_maker.begin() as session:
+            prior = None
+            if maybe:
+                prior = (await session.execute(
+                    update(EventRunModel).where(EventRunModel.id == run_id_pk)
+                    .values(updated_at=values["updated_at"])
+                    .returning(EventRunModel.profile, EventRunModel.status, EventRunModel.label)
+                )).first()
             if increment_turn:
                 values["turn_count"] = EventRunModel.turn_count + 1
             await session.execute(
                 update(EventRunModel).where(EventRunModel.id == run_id_pk).values(**values)
             )
+            if prior is not None and await tj.is_enabled_async(self.engine, prior.profile):
+                entries = self._journal_entries(
+                    tj, run_id=run_id_pk, label=prior.label, prior=prior.status, status=status,
+                    pending_question=pending_question, error=error,
+                )
+                if entries:
+                    await tj.append_async(session, prior.profile, entries)
+        if entries:
+            tj.wake()
 
     # ── event-task delivery ───────────────────────────────────────────────
 
@@ -518,8 +591,11 @@ class EventRunStorage:
         a long outage produces.
         """
         now_ms = time.time() * 1000
+        tj = _tags_journal()
+        enabled = await tj.enabled_profiles_async(self.engine)
+        journalled = False
         async with self.async_session_maker.begin() as session:
-            result = await session.execute(
+            stmt = (
                 update(EventRunModel)
                 .where(EventRunModel.status == "running")
                 .values(
@@ -534,7 +610,29 @@ class EventRunStorage:
                     updated_at=now_ms,
                 )
             )
-            n = result.rowcount or 0
+            if not enabled:
+                result = await session.execute(stmt)
+                n = result.rowcount or 0
+            else:
+                # Cremind Tag: the same statement names the runs it failed, so
+                # their run.failed entries join this transaction.
+                rows = (await session.execute(stmt.returning(
+                    EventRunModel.id, EventRunModel.profile, EventRunModel.label,
+                ))).all()
+                n = len(rows)
+                by_profile: dict[str, list] = {}
+                for r in rows:
+                    if r.profile in enabled:
+                        by_profile.setdefault(r.profile, []).extend(self._journal_entries(
+                            tj, run_id=r.id, label=r.label, prior="running", status="failed",
+                            error="Interrupted by server restart",
+                        ))
+                for prof in sorted(by_profile):
+                    if by_profile[prof]:
+                        await tj.append_async(session, prof, by_profile[prof])
+                        journalled = True
+        if journalled:
+            tj.wake()
         if n:
             logger.info(f"[event_runs] boot recovery: marked {n} interrupted run(s) failed")
         return n

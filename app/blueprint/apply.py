@@ -617,7 +617,7 @@ async def apply_listeners(session: ImportSession, inputs: dict, deps: Deps) -> d
         if skill_dir in confirmed:
             process_id, error = await spawn_from_autostart(row)
             if error:
-                autostart.set_error(row["id"], error)
+                autostart.set_error(row["id"], error, profile=profile)
                 needs_attention.append(f"listener {skill_dir!r} failed to start: {error}")
             else:
                 autostart.clear_error(row["id"])

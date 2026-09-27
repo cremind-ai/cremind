@@ -622,6 +622,99 @@ def _close_out_undelivered_event_results(engine: Any) -> int:
         return -1
 
 
+_TAG_DELIVERY_ID_JUMP = 2 ** 32
+
+
+def _capture_tag_credentials(engine: Any) -> list[dict[str, Any]]:
+    """This install's Cremind Tag connector credentials, read before the wipe.
+
+    They are local secrets (never in an archive), so like the JWT secret they
+    are put back after the load — a companion registered here keeps working
+    across a restore of this install. [] when the table does not exist."""
+    from sqlalchemy import inspect as sa_inspect
+
+    try:
+        if not sa_inspect(engine).has_table("tag_credentials"):
+            return []
+        from app.storage.models import TagCredentialModel
+
+        with engine.connect() as conn:
+            rows = conn.execute(TagCredentialModel.__table__.select()).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception:  # noqa: BLE001
+        logger.warning("[backup:restore] could not read the local tag credentials", exc_info=True)
+        return []
+
+
+def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]]) -> dict[str, int]:
+    """Stop an archive's tag state from replaying onto live tags.
+
+    Deliveries, streams and the journal travel inside the archive, so a restore
+    rewinds them. Close-out: every non-terminal delivery -> ``cancelled``
+    (detail ``restored``); every stream gets a new ``stream_id`` (a companion
+    that sees it calls ``sync`` and drops what Cremind no longer lists); the
+    ``delivery_id`` counter jumps 2**32 past every restored id, so no id a
+    companion already knows is ever issued again. Then this install's own
+    connector credentials are re-pinned where their companion (and, for a
+    content credential, profile) survived the restore."""
+    import uuid as _uuid
+
+    from sqlalchemy import func, insert, select, update
+
+    from app.storage.models import (
+        ProfileModel, TagCompanionModel, TagCounterModel, TagCredentialModel,
+        TagDeliveryModel, TagStreamModel,
+    )
+    from app.tags.storage import ACTIVE_STAGES
+
+    deliveries = TagDeliveryModel.__table__
+    streams = TagStreamModel.__table__
+    counters = TagCounterModel.__table__
+    now_ms = time.time() * 1000
+    report = {"cancelled": 0, "streams": 0, "credentials": 0}
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                update(deliveries)
+                .where(deliveries.c.stage.in_(ACTIVE_STAGES))
+                .values(stage="cancelled", outcome="cancelled", detail="restored",
+                        finished_at=now_ms, updated_at=now_ms)
+            )
+            report["cancelled"] = int(result.rowcount or 0)
+            for (profile,) in conn.execute(select(streams.c.profile)).all():
+                conn.execute(update(streams).where(streams.c.profile == profile).values(
+                    stream_id=str(_uuid.uuid4()), updated_at=now_ms,
+                ))
+                report["streams"] += 1
+            top = conn.execute(select(func.max(deliveries.c.id))).scalar() or 0
+            current = conn.execute(
+                select(counters.c.value).where(counters.c.name == "delivery_id")
+            ).scalar()
+            value = max(int(top), int(current or 0)) + _TAG_DELIVERY_ID_JUMP
+            if current is None:
+                conn.execute(insert(counters), [{"name": "delivery_id", "value": value}])
+            else:
+                conn.execute(update(counters).where(counters.c.name == "delivery_id").values(value=value))
+
+            if local_credentials:
+                companions = set(conn.execute(select(TagCompanionModel.__table__.c.id)).scalars().all())
+                profiles = set(conn.execute(select(ProfileModel.__table__.c.name)).scalars().all())
+                creds = TagCredentialModel.__table__
+                present = set(conn.execute(select(creds.c.id)).scalars().all())
+                keep = [
+                    r for r in local_credentials
+                    if r.get("companion_id") in companions and r.get("id") not in present
+                    and (r.get("kind") != "content" or r.get("profile") in profiles)
+                ]
+                if keep:
+                    conn.execute(insert(creds), keep)
+                report["credentials"] = len(keep)
+    except Exception:  # noqa: BLE001
+        logger.warning("[backup:restore] could not close out Cremind Tag state", exc_info=True)
+        return {"cancelled": -1, "streams": -1, "credentials": -1}
+    return report
+
+
 def apply_staged_restore(
     staged_dir: Path,
     *,
@@ -666,6 +759,8 @@ def apply_staged_restore(
     # the archive's secret instead would invalidate every token this install
     # already issued — a 401 across the board on the next boot.
     local_secret = _read_local_jwt_secret(engine) or secrets.token_urlsafe(32)
+    # Likewise this install's Cremind Tag connector credentials (never archived).
+    local_tag_credentials = _capture_tag_credentials(engine)
 
     load_stats = None
     try:
@@ -687,6 +782,9 @@ def apply_staged_restore(
             _close_out_undelivered_event_results(engine)
             if close_out_owed_results else 0
         )
+        # Cremind Tag, unconditionally: even a rollback rewinds delivery ids
+        # and cursors a live companion has already seen past.
+        _close_out_tags(engine, local_tag_credentials)
 
         # Re-pin the local secret — overwrites any value an older archive
         # carried and guarantees the row exists for newer archives that omit it

@@ -34,6 +34,9 @@ from app.api.documents_query import get_documents_query_routes
 from app.api.documents_research import get_documents_research_routes
 from app.api.retired import get_retired_routes
 from app.api.search_tools import get_search_tools_routes
+from app.api.tag_connector import get_tag_connector_routes
+from app.api.tags import get_tags_routes
+from app.api.tags_hardware import get_tags_hardware_routes
 
 
 def get_api_routes(
@@ -117,6 +120,12 @@ def get_api_routes(
     routes.extend(get_logs_stream_routes())
     routes.extend(get_profile_events_routes(conversation_storage))
     routes.extend(get_usage_routes())
+    # Cremind Tag: the admin hardware routes first (/api/tags/hardware/* must
+    # not be read as a profile route), then the profile's own, then the
+    # connector API (CremindTag credentials only).
+    routes.extend(get_tags_hardware_routes(config_storage))
+    routes.extend(get_tags_routes())
+    routes.extend(get_tag_connector_routes())
     routes.extend(get_blueprint_routes(
         registry=registry,
         conversation_storage=conversation_storage,

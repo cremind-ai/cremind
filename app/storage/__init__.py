@@ -90,6 +90,14 @@ def get_schedule_event_storage(provider: DatabaseProvider | None = None) -> Sche
     return _schedule_event_instance
 
 
+def get_tag_storage(provider: DatabaseProvider | None = None):
+    """Cremind Tag's store (:class:`app.tags.storage.TagStorage`). Imported
+    lazily: ``app.tags`` imports the ORM models of this package."""
+    from app.tags.storage import get_tag_storage as _get_tag_storage
+
+    return _get_tag_storage(provider)
+
+
 def invalidate_storage_singletons() -> None:
     """Drop every cached storage instance.
 
@@ -130,6 +138,12 @@ def invalidate_storage_singletons() -> None:
     _uds._instance = None
     import app.storage.documents_citations_storage as _udc
     _udc._instance = None
+    # Cremind Tag: its store holds the old provider, and the enabled-profile
+    # cache describes the old database.
+    import app.tags.storage as _tgs
+    _tgs._instance = None
+    import app.tags.journal as _tgj
+    _tgj.invalidate_enabled_cache()
     try:
         from app.utils.client_storage import _reset_auth_client_storage_singleton
         _reset_auth_client_storage_singleton()
@@ -162,5 +176,6 @@ __all__ = [
     "get_memory_storage",
     "get_usage_storage",
     "get_tool_storage",
+    "get_tag_storage",
     "invalidate_storage_singletons",
 ]

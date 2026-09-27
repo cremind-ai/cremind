@@ -318,7 +318,10 @@ async def _conversation_flags(
         run = await store.get_by_conversation(conversation_id)
         if run is None:
             return None, True, False
-        await store.update_status(run["id"], status="running", clear_pending=True)
+        await store.update_status(
+            run["id"], status="running", clear_pending=True,
+            profile=run.get("profile") or profile,
+        )
         from app.events.event_runs_admin_bus import publish_event_runs_changed
         publish_event_runs_changed(profile)
         return run["id"], True, False

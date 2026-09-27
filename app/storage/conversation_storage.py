@@ -4,6 +4,7 @@ import uuid
 
 from sqlalchemy import String, delete, func, select, text, update
 from sqlalchemy import cast as sa_cast
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -41,6 +42,14 @@ def _search_policy():
     from app.agent import search_tools
 
     return search_tools
+
+
+def _tags_journal():
+    """:mod:`app.tags.journal`, imported on first use (it imports the ORM
+    models, which import this package)."""
+    from app.tags import journal
+
+    return journal
 
 
 # The CAS outcomes of ``set_search_tools`` (and of
@@ -210,7 +219,16 @@ class ConversationStorage:
 
     async def delete_profile(self, name: str) -> bool:
         await self._ensure_initialized()
+        woken: list[str] = []
+        has_tags = await self._has_tag_tables()
         async with self.async_session_maker.begin() as session:
+            # Tags the profile owns are released first, in this transaction:
+            # the FK would only null the owner, leaving the old screen up and
+            # the old key (epoch) valid.
+            if has_tags:
+                from app.tags.service import release_profile_tags
+
+                woken = await release_profile_tags(session, name)
             # Cascade will handle conversations and messages
             result = await session.execute(
                 delete(ProfileModel).where(ProfileModel.name == name)
@@ -218,7 +236,21 @@ class ConversationStorage:
             deleted = result.rowcount > 0
             if deleted:
                 logger.info(f"[storage] deleted profile name={name}")
-            return deleted
+        if deleted and woken:
+            from app.tags.storage import notify_commands
+
+            notify_commands(woken)
+        return deleted
+
+    async def _has_tag_tables(self) -> bool:
+        """Whether the Tags tables exist (always, after migrations; a test
+        database built from a few tables may lack them). Cached."""
+        cached = getattr(self, "_tag_tables", None)
+        if cached is None:
+            async with self.engine.connect() as conn:
+                cached = await conn.run_sync(lambda c: sa_inspect(c).has_table("tag_devices"))
+            self._tag_tables = bool(cached)
+        return bool(cached)
 
     async def profile_exists(self, name: str) -> bool:
         await self._ensure_initialized()
@@ -609,16 +641,26 @@ class ConversationStorage:
         return self._channel_to_dict(ch)
 
     async def update_channel(self, channel_id: str, **fields) -> dict | None:
+        """Patch a channel row. A ``journal.intent`` around the call (the
+        registry's disable path, an adapter's unlink/relink) is journalled for
+        Cremind Tag in this same transaction."""
         await self._ensure_initialized()
         if not fields:
             return await self.get_channel(channel_id)
         fields["updated_at"] = time.time() * 1000
+        tj = _tags_journal()
+        pending = tj.take_intent()
+        emit = pending is not None and await tj.is_enabled_async(self.engine, pending[0])
         async with self.async_session_maker.begin() as session:
             await session.execute(
                 update(ChannelModel)
                 .where(ChannelModel.id == channel_id)
                 .values(**fields)
             )
+            if emit:
+                await tj.append_async(session, pending[0], pending[1])
+        if emit:
+            tj.wake()
         return await self.get_channel(channel_id)
 
     async def delete_channel(self, channel_id: str) -> bool:
@@ -771,10 +813,16 @@ class ConversationStorage:
             return self._sender_to_dict(row) if row else None
 
     async def update_sender(self, sender_row_id: str, **fields) -> dict | None:
+        """Patch a sender row. A ``journal.intent`` around the call — only the
+        sites that flip the ACCESS flag set one, never an OTP issue — is
+        journalled for Cremind Tag in this same transaction."""
         await self._ensure_initialized()
         if not fields:
             return None
         fields["updated_at"] = time.time() * 1000
+        tj = _tags_journal()
+        pending = tj.take_intent()
+        emit = pending is not None and await tj.is_enabled_async(self.engine, pending[0])
         async with self.async_session_maker.begin() as session:
             await session.execute(
                 update(ChannelSenderModel)
@@ -784,7 +832,12 @@ class ConversationStorage:
             row = (await session.execute(
                 select(ChannelSenderModel).where(ChannelSenderModel.id == sender_row_id)
             )).scalar_one_or_none()
-            return self._sender_to_dict(row) if row else None
+            if emit and row is not None:
+                await tj.append_async(session, pending[0], pending[1])
+            result = self._sender_to_dict(row) if row else None
+        if emit and row is not None:
+            tj.wake()
+        return result
 
     async def delete_sender(self, sender_row_id: str) -> bool:
         """Delete one channel sender row outright. Returns False if it was gone.
@@ -817,9 +870,22 @@ class ConversationStorage:
         parts: list | None = None, thinking_steps: list | None = None,
         token_usage: dict | None = None, metadata: dict | None = None,
         summary: str | None = None, llm_messages: list | None = None,
+        turn=None,
     ) -> dict:
+        """Append a message. ``turn`` (:class:`app.tags.journal.TurnContext`)
+        is passed by the paths that persist a turn's answer or a plan-mode
+        decision; for a ``chat`` conversation of a profile with Cremind Tag
+        enabled, the matching journal entries are written in this same
+        transaction. Without it — or for any other profile — nothing extra
+        runs beyond the cached enabled check."""
         await self._ensure_initialized()
         now = time.time() * 1000
+        tj = _tags_journal()
+        journal_turn = (
+            turn if turn is not None and getattr(turn, "conversation_kind", None) == "chat"
+            and await tj.is_enabled_async(self.engine, turn.profile) else None
+        )
+        journalled = False
 
         async with self.async_session_maker.begin() as session:
             # Get next ordering number
@@ -859,6 +925,24 @@ class ConversationStorage:
             )
             session.add(msg)
 
+            if journal_turn is not None:
+                try:
+                    from app.tags.sanitize import turn_entries
+
+                    entries = turn_entries(
+                        journal_turn, conversation_id=conversation_id, message_id=msg.id,
+                        role=role, content=content, metadata=metadata,
+                    )
+                except Exception:  # noqa: BLE001 — never fail the message over a payload
+                    logger.exception(f"[tags] could not build journal entries for {conversation_id}")
+                    entries = []
+                if entries:
+                    await session.flush()
+                    await tj.append_async(session, journal_turn.profile, entries)
+                    journalled = True
+
+        if journalled:
+            tj.wake()
         return self._msg_to_dict(msg)
 
     async def update_message_metadata(self, message_id: str, patch: dict) -> bool:

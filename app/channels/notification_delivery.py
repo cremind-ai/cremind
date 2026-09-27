@@ -80,6 +80,19 @@ SUBSCRIBE_AUTH_METHODS = ("open", "passcode", "otp", "approval", "allowlist")
 _SUBSCRIBE_OTP_TTL_SECONDS = 600
 
 
+def _access_intent(adapter: Any, sender: dict, *, subscribed: bool):
+    """Cremind Tag: journal a subscriber's access flip with the write that
+    makes it (never an OTP issue — only the flag)."""
+    from app.tags import journal
+    from app.tags.sanitize import access_change_entries
+
+    return journal.intent(getattr(adapter, "profile", None), access_change_entries(
+        channel_id=getattr(adapter, "channel_id", ""),
+        channel_type=getattr(adapter, "channel_type", ""),
+        sender=sender, subscribed=subscribed,
+    ))
+
+
 class NotificationDeliveryMixin:
     """Notification-mode delivery + subscription behavior.
 
@@ -292,10 +305,11 @@ class NotificationDeliveryMixin:
         self, sender_id: str, display_name: str | None,
     ) -> None:
         sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
-        await self.storage.update_sender(  # type: ignore[attr-defined]
-            sender["id"], authenticated=True,
-            pending_otp=None, pending_otp_expires_at=None,
-        )
+        with _access_intent(self, sender, subscribed=True):
+            await self.storage.update_sender(  # type: ignore[attr-defined]
+                sender["id"], authenticated=True,
+                pending_otp=None, pending_otp_expires_at=None,
+            )
         await self.send(  # type: ignore[attr-defined]
             sender_id,
             "✅ Subscribed. You'll receive Cremind notifications here.\n"
@@ -359,10 +373,11 @@ class NotificationDeliveryMixin:
         code = (text or "").strip()
 
         if pending and expires_at > now and code == str(pending):
-            await self.storage.update_sender(  # type: ignore[attr-defined]
-                sender["id"], authenticated=True,
-                pending_otp=None, pending_otp_expires_at=None,
-            )
+            with _access_intent(self, sender, subscribed=True):
+                await self.storage.update_sender(  # type: ignore[attr-defined]
+                    sender["id"], authenticated=True,
+                    pending_otp=None, pending_otp_expires_at=None,
+                )
             await self.send(  # type: ignore[attr-defined]
                 sender["sender_id"],
                 "✅ Subscribed. You'll receive Cremind notifications here.\n"
@@ -466,7 +481,8 @@ class NotificationDeliveryMixin:
 
         if cmd in _UNSUBSCRIBE_CMDS:
             sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
-            await self.storage.update_sender(sender["id"], authenticated=False)  # type: ignore[attr-defined]
+            with _access_intent(self, sender, subscribed=False):
+                await self.storage.update_sender(sender["id"], authenticated=False)  # type: ignore[attr-defined]
             await self.send(  # type: ignore[attr-defined]
                 sender_id,
                 "🔕 Unsubscribed. Send /start to receive notifications again.",

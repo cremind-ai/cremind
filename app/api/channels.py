@@ -981,7 +981,17 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         if sender is None:
             return JSONResponse({"error": "Sender not found"}, status_code=404)
 
-        updated = await conversation_storage.update_sender(sender["id"], **fields)
+        from app.tags import journal
+        from app.tags.sanitize import access_change_entries
+
+        entries = (
+            access_change_entries(
+                channel_id=cid, channel_type=ch.get("channel_type"),
+                sender=sender, subscribed=bool(fields["authenticated"]),
+            ) if "authenticated" in fields else []
+        )
+        with journal.intent(ch.get("profile"), entries):
+            updated = await conversation_storage.update_sender(sender["id"], **fields)
         if updated is None:
             return JSONResponse({"error": "Sender not found"}, status_code=404)
         out = {

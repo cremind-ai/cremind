@@ -648,6 +648,7 @@ def get_conversation_routes(
                     event_run_id = run["id"]
                     await store.update_status(
                         run["id"], status="running", clear_pending=True,
+                        profile=run.get("profile") or profile,
                     )
                     from app.events.event_runs_admin_bus import publish_event_runs_changed
                     publish_event_runs_changed(profile)
@@ -1006,11 +1007,20 @@ def get_conversation_routes(
         content = "Cancel this plan."
         message_id: str | None = None
         try:
+            from app.tags.journal import TurnContext
+
             msg = await conversation_storage.add_message(
                 conversation_id=conversation_id,
                 role="user",
                 content=content,
                 metadata={"plan_mode": {"stage": "cancelled"}},
+                # Cremind Tag: retires the "waiting for you" card, if any.
+                turn=TurnContext(
+                    profile=profile,
+                    conversation_kind=conv.get("kind") or "chat",
+                    conversation_title=conv.get("title") or "",
+                    result=False,
+                ),
             )
             message_id = msg.get("id") if isinstance(msg, dict) else None
         except Exception:  # noqa: BLE001

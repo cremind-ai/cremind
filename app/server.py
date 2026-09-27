@@ -422,6 +422,12 @@ async def _do_shutdown() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping task timeout manager during shutdown")
     try:
+        from app.tags.projection import get_tag_projection_worker
+
+        get_tag_projection_worker().stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping the Cremind Tag projection worker during shutdown")
+    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -1378,7 +1384,7 @@ async def main(
     # Where those callbacks send the consent window once their work is done.
     routes.extend(get_oauth_close_routes())
 
-    from app.middleware import ClientProtocolGuard, ConnectionHeaderFilter
+    from app.middleware import ClientProtocolGuard, ConnectionHeaderFilter, TagConnectorGuard
 
     from app.api.tls_recovery import EdgeTlsRecovery, TlsHandoffCors
 
@@ -1400,6 +1406,9 @@ async def main(
         # CORS, so preflights are answered first and the refusal still carries
         # CORS headers the browser needs to read it.
         Middleware(ClientProtocolGuard),
+        # A Cremind Tag connector credential is 401 everywhere but the
+        # connector API, before the JWT backend (which ignores the scheme).
+        Middleware(TagConnectorGuard),
         Middleware(
             AuthenticationMiddleware,
             backend=JWTAuthBackend(secret_provider=BaseConfig.get_jwt_secret),
@@ -1942,6 +1951,15 @@ async def main(
                 await sweep_undelivered()
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to sweep undelivered event results")
+
+            # 12a. Cremind Tag: project the journal onto tags from here on
+            #      (the boot sweep above has settled what a crash left owed).
+            try:
+                from app.tags.projection import get_tag_projection_worker
+
+                get_tag_projection_worker().start(loop)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start the Cremind Tag projection worker")
 
             # 12b. Document research jobs the restart cut short: mark them
             #      interrupted and report every result still owed to its

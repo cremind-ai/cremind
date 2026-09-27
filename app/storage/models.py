@@ -58,12 +58,30 @@ Tables
 - document_research_jobs : deep-research jobs over the user's documents — the
                         question, the checkpoint, the dossier, and the delivery
                         counters (FK profile CASCADE, FK conversation CASCADE)
+- tag_companions       : Cremind Tag PC companions (system-wide hardware)
+- tag_credentials      : connector credentials of a companion; ``content`` ones
+                        are bound to one profile too (FK companion CASCADE,
+                        FK profile CASCADE). Never written to a backup
+- tag_devices          : gateways, bridges and e-paper tags a companion manages
+                        (FK companion CASCADE, FK owner profile SET NULL)
+- tag_streams          : per-profile journal / delivery head row (FK profile CASCADE)
+- tag_events           : the per-profile Tags journal. UNIQUE(profile, seq)
+- tag_deliveries       : one card for one tag, with its delivery stage.
+                        UNIQUE(profile, seq) (FK profile CASCADE, FK device CASCADE)
+- tag_counters         : singleton counters (``delivery_id``)
+- tag_commands         : hardware operations queued for a companion (FK companion CASCADE)
+- tag_previews         : the last rendered screen of a tag (FK device CASCADE)
+- tag_settings         : whether a profile uses Tags, and its routing options
+                        (FK profile CASCADE)
 """
 
 import uuid
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, false, text
+from sqlalchemy import (
+    JSON, BigInteger, Boolean, Float, ForeignKey, Index, Integer, String, Text,
+    UniqueConstraint, false, text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from a2a.server.models import Base
@@ -1272,3 +1290,280 @@ class DocumentResearchJobModel(Base):
         # The turn-end delivery hook and the conversation cascade.
         Index("ix_document_research_jobs_conversation", "conversation_id"),
     )
+
+
+# ── Cremind Tag ───────────────────────────────────────────────────────────────
+#
+# E-paper tags driven by a PC companion that connects OUT to Cremind (see
+# app/tags and the connector API in app/api/tag_connector.py). Timestamps are
+# epoch milliseconds. No table uses a database sequence: restore never resets
+# sequences, so ``tag_deliveries.id`` comes from the ``tag_counters`` row and
+# every per-profile ``seq`` from the ``tag_streams`` head row.
+
+
+class TagCompanionModel(Base):
+    """One PC companion. Hardware is system-wide: the admin registers it."""
+
+    __tablename__ = "tag_companions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_seen_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The last heartbeat's companion/queue block, as sent.
+    heartbeat: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class TagCredentialModel(Base):
+    """A connector credential. ``id`` is the public ``tagc_…`` identifier; only
+    SHA-256 of the secret is stored. ``hardware`` credentials are bound to the
+    companion, ``content`` ones to the companion AND one profile, so they die
+    with that profile. Excluded from every backup dump (app/backup/dbdump.py)."""
+
+    __tablename__ = "tag_credentials"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    companion_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="CASCADE"), nullable=False,
+    )
+    # hardware | content
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    profile: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=True,
+    )
+    secret_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("ix_tag_credentials_companion", "companion_id"),
+        Index("ix_tag_credentials_profile", "profile"),
+    )
+
+
+class TagDeviceModel(Base):
+    """A gateway, bridge or tag. A tag is visible to one profile only: its
+    ``owner_profile``. ``epoch`` fences every ownership or bridge change (the
+    companion derives the tag key from it); ``clear_required`` holds content
+    back until the companion confirms the screen was blanked."""
+
+    __tablename__ = "tag_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    companion_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="CASCADE"), nullable=False,
+    )
+    # gateway | bridge | tag
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    hw_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    owner_profile: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="SET NULL"), nullable=True,
+    )
+    bridge_device_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tag_devices.id", ondelete="SET NULL"), nullable=True,
+    )
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    rotation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    board: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    panel: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    planes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fw: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unclaimed", server_default=text("'unclaimed'"),
+    )
+    battery_mv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rssi: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_contact_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    desired_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    displayed_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    displayed_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    clear_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false(),
+    )
+    claimed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("companion_id", "kind", "hw_id", name="uq_tag_devices_companion_kind_hw"),
+        Index("ix_tag_devices_owner", "owner_profile"),
+    )
+
+
+class TagStreamModel(Base):
+    """The per-profile head row. Journal appends and delivery allocation
+    ``UPDATE … RETURNING`` it, so on PostgreSQL its row lock orders commits
+    (commit order = seq order); ``stream_id`` changes on restore."""
+
+    __tablename__ = "tag_streams"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    stream_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    next_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    projected_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    next_delivery_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0"),
+    )
+    # Projection bookkeeping: periodic-content hashes, diagnostics state, the
+    # pruned-through delivery seq, companions' acknowledged cursors.
+    state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class TagEventModel(Base):
+    """One journal entry: an allowlisted kind with a sanitised payload, written
+    in the same transaction as the state it describes."""
+
+    __tablename__ = "tag_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    # durable | checkpoint
+    durability: Mapped[str] = mapped_column(String(16), nullable=False)
+    replace_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("profile", "seq", name="uq_tag_events_profile_seq"),
+    )
+
+
+class TagDeliveryModel(Base):
+    """One card for one tag. ``id`` is the connector ``delivery_id`` (from
+    ``tag_counters``), ``seq`` the profile's delivery cursor position."""
+
+    __tablename__ = "tag_deliveries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    companion_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="SET NULL"), nullable=True,
+    )
+    tag_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_devices.id", ondelete="CASCADE"), nullable=False,
+    )
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    event_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tag_events.id", ondelete="SET NULL"), nullable=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    replace_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    resolves: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    card: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    stage: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="queued", server_default=text("'queued'"),
+    )
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timing: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    stage_times: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+    finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("profile", "seq", name="uq_tag_deliveries_profile_seq"),
+        Index("ix_tag_deliveries_device_created", "tag_device_id", "created_at"),
+        Index("ix_tag_deliveries_stage", "stage"),
+    )
+
+
+class TagCounterModel(Base):
+    """Singleton counters, allocated with ``UPDATE … RETURNING``."""
+
+    __tablename__ = "tag_counters"
+
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+
+
+class TagCommandModel(Base):
+    """An asynchronous hardware operation the companion executes."""
+
+    __tablename__ = "tag_commands"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    companion_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="CASCADE"), nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    args: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    # queued | claimed | succeeded | failed | expired | cancelled
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="queued", server_default=text("'queued'"),
+    )
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    claimed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        Index("ix_tag_commands_companion_status", "companion_id", "status"),
+    )
+
+
+class TagPreviewModel(Base):
+    """The latest rendered screen of a tag (a 1-bit PNG, ≤ 64 KiB)."""
+
+    __tablename__ = "tag_previews"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tag_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_devices.id", ondelete="CASCADE"), nullable=False,
+    )
+    # desired | displayed
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    png_base64: Mapped[str] = mapped_column(Text, nullable=False)
+    delivery_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tag_device_id", "kind", name="uq_tag_previews_device_kind"),
+    )
+
+
+class TagSettingsModel(Base):
+    """Whether a profile uses Tags, and its own option overrides (see
+    :mod:`app.tags.routing`). Admin defaults live in ``server_config``."""
+
+    __tablename__ = "tag_settings"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)

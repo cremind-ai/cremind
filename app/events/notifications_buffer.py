@@ -55,12 +55,28 @@ class EventNotificationsBuffer:
             if len(bucket) > _MAX_PER_PROFILE:
                 del bucket[: len(bucket) - _MAX_PER_PROFILE]
         get_notifications_stream_bus().publish(profile, entry)
+        _journal_for_tags(profile, entry)
         return entry
 
     def since(self, profile: str, since_ms: float) -> List[Dict[str, Any]]:
         with self._lock:
             bucket = self._by_profile.get(profile, [])
             return [e for e in bucket if e["created_at"] > since_ms]
+
+
+def _journal_for_tags(profile: str, entry: Dict[str, Any]) -> None:
+    """Cremind Tag: hand a copy to the journal (asynchronously — ``push`` stays
+    synchronous; the journal commit is the acceptance boundary). An OTP, and
+    any kind the journal records on its own, is dropped by the builder."""
+    try:
+        from app.tags import journal
+        from app.tags.sanitize import notification_entry
+
+        journal_entry = notification_entry(entry)
+        if journal_entry is not None:
+            journal.submit_standalone(profile, [journal_entry])
+    except Exception:  # noqa: BLE001 — a notification must never fail over this
+        pass
 
 
 _instance: EventNotificationsBuffer | None = None

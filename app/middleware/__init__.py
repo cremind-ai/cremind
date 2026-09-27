@@ -8,6 +8,7 @@ from app.middleware.client_protocol import (  # noqa: F401
     CLIENT_PROTOCOL_VERSION,
     ClientProtocolGuard,
 )
+from app.middleware.tag_connector_guard import TagConnectorGuard  # noqa: F401
 
 # Connection-specific header fields, which RFC 9113 §8.2.2 forbids in HTTP/2.
 # Same set as h2's own ``CONNECTION_HEADERS``.

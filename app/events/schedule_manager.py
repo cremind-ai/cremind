@@ -256,8 +256,18 @@ class ScheduleManager:
             await run_dispatcher.dispatch_schedule_event(
                 sub=sub, action=action, payload=payload,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception(f"ScheduleManager: dispatch failed for {sub_id}")
+            try:
+                from app.tags import journal
+                from app.tags.sanitize import automation_failed_entry
+
+                journal.submit_standalone(sub.get("profile") or "", [automation_failed_entry(
+                    automation_kind="schedule", name=sub.get("title") or "Schedule",
+                    error=str(exc) or type(exc).__name__, source_id=sub_id,
+                )])
+            except Exception:  # noqa: BLE001
+                logger.debug("ScheduleManager: could not journal the dispatch failure", exc_info=True)
 
         # Nudge any open Events-page / calendar SSE subscribers.
         self._publish_admin_changed(sub["profile"])
