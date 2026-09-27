@@ -34,6 +34,9 @@ export const PROFILE_ROUTES = new Set([
   'calendar-schedule',
   'developer',
   'usage',
+  'tags',
+  'tags-settings',
+  'tags-hardware-settings',
 ]);
 
 // Routes that actually render chat (sidebar conversation list + per-conversation

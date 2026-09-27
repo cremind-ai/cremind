@@ -79,6 +79,13 @@ export const NAV_ITEMS: NavItem[] = [
     routeName: 'channels-page',
   },
   {
+    id: 'tags',
+    label: 'Tags',
+    icon: 'mdi:tablet-dashboard',
+    kind: 'route',
+    routeName: 'tags',
+  },
+  {
     id: 'processes',
     label: 'Process Manager',
     icon: 'mdi:console',
@@ -123,5 +130,7 @@ export const SETTINGS_ITEM: NavItem = {
     'blueprint-import',
     'profile-settings',
     'channels-settings',
+    'tags-settings',
+    'tags-hardware-settings',
   ],
 };

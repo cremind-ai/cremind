@@ -66,6 +66,19 @@ const allCards: SettingsCard[] = [
     route: 'channels',
   },
   {
+    title: 'Tags',
+    description: 'Which of your Cremind Tag screens get which cards, how they look, and the credentials a companion uses',
+    icon: 'mdi:tablet-dashboard',
+    route: 'tags',
+  },
+  {
+    title: 'Tag hardware',
+    description: 'Register companions, see every gateway, bridge and tag, and decide which profile owns which tag',
+    icon: 'mdi:chip',
+    route: 'tags/hardware',
+    adminOnly: true,
+  },
+  {
     title: 'GSuite',
     description: 'The Google account behind each Google skill, and which Drive files Cremind can open',
     icon: 'mdi:google',

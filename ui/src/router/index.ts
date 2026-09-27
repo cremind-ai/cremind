@@ -316,6 +316,31 @@ const routes = [
     props: true,
     meta: { title: 'Channels' },
   },
+  // Cremind Tag — the profile's routing/look settings and content credentials.
+  {
+    path: '/:profile/settings/tags',
+    name: 'tags-settings',
+    component: () => import('../views/TagsSettings.vue'),
+    props: true,
+    meta: { title: 'Tags' },
+  },
+  {
+    // Companions, inventory and ownership are server-wide and admin-owned (the
+    // backend gates /api/tags/hardware with require_admin). Mirror the
+    // embedding-settings guard so other profiles never land on a 403'd page.
+    path: '/:profile/settings/tags/hardware',
+    name: 'tags-hardware-settings',
+    component: () => import('../views/TagsHardwareSettings.vue'),
+    props: true,
+    meta: { title: 'Tag hardware' },
+    beforeEnter: (to: RouteLocationNormalized) => {
+      const profile = to.params.profile as string | undefined;
+      if (profile && profile !== 'admin') {
+        return { path: `/${profile}/settings/tags`, replace: true };
+      }
+      return true;
+    },
+  },
   {
     path: '/:profile/updates',
     name: 'updates',
@@ -336,6 +361,14 @@ const routes = [
     component: () => import('../views/AboutPage.vue'),
     props: true,
     meta: { title: 'About' },
+  },
+  // Tags — the Cremind Tag e-paper screens this profile owns
+  {
+    path: '/:profile/tags',
+    name: 'tags',
+    component: () => import('../views/TagsPage.vue'),
+    props: true,
+    meta: { title: 'Tags' },
   },
   // Usage & Cost — token-usage + estimated-pricing dashboard
   {
