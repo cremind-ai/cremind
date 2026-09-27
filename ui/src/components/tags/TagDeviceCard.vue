@@ -40,6 +40,11 @@ const status = computed(() => deviceStatusPill(d.value.status));
 const title = computed(() => deviceTitle(d.value));
 /** The clear after a change of owner failed or expired 3 times. */
 const clearFailed = computed(() => d.value.status === 'clear_failed');
+/** Its bridge refused the assignment (full) and it was detached from it. */
+const assignFailed = computed(() => d.value.status === 'assign_failed');
+function openHardware() {
+  router.push({ path: `/${route.params.profile}/settings/tags/hardware`, query: { tag: d.value.id } });
+}
 const lowBattery = computed(() => d.value.battery_mv != null && d.value.battery_mv < BATTERY_LOW_MV);
 const behind = computed(() => d.value.desired_revision > d.value.displayed_revision);
 // What the history should re-read on: anything the poll sees move on this tag.
@@ -168,16 +173,21 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
       </div>
     </div>
 
-    <div v-if="clearFailed" class="callout callout-danger" role="alert">
+    <div v-if="assignFailed" class="callout callout-danger" role="alert">
+      <Icon icon="mdi:alert-octagon-outline" class="callout-icon danger" />
+      <span class="callout-text">
+        The tag's bridge could not take it (its table is full), so the tag is not connected to any
+        bridge. Cards wait until an admin assigns it to another bridge or releases it.
+      </span>
+      <ElButton v-if="isAdmin" size="small" @click="openHardware">Open Hardware</ElButton>
+    </div>
+    <div v-else-if="clearFailed" class="callout callout-danger" role="alert">
       <Icon icon="mdi:alert-octagon-outline" class="callout-icon danger" />
       <span class="callout-text">
         The tag could not clear its screen after a change of owner — three tries failed or ran
         out of time. Nothing can be shown on it until an admin claims or releases it again.
       </span>
-      <ElButton
-        v-if="isAdmin" size="small"
-        @click="router.push({ path: `/${route.params.profile}/settings/tags/hardware`, query: { tag: d.id } })"
-      >Open Hardware</ElButton>
+      <ElButton v-if="isAdmin" size="small" @click="openHardware">Open Hardware</ElButton>
     </div>
     <div v-else-if="d.clear_required" class="callout callout-warning" role="status">
       <Icon icon="mdi:progress-clock" class="callout-icon" />

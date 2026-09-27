@@ -314,6 +314,32 @@ test('admin: claim sends owner/bridge/name, and bridge_required / unknown_profil
   assert.ok(env.callsTo('/claim').every((c) => c.init.method === 'POST'))
 })
 
+test('admin: bridge rows carry capacity; claim/assign 409 bridge_full keep the bridge', async () => {
+  env = installBrowser()
+  const bridge = { ...DEVICE, id: 'br-1', kind: 'bridge', max_tags: 10, assigned_count: 10 }
+  env.route('/api/tags/hardware', () => json({ companions: [], devices: [bridge], commands: [] }))
+  const full = { id: 'br-1', name: 'Kitchen', max_tags: 10, assigned: 10 }
+  env.route('/api/tags/hardware/tags/dev-1/claim', () => refusal(409, 'bridge_full',
+    "Bridge 'Kitchen' is full: it holds 10 of 10 tags.", { bridge: full }))
+  env.route('/api/tags/hardware/tags/dev-1/assign', () => refusal(409, 'bridge_full',
+    "Bridge 'Kitchen' is full: it holds 10 of 10 tags.", { bridge: full }))
+  const hw = await api.getTagHardware(URL_, TOKEN)
+  assert.equal(hw.devices[0].max_tags, 10)
+  assert.equal(hw.devices[0].assigned_count, 10)
+  for (const attempt of [
+    () => api.claimTag(URL_, TOKEN, 'dev-1', { owner: 'ann', bridge_id: 'br-1' }),
+    () => api.assignTagBridge(URL_, TOKEN, 'dev-1', 'br-1'),
+  ]) {
+    await assert.rejects(attempt(), (e) => {
+      assert.equal(e.status, 409)
+      assert.equal(e.code, 'bridge_full')
+      assert.deepEqual(e.body.bridge, full)
+      assert.match(e.message, /is full/)
+      return true
+    })
+  }
+})
+
 test('admin: assign, release, rename, forget (409 tag_owned) and commands', async () => {
   env = installBrowser()
   env.route('/api/tags/hardware/tags/dev-1/assign', () => json({ device: DEVICE, command: { kind: 'assign_tag' } }))

@@ -204,7 +204,7 @@ watch(() => settingsStore.authToken, (t, prev) => { if (t && !prev) void loadAll
   width: 100%; height: 100%; overflow-y: auto; box-sizing: border-box;
   padding: 24px; background: var(--bg-color); color: var(--text-primary);
 }
-.settings-container { max-width: 1040px; margin: 0 auto; }
+.settings-container { max-width: 1120px; margin: 0 auto; }
 .settings-header { margin-bottom: 24px; }
 .back-btn {
   display: flex; align-items: center; gap: 6px; background: none;

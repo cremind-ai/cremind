@@ -8,12 +8,18 @@
  *
  * A tag reading `clear_failed` (its clear failed or expired 3 times) is
  * stuck until it is claimed again (the same owner is fine: a new epoch and a
- * fresh clear) or released; its row says so and offers "Claim again".
+ * fresh clear) or released; its row says so and offers "Claim again". A tag
+ * reading `assign_failed` (its bridge refused it — full — and it was detached)
+ * offers "Assign to another bridge…" (or release it).
+ *
+ * Bridges show their assignment-table use against the capacity they report
+ * (`assigned_count` / `max_tags`); bridge pickers disable a bridge whose known
+ * capacity is used up, and the server's 409 `bridge_full` shows on the field.
  */
 import { computed, ref } from 'vue';
 import {
   ElButton, ElCard, ElDialog, ElDropdown, ElDropdownItem, ElDropdownMenu, ElMessage, ElMessageBox,
-  ElOption, ElSelect, ElTable, ElTableColumn, ElTag,
+  ElOption, ElSelect, ElTable, ElTableColumn, ElTag, ElTooltip,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useTagsStore } from '../../stores/tags';
@@ -22,7 +28,8 @@ import TagClaimDialog from './TagClaimDialog.vue';
 import { formatRelativeTime } from '../../utils/relativeTime';
 import { formatTimestamp } from '../../utils/usageFormat';
 import {
-  BATTERY_LOW_MV, commandLabel, deviceStatusPill, deviceTitle, formatBattery, panelLabel,
+  BATTERY_LOW_MV, CAPACITY_NOTE, bridgeCapacity, commandLabel, deviceStatusPill, deviceTitle, formatBattery, isStuck,
+  panelLabel,
 } from '../../utils/tagsFormat';
 
 const props = defineProps<{
@@ -43,15 +50,20 @@ const assignOpen = ref(false);
 const assignTag = ref<TagDevice | null>(null);
 const assignBridge = ref('');
 const assigning = ref(false);
+const assignError = ref('');
 
 const gateways = computed(() => props.devices.filter((d) => d.kind === 'gateway'));
 const bridges = computed(() => props.devices.filter((d) => d.kind === 'bridge'));
 const tags = computed(() => props.devices.filter((d) => d.kind === 'tag'));
 const clearFailed = computed(() => tags.value.filter((t) => t.status === 'clear_failed'));
+const assignFailed = computed(() => tags.value.filter((t) => t.status === 'assign_failed'));
 const tagRowClass = ({ row }: { row: TagDevice }) => [
-  row.status === 'clear_failed' ? 'row-clear-failed' : '',
+  isStuck(row.status) ? 'row-stuck' : '',
   row.id === props.highlightId ? 'row-highlight' : '',
 ].join(' ');
+const bridgeRowClass = ({ row }: { row: TagDevice }) => (bridgeCapacity(row).full ? 'row-full' : '');
+const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+const CAPACITY_HINT = CAPACITY_NOTE;
 const multiCompanion = computed(() => props.companions.length > 1);
 
 const byId = computed(() => new Map(props.devices.map((d) => [d.id, d])));
@@ -73,7 +85,12 @@ function openClaim(tag: TagDevice) {
 
 function openAssign(tag: TagDevice) {
   assignTag.value = tag;
-  assignBridge.value = tag.bridge_device_id ?? '';
+  // Start on a bridge with room; never pre-pick one the tag cannot go to.
+  const current = tag.bridge_device_id ?? '';
+  const room = bridgesOf(tag.companion_id).find((b) => !bridgeCapacity(b, tag).full);
+  assignBridge.value = current && !bridgeCapacity(byId.value.get(current) ?? { id: current }, tag).full
+    ? current : (room?.id ?? '');
+  assignError.value = '';
   assignOpen.value = true;
 }
 
@@ -81,13 +98,19 @@ async function assign() {
   const tag = assignTag.value;
   if (!tag || !assignBridge.value) return;
   assigning.value = true;
+  assignError.value = '';
   try {
     await store.assign(tag.id, assignBridge.value);
     ElMessage.success(`${deviceTitle(tag)} moves to ${bridgeName(assignBridge.value)}`);
     assignOpen.value = false;
     emit('changed');
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : 'Failed to assign the bridge');
+    if (e instanceof TagsApiError && (e.code === 'bridge_full' || e.code === 'bridge_not_found')) {
+      assignError.value = e.message;
+      emit('changed'); // refresh the counts the picker shows
+    } else {
+      ElMessage.error(e instanceof Error ? e.message : 'Failed to assign the bridge');
+    }
   } finally {
     assigning.value = false;
   }
@@ -199,6 +222,7 @@ async function queue(device: TagDevice, kind: string) {
 
 function onTagCommand(tag: TagDevice, cmd: string) {
   if (cmd === 'assign') openAssign(tag);
+  else if (cmd === 'claim') openClaim(tag);
   else if (cmd === 'release') void release(tag);
   else if (cmd === 'rename') void rename(tag);
   else if (cmd === 'forget') void forget(tag);
@@ -229,6 +253,14 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
       </div>
     </template>
 
+    <div v-if="assignFailed.length" class="callout callout-danger" role="alert">
+      <Icon icon="mdi:alert-octagon-outline" class="callout-icon" />
+      <span>
+        <strong>{{ plural(assignFailed.length, '1 tag', `${assignFailed.length} tags`) }} could not be
+        assigned to {{ plural(assignFailed.length, 'its', 'their') }} bridge</strong>: the bridge refused
+        (its table was full) and the tag was detached from it. Assign it to another bridge or release it.
+      </span>
+    </div>
     <div v-if="clearFailed.length" class="callout callout-danger" role="alert">
       <Icon icon="mdi:alert-octagon-outline" class="callout-icon" />
       <span>
@@ -249,11 +281,12 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
           <div class="muted small">
             <span class="mono">{{ row.hw_id }}</span>
             <span v-if="panelLabel(row as TagDevice)"> · {{ panelLabel(row as TagDevice) }}</span>
+            <span v-if="row.fw"> · fw {{ row.fw }}</span>
             <span v-if="multiCompanion"> · {{ companionName(row.companion_id) }}</span>
           </div>
         </template>
       </ElTableColumn>
-      <ElTableColumn label="Owner" min-width="110">
+      <ElTableColumn label="Owner" min-width="100">
         <template #default="{ row }">
           <span v-if="row.owner_profile" class="owner">{{ row.owner_profile }}</span>
           <span v-else class="muted">unclaimed</span>
@@ -265,22 +298,20 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
           <span v-else class="muted">—</span>
         </template>
       </ElTableColumn>
-      <ElTableColumn label="Status" width="130">
+      <ElTableColumn label="Status" width="150">
         <template #default="{ row }">
           <div class="pills">
             <ElTag :type="deviceStatusPill(row.status).type" size="small" effect="plain">{{ deviceStatusPill(row.status).label }}</ElTag>
             <ElTag v-if="row.clear_required && row.status !== 'clear_failed'" type="warning" size="small" effect="plain">clearing</ElTag>
           </div>
           <div v-if="row.status === 'clear_failed'" class="hint-danger">claim or release again</div>
+          <div v-else-if="row.status === 'assign_failed'" class="hint-danger">assign it to another bridge or release it</div>
         </template>
       </ElTableColumn>
       <ElTableColumn label="Battery" width="84">
         <template #default="{ row }">
           <span :class="{ danger: row.battery_mv != null && row.battery_mv < BATTERY_LOW_MV }">{{ formatBattery(row.battery_mv) }}</span>
         </template>
-      </ElTableColumn>
-      <ElTableColumn label="FW" width="70">
-        <template #default="{ row }">{{ row.fw || '—' }}</template>
       </ElTableColumn>
       <ElTableColumn label="Epoch" width="64" align="right">
         <template #default="{ row }"><span class="num">{{ row.epoch }}</span></template>
@@ -291,10 +322,18 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
           <span v-else class="muted">never</span>
         </template>
       </ElTableColumn>
-      <ElTableColumn label="" width="170" align="right">
+      <ElTableColumn label="" width="236" align="right">
         <template #default="{ row }">
           <div class="row-actions">
             <ElButton
+              v-if="row.status === 'assign_failed'"
+              size="small" type="danger"
+              :loading="busy === row.id"
+              :disabled="bridgesOf(row.companion_id).length === 0"
+              @click="openAssign(row as TagDevice)"
+            >Assign to another bridge…</ElButton>
+            <ElButton
+              v-else
               size="small"
               :type="row.status === 'clear_failed' ? 'danger' : row.owner_profile ? 'default' : 'primary'"
               :loading="busy === row.id"
@@ -308,7 +347,10 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
               </ElButton>
               <template #dropdown>
                 <ElDropdownMenu>
-                  <ElDropdownItem command="assign" :disabled="bridgesOf(row.companion_id).length === 0">Assign bridge…</ElDropdownItem>
+                  <ElDropdownItem v-if="row.status === 'assign_failed'" command="claim">
+                    {{ row.owner_profile ? 'Owner…' : 'Claim…' }}
+                  </ElDropdownItem>
+                  <ElDropdownItem v-else command="assign" :disabled="bridgesOf(row.companion_id).length === 0">Assign bridge…</ElDropdownItem>
                   <ElDropdownItem command="release" :disabled="!row.owner_profile">Release</ElDropdownItem>
                   <ElDropdownItem command="refresh_tag" :disabled="!row.owner_profile">Refresh</ElDropdownItem>
                   <ElDropdownItem command="identify">Identify</ElDropdownItem>
@@ -327,7 +369,7 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
     <h4 class="group-title">
       <Icon icon="mdi:access-point-network" /> Bridges <span class="count">{{ bridges.length }}</span>
     </h4>
-    <ElTable :data="bridges" size="small" row-key="id" empty-text="No bridges reported yet" class="inv-table">
+    <ElTable :data="bridges" size="small" row-key="id" empty-text="No bridges reported yet" class="inv-table" :row-class-name="bridgeRowClass">
       <ElTableColumn label="Bridge" min-width="170">
         <template #default="{ row }">
           <div class="strong">{{ deviceTitle(row as TagDevice) }}</div>
@@ -342,8 +384,15 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
           <ElTag :type="deviceStatusPill(row.status).type" size="small" effect="plain">{{ deviceStatusPill(row.status).label }}</ElTag>
         </template>
       </ElTableColumn>
-      <ElTableColumn label="Tags" width="64" align="right">
-        <template #default="{ row }"><span class="num">{{ tagsOn(row.id) }}</span></template>
+      <ElTableColumn label="Tags" width="130">
+        <template #default="{ row }">
+          <ElTooltip :content="bridgeCapacity(row as TagDevice).tooltip" placement="top" :show-after="200">
+            <span class="capacity" :class="{ 'at-capacity': bridgeCapacity(row as TagDevice).full }">
+              <Icon v-if="bridgeCapacity(row as TagDevice).full" icon="mdi:alert-outline" class="capacity-icon" />
+              {{ bridgeCapacity(row as TagDevice).label }}<template v-if="bridgeCapacity(row as TagDevice).full"> · full</template>
+            </span>
+          </ElTooltip>
+        </template>
       </ElTableColumn>
       <ElTableColumn label="Mesh addr" width="90">
         <template #default="{ row }"><span class="num">{{ row.info?.addr ?? '—' }}</span></template>
@@ -427,18 +476,27 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
       :bridges="claimTag ? bridgesOf(claimTag.companion_id) : []"
       :profiles="profiles"
       @done="emit('changed')"
+      @refused="emit('changed')"
     />
 
     <ElDialog v-model="assignOpen" :title="assignTag ? `Assign ${deviceTitle(assignTag)} to a bridge` : 'Assign bridge'" width="440px" append-to-body>
       <label class="field-label">Bridge</label>
-      <ElSelect v-model="assignBridge" placeholder="Pick the bridge" class="full" aria-label="Bridge">
+      <ElSelect v-model="assignBridge" placeholder="Pick the bridge" class="full" aria-label="Bridge" @change="assignError = ''">
         <ElOption
           v-for="b in assignTag ? bridgesOf(assignTag.companion_id) : []"
           :key="b.id" :label="deviceTitle(b)" :value="b.id"
-        />
+          :disabled="bridgeCapacity(b, assignTag).full"
+        >
+          <span>{{ deviceTitle(b) }}</span>
+          <span class="opt-meta" :class="{ 'at-capacity': bridgeCapacity(b, assignTag).full }">
+            {{ bridgeCapacity(b).label }}{{ bridgeCapacity(b, assignTag).full ? ' · full' : '' }}
+          </span>
+        </ElOption>
       </ElSelect>
+      <p v-if="assignError" class="field-error">{{ assignError }}</p>
       <p class="field-hint">
         The tag is re-keyed for the new bridge; cards already on their way to it move along.
+        A full bridge cannot take it. {{ CAPACITY_HINT }}
       </p>
       <template #footer>
         <ElButton @click="assignOpen = false">Cancel</ElButton>
@@ -473,6 +531,12 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
 .danger { color: var(--el-color-danger); }
 .pills { display: flex; flex-wrap: wrap; gap: 4px; }
 .hint-danger { margin-top: 3px; font-size: 0.72rem; color: var(--el-color-danger); line-height: 1.3; }
+.capacity { font-variant-numeric: tabular-nums; color: var(--text-primary); display: inline-flex; align-items: center; gap: 3px; cursor: default; }
+.capacity.at-capacity { color: var(--el-color-warning); font-weight: 600; }
+.capacity-icon { font-size: 0.95rem; }
+.opt-meta { float: right; margin-left: 12px; color: var(--text-tertiary); font-size: 0.8rem; }
+.opt-meta.at-capacity { color: var(--el-color-warning); }
+.field-error { margin: 6px 0 0; font-size: 0.8rem; color: var(--el-color-danger); }
 .callout {
   display: flex; align-items: flex-start; gap: 8px; margin-bottom: 14px;
   padding: 10px 12px; border-radius: 8px; font-size: 0.85rem; line-height: 1.45;
@@ -483,7 +547,10 @@ function onGatewayCommand(gateway: TagDevice, cmd: string) {
   background: color-mix(in srgb, var(--el-color-danger) 12%, var(--surface-color));
 }
 .callout-icon { flex-shrink: 0; font-size: 1.1rem; margin-top: 1px; color: var(--el-color-danger); }
-.inv-table :deep(.row-clear-failed > td.el-table__cell) {
+.inv-table :deep(.row-full > td.el-table__cell) {
+  background: color-mix(in srgb, var(--el-color-warning) 7%, transparent);
+}
+.inv-table :deep(.row-stuck > td.el-table__cell) {
   background: color-mix(in srgb, var(--el-color-danger) 6%, transparent);
 }
 .inv-table :deep(.row-highlight > td.el-table__cell) {

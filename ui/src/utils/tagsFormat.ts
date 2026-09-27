@@ -17,6 +17,8 @@ const DEVICE_STATUS: Record<string, { label: string; type: PillType }> = {
   error: { label: 'error', type: 'danger' },
   // Its screen clear failed or expired 3 times; an admin must claim or release it again.
   clear_failed: { label: 'clear failed', type: 'danger' },
+  // Its bridge refused the assignment (full) and it was detached; assign it elsewhere or release it.
+  assign_failed: { label: 'assign failed', type: 'danger' },
   unclaimed: { label: 'unclaimed', type: 'info' },
 };
 
@@ -39,6 +41,35 @@ export function batteryIcon(mv: number | null | undefined): string {
   if (mv < 2700) return 'mdi:battery-30';
   if (mv < 2900) return 'mdi:battery-60';
   return 'mdi:battery';
+}
+
+/** Statuses only an admin action (claim / assign / release) clears. */
+export const STUCK_STATUSES = ['clear_failed', 'assign_failed'] as const;
+
+export function isStuck(status: string | null | undefined): boolean {
+  return !!status && (STUCK_STATUSES as readonly string[]).includes(status);
+}
+
+export const CAPACITY_NOTE = 'A released tag still holds its slot: a slot frees only when the tag moves '
+  + 'to another bridge or is forgotten.';
+
+/** A bridge's assignment-table use, for the hardware page and bridge pickers.
+ *  With `forTagId`, the count leaves that tag out (the server does the same:
+ *  keeping a tag on its own bridge never needs a new slot). */
+export function bridgeCapacity(
+  bridge: { id: string; max_tags?: number | null; assigned_count?: number },
+  forTagId?: { id: string; bridge_device_id: string | null } | null,
+): { assigned: number; max: number | null; full: boolean; label: string; tooltip: string } {
+  const max = typeof bridge.max_tags === 'number' ? bridge.max_tags : null;
+  const all = bridge.assigned_count ?? 0;
+  const assigned = forTagId && forTagId.bridge_device_id === bridge.id ? Math.max(0, all - 1) : all;
+  const full = max !== null && assigned >= max;
+  const tags = (n: number) => (n === 1 ? '1 tag' : `${n} tags`);
+  const label = max === null ? tags(all) : `${all} / ${max} tags`;
+  const tooltip = max === null
+    ? `${tags(all)} assigned; this bridge has not reported how many it can hold. ${CAPACITY_NOTE}`
+    : `${all} of the ${max} tags this bridge can hold${full ? ' — full' : ''}. ${CAPACITY_NOTE}`;
+  return { assigned, max, full, label, tooltip };
 }
 
 export function formatRssi(rssi: number | null | undefined): string {

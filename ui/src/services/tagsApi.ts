@@ -29,7 +29,8 @@ function authHeaders(authToken: string): Record<string, string> {
 export type TagDeviceKind = 'gateway' | 'bridge' | 'tag';
 /** `unclaimed` | `assigning` | `ok` | `pending` | `offline` | `error` |
  *  `clear_failed` (its clear failed or expired 3 times: an admin must claim or
- *  release it again) — an open set. */
+ *  release it again) | `assign_failed` (its bridge refused it — e.g. full — and
+ *  it was detached: assign it to another bridge or release it) — an open set. */
 export type TagDeviceStatus = string;
 
 export interface TagDevice {
@@ -65,6 +66,11 @@ export interface TagDevice {
   previews?: { desired: number | null; displayed: number | null };
   /** Overview only: deliveries still on their way to this tag. */
   pending_count?: number;
+  /** Hardware view, bridges only: assignment-table capacity (null = not reported). */
+  max_tags?: number | null;
+  /** Hardware view, bridges only: tags Cremind has assigned to it, owned or
+   *  not — a released tag keeps its slot until it moves or is forgotten. */
+  assigned_count?: number;
   /** Overview only. */
   companion_name?: string | null;
   companion_online?: boolean;
@@ -548,7 +554,9 @@ export async function getTagCommand(
 }
 
 /** 409 `bridge_required` when the companion has several bridges and none was
- *  named; 422 `unknown_profile` for an owner that does not exist. */
+ *  named; 409 `bridge_full` (`body.bridge` = {id, name, max_tags, assigned})
+ *  when the bridge's known capacity is used up; 422 `unknown_profile` for an
+ *  owner that does not exist. */
 export function claimTag(
   agentUrl: string,
   token: string,
@@ -560,6 +568,7 @@ export function claimTag(
   });
 }
 
+/** 409 `bridge_full` like claim. */
 export function assignTagBridge(
   agentUrl: string, token: string, deviceId: string, bridgeId: string,
 ): Promise<{ device: TagDevice; command: TagCommand }> {

@@ -7,6 +7,10 @@
  * already has one or the companion has only one; otherwise it answers 409
  * `bridge_required`, shown on the bridge field.
  *
+ * Bridges whose known capacity is used up are listed but disabled; if the
+ * server still answers 409 `bridge_full` (the automatic bridge is full, or a
+ * slot was taken meanwhile) it shows on the bridge field too.
+ *
  * A claim starts the tag clean (name, previews, revisions): the name field is
  * prefilled only when re-claiming for the SAME owner (e.g. to retry a failed
  * clear) and is then sent explicitly; a new owner never inherits the old name.
@@ -15,7 +19,7 @@ import { computed, ref, watch } from 'vue';
 import { ElButton, ElDialog, ElInput, ElMessage, ElOption, ElSelect } from 'element-plus';
 import { useTagsStore } from '../../stores/tags';
 import { TagsApiError, type TagDevice } from '../../services/tagsApi';
-import { deviceTitle } from '../../utils/tagsFormat';
+import { CAPACITY_NOTE, bridgeCapacity, deviceTitle } from '../../utils/tagsFormat';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -23,7 +27,11 @@ const props = defineProps<{
   bridges: TagDevice[];
   profiles: string[];
 }>();
-const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void; (e: 'done'): void }>();
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: boolean): void;
+  (e: 'done'): void;
+  (e: 'refused'): void;
+}>();
 
 const store = useTagsStore();
 const owner = ref('');
@@ -32,12 +40,24 @@ const name = ref('');
 const saving = ref(false);
 const fieldError = ref<{ field: 'owner' | 'bridge' | 'name' | 'other'; message: string } | null>(null);
 
-const autoBridge = computed(() => {
-  if (!props.tag) return '';
+/** The bridge the server picks when none is named: the tag's own, else the only one. */
+const autoBridgeRow = computed<TagDevice | null>(() => {
+  if (!props.tag) return null;
   const current = props.bridges.find((b) => b.id === props.tag!.bridge_device_id);
-  if (current) return `Keep ${deviceTitle(current)}`;
-  if (props.bridges.length === 1) return `Automatic (${deviceTitle(props.bridges[0])})`;
-  return '';
+  if (current) return current;
+  return props.bridges.length === 1 ? props.bridges[0] : null;
+});
+const autoBridge = computed(() => {
+  const b = autoBridgeRow.value;
+  if (!b || !props.tag) return '';
+  const full = bridgeCapacity(b, props.tag).full ? ' — full' : '';
+  return b.id === props.tag.bridge_device_id ? `Keep ${deviceTitle(b)}${full}` : `Automatic (${deviceTitle(b)}${full})`;
+});
+/** Warn before submitting when the bridge that would be used is known full. */
+const chosenFull = computed(() => {
+  if (!props.tag) return null;
+  const b = bridgeId.value ? props.bridges.find((x) => x.id === bridgeId.value) : autoBridgeRow.value;
+  return b && bridgeCapacity(b, props.tag).full ? b : null;
 });
 
 const sameOwner = computed(() => !!props.tag?.owner_profile && owner.value === props.tag.owner_profile);
@@ -73,7 +93,18 @@ async function submit() {
     emit('done');
     close();
   } catch (e) {
-    if (e instanceof TagsApiError && e.code === 'bridge_required') {
+    if (e instanceof TagsApiError && e.code === 'bridge_full') {
+      const b = e.body?.bridge as { id?: string; name?: string; max_tags?: number; assigned?: number } | undefined;
+      const known = b?.id ? props.bridges.find((x) => x.id === b.id) : undefined;
+      const label = b?.name || (known ? deviceTitle(known) : 'That bridge');
+      fieldError.value = {
+        field: 'bridge',
+        message: b && b.max_tags
+          ? `${label} is full (${b.assigned ?? b.max_tags} of ${b.max_tags} tags). Pick another bridge, or free a slot by moving or forgetting a tag.`
+          : e.message,
+      };
+      emit('refused'); // the counts the picker shows are stale: refresh them
+    } else if (e instanceof TagsApiError && e.code === 'bridge_required') {
       fieldError.value = {
         field: 'bridge',
         message: `This companion has ${props.bridges.length} bridges — pick the one the tag should use.`,
@@ -110,11 +141,25 @@ async function submit() {
     </div>
     <div class="field">
       <label class="field-label">Bridge</label>
-      <ElSelect v-model="bridgeId" clearable :placeholder="autoBridge || 'Pick the bridge'" class="full" aria-label="Bridge">
-        <ElOption v-for="b in bridges" :key="b.id" :label="deviceTitle(b)" :value="b.id" />
+      <ElSelect
+        v-model="bridgeId" clearable :placeholder="autoBridge || 'Pick the bridge'" class="full" aria-label="Bridge"
+        @change="fieldError?.field === 'bridge' && (fieldError = null)"
+      >
+        <ElOption
+          v-for="b in bridges" :key="b.id" :label="deviceTitle(b)" :value="b.id"
+          :disabled="!!tag && bridgeCapacity(b, tag).full"
+        >
+          <span>{{ deviceTitle(b) }}</span>
+          <span class="opt-meta" :class="{ 'at-capacity': !!tag && bridgeCapacity(b, tag).full }">
+            {{ bridgeCapacity(b).label }}{{ tag && bridgeCapacity(b, tag).full ? ' · full' : '' }}
+          </span>
+        </ElOption>
       </ElSelect>
       <p v-if="fieldError?.field === 'bridge'" class="field-error">{{ fieldError.message }}</p>
-      <p v-else class="field-hint">The bridge on the tag's companion that talks to it over the mesh.</p>
+      <p v-else-if="chosenFull" class="field-warn">
+        {{ deviceTitle(chosenFull) }} is full ({{ bridgeCapacity(chosenFull).label }}) — pick another bridge.
+      </p>
+      <p v-else class="field-hint" :title="CAPACITY_NOTE">The bridge on the tag's companion that talks to it over the mesh.</p>
     </div>
     <div class="field">
       <label class="field-label">Name <span class="optional">(optional)</span></label>
@@ -142,6 +187,9 @@ async function submit() {
 .optional { font-weight: 400; color: var(--text-tertiary); }
 .field-hint { margin: 6px 0 0; font-size: 0.78rem; color: var(--text-tertiary); }
 .field-error { margin: 6px 0 0; font-size: 0.8rem; color: var(--el-color-danger); }
+.field-warn { margin: 6px 0 0; font-size: 0.8rem; color: var(--el-color-warning); }
+.opt-meta { float: right; margin-left: 12px; color: var(--text-tertiary); font-size: 0.8rem; }
+.opt-meta.at-capacity { color: var(--el-color-warning); }
 .note { margin: 4px 0 0; font-size: 0.8rem; color: var(--text-secondary); line-height: 1.45; }
 .full { width: 100%; }
 </style>

@@ -109,6 +109,31 @@ test('pill types: stages, commands, and clear_failed as danger', () => {
   assert.equal(fmt.commandStatusPill('claimed').label, 'running')
   assert.equal(fmt.deviceStatusPill(null).label, 'unclaimed')
   assert.deepEqual(fmt.deviceStatusPill('clear_failed'), { label: 'clear failed', type: 'danger' })
+  assert.deepEqual(fmt.deviceStatusPill('assign_failed'), { label: 'assign failed', type: 'danger' })
+  assert.equal(fmt.isStuck('assign_failed'), true)
+  assert.equal(fmt.isStuck('clear_failed'), true)
+  assert.equal(fmt.isStuck('assigning'), false)
+})
+
+test('bridge capacity: known, full, unknown, and the tag already on the bridge', () => {
+  const full = fmt.bridgeCapacity({ id: 'b1', max_tags: 10, assigned_count: 10 })
+  assert.equal(full.label, '10 / 10 tags')
+  assert.equal(full.full, true)
+  assert.match(full.tooltip, /full/)
+  assert.match(full.tooltip, /released tag still holds its slot/)
+
+  const room = fmt.bridgeCapacity({ id: 'b1', max_tags: 10, assigned_count: 3 })
+  assert.deepEqual([room.label, room.full], ['3 / 10 tags', false])
+
+  const unknown = fmt.bridgeCapacity({ id: 'b2', max_tags: null, assigned_count: 1 })
+  assert.deepEqual([unknown.label, unknown.full, unknown.max], ['1 tag', false, null])
+  assert.match(unknown.tooltip, /has not reported/)
+  assert.equal(fmt.bridgeCapacity({ id: 'b3' }).label, '0 tags')
+
+  // Keeping a tag on its own full bridge needs no new slot (the server leaves it out too).
+  assert.equal(fmt.bridgeCapacity({ id: 'b1', max_tags: 2, assigned_count: 2 }, { id: 't', bridge_device_id: 'b1' }).full, false)
+  assert.equal(fmt.bridgeCapacity({ id: 'b1', max_tags: 2, assigned_count: 2 }, { id: 't', bridge_device_id: 'b9' }).full, true)
+  assert.equal(fmt.bridgeCapacity({ id: 'b1', max_tags: 2, assigned_count: 2 }, { id: 't', bridge_device_id: null }).full, true)
 })
 
 test('cancel wording: a card the companion holds can still be cancelled', () => {
