@@ -81,6 +81,7 @@ _ADMIN_HINTS = {
     "bridge_not_found": "The bridge must be on the same companion as the tag: cremind tags hardware list",
     "unknown_profile": "List profiles: cremind profile list",
     "use_tag_endpoint": "Use `cremind tags hardware claim`, `assign` or `release` instead.",
+    "tag_owned": "Release it first: cremind tags hardware release <tag>",
     "unknown_command": "Kinds: scan_unprovisioned, provision_bridge, configure_bridge, remove_bridge, "
                        "identify, refresh_tag, install_fontpack, collect_diagnostics.",
 }
@@ -106,11 +107,12 @@ def _api_detail(e: Any) -> Optional[dict[str, Any]]:
     return detail if isinstance(detail, dict) else None
 
 
-def _explain(e: Any, *, admin: bool) -> None:
+def _explain(e: Any, *, admin: bool, hints: Optional[dict[str, str]] = None) -> None:
     """Print a Tags API error (code, message, field details, hint) and exit 1.
 
-    Returns normally for a body it does not recognise, so the caller re-raises
-    and `graceful_errors` prints the generic line.
+    `hints` overrides the table for this one call (a hint that names the
+    user's own argument). Returns normally for a body it does not recognise,
+    so the caller re-raises and `graceful_errors` prints the generic line.
     """
     if admin and getattr(e, "status", None) == 403:
         _fail(_ADMIN_REQUIRED)
@@ -126,13 +128,14 @@ def _explain(e: Any, *, admin: bool) -> None:
     details = detail.get("details")
     if isinstance(details, dict):
         lines += [f"  {field}: {why}" for field, why in details.items()]
-    hint = (_ADMIN_HINTS if admin else _HINTS).get(code)
+    hint = (hints or {}).get(code) or (_ADMIN_HINTS if admin else _HINTS).get(code)
     if hint:
         lines.append(hint)
     _fail("\n".join(lines))
 
 
-def _call(ctx: typer.Context, fn: Callable[[Any], Awaitable[Any]], *, admin: bool = False) -> Any:
+def _call(ctx: typer.Context, fn: Callable[[Any], Awaitable[Any]], *, admin: bool = False,
+          hints: Optional[dict[str, str]] = None) -> Any:
     """Run `fn(client)` against the server; explain a Tags API error and exit 1."""
     import asyncio
 
@@ -149,7 +152,7 @@ def _call(ctx: typer.Context, fn: Callable[[Any], Awaitable[Any]], *, admin: boo
     try:
         return asyncio.run(_go())
     except APIError as e:
-        _explain(e, admin=admin)
+        _explain(e, admin=admin, hints=hints)
         raise
 
 
@@ -202,6 +205,11 @@ def _screen(device: dict[str, Any]) -> str:
 def _label(device: dict[str, Any]) -> str:
     """How a device is named in a sentence: its name, else its hardware id, else its id."""
     return str(device.get("name") or device.get("hw_id") or device.get("id") or "")
+
+
+def _shell_arg(value: str) -> str:
+    """`value` as one shell word in a suggested command (quoted when it has to be)."""
+    return value if re.fullmatch(r"[\w.:@/+-]+", value) else '"' + value.replace('"', '\\"') + '"'
 
 
 def _rows(value: Any) -> list[dict[str, Any]]:
@@ -383,41 +391,38 @@ def _route_specs(values: Optional[list[str]]) -> dict[str, Any]:
     return specs
 
 
-async def _resolve_routes(specs: dict[str, Any], kinds: list[str],
-                          resolve: Callable[[str], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
-    unknown = [k for k in specs if kinds and k not in kinds]
-    if unknown:
-        _fail(f"--route: unknown card kind {', '.join(unknown)}. Kinds: {', '.join(kinds)}")
-    out: dict[str, Any] = {}
-    for kind, value in specs.items():
-        if isinstance(value, list):
-            out[kind] = [(await resolve(ref))["id"] for ref in value]
-        else:
-            out[kind] = value
-    return out
+def _check_no_clash(changes: dict[str, Any], specs: dict[str, Any], inherit: list[str]) -> None:
+    """One PATCH cannot both set a setting and inherit it."""
+    clash = sorted({k for k in inherit if k in changes or (k == "routes" and specs)})
+    if clash:
+        _fail(f"--inherit {', '.join(clash)} contradicts a value given for it in the same command; "
+              "pass one or the other.")
 
 
-def _merge_options(own: dict[str, Any], changes: dict[str, Any], routes: dict[str, Any],
-                   inherit: list[str]) -> dict[str, Any]:
-    """The new override object: drop `inherit` keys, then apply the changes."""
-    import copy
+def _needs_lookup(specs: dict[str, Any]) -> bool:
+    """Whether a `--route` names a tag by anything but its full id."""
+    return any(isinstance(v, list) and not all(_UUID_RE.match(r) for r in v) for v in specs.values())
 
-    out = copy.deepcopy(own or {})
+
+async def _options_patch(changes: dict[str, Any], specs: dict[str, Any], inherit: list[str],
+                         resolve: Callable[[str], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+    """The partial options object the PATCH routes merge: values given
+    replace, `None` drops an override (inherit again), `routes` is per kind.
+    Card kinds and values are validated by the server (422 invalid_settings)."""
+    patch: dict[str, Any] = dict(changes)
     for key in inherit:
-        out.pop(key, None)
-    out.update(changes)
-    if routes:
-        merged = dict(out.get("routes") or {})
-        for kind, value in routes.items():
+        patch[key] = None
+    if specs:
+        routes: dict[str, Any] = {}
+        for kind, value in specs.items():
             if value is _INHERIT:
-                merged.pop(kind, None)
+                routes[kind] = None
+            elif isinstance(value, list):
+                routes[kind] = [(await resolve(ref))["id"] for ref in value]
             else:
-                merged[kind] = value
-        if merged:
-            out["routes"] = merged
-        else:
-            out.pop("routes", None)
-    return out
+                routes[kind] = value
+        patch["routes"] = routes
+    return patch
 
 
 def _route_text(value: Any) -> str:
@@ -637,21 +642,18 @@ def tags_set(
     inherit_keys = _inherit_keys(inherit)
     if enable is None and not changes and not specs and not inherit_keys:
         _fail("nothing to change — pass at least one option (cremind tags set --help).")
+    _check_no_clash(changes, specs, inherit_keys)
 
     async def go(client: Any) -> dict[str, Any]:
         body: dict[str, Any] = {}
         if enable is not None:
             body["enabled"] = enable
         if changes or specs or inherit_keys:
-            current = await api.get_settings(client)
-            kinds = [str(k) for k in current.get("routable_kinds") or []]
-            owned = None
-            if any(isinstance(v, list) and not all(_UUID_RE.match(r) for r in v) for v in specs.values()):
-                owned = await api.overview(client)
-            routes = await _resolve_routes(specs, kinds, lambda ref: _owned_tag(client, ref, overview=owned))
-            own = current.get("options") if isinstance(current.get("options"), dict) else {}
-            body["options"] = _merge_options(own, changes, routes, inherit_keys)
-        return await api.put_settings(client, body)
+            owned = await api.overview(client) if _needs_lookup(specs) else None
+            body["options"] = await _options_patch(
+                changes, specs, inherit_keys, lambda ref: _owned_tag(client, ref, overview=owned),
+            )
+        return await api.patch_settings(client, body)
 
     out = _call(ctx, go)
     if mode.json:
@@ -665,7 +667,7 @@ def tags_set(
 def tags_rename(
     ctx: typer.Context,
     tag: str = typer.Argument(..., help="The tag: id, id prefix, hardware id or name."),
-    name: str = typer.Argument(..., help="The new name (at most 128 characters)."),
+    name: str = typer.Argument(..., help="The new name (1-128 characters)."),
 ) -> None:
     """Rename one of your tags."""
     from app.cli.client import tags as api
@@ -1339,7 +1341,7 @@ def hardware_release(
 def hardware_rename(
     ctx: typer.Context,
     device: str = typer.Argument(..., help="Any device: id, id prefix, hardware id or name."),
-    name: str = typer.Argument(..., help="The new name (at most 128 characters)."),
+    name: str = typer.Argument(..., help="The new name (1-128 characters)."),
 ) -> None:
     """Rename any gateway, bridge or tag."""
     from app.cli.client import tags as api
@@ -1366,31 +1368,37 @@ def hardware_forget(
     device: str = typer.Argument(..., help="Any device: id, id prefix, hardware id or name."),
     yes: bool = typer.Option(False, "--yes", help="Really forget it (without this, nothing changes)."),
 ) -> None:
-    """Delete a device record and its delivery history."""
+    """Delete a device record and its delivery history. A tag a profile owns must be released first."""
     from app.cli.client import tags as api
     from app.cli.output import print_json
 
     mode = _mode(ctx)
+    release = f"cremind tags hardware release {_shell_arg(device)}"
+    owned_message = "Release it first, so its screen is blanked and its epoch moves on: " + release
 
     async def go(client: Any) -> dict[str, Any]:
+        if yes:
+            found = await _hardware_device(client, device)
+            return await api.delete_hardware_device(client, found["id"])
         inv = await api.hardware_inventory(client)
         found = await _hardware_device(client, device, inventory=inv)
-        if not yes:
-            full = next((d for d in _rows(inv.get("devices")) if d.get("id") == found["id"]), found)
-            owner = full.get("owner_profile")
-            note = (f" It still belongs to {owner}: release it first (cremind tags hardware release) "
-                    "so its screen is blanked." if owner else "")
-            _fail(f"This would forget {full.get('kind') or 'device'} {_label(full)} and its delivery history; "
-                  "if the companion still reports it, it comes back as a new, unclaimed device." + note +
-                  "\nNothing was changed. Re-run with --yes to apply.", code=2)
-        return await api.delete_hardware_device(client, found["id"])
+        full = next((d for d in _rows(inv.get("devices")) if d.get("id") == found["id"]), found)
+        if full.get("kind") == "tag" and full.get("owner_profile"):
+            _fail(f"tag {_label(full)} belongs to {full['owner_profile']}, so it cannot be forgotten.\n"
+                  + owned_message)
+        _fail(f"This would forget {full.get('kind') or 'device'} {_label(full)} and its delivery history; "
+              "if the companion still reports it, it comes back as a new, unclaimed device.\n"
+              "Nothing was changed. Re-run with --yes to apply.", code=2)
 
-    out = _call(ctx, go, admin=True)
+    out = _call(ctx, go, admin=True, hints={"tag_owned": owned_message})
     if mode.json:
         print_json(out)
         return
     d = out.get("device") if isinstance(out.get("device"), dict) else {}
-    sys.stdout.write(f"forgot {d.get('kind', '')} {_label(d)}\n")
+    epoch = ""
+    if d.get("kind") == "tag" and out.get("last_epoch") is not None:
+        epoch = f" (last epoch {out['last_epoch']})"
+    sys.stdout.write(f"forgot {d.get('kind', '')} {_label(d)}{epoch}\n")
 
 
 def _render_defaults(mode: Any, out: dict[str, Any]) -> None:
@@ -1452,19 +1460,15 @@ def hardware_set_defaults(
     inherit_keys = _inherit_keys(inherit)
     if not changes and not specs and not inherit_keys:
         _fail("nothing to change — pass at least one option (cremind tags hardware set-defaults --help).")
+    _check_no_clash(changes, specs, inherit_keys)
 
     async def go(client: Any) -> dict[str, Any]:
-        current = await api.get_defaults(client)
-        builtin = current.get("builtin") if isinstance(current.get("builtin"), dict) else {}
-        kinds = [str(k) for k in (builtin.get("routes") or {})]
-        inv = None
-        if any(isinstance(v, list) and not all(_UUID_RE.match(r) for r in v) for v in specs.values()):
-            inv = await api.hardware_inventory(client)
-        routes = await _resolve_routes(
-            specs, kinds, lambda ref: _hardware_device(client, ref, kind="tag", inventory=inv),
+        inv = await api.hardware_inventory(client) if _needs_lookup(specs) else None
+        patch = await _options_patch(
+            changes, specs, inherit_keys,
+            lambda ref: _hardware_device(client, ref, kind="tag", inventory=inv),
         )
-        defaults = current.get("defaults") if isinstance(current.get("defaults"), dict) else {}
-        return await api.put_defaults(client, _merge_options(defaults, changes, routes, inherit_keys))
+        return await api.patch_defaults(client, patch)
 
     out = _call(ctx, go, admin=True)
     if mode.json:

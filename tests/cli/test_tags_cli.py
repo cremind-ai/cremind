@@ -106,6 +106,7 @@ def _responses() -> dict:
                      "counts": {"devices": 2, "active_deliveries": 1, "needs_input": 1, "failed_24h": 0}},
         "get_settings": SETTINGS,
         "put_settings": SETTINGS,
+        "patch_settings": SETTINGS,
         "get_device": {"device": _device(DESK, "Desk", "1A2B3C4D"), "deliveries": [_delivery()]},
         "rename_device": {"device": _device(DESK, "Office", "1A2B3C4D")},
         "display": {"delivery": _delivery()},
@@ -137,11 +138,14 @@ def _responses() -> dict:
         "release_tag": {"device": _device(DESK, "Desk", "1A2B3C4D", owner_profile=None, epoch=5),
                         "commands": [_command("clear_tag")]},
         "rename_hardware_device": {"device": {**_device(BRIDGE, "Hall", "br-9f"), "kind": "bridge"}},
-        "delete_hardware_device": {"deleted": True, "device": _device(KITCHEN, "", "5E6F7A8B")},
+        "delete_hardware_device": {"deleted": True, "device": _device(KITCHEN, "", "5E6F7A8B", owner_profile=None,
+                                                                      epoch=6),
+                                   "last_epoch": 6},
         "get_defaults": {"defaults": {"language": "vi", "routes": {"usage": "all"}},
                          "builtin": {"layout": "status", "language": "en",
                                      "routes": {"notification": "all", "usage": "none"}}},
         "put_defaults": {"defaults": {"language": "en"}, "builtin": {"layout": "status", "routes": {}}},
+        "patch_defaults": {"defaults": {"qr_links": True}, "builtin": {"layout": "status", "routes": {}}},
     }
 
 
@@ -260,24 +264,36 @@ def test_settings_shows_each_value_and_where_it_comes_from(api):
     assert "push_pin" in out
 
 
-def test_set_merges_into_the_profiles_own_overrides(api):
+def test_set_patches_only_the_settings_given(api):
+    """PATCH merges server-side, so nothing is read first: values replace,
+    `--inherit X` sends X: null, `KIND=inherit` sends that route as null."""
     result = _run(
         "tags", "set", "--layout", "status", "--no-excerpts", "--timezone", "own",
-        "--route", "needs_input=Kitchen,Desk", "--route", "usage=inherit", "--inherit", "language",
+        "--route", "needs_input=Kitchen,Desk", "--route", "usage=inherit", "--route", "task-outcome=none",
+        "--inherit", "language",
     )
     assert result.exit_code == 0, result.output
-    [(args, _)] = _calls(api, "put_settings")
-    assert args == ({"options": {
-        "layout": "status", "show_excerpts": False, "timezone": "",
-        "routes": {"notification": "none", "needs_input": [KITCHEN, DESK]},
-    }},)
+    assert _calls(api, "patch_settings") == [(({"options": {
+        "layout": "status", "show_excerpts": False, "timezone": "", "language": None,
+        "routes": {"needs_input": [KITCHEN, DESK], "usage": None, "task_outcome": "none"},
+    }},), {})]
+    assert _calls(api, "get_settings") == [] and _calls(api, "put_settings") == []
+    assert len(_calls(api, "overview")) == 1  # one lookup for both tag names
 
 
-def test_set_enable_alone_leaves_the_options_untouched(api):
+def test_set_enable_alone_sends_no_options(api):
     result = _run("tags", "set", "--enable")
     assert result.exit_code == 0, result.output
-    assert _calls(api, "put_settings") == [(({"enabled": True},), {})]
-    assert _calls(api, "get_settings") == []
+    assert _calls(api, "patch_settings") == [(({"enabled": True},), {})]
+    assert _calls(api, "overview") == []
+
+
+def test_set_inherit_routes_drops_every_route_override(api):
+    result = _run("tags", "set", "--disable", "--inherit", "routes", "--inherit", "qr-links")
+    assert result.exit_code == 0, result.output
+    assert _calls(api, "patch_settings") == [
+        (({"enabled": False, "options": {"routes": None, "qr_links": None}},), {}),
+    ]
 
 
 def test_set_with_nothing_to_change_is_refused(api):
@@ -287,15 +303,34 @@ def test_set_with_nothing_to_change_is_refused(api):
     assert api["calls"] == []
 
 
-def test_set_rejects_an_unknown_card_kind_before_writing(api):
+@pytest.mark.parametrize("argv", [
+    ["--layout", "status", "--inherit", "layout"],
+    ["--route", "usage=all", "--inherit", "routes"],
+])
+def test_set_refuses_to_set_and_inherit_the_same_setting(api, argv):
+    result = _run("tags", "set", *argv)
+    assert result.exit_code == 1
+    assert "contradicts" in result.output
+    assert api["calls"] == []
+
+
+def test_set_refuses_an_unknown_inherit_name_locally(api):
+    result = _run("tags", "set", "--inherit", "colour")
+    assert result.exit_code == 1
+    assert "unknown setting" in result.output
+    assert api["calls"] == []
+
+
+def test_set_surfaces_the_servers_rejection_of_an_unknown_card_kind(api):
+    api["raise"]["patch_settings"] = _tag_error(422, "invalid_settings", "routes.weather: unknown card kind",
+                                                details={"routes.weather": "unknown card kind"})
     result = _run("tags", "set", "--route", "weather=all")
     assert result.exit_code == 1
-    assert "unknown card kind weather" in result.output
-    assert _calls(api, "put_settings") == []
+    assert "  routes.weather: unknown card kind" in result.output
 
 
 def test_set_prints_each_rejected_field(api):
-    api["raise"]["put_settings"] = _tag_error(
+    api["raise"]["patch_settings"] = _tag_error(
         422, "invalid_settings", "progress_cadence_s: must be a number of seconds between 60 and 3600",
         details={"progress_cadence_s": "must be a number of seconds between 60 and 3600"},
     )
@@ -310,6 +345,17 @@ def test_rename(api):
     assert result.exit_code == 0, result.output
     assert _calls(api, "rename_device") == [((DESK, "Office"), {})]
     assert "Office" in result.output
+
+
+@pytest.mark.parametrize("argv, fn", [
+    (["tags", "rename", DESK, "  "], "rename_device"),
+    (["tags", "hardware", "rename", BRIDGE, ""], "rename_hardware_device"),
+])
+def test_a_blank_name_is_refused_with_the_servers_reason(api, argv, fn):
+    api["raise"][fn] = _tag_error(422, "invalid_name", "'name' must be 1 to 128 characters.")
+    result = _run(*argv)
+    assert result.exit_code == 1
+    assert "422: invalid_name: 'name' must be 1 to 128 characters." in result.output
 
 
 def test_display_sends_the_note_with_a_body_file(api, tmp_path):
@@ -596,13 +642,45 @@ def test_hardware_assign_release_rename(api):
 
 
 def test_hardware_forget_changes_nothing_without_yes(api):
-    dry = _run("tags", "hardware", "forget", "Desk")
+    dry = _run("tags", "hardware", "forget", "5E6F7A8B")
     assert dry.exit_code == 2
-    assert "It still belongs to alice" in dry.output and "Re-run with --yes" in dry.output
+    assert "comes back as a new, unclaimed device" in dry.output and "Re-run with --yes" in dry.output
     assert _calls(api, "delete_hardware_device") == []
-    done = _run("tags", "hardware", "forget", "Desk", "--yes")
+    done = _run("tags", "hardware", "forget", "5E6F7A8B", "--yes")
     assert done.exit_code == 0, done.output
-    assert _calls(api, "delete_hardware_device") == [((DESK,), {})]
+    assert _calls(api, "delete_hardware_device") == [((KITCHEN,), {})]
+    assert "(last epoch 6)" in done.output
+
+
+def test_hardware_forget_of_an_owned_tag_says_to_release_it_first(api):
+    """The dry run knows from the inventory; it does not suggest --yes, which
+    the server would refuse anyway."""
+    dry = _run("tags", "hardware", "forget", "Desk")
+    assert dry.exit_code == 1
+    assert "belongs to alice" in dry.output
+    assert "release it first" in dry.output.lower()
+    assert "cremind tags hardware release Desk" in dry.output
+    assert "--yes" not in dry.output
+    assert _calls(api, "delete_hardware_device") == []
+
+
+def test_hardware_forget_explains_the_servers_tag_owned_refusal(api):
+    api["raise"]["delete_hardware_device"] = _tag_error(
+        409, "tag_owned", "The tag is owned by 'alice'; release it first "
+        "(POST /api/tags/hardware/tags/{id}/release).", device=_device(DESK, "Desk", "1A2B3C4D"),
+    )
+    api["responses"]["hardware_inventory"]["devices"][0]["name"] = "Front desk"
+    result = _run("tags", "hardware", "forget", "Front desk", "--yes")
+    assert result.exit_code == 1, result.output
+    assert "409: tag_owned" in result.output
+    assert 'cremind tags hardware release "Front desk"' in result.output
+
+
+def test_hardware_forget_by_full_id_with_yes_skips_the_inventory(api):
+    result = _run("tags", "hardware", "forget", KITCHEN, "--yes")
+    assert result.exit_code == 0, result.output
+    assert _calls(api, "hardware_inventory") == []
+    assert _calls(api, "delete_hardware_device") == [((KITCHEN,), {})]
 
 
 def test_hardware_defaults_and_set_defaults(api):
@@ -610,9 +688,16 @@ def test_hardware_defaults_and_set_defaults(api):
     assert shown.exit_code == 0, shown.output
     assert "ADMIN DEFAULT" in shown.output or "admin default" in shown.output.lower()
     result = _run("tags", "hardware", "set-defaults", "--qr-links", "--route", "usage=inherit",
-                  "--route", "notification=none", "--inherit", "language")
+                  "--route", "notification=none", "--route", f"needs_input={DESK},5E6F7A8B",
+                  "--inherit", "language")
     assert result.exit_code == 0, result.output
-    assert _calls(api, "put_defaults") == [(({"qr_links": True, "routes": {"notification": "none"}},), {})]
+    assert _calls(api, "patch_defaults") == [(({
+        "qr_links": True, "language": None,
+        "routes": {"usage": None, "notification": "none", "needs_input": [DESK, KITCHEN]},
+    },), {})]
+    assert _calls(api, "get_defaults") == [((), {})]  # the `defaults` read above, none for the write
+    assert _calls(api, "put_defaults") == []
+    assert len(_calls(api, "hardware_inventory")) == 1
 
 
 def test_set_defaults_with_nothing_to_change_is_refused(api):
@@ -662,6 +747,7 @@ def test_the_client_builds_the_documented_requests(tmp_path):
         await c.overview(cl)
         await c.get_settings(cl)
         await c.put_settings(cl, {"enabled": True})
+        await c.patch_settings(cl, {"options": {"language": None}})
         await c.get_device(cl, "a/b")
         await c.rename_device(cl, "d1", "Desk")
         await c.display(cl, "d1", {"title": "t"})
@@ -693,6 +779,7 @@ def test_the_client_builds_the_documented_requests(tmp_path):
         await c.delete_hardware_device(cl, "t1")
         await c.get_defaults(cl)
         await c.put_defaults(cl, {"language": "vi"})
+        await c.patch_defaults(cl, {"routes": {"usage": None}})
         return saved
 
     saved = asyncio.run(go())
@@ -702,6 +789,7 @@ def test_the_client_builds_the_documented_requests(tmp_path):
         ("GET", "/api/tags", None),
         ("GET", "/api/tags/settings", None),
         ("PUT", "/api/tags/settings", {"enabled": True}),
+        ("PATCH", "/api/tags/settings", {"options": {"language": None}}),
         ("GET", "/api/tags/devices/a%2Fb", None),
         ("PATCH", "/api/tags/devices/d1", {"name": "Desk"}),
         ("POST", "/api/tags/devices/d1/display", {"title": "t"}),
@@ -734,6 +822,7 @@ def test_the_client_builds_the_documented_requests(tmp_path):
         ("DELETE", "/api/tags/hardware/devices/t1", None),
         ("GET", "/api/tags/hardware/defaults", None),
         ("PUT", "/api/tags/hardware/defaults", {"defaults": {"language": "vi"}}),
+        ("PATCH", "/api/tags/hardware/defaults", {"defaults": {"routes": {"usage": None}}}),
     ]
 
 

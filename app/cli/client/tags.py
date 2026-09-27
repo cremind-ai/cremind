@@ -40,6 +40,12 @@ async def put_settings(client, body: dict[str, Any]) -> dict[str, Any]:
     return _obj(await client.put_json("/api/tags/settings", body))
 
 
+async def patch_settings(client, body: dict[str, Any]) -> dict[str, Any]:
+    """`{enabled?, options?}` — `options` MERGES: keys given replace, `null`
+    drops the profile's override (inherit again), `routes` merges per kind."""
+    return _obj(await client.patch_json("/api/tags/settings", body))
+
+
 async def get_device(client, device_id: str) -> dict[str, Any]:
     """`{device, deliveries}` (the 20 latest deliveries)."""
     return _obj(await client.get_json(f"/api/tags/devices/{_seg(device_id)}"))
@@ -212,3 +218,9 @@ async def get_defaults(client) -> dict[str, Any]:
 async def put_defaults(client, defaults: dict[str, Any]) -> dict[str, Any]:
     """Replace the admin defaults (the whole object) -> `{defaults, builtin}`."""
     return _obj(await client.put_json("/api/tags/hardware/defaults", {"defaults": defaults}))
+
+
+async def patch_defaults(client, defaults: dict[str, Any]) -> dict[str, Any]:
+    """Merge into the admin defaults (`null` drops one, `routes` merges per
+    kind) -> `{defaults, builtin}`."""
+    return _obj(await client.patch_json("/api/tags/hardware/defaults", {"defaults": defaults}))

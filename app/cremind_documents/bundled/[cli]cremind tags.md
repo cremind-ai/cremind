@@ -59,6 +59,8 @@ preview revisions) and its 20 latest deliveries.
 cremind tags rename <tag> <name>
 ```
 
+The name is 1–128 characters; a blank one is refused (`422 invalid_name`).
+
 ### `cremind tags display`
 
 Pin a note on a tag.
@@ -77,8 +79,8 @@ cremind tags display <tag> <title> [--body <text> | --body-file <path>] [--icon 
 The title is at most 120 characters. Text that looks like a one-time code (4–8
 digits near a word such as "code", "OTP", "PIN", "passcode" or "verification")
 is refused with `422 otp_refused` and nothing is sent: codes are never shown on
-a tag. Tokens and passwords in the text are masked, and line breaks become
-spaces.
+a tag. The title is one line; the body keeps its line breaks (a run of blank
+lines becomes one). Tokens and passwords in the text are masked.
 
 ### `cremind tags clear`, `refresh` and `identify`
 
@@ -127,7 +129,9 @@ the icon names.
 
 ### `cremind tags set`
 
-Only what you pass changes.
+Only what you pass changes: the command sends just those settings and the
+server merges them into this profile's own, so a change made elsewhere at the
+same time is kept. A setting cannot be both given and inherited in one command.
 
 ```bash
 cremind tags set [--enable|--disable] [--layout <name>] [--excerpts|--no-excerpts]
@@ -144,7 +148,7 @@ cremind tags set [--enable|--disable] [--layout <name>] [--excerpts|--no-excerpt
 | `--progress-cadence` | Seconds between progress screens, 60–3600 (built-in 300). |
 | `--language` | Language of tag text, e.g. `en`, `vi`. |
 | `--timezone` | A timezone name or UTC offset; `own` = the profile's Cremind timezone. |
-| `--route` | `KIND=all` (every tag you own), `KIND=none`, `KIND=<tag>[,<tag>...]`, or `KIND=inherit`. Repeatable. |
+| `--route` | `KIND=all` (every tag you own), `KIND=none`, `KIND=<tag>[,<tag>...]`, or `KIND=inherit` (drop your route for that kind). Repeatable. |
 | `--inherit` | Drop your own value for `layout`, `excerpts`, `qr-links`, `progress-cadence`, `language`, `timezone` or `routes`: the admin default applies, else the built-in. Repeatable. |
 
 Card kinds: `notification`, `task_outcome`, `needs_input`, `excerpt`,
@@ -262,7 +266,9 @@ cremind --json tags deliveries list --state failed | jq '.deliveries[] | {id, de
   owner. Try again in a minute.
 - **`422 invalid_title`, `invalid_body`, `invalid_icon`, `invalid_ttl`** — see
   the limits under `display`.
-- **`422 invalid_settings`** — one line per rejected field follows.
+- **`422 invalid_settings`** — one line per rejected field follows (an
+  unknown card kind shows as `routes.<kind>`).
+- **`422 invalid_name`** — a name must be 1–128 characters.
 - **`404 no_preview`** — the companion has not uploaded that screen yet.
 - **Nothing reaches a tag** — check `cremind tags settings` (enabled, the
   kind's route), that the companion is online (`cremind tags companions`), and

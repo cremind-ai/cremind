@@ -18,8 +18,9 @@ prefix or name. Timestamps in `--json` output are epoch **milliseconds**.
 
 ## Finding this in the web UI
 
-> **Settings → Tags** (admin profile) — companions, the device inventory,
-> hardware commands, who owns each tag, and the defaults profiles inherit.
+> **Settings → Tags → Hardware** (admin profile) — companions, the device
+> inventory, hardware commands, who owns each tag, and the defaults profiles
+> inherit.
 
 ## Global flags
 
@@ -147,9 +148,13 @@ cremind tags hardware rename <device> <name>
 cremind tags hardware forget <device> --yes
 ```
 
+A name is 1–128 characters; a blank one is refused (`422 invalid_name`).
+
 `forget` deletes the device's record and delivery history (without `--yes` it
-only explains and exits 2). A device the companion still reports comes back
-as a new, unclaimed one. Release an owned tag first so its screen is blanked.
+only explains and exits 2) and prints the tag's last epoch. A tag a profile
+owns is refused (`409 tag_owned`): release it first (`cremind tags hardware
+release <tag>`), which blanks its screen and moves its epoch on. A device the
+companion still reports comes back as a new, unclaimed one.
 
 ## Defaults for every profile
 
@@ -163,8 +168,9 @@ Each setting and card route: the admin default next to the built-in value.
 
 ### `cremind tags hardware set-defaults`
 
-Only what you pass changes. A profile's own value (`cremind tags set`) still
-wins over these.
+Only what you pass changes: just those settings are sent and merged into the
+current defaults. A profile's own value (`cremind tags set`) still wins over
+these.
 
 ```bash
 cremind tags hardware set-defaults [--layout <name>] [--excerpts|--no-excerpts]
@@ -215,6 +221,8 @@ cremind --json tags hardware list | jq '.devices[] | select(.kind == "tag" and .
 - **`422 bridge_not_found`** — that bridge is not on the tag's companion.
 - **`422 unknown_profile`** — no such profile (`cremind profile list`).
 - **`422 use_tag_endpoint`** — use `claim`, `assign` or `release`.
+- **`409 tag_owned`** on `forget` — a profile owns the tag; `release` it first.
+- **`422 invalid_name`** — a name must be 1–128 characters.
 - **`422 unknown_command` / `invalid_args`** — see the kinds table under `run`.
 - **A command stays `queued`** — the companion is offline or not connected;
   check `ONLINE` in `list`. Unclaimed commands expire (tag ownership after 7

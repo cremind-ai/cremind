@@ -103,7 +103,8 @@ def test_the_descriptions_carry_what_users_ask_and_point_at_each_other():
 
 def test_the_docs_name_their_web_ui_places():
     assert "Sidebar → Tags" in _doc_text() and "Settings → Tags" in _doc_text()
-    assert "Settings → Tags" in _doc_text(HARDWARE_DOC)
+    # /:profile/settings/tags/hardware, shown to the admin profile only.
+    assert "Settings → Tags → Hardware** (admin profile)" in _doc_text(HARDWARE_DOC)
 
 
 @pytest.mark.parametrize("doc", ALL_DOCS, ids=lambda d: d.name)
@@ -114,15 +115,18 @@ def test_every_json_example_runs_the_tags_group_with_the_root_flag(doc):
 
 
 def test_the_docs_explain_what_a_script_cannot_guess():
-    text = _doc_text()
+    text = " ".join(_doc_text().split())  # prose is wrapped; compare it unwrapped
     for word in ("otp_refused", "clear_pending", "device_not_found", "no_preview", "already_terminal",
-                 "invalid_settings", "--body-file", "stdin", "cremind-tag connect", "**once**",
-                 "milliseconds", "`own`", "KIND=inherit"):
+                 "invalid_settings", "invalid_name", "--body-file", "stdin", "cremind-tag connect", "**once**",
+                 "milliseconds", "`own`", "KIND=inherit", "the body keeps its line breaks",
+                 "the server merges them"):
         assert word in text, f"tags doc never explains {word!r}"
-    hardware = _doc_text(HARDWARE_DOC)
+    assert "line breaks become" not in text, "bodies keep their line breaks now"
+    hardware = " ".join(_doc_text(HARDWARE_DOC).split())
     for word in ("403", "cremind -p admin", "bridge_required", "bridge_not_found", "unknown_profile",
-                 "use_tag_endpoint", "--yes", "exits 2", "cremind-tag connect", "**once**",
-                 "cremind tags credentials create", "milliseconds"):
+                 "use_tag_endpoint", "tag_owned", "invalid_name", "--yes", "exits 2", "last epoch",
+                 "release it first (`cremind tags hardware release <tag>`)", "cremind-tag connect", "**once**",
+                 "cremind tags credentials create", "milliseconds", "merged into the current defaults"):
         assert word in hardware, f"hardware doc never explains {word!r}"
 
 
@@ -134,12 +138,84 @@ def test_every_hint_the_cli_prints_is_a_code_the_docs_explain():
     documented = _doc_text() + _doc_text(HARDWARE_DOC)
     for code in ("otp_refused", "clear_pending", "device_not_found", "no_preview", "already_terminal",
                  "bridge_required", "bridge_not_found", "unknown_profile", "use_tag_endpoint",
-                 "unknown_command"):
+                 "unknown_command", "tag_owned"):
         assert code in cmd._HINTS or code in cmd._ADMIN_HINTS, code
         assert code in documented, code
 
 
 # ── lists the docs and the CLI spell out, pinned to the server ──────────────
+
+
+def test_every_request_the_client_makes_is_a_real_server_route(tmp_path):
+    """Each wrapper's method + path must match a route in app/api/tags.py or
+    app/api/tags_hardware.py — so `set` really PATCHes a merging route, and a
+    renamed or dropped endpoint fails here instead of in a user's terminal."""
+    import asyncio
+
+    import app.cli.client.tags as c
+    from app.api.tags import get_tags_routes
+    from app.api.tags_hardware import get_tags_hardware_routes
+
+    routes = [
+        (method, re.compile("^" + re.sub(r"\{[^}]+\}", "[^/]+", r.path) + "$"))
+        for r in [*get_tags_routes(), *get_tags_hardware_routes()]
+        for method in (r.methods or ()) if method != "HEAD"
+    ]
+    seen: list[tuple[str, str]] = []
+
+    class _Client:
+        async def get_json(self, path, *, params=None):
+            seen.append(("GET", path))
+            return {}
+
+        async def get_bytes(self, path, *, params=None):
+            seen.append(("GET", path))
+            return b"", {}
+
+        async def _body(self, method, path):
+            seen.append((method, path))
+            return {}
+
+        async def post_json(self, path, body=None, *, params=None):
+            return await self._body("POST", path)
+
+        async def put_json(self, path, body=None, *, params=None):
+            return await self._body("PUT", path)
+
+        async def patch_json(self, path, body=None, *, params=None):
+            return await self._body("PATCH", path)
+
+        async def delete(self, path, body=None, *, params=None):
+            return await self._body("DELETE", path)
+
+    samples = {"device_id": "d1", "delivery_id": 5, "companion_id": "c1", "credential_id": "k1",
+               "command_id": "m1", "name": "n", "body": {}, "defaults": {}, "kind": "identify",
+               "owner": "bob", "bridge_id": "b1", "path": tmp_path / "p.png", "label": None, "args": None}
+
+    async def go():
+        cl = _Client()
+        for name, fn in inspect.getmembers(c, inspect.iscoroutinefunction):
+            if name.startswith("_") or fn.__module__ != c.__name__:
+                continue
+            params = [p for p in inspect.signature(fn).parameters.values()
+                      if p.name != "client" and p.default is inspect.Parameter.empty
+                      and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+            await fn(cl, *[samples[p.name] for p in params])
+
+    asyncio.run(go())
+    assert ("PATCH", "/api/tags/settings") in seen and ("PATCH", "/api/tags/hardware/defaults") in seen
+    unmatched = [(m, p) for m, p in seen if not any(m == rm and rx.match(p) for rm, rx in routes)]
+    assert not unmatched, f"the CLI calls endpoints the server does not serve: {unmatched}"
+
+
+def test_set_and_set_defaults_use_the_merging_routes():
+    """`tags set` / `hardware set-defaults` send only the flags given, so they
+    must use PATCH (merge), never PUT (which would wipe every other override)."""
+    from app.cli.commands import tags as cmd
+
+    source = inspect.getsource(cmd)
+    assert "api.patch_settings(" in source and "api.patch_defaults(" in source
+    assert "api.put_settings(" not in source and "api.put_defaults(" not in source
 
 
 def test_the_hardware_command_kinds_match_the_server():
