@@ -231,6 +231,13 @@ class ConversationStorage:
 
             async with self.engine.begin() as conn:
                 woken = await release_profile_tags(conn, name)
+            if await self._has_tag_setup_tables():
+                # The profile's own Connect workers (private hardware) are
+                # revoked outright: credentials revoked, tombstones kept.
+                from app.tags.ownership import revoke_profile_workers
+
+                async with self.engine.begin() as conn:
+                    await revoke_profile_workers(conn, name)
         async with self.async_session_maker.begin() as session:
             # The rows a journalled write holds before it appends to the Tags
             # journal (a conversation, a run, a channel or its sender) go
@@ -253,6 +260,15 @@ class ConversationStorage:
 
             notify_commands(woken)
         return deleted
+
+    async def _has_tag_setup_tables(self) -> bool:
+        """Whether the simple-setup tables exist (migration 20261001_tag_setup). Cached."""
+        cached = getattr(self, "_tag_setup_tables", None)
+        if cached is None:
+            async with self.engine.connect() as conn:
+                cached = await conn.run_sync(lambda c: sa_inspect(c).has_table("tag_bindings"))
+            self._tag_setup_tables = bool(cached)
+        return bool(cached)
 
     async def _has_tag_tables(self) -> bool:
         """Whether the Tags tables exist (always, after migrations; a test

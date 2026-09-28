@@ -369,9 +369,11 @@ def get_tags_routes() -> list[Route]:
         unauth = require_auth(request)
         if unauth is not None:
             return unauth
+        # Shared (legacy) companions, and this profile's own Connect workers —
+        # never another profile's.
         companions = [
-            {k: c[k] for k in ("id", "name", "online", "last_seen_at", "version")}
-            for c in await store().list_companions()
+            {k: c[k] for k in ("id", "name", "online", "last_seen_at", "version", "mode")}
+            for c in await store().list_companions(private_owner=_profile(request))
         ]
         return JSONResponse({"companions": companions})
 

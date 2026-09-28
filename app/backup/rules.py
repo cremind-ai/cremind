@@ -77,6 +77,10 @@ _TOP_LEVEL_EXCLUDES: tuple[tuple[str, ...], ...] = (
     # HF_HOME / SENTENCE_TRANSFORMERS_HOME in the container image: embedding
     # models, downloaded again on first use.
     (".cache",),
+    # Cremind Tag's grant-signing and vault master keys (app/tags/authority.py):
+    # never in an ordinary backup. An ENCRYPTED backup can carry them when
+    # asked (BackupOptions.include_tag_authority).
+    (".tag-authority",),
 )
 
 # Each profile's own manual pages: ``storage/cremind_documents/profiles/<uuid>``

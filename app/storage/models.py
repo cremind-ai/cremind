@@ -73,6 +73,23 @@ Tables
 - tag_previews         : the last rendered screen of a tag (FK device CASCADE)
 - tag_settings         : whether a profile uses Tags, and its routing options
                         (FK profile CASCADE)
+- tag_authority        : this installation's grant authority (public half; the
+                        signing and vault master keys are files outside the DB)
+- tag_connect_installations : Cremind Connect installations that ran a
+                        profile's private worker (public identity only)
+- tag_bindings         : one row per paired v2 device: canonical identity,
+                        owner (profile name + UUID), worker, generation, pairing
+                        state. UNIQUE(device_id) (FK companion CASCADE,
+                        FK device SET NULL)
+- tag_setup_sessions   : five-minute Connect setup sessions (FK profile CASCADE)
+- tag_operations       : discovery / pairing / unpair / recovery operations and
+                        their stages (FK profile CASCADE, FK companion SET NULL)
+- tag_vault            : encrypted recovery state per worker subject, versioned
+                        (FK companion CASCADE). UNIQUE(companion_id, subject, version)
+- tag_revocations      : tombstones of removed v2 devices with their highest
+                        generation (no FK: they outlive profiles and companions)
+- tag_idempotency      : remembered answers to mutations sent with an
+                        Idempotency-Key
 """
 
 import uuid
@@ -1302,7 +1319,11 @@ class DocumentResearchJobModel(Base):
 
 
 class TagCompanionModel(Base):
-    """One PC companion. Hardware is system-wide: the admin registers it."""
+    """One PC companion. ``legacy_shared`` (every companion an admin
+    registered): system-wide hardware, as before. ``private`` (created by a
+    Connect setup session): one worker of ONE profile — its gateway, bridges
+    and tags belong to that profile only, and no other profile or admin API
+    sees them."""
 
     __tablename__ = "tag_companions"
 
@@ -1316,6 +1337,26 @@ class TagCompanionModel(Base):
     host: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The last heartbeat's companion/queue block, as sent.
     heartbeat: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # legacy_shared | private
+    mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="legacy_shared", server_default=text("'legacy_shared'"),
+    )
+    # Private workers only. Name AND immutable profile UUID: a profile deleted
+    # and recreated under the same name inherits nothing. No FK — deleting the
+    # profile revokes the worker explicitly and keeps its tombstones.
+    owner_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    owner_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    installation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The worker's X25519 controller key (hex); grants name it.
+    controller_pub: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Moves on every recovery onto another computer (old credentials revoked).
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    # active | recovering | removing | removed
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default=text("'active'"))
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    lease_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lease_credential_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    gateway_device_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class TagCredentialModel(Base):
@@ -1570,3 +1611,222 @@ class TagSettingsModel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+# ── Cremind Tag: simple device setup (protocol v2, cremind-tag docs/connect-setup.md) ──
+
+
+class TagAuthorityModel(Base):
+    """The installation's grant authority: the Ed25519 public key devices pin,
+    and the ids of the key files (``<SYS>/tags/authority/``) that hold the
+    signing key and the vault master key. One row (``id = "authority"``)."""
+
+    __tablename__ = "tag_authority"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    installation_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    authority_pub: Mapped[str] = mapped_column(String(64), nullable=False)
+    signing_kid: Mapped[str] = mapped_column(String(32), nullable=False)
+    master_kid: Mapped[str] = mapped_column(String(32), nullable=False)
+    # HMAC of a fixed label under the master key: tells a key file that
+    # belongs to this row from one that does not, without storing the key.
+    master_check: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class TagConnectInstallationModel(Base):
+    """A Cremind Connect installation (one per computer user) that bound a
+    setup session. Public identity only."""
+
+    __tablename__ = "tag_connect_installations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    public_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    computer: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    platform: Mapped[str] = mapped_column(String(16), nullable=False, default="", server_default=text("''"))
+    version: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    first_seen_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_seen_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class TagBindingModel(Base):
+    """One paired v2 device. ``device_id`` is the canonical identity (hex of
+    SHA-256(label | role | identity key)[0:16]) and is unique across every
+    worker, so a physical device can never be bound twice."""
+
+    __tablename__ = "tag_bindings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # gateway | bridge | tag
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    identity_pub: Mapped[str] = mapped_column(String(64), nullable=False)
+    short_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    companion_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="CASCADE"), nullable=False,
+    )
+    tag_device_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tag_devices.id", ondelete="SET NULL"), nullable=True,
+    )
+    owner_profile: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # pairing | paired | ready | recovery_pending | removal_pending | reconciling
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="pairing", server_default=text("'pairing'"))
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    # A grant was signed for gen -> gen + 1 and the device has not confirmed it.
+    pending_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    fw: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    board: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    paired_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ready_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("device_id", name="uq_tag_bindings_device"),
+        Index("ix_tag_bindings_companion", "companion_id"),
+        Index("ix_tag_bindings_owner", "owner_profile_id"),
+    )
+
+
+class TagSetupSessionModel(Base):
+    """A five-minute, single-use Connect setup session. Only the SHA-256 of
+    the launch-link token is stored."""
+
+    __tablename__ = "tag_setup_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # connect_gateway | recover | probe
+    operation: Mapped[str] = mapped_column(String(24), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    owner_profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # SHA-256 of the JWT that created the session: binds it to that sign-in.
+    session_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    server_origin: Mapped[str] = mapped_column(String(255), nullable=False)
+    server_nonce: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    installation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    installation_pub: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    computer: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    verification_phrase: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    gateway: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    companion_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    native_approved_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    browser_confirmed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    redeemed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    redeem_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        Index("ix_tag_setup_sessions_owner", "owner_profile", "created_at"),
+    )
+
+
+class TagOperationModel(Base):
+    """A hardware operation of a private worker: discovery, pairing, unpair,
+    recovery, … with its stage, its result and (sealed under the vault master
+    key, only while needed) the setup secret it works with."""
+
+    __tablename__ = "tag_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    # queued | running | succeeded | failed | cancelled | pending_device
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="queued", server_default=text("'queued'"))
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", server_default=text("'queued'"))
+    stage_detail: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    owner_profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    owner_profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    companion_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="SET NULL"), nullable=True,
+    )
+    binding_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    args: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    secret_sealed: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    command_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+    finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("ix_tag_operations_owner", "owner_profile", "created_at"),
+        Index("ix_tag_operations_companion", "companion_id", "state"),
+    )
+
+
+class TagVaultModel(Base):
+    """One saved version of a worker's recovery state for one subject (a
+    device id, or ``worker``): AES-256-GCM ciphertext under a fresh data key,
+    the data key wrapped (AES-KW) under the versioned master key."""
+
+    __tablename__ = "tag_vault"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    companion_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_companions.id", ondelete="CASCADE"), nullable=False,
+    )
+    subject: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    # pending | committed
+    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    key_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    wrapped_key: Mapped[str] = mapped_column(Text, nullable=False)
+    nonce: Mapped[str] = mapped_column(String(32), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("companion_id", "subject", "version", name="uq_tag_vault_subject_version"),
+    )
+
+
+class TagRevocationModel(Base):
+    """A removed v2 device: its identity and the highest generation it was
+    ever authorised for. Survives profile and companion deletion, and restores
+    keep the maximum of the archive's and the live installation's."""
+
+    __tablename__ = "tag_revocations"
+
+    device_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    identity_pub: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    last_owner_profile: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    last_owner_profile_id: Mapped[str] = mapped_column(String(36), nullable=False, default="", server_default=text("''"))
+    highest_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    reason: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    # pending | done | abandoned
+    cleanup: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default=text("'pending'"))
+    revoked_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class TagIdempotencyModel(Base):
+    """The first answer to a mutation sent with an ``Idempotency-Key``."""
+
+    __tablename__ = "tag_idempotency"
+
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)

@@ -72,7 +72,9 @@ ONLINE_WINDOW_MS = 120_000
 
 # Device statuses only an admin action (claim, assign, release) or a later
 # success of the failed command clears — a heartbeat never overwrites them.
-STUCK_STATUSES = ("clear_failed", "assign_failed")
+# The v2 ones (private workers) belong to an operation or a user choice.
+STUCK_STATUSES = ("clear_failed", "assign_failed", "pairing", "paused", "recovering", "removing",
+                  "needs_bridge")
 
 
 def now_ms() -> float:
@@ -118,6 +120,12 @@ def companion_json(row: Any, *, now: float | None = None) -> dict[str, Any]:
         "version": r.get("version"),
         "host": r.get("host"),
         "heartbeat": r.get("heartbeat"),
+        "mode": r.get("mode") or "legacy_shared",
+        "owner_profile": r.get("owner_profile"),
+        "state": r.get("state") or "active",
+        "paused": bool(r.get("paused")),
+        "generation": int(r.get("generation") or 0),
+        "gateway_device_id": r.get("gateway_device_id"),
     }
 
 
@@ -761,11 +769,26 @@ class TagStorage:
 
     # ── companions ──
 
-    async def list_companions(self) -> list[dict[str, Any]]:
+    async def list_companions(self, *, include_private: bool = True,
+                              private_owner: str | None = None) -> list[dict[str, Any]]:
+        """Companions. ``include_private=False`` (the admin's shared-hardware
+        views) leaves every private worker out; ``private_owner`` keeps only
+        that profile's private workers next to the shared ones."""
+        conds = []
+        if not include_private:
+            conds.append(COMPANIONS.c.mode != "private")
+        elif private_owner is not None:
+            conds.append(or_(COMPANIONS.c.mode != "private", COMPANIONS.c.owner_profile == private_owner))
         async with self.engine.connect() as conn:
-            rows = (await conn.execute(select(COMPANIONS).order_by(COMPANIONS.c.created_at.asc()))).all()
+            rows = (await conn.execute(select(COMPANIONS).where(*conds)
+                                       .order_by(COMPANIONS.c.created_at.asc()))).all()
         now = now_ms()
         return [companion_json(r, now=now) for r in rows]
+
+    async def is_private(self, companion_id: str) -> bool:
+        async with self.engine.connect() as conn:
+            mode = (await conn.execute(select(COMPANIONS.c.mode).where(COMPANIONS.c.id == companion_id))).scalar()
+        return mode == "private"
 
     async def get_companion(self, companion_id: str) -> dict[str, Any] | None:
         async with self.engine.connect() as conn:
@@ -930,7 +953,7 @@ class TagStorage:
     # ── devices ──
 
     async def list_devices(self, *, owner: str | None = None, companion_id: str | None = None,
-                           kind: str | None = None) -> list[dict[str, Any]]:
+                           kind: str | None = None, include_private: bool = True) -> list[dict[str, Any]]:
         conds = []
         if owner is not None:
             conds.append(DEVICES.c.owner_profile == owner)
@@ -938,6 +961,9 @@ class TagStorage:
             conds.append(DEVICES.c.companion_id == companion_id)
         if kind is not None:
             conds.append(DEVICES.c.kind == kind)
+        if not include_private:
+            conds.append(DEVICES.c.companion_id.in_(
+                select(COMPANIONS.c.id).where(COMPANIONS.c.mode != "private")))
         async with self.engine.connect() as conn:
             rows = (await conn.execute(
                 select(DEVICES).where(*conds).order_by(DEVICES.c.kind.asc(), DEVICES.c.created_at.asc())
@@ -1015,6 +1041,8 @@ class TagStorage:
             # The companion row first, as a heartbeat takes it.
             await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == companion_id)
                                .values(last_seen_at=now, updated_at=now))
+            private = (await conn.execute(select(COMPANIONS.c.mode).where(
+                COMPANIONS.c.id == companion_id))).scalar() == "private"
             existing = {
                 (r.kind, r.hw_id): r for r in (await conn.execute(
                     select(DEVICES).where(DEVICES.c.companion_id == companion_id)
@@ -1039,6 +1067,10 @@ class TagStorage:
                 values = _inventory_values(kind, item)
                 reported = _reported_epoch(item) if kind == "tag" else None
                 row = existing.get((kind, hw_id))
+                if row is None and private:
+                    # A private worker's devices come from pairing only: an
+                    # inventory report or an open USB port never adds one.
+                    continue
                 if row is None:
                     await conn.execute(insert(DEVICES), [{
                         "id": str(uuid.uuid4()), "companion_id": companion_id, "kind": kind,
@@ -1464,21 +1496,28 @@ class TagStorage:
         notify_commands([companion_id])
         return command_json(row)
 
-    async def get_command(self, command_id: str, *, companion_id: str | None = None) -> dict[str, Any] | None:
+    async def get_command(self, command_id: str, *, companion_id: str | None = None,
+                          include_private: bool = True) -> dict[str, Any] | None:
         conds = [COMMANDS.c.id == command_id]
         if companion_id is not None:
             conds.append(COMMANDS.c.companion_id == companion_id)
+        if not include_private:
+            conds.append(COMMANDS.c.companion_id.in_(
+                select(COMPANIONS.c.id).where(COMPANIONS.c.mode != "private")))
         async with self.engine.connect() as conn:
             row = (await conn.execute(select(COMMANDS).where(*conds))).first()
         return command_json(row) if row is not None else None
 
     async def list_commands(self, *, companion_id: str | None = None, statuses: Sequence[str] | None = None,
-                            limit: int = 100) -> list[dict[str, Any]]:
+                            limit: int = 100, include_private: bool = True) -> list[dict[str, Any]]:
         conds = []
         if companion_id is not None:
             conds.append(COMMANDS.c.companion_id == companion_id)
         if statuses:
             conds.append(COMMANDS.c.status.in_(list(statuses)))
+        if not include_private:
+            conds.append(COMMANDS.c.companion_id.in_(
+                select(COMPANIONS.c.id).where(COMPANIONS.c.mode != "private")))
         async with self.engine.connect() as conn:
             rows = (await conn.execute(
                 select(COMMANDS).where(*conds).order_by(COMMANDS.c.created_at.desc()).limit(limit)

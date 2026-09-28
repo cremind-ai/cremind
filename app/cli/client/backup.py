@@ -15,6 +15,7 @@ from app.cli.client._base import Client
 
 async def create(
     client: Client, passphrase: str | None = None, *, include_workspaces: bool = True,
+    include_tag_authority: bool = False,
 ) -> Any:
     body: dict[str, Any] = {}
     if passphrase:
@@ -23,6 +24,8 @@ async def create(
         # Only the opt-out is sent: the server includes the profiles' working
         # directories unless told otherwise.
         body["include_workspaces"] = False
+    if include_tag_authority:
+        body["include_tag_authority"] = True
     return await client.post_json("/api/backup/create", body or None)
 
 

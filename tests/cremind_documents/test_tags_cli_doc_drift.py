@@ -26,8 +26,10 @@ pytest.importorskip("typer")
 BUNDLED = Path(__file__).resolve().parents[2] / "app" / "cremind_documents" / "bundled"
 DOC = BUNDLED / "[cli]cremind tags.md"
 HARDWARE_DOC = BUNDLED / "[cli]cremind tags hardware.md"
-ALL_DOCS = [DOC, HARDWARE_DOC]
+DEVICES_DOC = BUNDLED / "[cli]cremind tags devices.md"
+ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC]
 HARDWARE_GROUP = "hardware"
+DEVICES_GROUP = "devices"
 
 
 def _doc_text(doc: Path = DOC) -> str:
@@ -49,7 +51,8 @@ def _walk(app, prefix: str):
 
 
 def _doc_for(path: str) -> Path:
-    return HARDWARE_DOC if path.split(" ")[2] == HARDWARE_GROUP else DOC
+    group = path.split(" ")[2]
+    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC}.get(group, DOC)
 
 
 @pytest.mark.parametrize("doc", ALL_DOCS, ids=lambda d: d.name)

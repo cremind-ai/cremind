@@ -179,9 +179,10 @@ def test_cascades_fire(upgraded) -> None:
     assert count("tag_credentials") == count("tag_devices") == count("tag_commands") == 0
 
 
-def test_head_is_the_tags_revision_and_downgrade_removes_only_its_tables(upgraded) -> None:
+def test_tags_revision_is_in_the_chain_and_downgrade_removes_only_its_tables(upgraded) -> None:
     provider, mig = upgraded
-    assert list(mig.heads()) == [_REVISION]
+    # 20261001_tag_setup builds on this revision (tests/tags/test_tags_setup_migration.py).
+    assert list(mig.heads()) == ["20261001_tag_setup"]
     mig.downgrade(_PRIOR_HEAD)
     with provider.sync_engine().connect() as c:
         names = set(inspect(c).get_table_names())
@@ -199,11 +200,15 @@ def test_orm_models_match_the_migration(upgraded) -> None:
     import app.storage.models  # noqa: F401
 
     provider, _ = upgraded
+    # Columns the next revision (20261001_tag_setup) adds to a table of this one.
+    later = {"tag_companions": {"mode", "owner_profile", "owner_profile_id", "installation_id", "controller_pub",
+                                "generation", "state", "paused", "lease_expires_at", "lease_credential_id",
+                                "gateway_device_id"}}
     with provider.sync_engine().connect() as c:
         insp = inspect(c)
         for table in TABLES:
             db_cols = {col["name"] for col in insp.get_columns(table)}
-            orm_cols = {col.name for col in Base.metadata.tables[table].columns}
+            orm_cols = {col.name for col in Base.metadata.tables[table].columns} - later.get(table, set())
             assert db_cols == orm_cols, table
             db_ix = {i["name"] for i in insp.get_indexes(table)}
             orm_ix = {i.name for i in Base.metadata.tables[table].indexes}

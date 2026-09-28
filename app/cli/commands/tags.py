@@ -1544,3 +1544,10 @@ def hardware_set_defaults(
         print_json(out)
         return
     _render_defaults(mode, out)
+
+
+# Simple device setup through Cremind Connect: `cremind tags devices …`
+# (app/cli/commands/tags_devices.py; imported last — it reuses the helpers above).
+from app.cli.commands.tags_devices import devices_app  # noqa: E402
+
+tags_app.add_typer(devices_app, name="devices")

@@ -1,11 +1,16 @@
-"""Keep Cremind Tag connector credentials on the connector API.
+"""Keep Cremind Tag credentials on the APIs they belong to.
 
-A request carrying ``Authorization: CremindTag …`` anywhere outside
-``/api/tag-connector/v1/`` is answered 401 before authentication runs. The
-JWT backend already ignores the scheme (it reads ``Bearer`` only), so such a
-request would merely be anonymous — but "anonymous" still reaches the public
-routes, and a connector secret has no business on any of them. Failing loudly
-also tells a misconfigured companion (wrong base URL) what is wrong.
+- ``Authorization: CremindTag …`` (a worker/companion connector credential) is
+  answered 401 anywhere outside ``/api/tag-connector/v1/``;
+- ``Authorization: CremindSetup …`` (the one-session setup capability of a
+  Cremind Connect launch link) is answered 401 anywhere outside
+  ``/api/tag-setup/v1/``.
+
+Both run before authentication. The JWT backend already ignores these schemes
+(it reads ``Bearer`` only), so such a request would merely be anonymous — but
+"anonymous" still reaches the public routes, and these secrets have no
+business on any of them. Failing loudly also tells a misconfigured client
+(wrong base URL) what is wrong.
 
 Pure ASGI, like the rest of :mod:`app.middleware`: it reads the path and one
 header and never touches the body. Installed between ``ClientProtocolGuard``
@@ -18,43 +23,42 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 CONNECTOR_PREFIX = "/api/tag-connector/v1/"
-_SCHEME = b"cremindtag"
-_MESSAGE = (
-    "CremindTag credentials are accepted only by the connector API "
-    f"({CONNECTOR_PREFIX}); use a session token here."
-)
+SETUP_PREFIX = "/api/tag-setup/v1/"
+_RULES = {
+    b"cremindtag": (CONNECTOR_PREFIX, "tag_credential_not_accepted",
+                    "CremindTag credentials are accepted only by the connector API "
+                    f"({CONNECTOR_PREFIX}); use a session token here."),
+    b"cremindsetup": (SETUP_PREFIX, "setup_credential_not_accepted",
+                      "A Cremind Connect setup credential is accepted only by the setup API "
+                      f"({SETUP_PREFIX})."),
+}
 
 
-def _uses_tag_scheme(scope: Scope) -> bool:
+def _scheme(scope: Scope) -> bytes | None:
     for key, value in scope.get("headers") or ():
         if key == b"authorization":
-            return value.strip().split(b" ", 1)[0].lower() == _SCHEME
-    return False
+            return value.strip().split(b" ", 1)[0].lower()
+    return None
 
 
 class TagConnectorGuard:
-    """401 for the ``CremindTag`` scheme outside the connector prefix."""
+    """401 for the Tag credential schemes outside their own API."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         kind = scope["type"]
-        if kind not in ("http", "websocket") or not _uses_tag_scheme(scope):
-            await self.app(scope, receive, send)
-            return
-        if scope.get("path", "").startswith(CONNECTOR_PREFIX):
+        rule = _RULES.get(_scheme(scope) or b"") if kind in ("http", "websocket") else None
+        if rule is None or scope.get("path", "").startswith(rule[0]):
             await self.app(scope, receive, send)
             return
         if kind == "websocket":
             await receive()
             await send({"type": "websocket.close", "code": 1008})
             return
-        response = JSONResponse(
-            {"error": "tag_credential_not_accepted", "message": _MESSAGE, "detail": _MESSAGE},
-            status_code=401,
-        )
+        response = JSONResponse({"error": rule[1], "message": rule[2], "detail": rule[2]}, status_code=401)
         await response(scope, receive, send)
 
 
-__all__ = ["CONNECTOR_PREFIX", "TagConnectorGuard"]
+__all__ = ["CONNECTOR_PREFIX", "SETUP_PREFIX", "TagConnectorGuard"]

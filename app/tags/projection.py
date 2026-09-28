@@ -218,7 +218,8 @@ class TagProjectionWorker:
                     else:
                         targets = routing.route_targets(spec.kind, options, owned)
                     if spec.kind not in NON_CONTENT_KINDS:
-                        targets = [d for d in targets if not d["clear_required"]]
+                        # Held (clear pending) and paused tags get no content.
+                        targets = [d for d in targets if not d["clear_required"] and d["status"] != "paused"]
                     for device in targets:
                         items.append((device, spec, event["id"]))
                         if spec.kind == "resolved" and spec.resolves:
@@ -248,6 +249,13 @@ class TagProjectionWorker:
             await self.expire(now)
         except Exception:  # noqa: BLE001
             logger.exception("TagProjectionWorker: expiry failed")
+        try:
+            from app.tags import idempotency, operations
+
+            await operations.expire_operations(now)
+            await idempotency.prune(now)
+        except Exception:  # noqa: BLE001
+            logger.exception("TagProjectionWorker: setup-operation expiry failed")
         try:
             await self.prune(now)
         except Exception:  # noqa: BLE001

@@ -136,14 +136,24 @@ def backup_create(
         help="Leave out the profiles' working directories (the workspaces folder). "
              "Included by default.",
     ),
+    include_tag_keys: bool = typer.Option(
+        False, "--include-tag-keys",
+        help="Also store Cremind Tag's recovery keys (needed to recover paired tags if this "
+             "server is lost). Only with a passphrase.",
+    ),
 ) -> None:
     """Create a full-system backup archive.
 
     Includes every profile's default working directory (the workspaces
     folder) unless --no-workspaces. Folders an admin chose outside it are
-    never included.
+    never included. --include-tag-keys adds the keys paired Cremind Tag
+    hardware trusts; it needs --passphrase / --passphrase-prompt.
     """
     pw = _resolve_passphrase(passphrase, passphrase_prompt, confirm=True)
+    if include_tag_keys and not pw:
+        typer.echo("--include-tag-keys needs an encrypted backup: add --passphrase or --passphrase-prompt.",
+                   err=True)
+        raise typer.Exit(code=2)
 
     if offline:
         from app.backup.engine import BackupOptions, create_backup
@@ -152,6 +162,7 @@ def backup_create(
         try:
             result = create_backup(BackupOptions(
                 dest=to, passphrase=pw, include_workspaces=not no_workspaces,
+                include_tag_authority=include_tag_keys,
             ))
         except BackupError as e:
             typer.echo(str(e), err=True)
@@ -183,7 +194,8 @@ def backup_create(
 
     async def _kick() -> None:
         async with Client(cfg) as client:
-            await api.create(client, pw, include_workspaces=not no_workspaces)
+            await api.create(client, pw, include_workspaces=not no_workspaces,
+                             include_tag_authority=include_tag_keys)
 
     asyncio.run(_kick())
     typer.echo("Backup started:")

@@ -233,8 +233,12 @@ async def create_content_credential(profile: str, *, companion_id: Any, label: A
     text = label if isinstance(label, str) else ""
     text = clean_text(text, 128) or "Content credential"
     store = get_tag_storage()
-    if await store.get_companion(companion_id) is None:
+    companion = await store.get_companion(companion_id)
+    if companion is None or (companion["mode"] == "private" and companion["owner_profile"] != profile):
         raise TagError(404, "companion_not_found", "No companion with that id.")
+    if companion["mode"] == "private":
+        raise TagError(409, "managed_by_connect",
+                       "Cremind Connect manages this connection's credentials; nothing to add by hand.")
     row, secret = _new_credential(creds.KIND_CONTENT, label=text, created_by=profile, profile=profile)
     row["companion_id"] = companion_id
     cred = await store.insert_credential(row)

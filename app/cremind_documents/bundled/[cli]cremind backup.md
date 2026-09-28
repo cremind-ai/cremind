@@ -77,6 +77,17 @@ skipped.
   directories leaves the ones on disk exactly as they are. The safety backup a
   restore takes includes them only when the incoming archive does.
 
+## Cremind Tag recovery keys
+
+Hardware a profile set up with Cremind Connect trusts this server's grant key,
+and its recovery data is encrypted under a server key. Both are files outside
+the database and are **not** in an ordinary backup. `--include-tag-keys` adds
+them — only to an encrypted backup (it needs `--passphrase` or
+`--passphrase-prompt`; without one the command exits 2). Keep such an archive
+safe: whoever restores it can re-key your paired devices. A restore keeps this
+install's removed-device records and newest ownership counters, and cancels
+setups that were still running when the backup was taken.
+
 ## Environment independence
 
 Absolute paths stored in the database (a conversation's working directory, an
@@ -119,7 +130,7 @@ fresh install.
 ## Syntax
 
 ```bash
-cremind backup create   [--offline] [--to <path>] [--passphrase <text> | --passphrase-prompt] [--no-workspaces]
+cremind backup create   [--offline] [--to <path>] [--passphrase <text> | --passphrase-prompt] [--no-workspaces] [--include-tag-keys]
 cremind backup list
 cremind backup download <name> [--to <path>]
 cremind backup upload   <path>

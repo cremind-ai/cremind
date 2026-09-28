@@ -35,8 +35,10 @@ from app.api.documents_research import get_documents_research_routes
 from app.api.retired import get_retired_routes
 from app.api.search_tools import get_search_tools_routes
 from app.api.tag_connector import get_tag_connector_routes
+from app.api.tag_setup_bootstrap import get_tag_setup_bootstrap_routes
 from app.api.tags import get_tags_routes
 from app.api.tags_hardware import get_tags_hardware_routes
+from app.api.tags_setup import get_tags_setup_routes
 
 
 def get_api_routes(
@@ -125,6 +127,10 @@ def get_api_routes(
     # connector API (CremindTag credentials only).
     routes.extend(get_tags_hardware_routes(config_storage))
     routes.extend(get_tags_routes())
+    # Simple device setup: the profile's own Connect workers, and the
+    # bootstrap API Connect uses during a setup session (setup capability only).
+    routes.extend(get_tags_setup_routes())
+    routes.extend(get_tag_setup_bootstrap_routes())
     routes.extend(get_tag_connector_routes())
     routes.extend(get_blueprint_routes(
         registry=registry,

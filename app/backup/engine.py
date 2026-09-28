@@ -71,6 +71,10 @@ class BackupOptions:
     # Every profile's default-location working directory (the workspaces
     # root, deleted profiles' kept folders included). ``--no-workspaces``.
     include_workspaces: bool = True
+    # Cremind Tag's grant-signing and vault master keys (``<SYS>/.tag-authority``),
+    # so paired hardware can be recovered if this server is lost. Only into an
+    # ENCRYPTED backup (a passphrase is required); never by default.
+    include_tag_authority: bool = False
 
 
 @dataclass
@@ -300,6 +304,8 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
         # Informational (see SourcePaths): where the admin's files are.
         source_paths.user_working_dir = working_dirs["admin"]["path"]
 
+    if options.include_tag_authority and not options.passphrase:
+        raise BackupError("The tag recovery keys go only into an encrypted backup: set a passphrase.")
     dest = Path(options.dest) if options.dest else _default_dest()
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -388,6 +394,15 @@ def create_backup(options: BackupOptions, progress: ProgressFn | None = None) ->
                 ):
                     if _add_file(abs_path, FILES_PREFIX + arc, arc, inventory_files):
                         file_count += 1
+
+                # files/.tag-authority/** — only on request, only encrypted.
+                if options.include_tag_authority and options.passphrase:
+                    from app.tags import authority as tag_authority
+
+                    for key_path in tag_authority.key_files():
+                        arc = f"{tag_authority.DIR_NAME}/{key_path.name}"
+                        if _add_file(str(key_path), FILES_PREFIX + arc, arc, inventory_files):
+                            file_count += 1
 
                 # workspaces/** — every profile's default working directory.
                 # The system dir is pruned in case the root contains it, and
@@ -742,6 +757,127 @@ def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]],
     return report
 
 
+def _capture_tag_setup(engine: Any) -> dict[str, Any]:
+    """This install's simple-setup state that a restore must not rewind, read
+    before the wipe: revocation tombstones, each bound device's highest
+    generation, and the authority row whose key files live here. Empty when
+    the tables do not exist."""
+    from sqlalchemy import inspect as sa_inspect, select
+
+    out: dict[str, Any] = {"revocations": [], "generations": {}, "authority": None}
+    try:
+        insp = sa_inspect(engine)
+        if not insp.has_table("tag_bindings"):
+            return out
+        from app.storage.models import TagAuthorityModel, TagBindingModel, TagRevocationModel
+
+        with engine.connect() as conn:
+            out["revocations"] = [dict(r) for r in conn.execute(
+                TagRevocationModel.__table__.select()).mappings().all()]
+            b = TagBindingModel.__table__
+            for device, gen, pending in conn.execute(select(b.c.device_id, b.c.generation, b.c.pending_generation)):
+                out["generations"][device] = max(int(gen or 0), int(pending or 0))
+            row = conn.execute(TagAuthorityModel.__table__.select()).mappings().first()
+            out["authority"] = dict(row) if row is not None else None
+    except Exception:  # noqa: BLE001
+        logger.warning("[backup:restore] could not read the local tag setup state", exc_info=True)
+    return out
+
+
+def _close_out_tag_setup(engine: Any, captured: dict[str, Any]) -> dict[str, int]:
+    """Stop an archive's setup state from reopening anything (cremind-tag
+    docs/connect-setup.md §10.4):
+
+    - revocations and highest generations: the max of the archive's and this
+      install's; a binding the live install had already revoked is dropped
+      (its tombstone stays), every other paired binding reads ``reconciling``
+      until its worker confirms the devices' live generations;
+    - incomplete setup sessions, operations and their queued commands are
+      cancelled, and every worker lease is dropped;
+    - the authority row: when the archive's key files are not here but this
+      install's are, and nothing restored depends on the archive's, this
+      install's authority is kept (else ``authority_unavailable`` stays
+      visible — keys are never generated over existing bindings)."""
+    from sqlalchemy import delete, func, insert, select, update
+
+    from app.storage.models import (
+        TagAuthorityModel, TagBindingModel, TagCommandModel, TagCompanionModel, TagDeviceModel,
+        TagOperationModel, TagRevocationModel, TagSetupSessionModel, TagVaultModel,
+    )
+
+    report = {"revocations": 0, "reconciling": 0, "dropped": 0, "cancelled": 0}
+    now = time.time() * 1000
+    rev, bindings = TagRevocationModel.__table__, TagBindingModel.__table__
+    try:
+        with engine.begin() as conn:
+            restored = {r.device_id: r for r in conn.execute(rev.select()).all()}
+            for row in captured.get("revocations") or []:
+                have = restored.get(row["device_id"])
+                if have is None:
+                    conn.execute(insert(rev), [row])
+                elif int(row["highest_generation"] or 0) > int(have.highest_generation or 0):
+                    conn.execute(update(rev).where(rev.c.device_id == row["device_id"]).values(
+                        highest_generation=int(row["highest_generation"])))
+                report["revocations"] += 1
+            revoked = {r["device_id"] for r in captured.get("revocations") or []}
+            gens = captured.get("generations") or {}
+            for b in conn.execute(bindings.select()).all():
+                if b.device_id in revoked:
+                    conn.execute(delete(bindings).where(bindings.c.id == b.id))
+                    if b.tag_device_id:
+                        conn.execute(delete(TagDeviceModel.__table__).where(
+                            TagDeviceModel.__table__.c.id == b.tag_device_id))
+                    report["dropped"] += 1
+                    continue
+                values: dict[str, Any] = {"pending_generation": None, "updated_at": now}
+                live = gens.get(b.device_id)
+                if live is not None and live > int(b.generation or 0):
+                    values["generation"] = live
+                if b.state in ("paired", "ready"):
+                    values["state"] = "reconciling"
+                    report["reconciling"] += 1
+                conn.execute(update(bindings).where(bindings.c.id == b.id).values(**values))
+            sessions = TagSetupSessionModel.__table__
+            conn.execute(update(sessions).where(sessions.c.state.notin_(
+                ("completed", "cancelled", "expired", "failed"))).values(
+                state="cancelled", error={"code": "restored", "message": "Cremind was restored from a backup."},
+                updated_at=now))
+            ops = TagOperationModel.__table__
+            result = conn.execute(update(ops).where(ops.c.state.in_(
+                ("queued", "running", "pending_device", "waiting_for_connect"))).values(
+                state="cancelled", stage="cancelled", secret_sealed=None, finished_at=now, updated_at=now,
+                error={"code": "restored", "message": "Cremind was restored from a backup."}))
+            report["cancelled"] = int(result.rowcount or 0)
+            cmds = TagCommandModel.__table__
+            conn.execute(update(cmds).where(cmds.c.kind == "run_operation", cmds.c.status.in_(
+                ("queued", "claimed"))).values(status="cancelled", completed_at=now, error="restored"))
+            companions = TagCompanionModel.__table__
+            conn.execute(update(companions).values(lease_expires_at=None, lease_credential_id=None))
+
+            authority = TagAuthorityModel.__table__
+            local = captured.get("authority")
+            archived = conn.execute(authority.select()).mappings().first()
+            if local and (archived is None or dict(archived) != local):
+                from app.tags import authority as tag_authority
+
+                with_keys = tag_authority.authority_status_sync(conn)
+                depends = int(conn.execute(select(func.count()).select_from(bindings)).scalar() or 0) + \
+                    int(conn.execute(select(func.count()).select_from(TagVaultModel.__table__)).scalar() or 0)
+                if (archived is None or with_keys.get("state") != "ready") and not depends:
+                    conn.execute(delete(authority))
+                    conn.execute(insert(authority), [local])
+    except Exception:  # noqa: BLE001
+        logger.warning("[backup:restore] could not close out the tag setup state", exc_info=True)
+        return {k: -1 for k in report}
+    try:
+        from app.tags import authority as tag_authority
+
+        tag_authority.reset_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return report
+
+
 def apply_staged_restore(
     staged_dir: Path,
     *,
@@ -790,6 +926,9 @@ def apply_staged_restore(
     # and its delivery-id counter (ids up to it may be in a companion's queue).
     local_tag_credentials = _capture_tag_credentials(engine)
     local_tag_counter = _capture_tag_counter(engine)
+    # And the simple-setup floors: revocations, highest generations, the
+    # authority whose key files are on this machine.
+    local_tag_setup = _capture_tag_setup(engine)
 
     load_stats = None
     try:
@@ -814,6 +953,7 @@ def apply_staged_restore(
         # Cremind Tag, unconditionally: even a rollback rewinds delivery ids
         # and cursors a live companion has already seen past.
         _close_out_tags(engine, local_tag_credentials, local_tag_counter)
+        _close_out_tag_setup(engine, local_tag_setup)
 
         # Re-pin the local secret — overwrites any value an older archive
         # carried and guarantees the row exists for newer archives that omit it

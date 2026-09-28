@@ -65,6 +65,8 @@ def _make_create_handler(state: BootedState):
         # says ``"include_workspaces": false`` (CLI --no-workspaces, the UI
         # checkbox). Anything but an explicit false keeps the default.
         include_workspaces = True
+        # Cremind Tag's recovery keys: only when asked, only encrypted.
+        include_tag_authority = False
         try:
             body = await request.json()
             if isinstance(body, dict):
@@ -73,10 +75,17 @@ def _make_create_handler(state: BootedState):
                     passphrase = p
                 if body.get("include_workspaces") is False:
                     include_workspaces = False
+                include_tag_authority = body.get("include_tag_authority") is True
         except Exception:  # noqa: BLE001
             passphrase = None
+        if include_tag_authority and not passphrase:
+            return JSONResponse(
+                {"error": "The tag recovery keys go only into an encrypted backup: set a passphrase.",
+                 "code": "passphrase_required"},
+                status_code=422,
+            )
 
-        asyncio.create_task(_run_create(passphrase, include_workspaces))
+        asyncio.create_task(_run_create(passphrase, include_workspaces, include_tag_authority))
         return JSONResponse(
             {"ok": True, "status_url": "/api/backup/status"}, status_code=202
         )
@@ -84,7 +93,8 @@ def _make_create_handler(state: BootedState):
     return post_create
 
 
-async def _run_create(passphrase: str | None, include_workspaces: bool = True) -> None:
+async def _run_create(passphrase: str | None, include_workspaces: bool = True,
+                      include_tag_authority: bool = False) -> None:
     from app.backup import status as bstatus
     from app.backup.engine import BackupOptions, create_backup
 
@@ -102,7 +112,8 @@ async def _run_create(passphrase: str | None, include_workspaces: bool = True) -
         bstatus.backup_status.update_phase("dumping", "Creating backup...")
         result = await asyncio.to_thread(
             create_backup,
-            BackupOptions(passphrase=passphrase, include_workspaces=include_workspaces),
+            BackupOptions(passphrase=passphrase, include_workspaces=include_workspaces,
+                          include_tag_authority=include_tag_authority),
             _progress,
         )
         bstatus.backup_status.finish(

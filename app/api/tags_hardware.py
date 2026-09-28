@@ -58,6 +58,23 @@ def _admin(request: Request) -> str:
     return getattr(request.user, "username", "") or "admin"
 
 
+async def _private_companion(companion_id: str) -> bool:
+    """A profile's private Connect worker — invisible here, even to the admin
+    (cremind-tag docs/connect-setup.md §9: no shared-hardware route around a
+    profile's ownership)."""
+    return await get_tag_storage().is_private(companion_id)
+
+
+async def _private_device(device_id: str) -> bool:
+    device = await get_tag_storage().get_device(device_id)
+    return device is not None and await _private_companion(device["companion_id"])
+
+
+def _not_found(what: str) -> JSONResponse:
+    code = {"companion": "companion_not_found", "device": "device_not_found", "command": "command_not_found"}[what]
+    return error_response(404, code, f"No {what} with that id.")
+
+
 def get_tags_hardware_routes(config_storage=None) -> list[Route]:
     store = get_tag_storage
 
@@ -66,11 +83,12 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         if denied is not None:
             return denied
         s = store()
-        companions = await s.list_companions()
-        hardware = await s.list_credentials(kind="hardware")
+        companions = await s.list_companions(include_private=False)
+        shared = {c["id"] for c in companions}
+        hardware = [h for h in await s.list_credentials(kind="hardware") if h["companion_id"] in shared]
         for c in companions:
             c["credentials"] = [h for h in hardware if h["companion_id"] == c["id"]]
-        devices = await s.list_devices()
+        devices = await s.list_devices(include_private=False)
         pending = await s.pending_counts([d["id"] for d in devices if d["kind"] == "tag"])
         on_bridge = Counter(d["bridge_device_id"] for d in devices
                             if d["kind"] == "tag" and d["bridge_device_id"])
@@ -80,8 +98,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
             elif d["kind"] == "bridge":
                 d["max_tags"] = service.bridge_capacity(d["info"])
                 d["assigned_count"] = on_bridge.get(d["id"], 0)
-        active = await s.list_commands(statuses=COMMAND_ACTIVE, limit=200)
-        recent = await s.list_commands(limit=50)
+        active = await s.list_commands(statuses=COMMAND_ACTIVE, limit=200, include_private=False)
+        recent = await s.list_commands(limit=50, include_private=False)
         seen = {c["id"] for c in active}
         commands = active + [c for c in recent if c["id"] not in seen]
         return JSONResponse({"companions": companions, "devices": devices, "commands": commands})
@@ -106,6 +124,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
+        if await _private_companion(request.path_params["companion_id"]):
+            return _not_found("companion")
         try:
             cred, secret, revoked = await service.rotate_companion(
                 request.path_params["companion_id"], created_by=_admin(request),
@@ -120,7 +140,7 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         if denied is not None:
             return denied
         cid = request.path_params["companion_id"]
-        if not await store().delete_companion(cid):
+        if await _private_companion(cid) or not await store().delete_companion(cid):
             return error_response(404, "companion_not_found", "No companion with that id.")
         logger.info(f"[tags] companion {cid} deleted")
         return JSONResponse({"deleted": True})
@@ -138,6 +158,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
             return error_response(422, "invalid_companion", "'companion_id' is required.")
         if not isinstance(kind, str) or not kind:
             return error_response(422, "unknown_command", "'kind' is required.")
+        if await _private_companion(companion_id):
+            return _not_found("companion")
         try:
             command = await service.admin_command(companion_id, kind, body.get("args"),
                                                   requested_by=_admin(request))
@@ -149,7 +171,7 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
-        command = await store().get_command(request.path_params["command_id"])
+        command = await store().get_command(request.path_params["command_id"], include_private=False)
         if command is None:
             return error_response(404, "command_not_found", "No command with that id.")
         return JSONResponse({"command": command})
@@ -158,6 +180,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
+        if await _private_device(request.path_params["device_id"]):
+            return _not_found("device")
         body, err = await json_body(request)
         if err is not None:
             return err
@@ -177,6 +201,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
+        if await _private_device(request.path_params["device_id"]):
+            return _not_found("device")
         body, err = await json_body(request)
         if err is not None:
             return err
@@ -191,6 +217,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
+        if await _private_device(request.path_params["device_id"]):
+            return _not_found("device")
         try:
             result = await service.release_tag(request.path_params["device_id"], requested_by=_admin(request))
         except TagError as exc:
@@ -202,6 +230,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
+        if await _private_device(request.path_params["device_id"]):
+            return _not_found("device")
         body, err = await json_body(request)
         if err is not None:
             return err
@@ -215,6 +245,8 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
         denied = require_admin(request)
         if denied is not None:
             return denied
+        if await _private_device(request.path_params["device_id"]):
+            return _not_found("device")
         try:
             device = await service.forget_device(request.path_params["device_id"])
         except TagError as exc:

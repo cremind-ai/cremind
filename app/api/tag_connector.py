@@ -115,6 +115,9 @@ from app.utils.logger import logger
 
 PREFIX = "/api/tag-connector/v1"
 API_VERSION = 1
+# v2: private workers (lease, reconciliation state, operations, grants, vault).
+API_VERSION_V2 = 2
+V2_CAPABILITIES = ("lease", "state", "operations", "grants", "vault")
 MAX_WAIT_S = 30
 MAX_PREVIEW_BYTES = 64 * 1024
 MAX_U32 = 2 ** 32 - 1
@@ -228,7 +231,77 @@ def get_tag_connector_routes() -> list[Route]:
         grant, err = await authenticate(request, None)
         if err is not None:
             return err
-        return JSONResponse({**grant, "api_version": API_VERSION, "server_time": _now_iso()})
+        comp = await store().get_companion(grant["companion_id"]) or {}
+        private = comp.get("mode") == "private"
+        out: dict[str, Any] = {**grant, "api_version": API_VERSION_V2 if private else API_VERSION,
+                               "server_time": _now_iso(), "mode": comp.get("mode") or "legacy_shared",
+                               "capabilities": list(V2_CAPABILITIES) if private else []}
+        if private:
+            state = comp.get("state") or "active"
+            out["worker"] = {"generation": int(comp.get("generation") or 0),
+                             "state": state if state != "active" or not comp.get("paused") else "paused",
+                             "paused": bool(comp.get("paused"))}
+        return JSONResponse(out)
+
+    # ── v2: private workers (cremind-tag docs/setup-api.md §3) ──
+
+    def v2_handler(kind: str | None, run):
+        async def handler(request: Request) -> JSONResponse:
+            grant, err = await authenticate(request, kind)
+            if err is not None:
+                return err
+            from app.tags.service import TagError
+
+            try:
+                return JSONResponse(await run(request, grant))
+            except TagError as exc:
+                from app.api.tags import tag_error_response
+
+                return tag_error_response(exc)
+        return handler
+
+    async def _v2_body(request: Request) -> dict[str, Any]:
+        from app.tags.service import TagError
+
+        body, err = await _body(request)
+        if err is not None:
+            raise TagError(400, "invalid_json", "The request body must be a JSON object.")
+        return body
+
+    async def run_lease(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.lease(grant)
+
+    async def run_state(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.worker_state(grant)
+
+    async def run_operation(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.worker_operation(grant, request.path_params["operation_id"])
+
+    async def run_progress(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.progress(grant, request.path_params["operation_id"], await _v2_body(request))
+
+    async def run_grant(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.issue_grant(grant, await _v2_body(request))
+
+    async def run_vault_put(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.vault_put(grant, request.path_params["subject"], await _v2_body(request))
+
+    async def run_vault_get(request: Request, grant: dict[str, Any]) -> dict[str, Any]:
+        from app.tags import operations
+
+        return await operations.vault_get(grant)
 
     # ── hardware ──
 
@@ -261,6 +334,14 @@ def get_tag_connector_routes() -> list[Route]:
         if err is not None:
             return err
         pending = await store().record_heartbeat(grant["companion_id"], body)
+        comp = await store().get_companion(grant["companion_id"]) or {}
+        if comp.get("mode") == "private":
+            from app.tags import operations
+
+            async with store().engine.begin() as conn:
+                await operations.on_worker_heartbeat(conn, grant["companion_id"], time.time() * 1000,
+                                                     devices=body.get("devices") if isinstance(body.get("devices"), list)
+                                                     else None)
         return JSONResponse({"server_time": _now_iso(), "commands_pending": pending})
 
     async def handle_commands(request: Request) -> JSONResponse:
@@ -477,6 +558,15 @@ def get_tag_connector_routes() -> list[Route]:
         Route(f"{PREFIX}/accepted", handle_accepted, methods=["POST"]),
         Route(f"{PREFIX}/receipts", handle_receipts, methods=["POST"]),
         Route(f"{PREFIX}/previews", handle_previews, methods=["POST"]),
+        Route(f"{PREFIX}/lease", v2_handler(creds.KIND_HARDWARE, run_lease), methods=["POST"]),
+        Route(f"{PREFIX}/state", v2_handler(creds.KIND_HARDWARE, run_state), methods=["GET"]),
+        Route(f"{PREFIX}/operations/{{operation_id}}", v2_handler(creds.KIND_HARDWARE, run_operation),
+              methods=["GET"]),
+        Route(f"{PREFIX}/operations/{{operation_id}}/progress", v2_handler(creds.KIND_HARDWARE, run_progress),
+              methods=["POST"]),
+        Route(f"{PREFIX}/grants", v2_handler(creds.KIND_HARDWARE, run_grant), methods=["POST"]),
+        Route(f"{PREFIX}/vault/{{subject}}", v2_handler(creds.KIND_HARDWARE, run_vault_put), methods=["PUT"]),
+        Route(f"{PREFIX}/vault", v2_handler(creds.KIND_HARDWARE, run_vault_get), methods=["GET"]),
     ]
 
 

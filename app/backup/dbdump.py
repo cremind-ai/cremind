@@ -45,7 +45,9 @@ _EXCLUDE_ROWS: dict[str, set[str]] = {"server_config": {"jwt_secret"}}
 # - ``tag_counters``: the delivery-id allocator. The migration seeds its row,
 #   so a dumped copy would collide with it on restore; the restore close-out
 #   sets it past every restored id instead.
-_EXCLUDE_TABLES: frozenset[str] = frozenset({"tag_credentials", "tag_counters"})
+# - ``tag_idempotency``: remembered answers to retried requests of this
+#   install; replaying them after a restore would answer for work undone.
+_EXCLUDE_TABLES: frozenset[str] = frozenset({"tag_credentials", "tag_counters", "tag_idempotency"})
 
 
 def _ordered_select(table: Table):
