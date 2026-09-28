@@ -237,6 +237,19 @@ FEATURES: dict[str, Feature] = {
     # Messenger (Graph API webhook) and Zalo (Bot API long-poll) ride the core
     # ``httpx`` client, and the Zalo personal channel is a Node sidecar — none
     # of them need a Python extras group, so they have no FEATURES entry.
+
+    # ── Cremind Tag hardware runtime ────────────────────────────────────────
+    # The USB gateway link, CBOR messages, ICU/HarfBuzz/FreeType text layout
+    # and previews of app/tags/runtime. requires_restart=False: the runtime
+    # imports all of them lazily and the hardware host (app/tags/hosting)
+    # starts after the install, in-process. Installed when a gateway computer
+    # is prepared (Settings → Tags), never at boot.
+    "tags": Feature(
+        key="tags",
+        extras=("tags",),
+        probes=("serial", "cbor2", "icu", "uharfbuzz", "freetype", "PIL"),
+        requires_restart=False,
+    ),
 }
 
 

@@ -50,6 +50,15 @@ def _json_round_trip(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
 
 
+async def on_server(coro: Awaitable[Any], server_loop: asyncio.AbstractEventLoop | None, timeout: float) -> Any:
+    """Await ``coro`` on the server's loop (where Cremind's storage lives) from the runtime's; cancelling the
+    caller cancels it there too. Without a separate server loop it runs right here."""
+    if server_loop is None or server_loop is asyncio.get_running_loop():
+        return await asyncio.wait_for(coro, timeout)
+    future = asyncio.run_coroutine_threadsafe(asyncio.wait_for(coro, timeout), server_loop)
+    return await asyncio.wrap_future(future)
+
+
 class LocalConnector(ConnectorClient):
     """A :class:`ConnectorClient` whose requests run in this process (see the module docstring)."""
 
@@ -101,11 +110,7 @@ class LocalConnector(ConnectorClient):
         return self._decode(where, response)
 
     async def _on_server(self, coro: Awaitable[tuple[int, Any]], timeout: float) -> tuple[int, Any]:
-        loop = self._server_loop
-        if loop is None or loop is asyncio.get_running_loop():
-            return await asyncio.wait_for(coro, timeout)
-        future = asyncio.run_coroutine_threadsafe(asyncio.wait_for(coro, timeout), loop)
-        return await asyncio.wrap_future(future)
+        return await on_server(coro, self._server_loop, timeout)
 
     async def _serve(self, endpoint: svc.Endpoint, call: svc.Call) -> tuple[int, Any]:
         """Runs on the server's loop: the HTTP handler's steps, minus HTTP."""
@@ -122,4 +127,4 @@ class LocalConnector(ConnectorClient):
             return 500, {"error": "internal_error", "message": "Cremind could not handle the request."}
 
 
-__all__ = ["LOCAL_BASE_URL", "LocalConnector"]
+__all__ = ["LOCAL_BASE_URL", "LocalConnector", "on_server"]

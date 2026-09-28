@@ -181,8 +181,9 @@ def test_cascades_fire(upgraded) -> None:
 
 def test_tags_revision_is_in_the_chain_and_downgrade_removes_only_its_tables(upgraded) -> None:
     provider, mig = upgraded
-    # 20261001_tag_setup builds on this revision (tests/tags/test_tags_setup_migration.py).
-    assert list(mig.heads()) == ["20261001_tag_setup"]
+    # 20261001_tag_setup and 20261002_tag_hosts build on this revision
+    # (tests/tags/test_tags_setup_migration.py, tests/tags/test_tag_hosts_migration.py).
+    assert list(mig.heads()) == ["20261002_tag_hosts"]
     mig.downgrade(_PRIOR_HEAD)
     with provider.sync_engine().connect() as c:
         names = set(inspect(c).get_table_names())
@@ -200,10 +201,10 @@ def test_orm_models_match_the_migration(upgraded) -> None:
     import app.storage.models  # noqa: F401
 
     provider, _ = upgraded
-    # Columns the next revision (20261001_tag_setup) adds to a table of this one.
+    # Columns the later revisions (20261001_tag_setup, 20261002_tag_hosts) add to a table of this one.
     later = {"tag_companions": {"mode", "owner_profile", "owner_profile_id", "installation_id", "controller_pub",
                                 "generation", "state", "paused", "lease_expires_at", "lease_credential_id",
-                                "gateway_device_id"}}
+                                "gateway_device_id", "execution_kind", "host_id"}}
     with provider.sync_engine().connect() as c:
         insp = inspect(c)
         for table in TABLES:

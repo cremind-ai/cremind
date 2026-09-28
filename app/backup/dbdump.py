@@ -47,7 +47,8 @@ _EXCLUDE_ROWS: dict[str, set[str]] = {"server_config": {"jwt_secret"}}
 #   sets it past every restored id instead.
 # - ``tag_idempotency``: remembered answers to retried requests of this
 #   install; replaying them after a restore would answer for work undone.
-_EXCLUDE_TABLES: frozenset[str] = frozenset({"tag_credentials", "tag_counters", "tag_idempotency"})
+_EXCLUDE_TABLES: frozenset[str] = frozenset({"tag_credentials", "tag_host_credentials", "tag_counters",
+                                             "tag_idempotency"})
 
 
 def _ordered_select(table: Table):

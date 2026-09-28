@@ -4,9 +4,12 @@
   answered 401 anywhere outside ``/api/tag-connector/v1/``;
 - ``Authorization: CremindSetup …`` (the one-session setup capability of a
   Cremind Connect launch link) is answered 401 anywhere outside
-  ``/api/tag-setup/v1/``.
+  ``/api/tag-setup/v1/``;
+- ``Authorization: CremindHost …`` (a desktop hardware host's credential,
+  scoped to that computer and one profile) is answered 401 anywhere outside
+  ``/api/tag-host/v1/``.
 
-Both run before authentication. The JWT backend already ignores these schemes
+All run before authentication. The JWT backend already ignores these schemes
 (it reads ``Bearer`` only), so such a request would merely be anonymous — but
 "anonymous" still reaches the public routes, and these secrets have no
 business on any of them. Failing loudly also tells a misconfigured client
@@ -24,6 +27,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 CONNECTOR_PREFIX = "/api/tag-connector/v1/"
 SETUP_PREFIX = "/api/tag-setup/v1/"
+HOST_PREFIX = "/api/tag-host/v1/"
 _RULES = {
     b"cremindtag": (CONNECTOR_PREFIX, "tag_credential_not_accepted",
                     "CremindTag credentials are accepted only by the connector API "
@@ -31,6 +35,9 @@ _RULES = {
     b"cremindsetup": (SETUP_PREFIX, "setup_credential_not_accepted",
                       "A Cremind Connect setup credential is accepted only by the setup API "
                       f"({SETUP_PREFIX})."),
+    b"cremindhost": (HOST_PREFIX, "host_credential_not_accepted",
+                     "A gateway computer's credential is accepted only by the host API "
+                     f"({HOST_PREFIX})."),
 }
 
 
@@ -61,4 +68,4 @@ class TagConnectorGuard:
         await response(scope, receive, send)
 
 
-__all__ = ["CONNECTOR_PREFIX", "SETUP_PREFIX", "TagConnectorGuard"]
+__all__ = ["CONNECTOR_PREFIX", "HOST_PREFIX", "SETUP_PREFIX", "TagConnectorGuard"]

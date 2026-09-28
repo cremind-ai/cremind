@@ -35,9 +35,11 @@ from app.api.documents_research import get_documents_research_routes
 from app.api.retired import get_retired_routes
 from app.api.search_tools import get_search_tools_routes
 from app.api.tag_connector import get_tag_connector_routes
+from app.api.tag_host import get_tag_host_routes
 from app.api.tag_setup_bootstrap import get_tag_setup_bootstrap_routes
 from app.api.tags import get_tags_routes
 from app.api.tags_hardware import get_tags_hardware_routes
+from app.api.tags_hosts import get_tags_hosts_routes
 from app.api.tags_setup import get_tags_setup_routes
 
 
@@ -132,6 +134,10 @@ def get_api_routes(
     routes.extend(get_tags_setup_routes())
     routes.extend(get_tag_setup_bootstrap_routes())
     routes.extend(get_tag_connector_routes())
+    # Gateway computers: the profile's side (hosts, searches, connections), and
+    # the API a desktop hardware host reports to (CremindHost credentials only).
+    routes.extend(get_tags_hosts_routes())
+    routes.extend(get_tag_host_routes())
     routes.extend(get_blueprint_routes(
         registry=registry,
         conversation_storage=conversation_storage,

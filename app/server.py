@@ -404,6 +404,17 @@ async def _do_shutdown() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping Documentation search during shutdown")
     try:
+        # Early and bounded: its workers stop, close their serial ports and
+        # release the gateways; the thread finishes on its own if it needs
+        # longer, and a worker's queue survives a hard stop anyway.
+        from app.tags.hosting.host import stop_hosting
+
+        await asyncio.wait_for(stop_hosting("Cremind is stopping"), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning("The Cremind Tag hardware host is still stopping; leaving it to the process exit")
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping the Cremind Tag hardware host during shutdown")
+    try:
         from app.events import get_uploads_cleanup_manager
 
         get_uploads_cleanup_manager().stop()
@@ -1962,6 +1973,18 @@ async def main(
                 get_tag_projection_worker().start(loop)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start the Cremind Tag projection worker")
+
+            # 12a-bis. Cremind Tag's hardware host: gateways plugged into this
+            #      computer, driven by workers in their own thread (after
+            #      storage, migrations and profiles; before any restore could
+            #      be staged). In the background: preparing the runtime (loading
+            #      fonts, probing USB ports) must never hold up boot.
+            try:
+                from app.tags.hosting.host import schedule_start
+
+                schedule_start()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start the Cremind Tag hardware host")
 
             # 12b. Document research jobs the restart cut short: mark them
             #      interrupted and report every result still owed to its

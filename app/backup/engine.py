@@ -661,6 +661,26 @@ def _capture_tag_credentials(engine: Any) -> list[dict[str, Any]]:
         return []
 
 
+def _capture_tag_host_credentials(engine: Any) -> list[dict[str, Any]]:
+    """This install's gateway-computer credentials (a desktop host's
+    ``CremindHost`` credential), read before the wipe and put back like the
+    connector credentials: an enrolled computer keeps working across a
+    restore of this install. [] when the table does not exist."""
+    from sqlalchemy import inspect as sa_inspect
+
+    try:
+        if not sa_inspect(engine).has_table("tag_host_credentials"):
+            return []
+        from app.storage.models import TagHostCredentialModel
+
+        with engine.connect() as conn:
+            rows = conn.execute(TagHostCredentialModel.__table__.select()).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception:  # noqa: BLE001
+        logger.warning("[backup:restore] could not read the local gateway-computer credentials", exc_info=True)
+        return []
+
+
 def _capture_tag_counter(engine: Any) -> int:
     """This install's ``delivery_id`` counter, read before the wipe: ids up to
     it may already sit in a companion's queue, so the restored counter must
@@ -684,7 +704,8 @@ def _capture_tag_counter(engine: Any) -> int:
 
 
 def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]],
-                    local_counter: int = 0) -> dict[str, int]:
+                    local_counter: int = 0,
+                    local_host_credentials: list[dict[str, Any]] | None = None) -> dict[str, int]:
     """Stop an archive's tag state from replaying onto live tags.
 
     Deliveries, streams and the journal travel inside the archive, so a restore
@@ -697,14 +718,15 @@ def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]],
     (``local_counter``), so no id a companion already knows is ever issued
     again — also when an older archive is restored twice. Then this install's
     own connector credentials are re-pinned where their companion (and, for a
-    content credential, profile) survived the restore."""
+    content credential, profile) survived the restore, and its gateway-computer
+    credentials where their computer and profile did."""
     import uuid as _uuid
 
     from sqlalchemy import func, insert, select, update
 
     from app.storage.models import (
         ProfileModel, TagCompanionModel, TagCounterModel, TagCredentialModel,
-        TagDeliveryModel, TagStreamModel,
+        TagDeliveryModel, TagHostCredentialModel, TagHostModel, TagStreamModel,
     )
     from app.tags.storage import ACTIVE_STAGES
 
@@ -712,7 +734,7 @@ def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]],
     streams = TagStreamModel.__table__
     counters = TagCounterModel.__table__
     now_ms = time.time() * 1000
-    report = {"cancelled": 0, "streams": 0, "credentials": 0}
+    report = {"cancelled": 0, "streams": 0, "credentials": 0, "host_credentials": 0}
     try:
         with engine.begin() as conn:
             result = conn.execute(
@@ -751,9 +773,22 @@ def _close_out_tags(engine: Any, local_credentials: list[dict[str, Any]],
                 if keep:
                     conn.execute(insert(creds), keep)
                 report["credentials"] = len(keep)
+
+            if local_host_credentials:
+                hosts = set(conn.execute(select(TagHostModel.__table__.c.id)).scalars().all())
+                profiles = set(conn.execute(select(ProfileModel.__table__.c.name)).scalars().all())
+                host_creds = TagHostCredentialModel.__table__
+                present = set(conn.execute(select(host_creds.c.id)).scalars().all())
+                keep = [
+                    r for r in local_host_credentials
+                    if r.get("host_id") in hosts and r.get("profile") in profiles and r.get("id") not in present
+                ]
+                if keep:
+                    conn.execute(insert(host_creds), keep)
+                report["host_credentials"] = len(keep)
     except Exception:  # noqa: BLE001
         logger.warning("[backup:restore] could not close out Cremind Tag state", exc_info=True)
-        return {"cancelled": -1, "streams": -1, "credentials": -1}
+        return {"cancelled": -1, "streams": -1, "credentials": -1, "host_credentials": -1}
     return report
 
 
@@ -925,6 +960,7 @@ def apply_staged_restore(
     # Likewise this install's Cremind Tag connector credentials (never archived)
     # and its delivery-id counter (ids up to it may be in a companion's queue).
     local_tag_credentials = _capture_tag_credentials(engine)
+    local_tag_host_credentials = _capture_tag_host_credentials(engine)
     local_tag_counter = _capture_tag_counter(engine)
     # And the simple-setup floors: revocations, highest generations, the
     # authority whose key files are on this machine.
@@ -952,7 +988,7 @@ def apply_staged_restore(
         )
         # Cremind Tag, unconditionally: even a rollback rewinds delivery ids
         # and cursors a live companion has already seen past.
-        _close_out_tags(engine, local_tag_credentials, local_tag_counter)
+        _close_out_tags(engine, local_tag_credentials, local_tag_counter, local_tag_host_credentials)
         _close_out_tag_setup(engine, local_tag_setup)
 
         # Re-pin the local secret — overwrites any value an older archive

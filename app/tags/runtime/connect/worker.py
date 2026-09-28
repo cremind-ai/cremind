@@ -26,11 +26,12 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ..connector.client import ConnectorClient, parse_credential
+from ..connector.client import ConnectorClient, Credential, parse_credential
 from ..protocol.ids import NodeRole
 from .paths import ConnectPaths, default_paths
 from .workerdir import WorkerDirError, WorkerSpec, load_worker, write_worker
@@ -63,9 +64,15 @@ def load_identity(spec: WorkerSpec) -> Any:
         raise WorkerConfigError(f"worker.json lacks {exc}") from None
 
 
-def build(directory: Path, port: str, paths: ConnectPaths, *, transport: Any = None,
-          fonts: Any = None, gateway_options: dict[str, Any] | None = None) -> tuple[Any, Any]:
-    """The daemon and its agent for ``directory`` (not started)."""
+def build(directory: Path, port: str, paths: ConnectPaths | None, *, transport: Any = None,
+          fonts: Any = None, gateway_options: dict[str, Any] | None = None,
+          client_factory: Callable[[Credential], ConnectorClient] | None = None,
+          font_roots: list[Path] | None = None) -> tuple[Any, Any]:
+    """The daemon and its agent for ``directory`` (not started).
+
+    ``client_factory`` makes every connector client of the worker (a worker the backend hosts passes the
+    in-process connector); ``font_roots`` are where verified font asset bundles are looked up when no
+    loaded ``fonts`` are given (default: the standard asset roots)."""
     from ..daemon.service import DaemonOptions, DaemonService
     from ..gateway.link import SecureOptions
     from ..resources import find_font_assets
@@ -91,7 +98,7 @@ def build(directory: Path, port: str, paths: ConnectPaths, *, transport: Any = N
     ca_file = directory / str(ca) if ca else None
     pack = cache = None
     if fonts is None:
-        assets = find_font_assets(roots=None)
+        assets = find_font_assets(roots=font_roots)
         if assets is not None:
             pack, cache = assets.pack_path, assets.cache_dir
         else:
@@ -102,9 +109,11 @@ def build(directory: Path, port: str, paths: ConnectPaths, *, transport: Any = N
         db_path=directory / DB_FILE, data_dir=directory, cremind_url=spec.server_origin, ca_file=ca_file,
         hardware_credential=credentials[0], content_credentials=[credentials[1]], gateway_url=port,
         fontpack=pack, font_cache=cache, fonts=fonts, secrets=store, transport=transport,
-        gateway_options={"secure": secure, **(gateway_options or {})}, gateway_hw_id=ident.gateway_hw_id)
+        gateway_options={"secure": secure, **(gateway_options or {})}, gateway_hw_id=ident.gateway_hw_id,
+        client_factory=client_factory)
     svc = DaemonService(options)
-    client = ConnectorClient(spec.server_origin, credentials[0], ca_file=ca_file, transport=transport)
+    client = (client_factory(credentials[0]) if client_factory is not None else
+              ConnectorClient(spec.server_origin, credentials[0], ca_file=ca_file, transport=transport))
     agent = ConnectAgent(svc, ident, controller, client, directory)
 
     async def removed() -> None:

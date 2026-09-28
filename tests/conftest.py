@@ -35,6 +35,9 @@ for _d in (_SYSTEM, _INSTALL, _WORKSPACES):
 os.environ["CREMIND_SYSTEM_DIR"] = _SYSTEM
 os.environ["CREMIND_INSTALL_DIR"] = _INSTALL
 os.environ["CREMIND_WORKSPACES_DIR"] = _WORKSPACES
+# A booted server never drives the developer's real USB gateways from a test:
+# the hardware host (app/tags/hosting) stays off unless a test turns it on.
+os.environ["CREMIND_TAGS_SERVER_HARDWARE"] = "0"
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001 — pytest hook signature

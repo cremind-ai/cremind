@@ -1351,12 +1351,22 @@ class TagCompanionModel(Base):
     controller_pub: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Moves on every recovery onto another computer (old credentials revoked).
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
-    # active | recovering | removing | removed
+    # connecting | active | recovering | removing | removed
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default=text("'active'"))
     paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     lease_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     lease_credential_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
     gateway_device_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Where the worker runs — separate from ``mode`` (who owns the hardware):
+    # ``legacy_external`` (Cremind Connect, or a manual runtime, reaching the
+    # connector API over HTTP), ``server`` (this backend's own hardware host),
+    # ``desktop`` (an enrolled Cremind installation acting as hardware host).
+    execution_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="legacy_external", server_default=text("'legacy_external'"),
+    )
+    # The hardware host running it (``server``/``desktop``); no FK — a removed
+    # host leaves its workers to be recovered elsewhere.
+    host_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class TagCredentialModel(Base):
@@ -1753,6 +1763,9 @@ class TagOperationModel(Base):
     companion_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("tag_companions.id", ondelete="SET NULL"), nullable=True,
     )
+    # The hardware host an operation runs on before any worker exists (a
+    # gateway search, a connection, preparing components). No FK.
+    host_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     binding_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     args: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -1768,6 +1781,7 @@ class TagOperationModel(Base):
     __table_args__ = (
         Index("ix_tag_operations_owner", "owner_profile", "created_at"),
         Index("ix_tag_operations_companion", "companion_id", "state"),
+        Index("ix_tag_operations_host", "host_id", "state"),
     )
 
 
@@ -1830,3 +1844,86 @@ class TagIdempotencyModel(Base):
     response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+# ── Cremind Tag: hardware hosts (gateways driven by Cremind itself) ──
+
+
+class TagHostModel(Base):
+    """A computer whose USB ports Cremind drives gateways on: the backend's own
+    (``server``, id = its ``<SYS>/.tag-runtime/host.json``) or an enrolled
+    Cremind desktop installation (``desktop``, owned by the profile that
+    enrolled it). ``capabilities`` and ``status`` are what the host last
+    reported (components, USB access, its workers); no secret is kept here."""
+
+    __tablename__ = "tag_hosts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # server | desktop
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    owner_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    owner_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    installation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    public_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    platform: Mapped[str] = mapped_column(String(16), nullable=False, default="", server_default=text("''"))
+    version: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    capabilities: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # active | revoked
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default=text("'active'"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_seen_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class TagHostAccessModel(Base):
+    """A profile may search for and claim UNCLAIMED hardware on a host. It
+    never exposes another profile's devices; revoking it stops new claims and
+    leaves existing ownership alone. The admin reaches the server's own host
+    without a row."""
+
+    __tablename__ = "tag_host_access"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    host_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_hosts.id", ondelete="CASCADE"), nullable=False,
+    )
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    granted_by: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("host_id", "profile_id", name="uq_tag_host_access_host_profile"),
+        Index("ix_tag_host_access_profile", "profile_id"),
+    )
+
+
+class TagHostCredentialModel(Base):
+    """A desktop host's credential (``CremindHost <id>.<secret>``), scoped to
+    that host and ONE profile: it fetches that profile's work for that host
+    only. SHA-256 of the secret only; left out of every backup dump."""
+
+    __tablename__ = "tag_host_credentials"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    host_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tag_hosts.id", ondelete="CASCADE"), nullable=False,
+    )
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False,
+    )
+    profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    secret_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("ix_tag_host_credentials_host", "host_id"),
+    )

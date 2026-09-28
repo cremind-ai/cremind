@@ -129,10 +129,10 @@ async def check_gateway_available(conn, session: Any, gateway: dict[str, Any], a
 
 
 def _credential_row(kind: str, secret_sha256: str, companion_id: str, *, profile: str | None,
-                    label: str, now: float) -> dict[str, Any]:
+                    label: str, now: float, created_by: str = "cremind-connect") -> dict[str, Any]:
     return {
         "id": creds.new_credential_id(), "companion_id": companion_id, "kind": kind, "profile": profile,
-        "secret_sha256": secret_sha256, "label": label, "created_by": "cremind-connect",
+        "secret_sha256": secret_sha256, "label": label, "created_by": created_by,
         "created_at": now, "last_used_at": None, "revoked_at": None,
     }
 
@@ -219,7 +219,8 @@ async def redeem_connect(conn, session: Any, controller: str, hw_hash: str, ct_h
 
 
 async def redeem_recover(conn, session: Any, controller: str, hw_hash: str, ct_hash: str, authority: Any,
-                         now: float) -> dict[str, Any]:
+                         now: float, *, label: str | None = None, created_by: str = "cremind-connect",
+                         ) -> dict[str, Any]:
     """Hand an existing private worker to the Connect that bound this session:
     atomically revoke the old worker's credentials and lease, move the
     worker generation, hold every device (bindings ``recovery_pending``; tags
@@ -232,10 +233,11 @@ async def redeem_recover(conn, session: Any, controller: str, hw_hash: str, ct_h
     computer = (session.computer or {}).get("name") or "This computer"
     await conn.execute(update(CREDENTIALS).where(
         CREDENTIALS.c.companion_id == cid, CREDENTIALS.c.revoked_at.is_(None)).values(revoked_at=now))
-    hardware = _credential_row(creds.KIND_HARDWARE, hw_hash, cid, profile=None,
-                               label=f"Cremind Connect on {computer}"[:128], now=now)
-    content = _credential_row(creds.KIND_CONTENT, ct_hash, cid, profile=profile,
-                              label=f"Cremind Connect on {computer}"[:128], now=now)
+    label = (label or f"Cremind Connect on {computer}")[:128]
+    hardware = _credential_row(creds.KIND_HARDWARE, hw_hash, cid, profile=None, label=label, now=now,
+                               created_by=created_by)
+    content = _credential_row(creds.KIND_CONTENT, ct_hash, cid, profile=profile, label=label, now=now,
+                              created_by=created_by)
     await conn.execute(insert(CREDENTIALS), [hardware, content])
     await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == cid).values(
         installation_id=session.installation_id, controller_pub=controller, generation=COMPANIONS.c.generation + 1,

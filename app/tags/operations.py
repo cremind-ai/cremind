@@ -157,13 +157,22 @@ async def _connection(conn, comp: Any, now: float) -> dict[str, Any]:
         else:
             views[b.role].append(view)
     inst = None
-    if comp.installation_id:
+    if comp.host_id:
+        from app.tags.hosts import HOSTS
+
+        row = (await conn.execute(select(HOSTS).where(HOSTS.c.id == comp.host_id))).first()
+        if row is not None:
+            inst = {"host_id": row.id, "installation_id": row.installation_id, "name": row.name,
+                    "kind": row.kind, "platform": row.platform, "version": row.version,
+                    "last_seen_at": iso(row.last_seen_at) if row.last_seen_at else None}
+    elif comp.installation_id:
         row = (await conn.execute(select(INSTALLATIONS).where(INSTALLATIONS.c.id == comp.installation_id))).first()
         if row is not None:
             inst = {"installation_id": row.id, "name": row.computer, "platform": row.platform,
-                    "version": row.version, "last_seen_at": iso(row.last_seen_at)}
+                    "version": row.version, "last_seen_at": iso(row.last_seen_at), "kind": "connect"}
     return {
         "id": comp.id, "name": comp.name, "status": companion_status(comp, now), "paused": bool(comp.paused),
+        "execution_kind": comp.execution_kind, "host_id": comp.host_id,
         "computer": inst, "gateway": views["gateway"], "bridges": views["bridge"], "tags": views["tag"],
         "last_seen_at": iso(comp.last_seen_at) if comp.last_seen_at else None, "created_at": iso(comp.created_at),
     }
@@ -217,7 +226,7 @@ async def connections(profile: str) -> dict[str, Any]:
         profile_id = await profile_uuid(conn, profile)
         comps = (await conn.execute(select(COMPANIONS).where(
             COMPANIONS.c.mode == PRIVATE, COMPANIONS.c.owner_profile == profile,
-            COMPANIONS.c.owner_profile_id == profile_id, COMPANIONS.c.state != "removed",
+            COMPANIONS.c.owner_profile_id == profile_id, COMPANIONS.c.state.notin_(("removed", "connecting")),
         ).order_by(COMPANIONS.c.created_at))).all()
         out = [await _connection(conn, c, now) for c in comps]
         ops = (await conn.execute(select(OPERATIONS).where(
@@ -226,7 +235,7 @@ async def connections(profile: str) -> dict[str, Any]:
     computers: dict[str, Any] = {}
     for c in out:
         if c["computer"]:
-            computers[c["computer"]["installation_id"]] = c["computer"]
+            computers[c["computer"].get("host_id") or c["computer"]["installation_id"]] = c["computer"]
     return {
         "simple_setup": simple_setup_enabled(),
         "connections": out,
@@ -993,7 +1002,7 @@ async def progress(grant: dict[str, Any], op_id: str, body: dict[str, Any]) -> d
                 from app.tags.storage import _small
 
                 values["result"] = _small(result)
-            lifted += await _finish(conn, op, comp, state, now)
+            lifted += await _finish(conn, op, comp, state, now, error=values.get("error"))
             wake.append(comp.id)
         await conn.execute(update(OPERATIONS).where(OPERATIONS.c.id == op_id).values(**values))
         op = (await conn.execute(select(OPERATIONS).where(OPERATIONS.c.id == op_id))).first()
@@ -1004,11 +1013,16 @@ async def progress(grant: dict[str, Any], op_id: str, body: dict[str, Any]) -> d
     return {"operation": operation_json(op)}
 
 
-async def _finish(conn, op: Any, comp: Any, state: str, now: float) -> list[str]:
-    """Operation outcome -> bindings, devices, the worker."""
+async def _finish(conn, op: Any, comp: Any, state: str, now: float,
+                  error: dict[str, Any] | None = None) -> list[str]:
+    """Operation outcome -> bindings, devices, the worker (``error``: what the worker reported)."""
     lifted: list[str] = []
     binding = (await conn.execute(select(BINDINGS).where(BINDINGS.c.id == op.binding_id))).first() \
         if op.binding_id else None
+    if op.kind == "claim_gateway" and state == "failed":
+        from app.tags.hosts import on_claim_outcome
+
+        await on_claim_outcome(conn, op, state, now, error=error)
     if op.kind == "claim_gateway" and binding is not None:
         if state == "succeeded":
             await conn.execute(update(BINDINGS).where(BINDINGS.c.id == binding.id).values(
@@ -1310,6 +1324,10 @@ async def on_worker_heartbeat(conn, companion_id: str, now: float,
     if gateway is not None and gateway.state == "paired":
         await conn.execute(update(BINDINGS).where(BINDINGS.c.id == gateway.id).values(
             state="ready", ready_at=now, updated_at=now))
+    if gateway is not None and comp.state == "connecting" and gateway.state in ("paired", "ready"):
+        from app.tags.hosts import on_gateway_ready
+
+        await on_gateway_ready(conn, companion_id, now)
     for item in (devices or [])[:500]:
         if not isinstance(item, dict) or _u32(item.get("gen")) is None:
             continue
@@ -1335,10 +1353,14 @@ async def on_worker_heartbeat(conn, companion_id: str, now: float,
 
 async def expire_operations(now: float | None = None) -> int:
     now = now or now_ms()
+    from app.tags import hosts
+
+    expired = await hosts.expire(now)
     async with get_tag_storage().engine.begin() as conn:
         await begin_write(conn)
         rows = (await conn.execute(select(OPERATIONS).where(
-            OPERATIONS.c.state.in_(OPEN_STATES + (WAITING,)), OPERATIONS.c.expires_at <= now))).all()
+            OPERATIONS.c.state.in_(OPEN_STATES + (WAITING,)), OPERATIONS.c.expires_at <= now,
+            OPERATIONS.c.kind.notin_(hosts.HOST_OPS)))).all()
         for row in rows:
             if row.kind == "discovery":
                 result = dict(row.result or {})
@@ -1356,7 +1378,7 @@ async def expire_operations(now: float | None = None) -> int:
                 binding = (await conn.execute(select(BINDINGS).where(BINDINGS.c.id == row.binding_id))).first()
                 if binding is not None and binding.state == "pairing":
                     await _forget_binding(conn, binding, now, reason="pairing timed out", cleanup="pending")
-    return len(rows)
+    return len(rows) + expired
 
 
 __all__ = [
