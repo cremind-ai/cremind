@@ -105,8 +105,10 @@ A gateway set up with the older Cremind Connect moves into Cremind by itself:
 when a gateway computer starts (the Cremind server's own, or the Cremind app
 set up as one), it takes over every Cremind Connect worker of this server on
 that computer — its keys, credentials and waiting updates, nothing paired
-again — and tells Cremind Connect to stop that worker. Workers of other
-servers stay with Cremind Connect; once none is left, Cremind Connect's
+again — and tells Cremind Connect to stop that worker. A desktop gateway
+computer serves one profile, so only that profile's workers move to it.
+Workers of other servers (and there, of other profiles) stay with Cremind
+Connect, which keeps running them; once none is left, Cremind Connect's
 startup entry is removed. A worker that cannot move (a damaged key, Cremind
 refusing it) stays with Cremind Connect, which keeps running it.
 `cremind tags hosts show` tells how many moved.

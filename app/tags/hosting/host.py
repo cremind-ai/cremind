@@ -251,9 +251,11 @@ class HardwareHost:
             authority_id = await self._authority_id()
             if not authority_id or self._supervisor is None:
                 return
+            # A desktop gateway computer serves one profile: only that profile's workers can move to it.
+            profile_id = (self.remote.profile_id or None) if self.remote is not None else None
             outcomes = await migration.migrate(self.paths, connect, authority_id=authority_id,
                                                host_id=self.host_id or "", adopt=client.adopt_worker,
-                                               start=self._supervisor.add_worker)
+                                               start=self._supervisor.add_worker, profile_id=profile_id)
             if outcomes:
                 logger.info("[tags] from Cremind Connect: " + ", ".join(f"{o.worker_id} {o.state}" for o in outcomes))
                 if self._agent is not None:

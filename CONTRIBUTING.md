@@ -20,7 +20,7 @@ see [RELEASING.md](RELEASING.md).
 | `.github/workflows/` | `pr.yml`, `release.yml`, `release-test.yml`. |
 | `pyproject.toml` | Python deps + hatch config. |
 | `RELEASING.md` | How to ship a new version. |
-| `docs/` | Upgrade notes for releases that change what an existing identifier means (e.g. [`docs/upgrade-search-tool-rename.md`](docs/upgrade-search-tool-rename.md)). Repo-only: runtime assets belong under `app/`, and the agent's own docs under `app/cremind_documents/bundled/`. |
+| `docs/` | Upgrade notes for releases that change what an existing identifier means or how existing installs work (e.g. [`docs/upgrade-search-tool-rename.md`](docs/upgrade-search-tool-rename.md), [`docs/upgrade-tags-gateway-computers.md`](docs/upgrade-tags-gateway-computers.md)), and `docs/tags/`: the developer documents of the Cremind Tag hardware runtime (the runtime, connector and setup APIs, simulator, scale test, layout, fonts). Repo-only: runtime assets belong under `app/`, and the agent's own docs under `app/cremind_documents/bundled/`. |
 
 ## First-time setup
 

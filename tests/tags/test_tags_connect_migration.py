@@ -33,7 +33,8 @@ HW = "tagc_hardware0001." + "H" * 43
 CT = "tagc_content00001." + "C" * 43
 
 
-def make_worker(workers_dir: Path, worker_id: str, companion_id: str, authority_id: str) -> Path:
+def make_worker(workers_dir: Path, worker_id: str, companion_id: str, authority_id: str,
+                profile_id: str = "pid-anna") -> Path:
     directory = workers_dir / worker_id
     directory.mkdir(parents=True)
     private, _public = identity.x25519_generate()
@@ -43,7 +44,7 @@ def make_worker(workers_dir: Path, worker_id: str, companion_id: str, authority_
     store.set_credential("hardware", HW)
     store.set_credential("content", CT)
     write_worker(directory, WorkerSpec(worker_id, "https://cremind.example.org", "anna", companion_id, "c3" * 16,
-                                       True, extra={"profile_id": "pid-anna", "authority_id": authority_id,
+                                       True, extra={"profile_id": profile_id, "authority_id": authority_id,
                                                     "authority_pub": "d4" * 32, "installation_id": "e5" * 16,
                                                     "gateway_ik": "f6" * 32}))
     db = sqlite3.connect(directory / "companion.sqlite3")
@@ -212,3 +213,17 @@ def test_a_moved_worker_enabled_again_in_connect_is_disabled_again(tmp_path) -> 
     [outcome] = run_migration(runtime, connect, adopter([]))
     assert outcome.detail == "already moved" and load_worker(source).enabled is False
     assert ("disable", "w-1") in connect.calls
+
+
+def test_a_computer_serving_one_profile_never_touches_another_profiles_worker(tmp_path) -> None:
+    runtime = RuntimePaths(tmp_path / ".tag-runtime").ensure()
+    connect = FakeConnect(tmp_path / "connect")
+    make_worker(connect.paths.workers_dir, "w-anna", "comp-1", OURS)
+    bobs = make_worker(connect.paths.workers_dir, "w-bob", "comp-2", OURS, profile_id="pid-bob")
+    adopted: list[str] = []
+
+    [outcome] = run_migration(runtime, connect, adopter(adopted), profile_id="pid-anna")
+    assert outcome.worker_id == "w-anna" and outcome.state == "complete" and adopted == ["comp-1"]
+    assert load_worker(bobs).enabled is True and "migrated_to" not in load_worker(bobs).extra
+    assert connect.calls == [("disable", "w-anna")], "bob's worker keeps running in Connect; Connect stays"
+    assert not (runtime.migration_dir / "w-bob.json").exists()

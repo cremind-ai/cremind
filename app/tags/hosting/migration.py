@@ -5,8 +5,9 @@ Connect's data directory: its controller key, connector credentials, durable
 delivery queue and device keys. Cremind takes the workers over as they are —
 nothing is paired again and no key is made anew (the server's authority keys
 are never touched). Only the workers of THIS Cremind move: a worker belongs
-to it when its recorded authority id is this server's; every other worker in
-Connect's directory is left alone and keeps running there.
+to it when its recorded authority id is this server's — and a desktop gateway
+computer, which serves one profile, takes only that profile's; every other
+worker in Connect's directory is left alone and keeps running there.
 
 Each worker goes through a journal (``migration/<worker_id>.json`` under the
 runtime folder, rewritten atomically after every step)::
@@ -175,8 +176,10 @@ def connect_paths() -> Any | None:
     return paths if paths.workers_dir.is_dir() else None
 
 
-def candidates(connect: Any, authority_id: str) -> list[tuple[Path, Any]]:
-    """Connect's enabled workers of the server whose authority id is ``authority_id``."""
+def candidates(connect: Any, authority_id: str, profile_id: str | None = None) -> list[tuple[Path, Any]]:
+    """Connect's enabled workers of the server whose authority id is ``authority_id`` — and, for a gateway
+    computer that serves one profile (``profile_id``), of that profile only: another profile's worker is
+    never touched there (Cremind would refuse it, after Connect had already been told to stop it)."""
     from app.tags.runtime.connect.workerdir import WorkerDirError, list_workers
 
     out = []
@@ -185,6 +188,8 @@ def candidates(connect: Any, authority_id: str) -> list[tuple[Path, Any]]:
             continue
         if str(spec.extra.get("authority_id") or "").lower() != authority_id.lower():
             continue  # another Cremind's worker: left alone
+        if profile_id is not None and str(spec.extra.get("profile_id") or "") != profile_id:
+            continue  # another profile's worker: Connect keeps running it
         out.append((directory, spec))
     return out
 
@@ -364,15 +369,17 @@ async def migrate_worker(runtime: Any, source: Path, spec: Any, *, host_id: str,
 
 async def migrate(runtime: Any, connect: Any, *, authority_id: str, host_id: str,
                   adopt: Callable[[str], Awaitable[dict[str, Any]]], service: Any | None = None,
-                  start: Callable[[str], None] | None = None, **kwargs: Any) -> list[Outcome]:
-    """Every worker of this server in Connect's directory; then retire Connect if nothing is left there."""
+                  start: Callable[[str], None] | None = None, profile_id: str | None = None,
+                  **kwargs: Any) -> list[Outcome]:
+    """Every worker of this server (of ``profile_id``, when given) in Connect's directory; then retire Connect
+    if nothing is left there."""
     import asyncio
 
     from app.tags.runtime.connect.workerdir import WorkerDirError, list_workers
 
     service = service or ConnectService(connect)
     outcomes = []
-    for source, spec in await asyncio.to_thread(candidates, connect, authority_id):
+    for source, spec in await asyncio.to_thread(candidates, connect, authority_id, profile_id):
         outcomes.append(await migrate_worker(runtime, source, spec, host_id=host_id, adopt=adopt, service=service,
                                              start=start, **kwargs))
     remaining = [s for _, s in await asyncio.to_thread(list_workers, connect.workers_dir)
