@@ -10,7 +10,7 @@
 // report, never from where this page runs.
 import type {
   Discovery, DiscoveryCandidate, GatewayCandidate, GatewayHost, HostOperation, SetupCapacity,
-  SetupDeliveryStatus, SetupDevice, SetupError, SetupOperation, TagConnection,
+  SetupDeliveryStatus, SetupDevice, SetupError, SetupOperation, SetupSession, TagConnection,
 } from '../services/tagsSetupApi';
 import type { PillType } from './tagsFormat';
 
@@ -187,6 +187,34 @@ export const SESSION_TERMINAL = ['completed', 'cancelled', 'expired', 'failed'] 
 
 export function isSessionTerminal(state: string | null | undefined): boolean {
   return !!state && (SESSION_TERMINAL as readonly string[]).includes(state);
+}
+
+/** Setting up a gateway computer: where an `enroll_host` session is, as the dialog shows it. */
+export type EnrollStep = 'open' | 'approve' | 'confirm' | 'finish' | 'done' | 'failed';
+
+export function enrollStep(session: Pick<SetupSession, 'state'> | null | undefined): EnrollStep {
+  switch (session?.state) {
+    case undefined:
+    case null:
+    case 'waiting_for_connect': return 'open';
+    case 'waiting_for_approval': return 'approve';
+    case 'waiting_for_confirmation': return 'confirm';
+    case 'redeeming': return 'finish';
+    case 'completed': return 'done';
+    default: return isSessionTerminal(session?.state) ? 'failed' : 'open';
+  }
+}
+
+/** Why an `enroll_host` session ended without a computer, in words. */
+export function enrollFailure(session: Pick<SetupSession, 'state' | 'error'> | null | undefined): string {
+  switch (session?.state) {
+    case 'expired': return 'The setup took longer than five minutes and has expired. Start again.';
+    case 'cancelled': return 'The setup was cancelled. Nothing was changed.';
+    default:
+      return setupErrorMessage(session?.error?.code, {
+        fallback: session?.error?.message || 'The computer could not finish the setup. Start again.',
+      });
+  }
 }
 
 // ── gateway computers ──────────────────────────────────────────────────────
@@ -581,6 +609,10 @@ const ERROR_TEXT: Record<string, string> = {
   host_error: 'The computer could not finish. Try again.',
   prepare_failed: 'Preparing the components did not finish. Try again.',
   prepared_on_that_computer: 'Components are prepared on the computer itself.',
+  host_not_removable: 'The computer the Cremind server runs on cannot be removed.',
+  host_removed: 'That computer was removed.',
+  not_approved: 'Approve on the other computer first.',
+  declined: 'Setting up the computer was declined on it.',
   not_a_gateway: 'That device is not a gateway.',
   device_rejected: 'The gateway\'s identity does not check out. Unplug it and try again; if this repeats, reset it.',
 };
@@ -620,7 +652,8 @@ export function setupErrorMessage(
 
 // ── setups still running (resume after a refresh) ──────────────────────────
 
-export type PendingSetupKind = 'connect' | 'move' | 'discovery' | 'pair_bridge' | 'pair_tag' | 'recover_gateway';
+export type PendingSetupKind =
+  | 'enroll' | 'connect' | 'move' | 'discovery' | 'pair_bridge' | 'pair_tag' | 'recover_gateway';
 
 export interface PendingSetup {
   kind: PendingSetupKind;
@@ -629,9 +662,23 @@ export interface PendingSetup {
   detail: string;
 }
 
+const ENROLL_WAIT: Record<string, string> = {
+  waiting_for_connect: 'Waiting for the Cremind app to open the link',
+  waiting_for_approval: 'Waiting for approval on the computer',
+  waiting_for_confirmation: 'Waiting for you to confirm the words',
+  redeeming: 'Finishing',
+};
+
 /** The setups the server says are still running, as banners with a Continue. */
-export function pendingSetups(operations: SetupOperation[], hostOps: HostOperation[] = []): PendingSetup[] {
+export function pendingSetups(
+  operations: SetupOperation[], hostOps: HostOperation[] = [], sessions: SetupSession[] = [],
+): PendingSetup[] {
   const out: PendingSetup[] = [];
+  for (const s of sessions) {
+    if (s.operation !== 'enroll_host' || isSessionTerminal(s.state)) continue;
+    out.push({ kind: 'enroll', id: s.id, title: 'Setting up a gateway computer',
+               detail: ENROLL_WAIT[s.state] ?? humanize(s.state) });
+  }
   for (const h of hostOps) {
     if (h.kind !== 'host_connect' || isOperationTerminal(h.state)) continue;
     out.push(h.recover

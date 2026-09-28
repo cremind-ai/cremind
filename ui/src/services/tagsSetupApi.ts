@@ -115,7 +115,9 @@ export interface TagConnection {
 
 export interface SetupError { code: string; message: string }
 
-export type SetupSessionOperation = 'connect_gateway' | 'recover' | 'probe';
+/** `enroll_host`: set up a gateway computer (the Cremind app on it completes the link). The others belong to
+ *  the older Cremind Connect. */
+export type SetupSessionOperation = 'enroll_host' | 'connect_gateway' | 'recover' | 'probe';
 export type SetupSessionState =
   | 'waiting_for_connect' | 'waiting_for_approval' | 'waiting_for_confirmation'
   | 'redeeming' | 'connecting' | 'completed' | 'cancelled' | 'expired' | 'failed';
@@ -133,6 +135,8 @@ export interface SetupSession {
   browser_confirmed: boolean;
   companion_id: string | null;
   operation_id: string | null;
+  /** `enroll_host`, once completed: the gateway computer it set up. */
+  host_id?: string | null;
   error: SetupError | null;
 }
 
@@ -597,6 +601,13 @@ export async function connectGateway(
 export async function getHostOperation(agentUrl: string, token: string, id: string): Promise<HostOperation> {
   const res = await tagsRequest<{ operation: HostOperation }>(agentUrl, token, `/api/tags/operations/${enc(id)}`);
   return res.operation;
+}
+
+/** Remove one of this profile's desktop gateway computers (its credential stops working at once). */
+export function removeHost(
+  agentUrl: string, token: string, hostId: string, key?: string,
+): Promise<{ host: { id: string; name: string; state: string }; connections: number }> {
+  return mutation(agentUrl, token, `/api/tags/hosts/${enc(hostId)}`, 'DELETE', undefined, key);
 }
 
 export async function cancelHostOperation(

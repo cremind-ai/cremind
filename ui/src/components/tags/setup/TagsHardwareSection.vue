@@ -26,6 +26,7 @@ import {
 import { formatRelativeTime } from '../../../utils/relativeTime';
 import TagPreviewImage from '../TagPreviewImage.vue';
 import GatewayComputers from './GatewayComputers.vue';
+import EnrollComputerDialog from './EnrollComputerDialog.vue';
 import HardwareDeviceRow from './HardwareDeviceRow.vue';
 import ConnectGatewayDialog from './ConnectGatewayDialog.vue';
 import AddBridgeDialog from './AddBridgeDialog.vue';
@@ -39,6 +40,8 @@ const props = defineProps<{ profile: string; now: number }>();
 const setup = useTagsSetupStore();
 const tagsStore = useTagsStore();
 
+const enrollOpen = ref(false);
+const enrollResume = ref<string | null>(null);
 const connectOpen = ref(false);
 const connectResume = ref<string | null>(null);
 const connectHost = ref<string | null>(null);
@@ -78,6 +81,10 @@ const nextStep = computed(() => {
 
 // ── dialogs ──
 
+function openEnroll(resumeId: string | null = null) {
+  enrollResume.value = resumeId;
+  enrollOpen.value = true;
+}
 function openConnect(resumeId: string | null = null, hostId: string | null = null) {
   connectResume.value = resumeId;
   connectHost.value = hostId;
@@ -107,6 +114,7 @@ function openRemove(device: SetupDevice, connection: TagConnection) {
 
 async function continuePending(p: PendingSetup) {
   switch (p.kind) {
+    case 'enroll': openEnroll(p.id); break;
     case 'connect': openConnect(p.id); break;
     case 'move': openRecover(null, { operationId: p.id }); break;
     case 'recover_gateway': openRecover(null, { recoveryId: p.id }); break;
@@ -125,6 +133,7 @@ async function continuePending(p: PendingSetup) {
 }
 
 function pendingCancellable(p: PendingSetup): boolean {
+  if (p.kind === 'enroll') return true;
   if (p.kind === 'connect' || p.kind === 'move') {
     // Not once the gateway is being claimed (it is removed afterwards instead).
     return !setup.activeHostOps.find((o) => o.id === p.id)?.companion_id;
@@ -135,7 +144,8 @@ function pendingCancellable(p: PendingSetup): boolean {
 async function cancelPending(p: PendingSetup) {
   busy.value = `pending:${p.id}`;
   try {
-    if (p.kind === 'connect' || p.kind === 'move') await setup.cancelHostOp(p.id);
+    if (p.kind === 'enroll') await setup.cancelSession(p.id);
+    else if (p.kind === 'connect' || p.kind === 'move') await setup.cancelHostOp(p.id);
     else await setup.cancelPairing(p.id);
     await Promise.all([setup.loadConnections(), setup.loadHosts()]);
     ElMessage.success('Cancelled');
@@ -364,7 +374,7 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
       </div>
     </template>
 
-    <GatewayComputers :now="now" @connect="(id: string) => openConnect(null, id)" />
+    <GatewayComputers :now="now" @connect="(id: string) => openConnect(null, id)" @enroll="openEnroll()" />
 
     <div v-if="setup.pending.length" class="pending" role="status" aria-label="Setups in progress">
       <div v-for="p in setup.pending" :key="`${p.kind}:${p.id}`" class="pending-row">
@@ -482,6 +492,11 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
       <p v-else>No gateway yet.</p>
     </div>
 
+    <EnrollComputerDialog
+      v-model="enrollOpen"
+      :resume-session-id="enrollResume"
+      @connect="(id: string) => openConnect(null, id)"
+    />
     <ConnectGatewayDialog
       v-model="connectOpen"
       :host-id="connectHost"

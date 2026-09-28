@@ -159,25 +159,32 @@ type CremindBackendUpgradeBridge = {
   offDone: (cb: (result: CremindBackendUpgradeDone) => void) => void
 }
 
-// Cremind Connect (the Cremind Tag gateway service) as the desktop app bundles
-// it. ``status`` reports this OS user's installation; ``install`` installs or
-// updates the bundled copy and (re)registers its startup; ``launch`` hands a
-// ``cremind-connect://setup?…`` link to it over IPC.
-type CremindConnectStatus = {
-  installed: boolean
+// This computer as a Cremind Tag gateway computer of a Cremind server
+// elsewhere. ``status`` is the app's own report: whether it can drive
+// gateways here (not when Cremind itself runs on this computer — its own
+// hardware host does), whether it is set up, and its runner's state.
+// ``enroll`` completes a ``cremind://tags/setup?…`` link (the app's own
+// dialog shows the words to compare). ``forget`` stops being one.
+type CremindTagsHostStatus = {
+  available: boolean
+  reason?: string
+  /** The gateway components are not installed in this app yet (``prepare`` installs them). */
+  needsRuntime?: boolean
+  enrolled: boolean
+  server?: string
+  profile?: string
+  hostId?: string
   running: boolean
-  version?: string
-  /** The copy this desktop app bundles (newer than ``version`` → offer an update). */
-  bundledVersion?: string
-  installationId?: string
-  /** The computer's name as Connect reports it. */
-  computer?: string
+  state?: string
+  detail?: string
 }
 
-type CremindConnectBridge = {
-  status(): Promise<CremindConnectStatus>
-  install(): Promise<{ ok: boolean; error?: string }>
-  launch(url: string): Promise<{ ok: boolean; error?: string }>
+type CremindTagsHostBridge = {
+  status(): Promise<CremindTagsHostStatus>
+  enroll(url: string): Promise<{ ok: boolean; error?: string }>
+  forget(): Promise<{ ok: boolean; error?: string }>
+  prepare?(): Promise<{ ok: boolean; error?: string }>
+  onPrepareLog?(cb: (entry: { line: string }) => void): () => void
 }
 
 // Keeping Cremind (the local backend) running after the window closes, so tags
@@ -213,10 +220,11 @@ type CremindBridge = {
   // have no such bridge, so callers must feature-detect and fall back to
   // ``window.open``.
   openVncDesktop?: (url: string) => Promise<{ ok: boolean; error?: string }>
-  // Cremind Tag simple setup. Optional like ``openVncDesktop``: older desktop
-  // shells have neither, so Settings → Tags feature-detects them
-  // (services/connectBridge.ts) and falls back to the browser flow.
-  connect?: CremindConnectBridge
+  // Cremind Tag gateway computer and "keep running". Optional like
+  // ``openVncDesktop``: older desktop shells have neither, so Settings → Tags
+  // feature-detects them (services/desktopBridge.ts) and falls back to the
+  // browser flow.
+  tagsHost?: CremindTagsHostBridge
   background?: CremindBackgroundBridge
   installer: CremindInstallerBridge
   server: CremindServerBridge

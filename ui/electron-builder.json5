@@ -22,11 +22,25 @@
     { "from": "../install/install.ps1", "to": "install.ps1" },
     { "from": "../install/install.sh",  "to": "install.sh" }
   ],
+  // ``cremind://tags/setup?…`` links (setting up a Cremind Tag gateway
+  // computer) open in this app: Info.plist on macOS, the .desktop entry on
+  // Linux; Windows registers itself at launch (app.setAsDefaultProtocolClient).
+  "protocols": [
+    { "name": "Cremind", "schemes": ["cremind"] }
+  ],
+  // Apple silicon and Intel: both built on the (arm64) macOS runner; ${arch}
+  // in the name keeps one from overwriting the other.
   "mac": {
     "target": [
-      "dmg"
+      {
+        "target": "dmg",
+        "arch": [
+          "arm64",
+          "x64"
+        ]
+      }
     ],
-    "artifactName": "${productName}-Mac-${version}-Installer.${ext}"
+    "artifactName": "${productName}-Mac-${version}-${arch}-Installer.${ext}"
   },
   "win": {
     "target": [

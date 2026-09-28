@@ -9,10 +9,11 @@
  * The admin also prepares the server's gateway components (progress, retry)
  * and decides which other profiles may use the server's USB ports. A
  * profile allowed there claims only unclaimed gateways; everything it
- * connects stays its own.
+ * connects stays its own. "Set up a gateway computer" adds one of the
+ * profile's own computers (the Cremind app on it); "Remove" takes one away.
  */
 import { computed, ref } from 'vue';
-import { ElButton, ElMessage, ElSwitch, ElTag } from 'element-plus';
+import { ElButton, ElMessage, ElMessageBox, ElSwitch, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useTagsSetupStore } from '../../../stores/tagsSetup';
 import { TagsApiError } from '../../../services/tagsApi';
@@ -24,7 +25,7 @@ import {
 import { formatRelativeTime } from '../../../utils/relativeTime';
 
 const props = defineProps<{ now: number }>();
-const emit = defineEmits<{ (e: 'connect', hostId: string): void }>();
+const emit = defineEmits<{ (e: 'connect', hostId: string): void; (e: 'enroll'): void }>();
 
 const setup = useTagsSetupStore();
 /** `<host id>:<action>` while it runs. */
@@ -109,6 +110,29 @@ async function setAccess(h: GatewayHost, profileId: string, granted: boolean) {
   }
 }
 
+async function remove(h: GatewayHost) {
+  const yours = h.connections === 1 ? 'Its gateway stays yours' : h.connections > 1 ? 'Its gateways stay yours' : '';
+  try {
+    await ElMessageBox.confirm(
+      `Remove ${hostName(h)}? It stops driving gateways for this profile at once.`
+      + (yours ? ` ${yours}, offline until you move ${h.connections === 1 ? 'it' : 'them'} to another computer.` : ''),
+      'Remove gateway computer',
+      { confirmButtonText: 'Remove', cancelButtonText: 'Cancel', type: 'warning' },
+    );
+  } catch {
+    return;
+  }
+  busy.value = `${h.id}:remove`;
+  try {
+    await setup.removeHost(h.id);
+    ElMessage.success(`${hostName(h)} was removed`);
+  } catch (e) {
+    failed(e);
+  } finally {
+    busy.value = '';
+  }
+}
+
 function toggleAccess(h: GatewayHost) {
   accessOpen.value = { ...accessOpen.value, [h.id]: !accessOpen.value[h.id] };
 }
@@ -118,8 +142,15 @@ const grantedCount = (h: GatewayHost) => (h.access.profiles ?? []).filter((p) =>
 
 <template>
   <section class="computers" aria-labelledby="gateway-computers-title">
-    <h3 id="gateway-computers-title" class="computers-title">Gateway computers</h3>
-    <p class="computers-sub">Cremind drives your gateways over USB from these computers, and keeps your tags updated even when this page is closed.</p>
+    <div class="computers-head">
+      <div>
+        <h3 id="gateway-computers-title" class="computers-title">Gateway computers</h3>
+        <p class="computers-sub">Cremind drives your gateways over USB from these computers, and keeps your tags updated even when this page is closed.</p>
+      </div>
+      <ElButton size="small" @click="emit('enroll')">
+        <Icon icon="mdi:plus" class="btn-icon" aria-hidden="true" /> Set up a gateway computer
+      </ElButton>
+    </div>
 
     <p v-if="setup.hostsLoaded && !hosts.length" class="empty-note">
       This server does not report any computer it can drive gateways from. Update Cremind to use gateways
@@ -219,6 +250,9 @@ const grantedCount = (h: GatewayHost) => (h.access.profiles ?? []).filter((p) =>
           >
             Check again
           </ElButton>
+          <ElButton v-if="h.kind === 'desktop'" size="small" :loading="busy === `${h.id}:remove`" @click="remove(h)">
+            Remove
+          </ElButton>
         </div>
       </li>
     </ul>
@@ -227,6 +261,7 @@ const grantedCount = (h: GatewayHost) => (h.access.profiles ?? []).filter((p) =>
 
 <style scoped>
 .computers { margin-top: 4px; }
+.computers-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .computers-title {
   margin: 0 0 4px; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
   color: var(--text-secondary);

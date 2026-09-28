@@ -228,6 +228,47 @@ test('a connection still running shows as a setup to continue, also after a refr
   assert.equal(store.hostOps['conn-1'].stage, 'claiming')
 })
 
+test('set up a gateway computer: the link stays with the caller, the store follows the session to done', async () => {
+  const { env, M, store } = await setup()
+  const SECRET = 'T0ken-that-must-never-be-stored-AAAAAAAAAAAAAAAA'
+  const computer = { installation_id: 'inst-9', name: 'LAPTOP-9', platform: 'windows', version: '0.0.19' }
+  const enroll = (state, extra = {}) => session(state, { operation: 'enroll_host', computer, ...extra })
+  env.route('/api/tags/connections', () => json(listAnswer()))
+  env.route('/api/tags/setup-sessions', () => json({
+    session: enroll('waiting_for_connect', { computer: null }),
+    launch_url: `cremind://tags/setup?v=1&server=${encodeURIComponent(AGENT)}&session=ses-1&token=${SECRET}`,
+  }, 201))
+  env.route('/api/tags/setup-sessions/ses-1', sequence('session', [
+    enroll('waiting_for_approval', { verification_phrase: 'amber orbit lantern tidal' }),
+    enroll('waiting_for_confirmation', { verification_phrase: 'amber orbit lantern tidal', native_approved: true }),
+    enroll('completed', { verification_phrase: 'amber orbit lantern tidal', host_id: 'h-lap' }),
+  ]))
+  env.route('/api/tags/setup-sessions/ses-1/confirm', () => json({ session: enroll('redeeming') }))
+
+  const { session: created, launchUrl } = await store.startSession('enroll_host')
+  assert.ok(launchUrl.startsWith('cremind://tags/setup?v=1&server='))
+  const post = env.callsTo('/api/tags/setup-sessions').find((c) => c.init.method === 'POST')
+  assert.deepEqual(JSON.parse(post.init.body), { operation: 'enroll_host', server_url: AGENT })
+  assert.equal(M.enrollStep(created), 'open')
+  assert.ok(!JSON.stringify(store.sessions).includes(SECRET), "the link's secret never lands in the store")
+  assert.deepEqual(M.pendingSetups([], [], [created]).map((p) => [p.kind, p.title]),
+    [['enroll', 'Setting up a gateway computer']])
+
+  store.follow('session', 'ses-1')
+  await store.tick()
+  assert.equal(M.enrollStep(store.sessions['ses-1']), 'approve')
+  await store.tick()
+  assert.equal(M.enrollStep(store.sessions['ses-1']), 'confirm')
+  await store.confirmSession('ses-1')
+  assert.equal(M.enrollStep(store.sessions['ses-1']), 'finish')
+  await store.tick()
+  assert.equal(M.enrollStep(store.sessions['ses-1']), 'done')
+  assert.equal(store.sessions['ses-1'].host_id, 'h-lap')
+  assert.equal(store.isFollowing('session', 'ses-1'), false)
+  assert.equal(M.enrollFailure({ state: 'expired', error: null }),
+    'The setup took longer than five minutes and has expired. Start again.')
+})
+
 test('add tag: scanning → found with one bridge → pair at once → waiting for the tag to wake → ready', async () => {
   const { env, M, store } = await setup()
   const bridge = device('bridge', 'br-1', { name: 'Hall', capacity: { max_tags: 20, assigned: 3 } })

@@ -9,6 +9,7 @@ import {
   getHostOperation,
   getHosts,
   prepareHost as apiPrepareHost,
+  removeHost as apiRemoveHost,
   scanHost as apiScanHost,
   setHostAccess as apiSetHostAccess,
   cancelPairing as apiCancelPairing,
@@ -108,7 +109,7 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
 
   const pollIntervalMs = computed(() => (following.value.length ? FAST_POLL_MS : SLOW_POLL_MS));
   const readiness = computed(() => setupReadiness(connections.value));
-  const pending = computed(() => pendingSetups(activeOperations.value, activeHostOps.value));
+  const pending = computed(() => pendingSetups(activeOperations.value, activeHostOps.value, activeSessions.value));
   /** The computers this profile may connect a gateway on. */
   const usableHosts = computed(() => hosts.value.filter((h) => h.access.can_use));
   const bridges = computed(() => connections.value.flatMap((c) => c.bridges.map((device) => ({ device, connection: c }))));
@@ -437,6 +438,14 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     return res;
   }
 
+  /** Remove one of this profile's desktop gateway computers. */
+  async function removeHost(hostId: string) {
+    const tok = token();
+    const res = await keys.run(`remove-host:${hostId}`, {}, (key) => apiRemoveHost(url(), tok, hostId, key));
+    if (token() === tok) void Promise.allSettled([loadHosts(), loadConnections()]);
+    return res;
+  }
+
   async function unpair(deviceId: string) {
     const tok = token();
     const res = await keys.run(`unpair:${deviceId}`, {}, (key) => unpairDevice(url(), tok, deviceId, key));
@@ -510,6 +519,7 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     prepareHost,
     cancelHostOp,
     setHostAccess,
+    removeHost,
     unpair,
     setPaused,
     sendTest,

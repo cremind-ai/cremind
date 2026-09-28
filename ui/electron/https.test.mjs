@@ -246,7 +246,7 @@ async function mainHarness(run) {
         }
         : { install_mode: 'native', ui_features: [] },
     )) } },
-    Tray: class {}, Menu: {}, nativeImage: {}, shell: {},
+    Tray: class {}, Menu: {}, nativeImage: {}, shell: {}, dialog: {}, Notification: class {},
   }
   function makeWindow(id, url, state = {}, ready = Promise.resolve()) {
     const contents = Object.assign(new EventEmitter(), {
@@ -297,7 +297,7 @@ async function mainHarness(run) {
       external: ['electron-updater'], define: { __CREMIND_INSTALL_CHANNEL__: '"production"' },
       plugins: [{ name: 'electron-test', setup(builder) {
         builder.onResolve({ filter: /^electron$/ }, () => ({ path: 'electron', namespace: 'mock' }))
-        builder.onLoad({ filter: /.*/, namespace: 'mock' }, () => ({ contents: 'export const {app,ipcMain,BrowserWindow,session,Tray,Menu,nativeImage,shell} = globalThis.__cremindElectronTest' }))
+        builder.onLoad({ filter: /.*/, namespace: 'mock' }, () => ({ contents: 'export const {app,ipcMain,BrowserWindow,session,Tray,Menu,nativeImage,shell,dialog,Notification} = globalThis.__cremindElectronTest' }))
       } }],
     })
     await writeFile(outfile, result.outputFiles[0].text)

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Tray, Menu, nativeImage, Notification, session, shell } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
@@ -18,6 +18,7 @@ import {
 } from './backendTransport'
 import { filterTransitionState, transitionProfile, type TransitionState } from './transitionState'
 import { validVncUrl, vncUrlFor, type VncDescriptor } from './vncDesktop'
+import { TagsHostManager, parseTagsSetupLink, redactLink } from './tagsHost'
 // Pulled in lazily to keep the dev / web build (which doesn't ship
 // electron-updater) functional. The require is wrapped below.
 type AutoUpdaterModule = typeof import('electron-updater')
@@ -2704,6 +2705,213 @@ function killProcessTreeSync(pid: number): void {
   } catch { /* ignore — process may already be gone */ }
 }
 
+// ── This computer as a Cremind Tag gateway computer ────────────────────────
+//
+// See tagsHost.ts. ``cremind tags host`` runs from the runtime-only install
+// (``<INSTALL_DIR>/tag-host/venv``, made by the installer's
+// ``--runtime-only``) or, in development, ``$CREMIND_TAG_HOST_EXE``. A native
+// install on this computer drives its USB ports itself (the server's own
+// hardware host), so there is nothing to set up then; a Docker install
+// cannot see them, which is what this is for.
+function tagsHostExePath(): string | null {
+  const override = process.env.CREMIND_TAG_HOST_EXE
+  if (override) return fs.existsSync(override) ? override : null
+  const venv = path.join(installDirPath(), 'tag-host', 'venv')
+  const exe = process.platform === 'win32' ? path.join(venv, 'Scripts', 'cremind.exe') : path.join(venv, 'bin', 'cremind')
+  return fs.existsSync(exe) ? exe : null
+}
+
+function localBackendDrivesUsb(): boolean {
+  if (!fs.existsSync(path.join(systemDirPath(), '.env'))) return false
+  return (readInstallEnvironment().INSTALL_MODE || 'native') === 'native'
+}
+
+const tagsHost = new TagsHostManager({
+  runtimeExe: tagsHostExePath,
+  env: cremindSubprocessEnv,
+  systemDir: systemDirPath,
+  spawn: (command, args, options) => spawn(command, args, options),
+  localBackendDrivesUsb,
+  approve: async (bound) => {
+    const parent = BrowserWindow.getFocusedWindow() ?? (mainWin && !mainWin.isDestroyed() ? mainWin : null)
+    const options: Electron.MessageBoxOptions = {
+      type: 'question', buttons: ['Approve', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true,
+      title: 'Set up this computer',
+      message: `Set up this computer as a gateway computer for ${bound.profile || 'your profile'}?`,
+      detail: `Cremind: ${bound.server}\nThis computer: ${bound.computer}\n\n`
+        + `The Cremind page shows four words. Approve only if they are exactly:\n\n    ${bound.words}\n\n`
+        + 'This computer then drives the Cremind Tag gateways plugged into it, for that profile only.',
+    }
+    const result = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options)
+    return result.response === 0
+  },
+  notify: (title, body, kind) => {
+    try {
+      if (Notification.isSupported()) { new Notification({ title, body }).show(); return }
+    } catch { /* fall back to a dialog */ }
+    void dialog.showMessageBox({ type: kind === 'error' ? 'warning' : 'info', title, message: title, detail: body })
+  },
+  log: (line) => console.log(`[cremind] tags host: ${line}`),
+})
+
+// Links that arrived before the app was ready (macOS delivers ``open-url``
+// that early on a cold launch).
+const pendingCremindLinks: string[] = []
+
+function cremindLinkFromArgv(argv: string[]): string | undefined {
+  return argv.find((arg) => /^cremind:\/\//i.test(arg))
+}
+
+// A ``cremind://`` link from the OS: only ``cremind://tags/setup?…`` is
+// understood; anything else is refused with a sentence, and nothing but the
+// redacted link is ever logged.
+function handleCremindLink(raw: string): void {
+  let href: string
+  try {
+    href = parseTagsSetupLink(raw).href
+  } catch (err) {
+    console.warn(`[cremind] refused link ${redactLink(raw)}: ${(err as Error).message}`)
+    if (app.isReady()) dialog.showErrorBox('Cremind', (err as Error).message)
+    return
+  }
+  if (!app.isReady()) {
+    pendingCremindLinks.push(href)
+    return
+  }
+  focusMostRecentAppWindow()
+  void tagsHost.enroll(href).then((res) => {
+    if (res.ok) {
+      const status = tagsHost.status()
+      void dialog.showMessageBox({
+        type: 'info', title: 'Cremind', message: 'This computer is a gateway computer now',
+        detail: `It drives the Cremind Tag gateways plugged into it for ${status.profile || 'your profile'} on `
+          + `${status.server || 'Cremind'}, and keeps doing so while Cremind runs in the tray.`,
+      })
+    } else if (res.error) {
+      void dialog.showMessageBox({ type: 'error', title: 'Cremind', message: 'This computer was not set up', detail: res.error })
+    }
+  })
+}
+
+function registerCremindLinks(): void {
+  try {
+    if (process.defaultApp && process.argv.length >= 2) {
+      app.setAsDefaultProtocolClient('cremind', process.execPath, [path.resolve(process.argv[1])])
+    } else {
+      app.setAsDefaultProtocolClient('cremind')
+    }
+  } catch (err) {
+    console.warn('[cremind] cremind:// links could not be registered', err)
+  }
+}
+
+ipcMain.handle('cremind:tags-host:status', (event) => {
+  if (!isFirstPartySender(event)) {
+    return { available: false, enrolled: false, running: false, reason: 'Only a Cremind app window can ask.' }
+  }
+  return tagsHost.status()
+})
+
+ipcMain.handle('cremind:tags-host:enroll', async (event, url: unknown) => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can set up this computer.' }
+  if (typeof url !== 'string') return { ok: false, error: 'No link was given.' }
+  return tagsHost.enroll(url)
+})
+
+// The gateway components for this app alone: the installer's runtime-only
+// op (a venv with ``cremind[tags]`` under the Install Dir; no backend, no
+// database, no URL changes), with its output streamed to the app's windows.
+let tagsHostPrepare: Promise<{ ok: boolean; error?: string }> | null = null
+
+async function prepareTagsHostRuntime(): Promise<{ ok: boolean; error?: string }> {
+  const say = (line: string) => broadcastToAppWindows('cremind:tags-host:prepare-log', { line })
+  const isWindows = process.platform === 'win32'
+  const scriptName = isWindows ? 'install.ps1' : 'install.sh'
+  let scriptPath: string
+  if (INSTALL_CHANNEL === 'dev') {
+    scriptPath = path.resolve(__dirname, '..', '..', 'install', scriptName)
+  } else {
+    const scriptDir = path.join(app.getPath('userData'), 'installer')
+    fs.mkdirSync(scriptDir, { recursive: true })
+    scriptPath = path.join(scriptDir, scriptName)
+    say('Downloading the installer…')
+    try {
+      await downloadFile(`${INSTALLER_SCRIPT_BASE}/${scriptName}`, scriptPath)
+    } catch (err) {
+      return { ok: false, error: `The installer could not be downloaded (${(err as Error).message}).` }
+    }
+    if (!isWindows) fs.chmodSync(scriptPath, 0o755)
+  }
+  const version = app.getVersion()
+  const cmd = isWindows ? 'powershell.exe' : 'bash'
+  const args = isWindows
+    ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-RuntimeOnly', '-Channel', INSTALL_CHANNEL,
+       '-ElectronVersion', version]
+    : [scriptPath, '--runtime-only', '--channel', INSTALL_CHANNEL, '--electron-version', version]
+  say('Installing the gateway components (this may take a few minutes)…')
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      env: {
+        ...process.env, CREMIND_SYSTEM_DIR: systemDirPath(), CREMIND_INSTALL_DIR: installDirPath(),
+        CREMIND_INSTALLER_FRONTEND: 'electron',
+      },
+      windowsHide: true,
+    })
+    const relay = (chunk: Buffer) => {
+      for (const line of chunk.toString().split(/\r?\n/)) if (line.trim()) say(line.trim())
+    }
+    child.stdout.on('data', relay)
+    child.stderr.on('data', relay)
+    child.on('error', (err) => resolve({ ok: false, error: err.message }))
+    child.on('exit', (code) => {
+      if (code === 0 && tagsHostExePath()) resolve({ ok: true })
+      else resolve({ ok: false, error: `The gateway components were not installed (exit ${code}); see ${path.join(installDirPath(), 'install.log')}.` })
+    })
+  })
+}
+
+ipcMain.handle('cremind:tags-host:prepare', async (event) => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can install components.' }
+  if (localBackendDrivesUsb()) return { ok: false, error: 'Cremind runs on this computer and drives its USB ports itself.' }
+  if (!tagsHostPrepare) {
+    tagsHostPrepare = prepareTagsHostRuntime().finally(() => { tagsHostPrepare = null })
+  }
+  return tagsHostPrepare
+})
+
+ipcMain.handle('cremind:tags-host:forget', async (event) => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can do this.' }
+  return tagsHost.forget()
+})
+
+// "Keep running": the tray already keeps the app (and the gateway runner)
+// alive when its windows close; this also starts it at login, through the
+// OS's login items (Windows, macOS). Linux desktops use their own startup
+// applications list.
+ipcMain.handle('cremind:background:status', (event) => {
+  if (!isFirstPartySender(event)) return { applicable: false, enabled: false, owner: 'external' }
+  if (process.platform === 'linux') {
+    return { applicable: false, enabled: false, owner: 'external',
+             detail: "Add Cremind to your desktop's startup applications." }
+  }
+  try {
+    return { applicable: true, enabled: app.getLoginItemSettings().openAtLogin, owner: 'electron' }
+  } catch {
+    return { applicable: false, enabled: false, owner: 'external' }
+  }
+})
+
+ipcMain.handle('cremind:background:enable', (event) => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can change this.' }
+  if (process.platform === 'linux') return { ok: false, error: "Add Cremind to your desktop's startup applications." }
+  try {
+    app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true })
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: (err as Error).message }
+  }
+})
+
 function killTrackedProcessesSync(): void {
   // 1. The backend (``cremind serve``) tracked in-memory. This is the
   //    process Electron spawned via ``startBackend``; killing it
@@ -2886,10 +3094,24 @@ if (!gotSingleInstanceLock) {
   app.on('window-all-closed', () => { /* keep app alive in tray */ })
 
   app.on('before-quit', () => {
+    tagsHost.stopRunnerSync(killProcessTreeSync)
     killTrackedProcessesSync()
   })
 
+  // macOS hands ``cremind://`` links over here, also before ``ready`` on a
+  // cold launch (then they wait in ``pendingCremindLinks``).
+  app.on('open-url', (event, url) => {
+    event.preventDefault()
+    handleCremindLink(url)
+  })
+
   app.on('second-instance', (_event, argv) => {
+    // Windows and Linux start a second instance with the ``cremind://`` link.
+    const link = cremindLinkFromArgv(argv)
+    if (link) {
+      handleCremindLink(link)
+      return
+    }
     const openArg = argv.find((a) => a.startsWith('--open='))
     if (openArg) {
       const target = openArg.slice('--open='.length)
@@ -2991,6 +3213,14 @@ if (!gotSingleInstanceLock) {
     rebuildDockMenu();
     createAppWindow('main');
     setupAutoUpdater();
+    // ``cremind://tags/setup`` links: this app opens them (a cold launch on
+    // Windows/Linux carries the link in argv), and a set-up gateway computer
+    // starts driving its gateways right away.
+    registerCremindLinks();
+    const coldLink = cremindLinkFromArgv(process.argv);
+    if (coldLink) handleCremindLink(coldLink);
+    for (const link of pendingCremindLinks.splice(0)) handleCremindLink(link);
+    tagsHost.startIfEnrolled();
     // Subsequent launches: if the install has already completed, fire the
     // backend up so the chat / profile-selector views have a server to
     // talk to. First-run launches skip this — the backend (and the

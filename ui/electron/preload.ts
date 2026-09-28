@@ -92,6 +92,29 @@ contextBridge.exposeInMainWorld('cremind', {
   // refuses credentials) before loading anything.
   openVncDesktop: (url: string) => ipcRenderer.invoke('cremind:open-vnc', url),
 
+  // This computer as a Cremind Tag gateway computer (electron/tagsHost.ts):
+  // the app's own report, and a ``cremind://tags/setup`` link handed over
+  // directly (the app's dialog asks for approval with the four words).
+  tagsHost: {
+    status: () => ipcRenderer.invoke('cremind:tags-host:status'),
+    enroll: (url: string) => ipcRenderer.invoke('cremind:tags-host:enroll', url),
+    forget: () => ipcRenderer.invoke('cremind:tags-host:forget'),
+    // Install the gateway components for this app; ``onPrepareLog`` gets each line of progress.
+    prepare: () => ipcRenderer.invoke('cremind:tags-host:prepare'),
+    onPrepareLog: (cb: (entry: { line: string }) => void) => {
+      const wrapper = (_event: unknown, payload: { line: string }) => cb(payload)
+      ipcRenderer.on('cremind:tags-host:prepare-log', wrapper)
+      return () => { ipcRenderer.off('cremind:tags-host:prepare-log', wrapper) }
+    },
+  },
+
+  // Keep Cremind running: started at login (the tray keeps it running once
+  // started), so tags keep updating when the windows are closed.
+  background: {
+    status: () => ipcRenderer.invoke('cremind:background:status'),
+    enable: () => ipcRenderer.invoke('cremind:background:enable'),
+  },
+
   // First-run installer bridge — fronts the IPC handlers in
   // electron/main.ts. ``run`` returns a promise that resolves with the
   // installer's exit code; while it's pending, ``onLog`` callbacks
