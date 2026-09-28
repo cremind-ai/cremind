@@ -106,6 +106,9 @@ class HostFacts:
     fonts_pack: Callable[[], str | None] = lambda: None
     host_id: str | None = None
     """Recorded in each worker directory: the worker runs on this host (Cremind checks it)."""
+    ca_pem: str | None = None
+    """The server's own certificate authority (a desktop host enrolled with a Cremind that has one): copied into
+    each worker directory, so its connector client trusts exactly that CA."""
 
 
 def computer_name() -> str:
@@ -135,6 +138,16 @@ class HostAgent:
         self._running: dict[str, asyncio.Task[None]] = {}
         self.last_hello_error: str | None = None
         self.handled = 0
+        self.on_revoked: Callable[[HostError], None] | None = None
+        """Cremind no longer accepts this host's credential (a desktop host that was removed): called once."""
+        self._revoked = False
+
+    def _check_revoked(self, exc: BaseException) -> None:
+        if isinstance(exc, HostError) and exc.status == 401 and not self._revoked:
+            self._revoked = True
+            log.warning("host: Cremind no longer accepts this computer (%s)", exc)
+            if self.on_revoked is not None:
+                self.on_revoked(exc)
 
     # ------------------------------------------------------------------ loops
 
@@ -193,6 +206,7 @@ class HostAgent:
                 raise
             except Exception as exc:  # noqa: BLE001 - Cremind unreachable: try again soon
                 self.last_hello_error = str(exc)
+                self._check_revoked(exc)
                 log.info("host: status report failed (%s); again in %.0f s", exc, RETRY_S)
                 delay = RETRY_S
             with contextlib.suppress(TimeoutError):
@@ -205,6 +219,7 @@ class HostAgent:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                self._check_revoked(exc)
                 log.info("host: work poll failed (%s); again in %.0f s", exc, RETRY_S)
                 await asyncio.sleep(RETRY_S)
                 continue
@@ -303,7 +318,7 @@ class HostAgent:
                 raise ConnectFailed(exc.code or "refused", str(exc)) from None
             raise
         worker_id = await asyncio.to_thread(_finish_worker_dir, self.supervisor.paths.workers_dir, staged, registered,
-                                            identity, self.facts.server_origin, self._host_id())
+                                            identity, self.facts.server_origin, self._host_id(), self.facts.ca_pem)
         self.supervisor.add_worker(worker_id)
         log.info("host: connection %s: worker %s set up for gateway %s…", op_id, worker_id, device[:8])
         await self._report(op_id, stage="claiming", detail="Connecting to the gateway")
@@ -343,8 +358,9 @@ def _stage(workers_dir: Path, op_id: str) -> Any:
 
 
 def _finish_worker_dir(workers_dir: Path, staged: Any, registered: dict[str, Any], gateway: dict[str, Any],
-                       server_origin: str, host_id: str | None) -> str:
-    """Turn the staging directory into ``workers/<companion_id>``."""
+                       server_origin: str, host_id: str | None, ca_pem: str | None = None) -> str:
+    """Turn the staging directory into ``workers/<companion_id>`` (with ``ca.pem`` when the server has its own
+    certificate authority)."""
     from app.tags.runtime.connect.setup_flow import STAGING_FILE
     from app.tags.runtime.connect.workerdir import WorkerSpec, write_worker
     from app.tags.runtime.secrets import FileBackend, SecretStore
@@ -368,7 +384,10 @@ def _finish_worker_dir(workers_dir: Path, staged: Any, registered: dict[str, Any
                           "operation_id": registered.get("operation_id"), "generation": int(registered.get("generation") or 0),
                           "host_id": host_id,
                           "credentials": {"hardware_id": creds.get("hardware_id"), "content_id": creds.get("content_id")},
+                          **({"ca_file": "ca.pem"} if ca_pem else {}),
                       })
+    if ca_pem:
+        (staged.directory / "ca.pem").write_text(ca_pem, encoding="ascii")
     write_worker(staged.directory, spec)
     (staged.directory / STAGING_FILE).unlink(missing_ok=True)
     target = workers_dir / companion_id

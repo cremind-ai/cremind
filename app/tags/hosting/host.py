@@ -11,6 +11,14 @@ a worker that misbehaves stays there. The server's loop is remembered: the
 in-process connector (:mod:`.local_connector`) runs each worker request on
 it, where Cremind's storage lives.
 
+The same host runs **remote** on a desktop gateway computer of a Cremind
+server elsewhere (``cremind tags host run``, supervised by the Cremind app):
+``remote`` is that computer's enrollment
+(:mod:`app.tags.runtime.host.enroll`), the host agent reaches Cremind over
+HTTPS with its host credential (:mod:`app.tags.runtime.host.http_client`),
+and each worker uses its own connector credentials over HTTPS, as a Cremind
+Connect worker did. Nothing there needs Cremind's database.
+
 :func:`start_hosting` (server boot, after storage, migrations and profiles)
 and :func:`stop_hosting` (shutdown, an in-app upgrade, a backup restore) are
 idempotent and never raise. Hosting runs only when the gateway components
@@ -46,12 +54,17 @@ class HardwareHost:
     """See the module docstring."""
 
     def __init__(self, paths: RuntimePaths | None = None, *, options: SupervisorOptions | None = None,
-                 check_components: bool = True) -> None:
+                 check_components: bool = True, remote: Any = None) -> None:
         self.paths = paths or default_paths()
         self.options = options
         self.check_components = check_components
+        self.remote = remote
+        """A desktop gateway computer's enrollment (``None``: the backend's own host)."""
+        self.http_transport: Any = None
+        """Tests: the HTTP transport a remote host and its workers use."""
         self.state = "stopped"
-        """``stopped`` | ``running`` | ``unavailable`` (components) | ``busy_elsewhere`` | ``failed``."""
+        """``stopped`` | ``running`` | ``unavailable`` (components) | ``busy_elsewhere`` | ``failed`` |
+        ``revoked`` (a remote host Cremind removed)."""
         self.reason: str | None = None
         self.host_id: str | None = None
         self.readiness: dict[str, Any] | None = None
@@ -83,7 +96,7 @@ class HardwareHost:
             from .components import can_host, readiness
 
             self.paths.ensure()
-            self.host_id = host_identity(self.paths)["host_id"]
+            self.host_id = self.remote.host_id if self.remote is not None else host_identity(self.paths)["host_id"]
             self.readiness = readiness(self.paths.assets_dir)
             if self.check_components and not can_host(self.readiness):
                 self.state, self.reason = "unavailable", _components_reason(self.readiness)
@@ -166,10 +179,17 @@ class HardwareHost:
         self._supervisor = Supervisor(self.paths, self._build_worker, options)
         if self.client_factory is not None:
             client = self.client_factory()
+        elif self.remote is not None:
+            from app.tags.runtime.host.http_client import HttpHostClient
+
+            client = HttpHostClient(self.remote.server, self.remote.authorization, ca_pem=self.remote.ca_pem,
+                                    transport=self.http_transport)
         else:
             client = LocalHostClient(self.host_id or "", self._server_loop)
         self._agent = HostAgent(client, self._supervisor, self.facts())
         self._supervisor.on_change = self._agent.poke
+        if self.remote is not None:
+            self._agent.on_revoked = self._revoked
         # Before the agent's first status report: it tells Cremind searches may start.
         self.state, self.reason = "running", None
         self._ready.set()
@@ -193,9 +213,20 @@ class HardwareHost:
             return {"readiness": {k: v for k, v in self.readiness.items() if k != "usb"},
                     "usb": self.readiness.get("usb")}
 
-        return HostFacts(name=computer_name(), server_origin=server_origin(), capabilities=capabilities,
-                         state=lambda: (self.state, self.reason), version=__version__,
-                         fonts_pack=lambda: self.fonts_pack, host_id=self.host_id)
+        remote = self.remote
+        return HostFacts(name=(remote.host_name if remote is not None and remote.host_name else computer_name()),
+                         server_origin=remote.server if remote is not None else server_origin(),
+                         capabilities=capabilities, state=lambda: (self.state, self.reason), version=__version__,
+                         fonts_pack=lambda: self.fonts_pack, host_id=self.host_id,
+                         ca_pem=remote.ca_pem if remote is not None else None)
+
+    def _revoked(self, exc: Exception) -> None:
+        """A remote host's credential stopped working (it was removed, or re-enrolled elsewhere): stop driving
+        the gateways, and say why."""
+        self.state, self.reason = "revoked", (f"{self.remote.server} no longer accepts this computer ({exc}). "
+                                              "Set it up again from the Cremind page.")
+        if self._loop is not None and self._stop is not None:
+            self._loop.call_soon_threadsafe(self._stop.set)
 
     async def report(self) -> None:
         """From the server's loop, while the runtime is not running: say so in the host's record (the page
@@ -203,6 +234,8 @@ class HardwareHost:
         from app.tags import hosts
         from app.tags.runtime.host.agent import platform_name
 
+        if self.remote is not None:
+            return  # a remote host says so itself when it can reach Cremind
         if self.host_id is None:
             self.paths.ensure()
             self.host_id = host_identity(self.paths)["host_id"]
@@ -230,9 +263,14 @@ class HardwareHost:
     # ------------------------------------------------------------------ workers
 
     def _build_worker(self, worker: WorkerState, port: str) -> tuple[Any, Any]:
-        """Runs in a thread of the runtime: the daemon and agent of one worker, reaching Cremind in process."""
-        from app.tags.connector_service import WorkerExpectation
+        """Runs in a thread of the runtime: the daemon and agent of one worker, reaching Cremind in process (or,
+        on a remote host, over HTTPS with the worker's own credentials)."""
         from app.tags.runtime.connect.worker import WorkerConfigError, build
+
+        if self.remote is not None:
+            return build(worker.directory, port, None, fonts=self._fonts, font_roots=[self.paths.assets_dir],
+                         transport=self.http_transport)
+        from app.tags.connector_service import WorkerExpectation
 
         from .local_connector import LocalConnector
 

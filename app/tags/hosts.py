@@ -461,12 +461,93 @@ class HostPrincipal:
     credential_id: str | None = None
 
 
-def new_host_credential() -> tuple[str, str]:
-    """``(id, secret)`` of a desktop host credential (``tagh_…``; only the secret's SHA-256 is stored)."""
+def new_host_credential_id() -> str:
+    """A desktop host credential's id (``tagh_…``)."""
     import base64
 
-    cred_id = "tagh_" + base64.b32encode(secrets.token_bytes(16)).decode("ascii").rstrip("=").lower()
-    return cred_id, creds.new_secret()
+    return "tagh_" + base64.b32encode(secrets.token_bytes(16)).decode("ascii").rstrip("=").lower()
+
+
+def new_host_credential() -> tuple[str, str]:
+    """``(id, secret)`` of a desktop host credential (only the secret's SHA-256 is stored)."""
+    return new_host_credential_id(), creds.new_secret()
+
+
+async def enroll_redeem(conn, session: Any, credential_sha256: str, now: float) -> dict[str, Any]:
+    """An ``enroll_host`` setup session is redeemed: the computer that answered it becomes (or stays) one of the
+    profile's desktop gateway computers, and gets a credential scoped to that host and that profile — the one
+    whose SHA-256 it sent (the secret never reaches Cremind). Enrolling the same computer again for the same
+    profile keeps its host record and revokes its older credentials."""
+    computer = session.computer or {}
+    name = str(computer.get("name") or "")[:255] or "This computer"
+    values = {"name": name, "platform": str(computer.get("platform") or "")[:16],
+              "version": str(computer.get("version") or "")[:64], "public_key": session.installation_pub,
+              "state": "active", "updated_at": now}
+    host = (await conn.execute(select(HOSTS).where(
+        HOSTS.c.kind == DESKTOP, HOSTS.c.installation_id == session.installation_id,
+        HOSTS.c.owner_profile_id == session.owner_profile_id))).first()
+    if host is None:
+        host_id = str(uuid.uuid4())
+        await conn.execute(insert(HOSTS), [{
+            "id": host_id, "kind": DESKTOP, "owner_profile": session.owner_profile,
+            "owner_profile_id": session.owner_profile_id, "installation_id": session.installation_id,
+            "capabilities": None, "status": None, "created_at": now, "last_seen_at": None, **values}])
+    else:
+        host_id = host.id
+        await conn.execute(update(HOSTS).where(HOSTS.c.id == host_id).values(**values))
+        await conn.execute(update(HOST_CREDENTIALS).where(
+            HOST_CREDENTIALS.c.host_id == host_id, HOST_CREDENTIALS.c.revoked_at.is_(None)).values(revoked_at=now))
+    cred_id = new_host_credential_id()
+    await conn.execute(insert(HOST_CREDENTIALS), [{
+        "id": cred_id, "host_id": host_id, "profile": session.owner_profile, "profile_id": session.owner_profile_id,
+        "secret_sha256": credential_sha256, "label": f"Cremind app on {name}"[:128], "created_at": now,
+        "last_used_at": None, "revoked_at": None}])
+    return {"host_id": host_id, "credential_id": cred_id, "host": {"id": host_id, "name": name}}
+
+
+async def _retire_host(conn, host: Any, now: float, why: str) -> None:
+    """Revoke a desktop host's credentials and take it off the list; its connections stay the profile's (they are
+    offline until they move to another computer), its open searches and connections end."""
+    await conn.execute(update(HOST_CREDENTIALS).where(
+        HOST_CREDENTIALS.c.host_id == host.id, HOST_CREDENTIALS.c.revoked_at.is_(None)).values(revoked_at=now))
+    await conn.execute(update(HOSTS).where(HOSTS.c.id == host.id).values(state="revoked", updated_at=now))
+    for op in (await conn.execute(select(OPERATIONS).where(OPERATIONS.c.host_id == host.id,
+                                                           OPERATIONS.c.state.in_(OPEN)))).all():
+        await conn.execute(update(OPERATIONS).where(OPERATIONS.c.id == op.id).values(
+            state="failed", stage="done", finished_at=now, updated_at=now,
+            error={"code": "host_removed", "message": why}))
+        if op.kind == "host_connect" and (op.result or {}).get("companion_id"):
+            await _abandon_connection(conn, op.result["companion_id"], now)
+
+
+async def remove_host(profile: str, host_id: Any) -> dict[str, Any]:
+    """A profile removes one of its desktop gateway computers (the server's own cannot be removed)."""
+    now = now_ms()
+    async with get_tag_storage().engine.begin() as conn:
+        await begin_write(conn)
+        profile_id = await profile_uuid(conn, profile)
+        host = await _host(conn, host_id)
+        if host.kind == SERVER:
+            raise TagError(409, "host_not_removable", "The computer the Cremind server runs on cannot be removed; "
+                                                      "the admin can stop other profiles from using it.")
+        if host.owner_profile_id != profile_id or host.owner_profile != profile:
+            raise TagError(404, "host_not_found", "No gateway computer with that id.")
+        await _retire_host(conn, host, now, "The computer was removed.")
+        count = int((await conn.execute(select(func.count()).select_from(COMPANIONS).where(
+            COMPANIONS.c.host_id == host.id, COMPANIONS.c.state.notin_(("removed",))))).scalar_one() or 0)
+    return {"host": {"id": host.id, "name": host.name, "state": "revoked"}, "connections": count}
+
+
+async def host_leave(principal: HostPrincipal) -> dict[str, Any]:
+    """A desktop host forgets its enrollment (``cremind tags host forget``): the same as its owner removing it."""
+    now = now_ms()
+    async with get_tag_storage().engine.begin() as conn:
+        await begin_write(conn)
+        host = (await conn.execute(select(HOSTS).where(HOSTS.c.id == principal.host_id))).first()
+        if host is None or host.kind != DESKTOP:
+            raise TagError(409, "host_not_removable", "Only a desktop gateway computer can leave.")
+        await _retire_host(conn, host, now, "The computer left.")
+    return {"host": {"id": host.id, "state": "revoked"}}
 
 
 def parse_host_authorization(header: str | None) -> tuple[str, str] | None:
@@ -913,8 +994,9 @@ async def expire(now: float | None = None) -> int:
 
 __all__ = [
     "ADMIN", "CANDIDATE_STATES", "DESKTOP", "HOST_OPS", "HOST_SCHEME", "HostPrincipal", "SERVER", "USABLE",
-    "authenticate_host", "cancel_operation", "expire", "get_operation", "host_hello", "host_progress",
-    "host_register_worker", "host_work", "list_hosts", "may_use", "new_host_credential", "notify_host",
-    "on_claim_outcome", "on_gateway_ready", "operation_json", "parse_host_authorization", "set_access",
-    "start_connect", "start_prepare", "start_scan",
+    "authenticate_host", "cancel_operation", "enroll_redeem", "expire", "get_operation", "host_hello",
+    "host_leave", "host_progress", "host_register_worker", "host_work", "list_hosts", "may_use",
+    "new_host_credential", "new_host_credential_id", "notify_host", "on_claim_outcome", "on_gateway_ready",
+    "operation_json", "parse_host_authorization", "remove_host", "set_access", "start_connect", "start_prepare",
+    "start_scan",
 ]

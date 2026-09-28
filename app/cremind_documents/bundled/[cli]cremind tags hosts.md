@@ -99,6 +99,22 @@ cremind -p admin tags hosts access "Office PC" bob --allow
 |---|---|
 | `--allow` / `--deny` | allow the profile, or stop it |
 
+## Gateways and containers
+
+A Cremind in a container sees no USB ports unless the gateway's device is
+mapped into it (`cremind tags hosts list` shows `USB container`):
+
+- **Docker Desktop on Windows or macOS** cannot pass USB devices to a
+  container. Set up the computer the gateway plugs into as a gateway computer
+  instead: Settings → Tags → *Set up a gateway computer* (the Cremind app does
+  the rest), or `cremind tags host enroll` on it.
+- **Docker on Linux** can: add the gateway's device (its stable name is under
+  `/dev/serial/by-id/`) to the container with `devices:` and the device's group
+  with `group_add:` in a `docker-compose.override.yml`, then recreate the
+  container. The installer's README shows the exact lines.
+- **Kubernetes:** use a gateway computer; a pod seldom runs where the gateway
+  plugs in.
+
 ## Troubleshooting
 
 | Code | Meaning |

@@ -10,6 +10,10 @@
         assets/fonts/<pack_id>/   verified font asset bundles (read-only), shared by every worker
         locks/gateway-<device_id>.lock   held while a worker drives that gateway
         migration/          journals of moves from Cremind Connect
+        remote/             this computer as a desktop gateway computer of a Cremind server
+                            elsewhere: installation.key (owner-only) + installation.json,
+                            enrollment.json (server, host id, profile) + enrollment.key
+                            (owner-only: its host credential), ca.pem
 
 A dot directory next to ``.tag-authority``: profile names cannot take it
 (``[a-z0-9_-]+``), every file API refuses it
@@ -71,6 +75,33 @@ class RuntimePaths:
     @property
     def migration_dir(self) -> Path:
         return self.base / "migration"
+
+    @property
+    def remote_dir(self) -> Path:
+        return self.base / "remote"
+
+    # The installation identity of a desktop gateway computer (the shape Cremind Connect's installation module
+    # reads: ``data_dir``, ``installation_key``, ``installation_json``).
+
+    @property
+    def data_dir(self) -> Path:
+        return self.remote_dir
+
+    @property
+    def installation_key(self) -> Path:
+        return self.remote_dir / "installation.key"
+
+    @property
+    def installation_json(self) -> Path:
+        return self.remote_dir / "installation.json"
+
+    @property
+    def enrollment_file(self) -> Path:
+        return self.remote_dir / "enrollment.json"
+
+    @property
+    def enrollment_key(self) -> Path:
+        return self.remote_dir / "enrollment.key"
 
     def worker_dir(self, worker_id: str) -> Path:
         if not _WORKER_ID.match(worker_id or ""):

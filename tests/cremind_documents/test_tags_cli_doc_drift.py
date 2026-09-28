@@ -28,11 +28,13 @@ DOC = BUNDLED / "[cli]cremind tags.md"
 HARDWARE_DOC = BUNDLED / "[cli]cremind tags hardware.md"
 DEVICES_DOC = BUNDLED / "[cli]cremind tags devices.md"
 HOSTS_DOC = BUNDLED / "[cli]cremind tags hosts.md"
+HOST_DOC = BUNDLED / "[cli]cremind tags host.md"
 TOOLS_DOC = BUNDLED / "[cli]cremind tags tools.md"
-ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC, HOSTS_DOC, TOOLS_DOC]
+ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC, HOSTS_DOC, HOST_DOC, TOOLS_DOC]
 HARDWARE_GROUP = "hardware"
 DEVICES_GROUP = "devices"
 HOSTS_GROUP = "hosts"
+HOST_GROUP = "host"
 TOOLS_GROUP = "tools"
 
 
@@ -56,7 +58,7 @@ def _walk(app, prefix: str):
 
 def _doc_for(path: str) -> Path:
     group = path.split(" ")[2]
-    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC, HOSTS_GROUP: HOSTS_DOC,
+    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC, HOSTS_GROUP: HOSTS_DOC, HOST_GROUP: HOST_DOC,
             TOOLS_GROUP: TOOLS_DOC}.get(group, DOC)
 
 
@@ -95,7 +97,8 @@ def test_every_subcommand_and_flag_is_documented_in_the_right_doc():
     for expected in ("cremind tags list", "cremind tags display", "cremind tags deliveries list",
                      "cremind tags credentials create", "cremind tags hardware claim",
                      "cremind tags hardware set-defaults", "cremind tags devices connect",
-                     "cremind tags hosts scan", "cremind tags hosts access"):
+                     "cremind tags hosts scan", "cremind tags hosts access", "cremind tags host enroll",
+                     "cremind tags host run"):
         assert expected in seen
 
 

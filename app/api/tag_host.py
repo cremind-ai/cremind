@@ -15,6 +15,7 @@ It only ever connects out (no port opens on the gateway computer):
 - ``POST operations/{id}/progress``     ``{stage?, detail?, state?, found?, unidentified?, error?}`` -> ``{operation}``
 - ``POST operations/{id}/worker``       ``{controller_pub, credentials: {hardware_sha256, content_sha256}, gateway}``
   -> ``{companion_id, credentials, operation_id, profile, generation, server}``: a connection's worker records
+- ``POST leave``                        -> ``{host}``: the computer forgets its enrollment (its credential stops working)
 
 The backend's own hardware host calls the same functions in process
 (:mod:`app.tags.hosting.local_host`). The gateway workers themselves use the
@@ -75,11 +76,15 @@ def get_tag_host_routes() -> list[Route]:
     async def worker(request: Request, p: hosts.HostPrincipal) -> dict[str, Any]:
         return await hosts.host_register_worker(p, request.path_params["op_id"], await _body(request))
 
+    async def leave(request: Request, p: hosts.HostPrincipal) -> dict[str, Any]:
+        return await hosts.host_leave(p)
+
     return [
         Route(f"{PREFIX}/hello", route(hello), methods=["POST"]),
         Route(f"{PREFIX}/work", route(work), methods=["GET"]),
         Route(f"{PREFIX}/operations/{{op_id}}/progress", route(progress), methods=["POST"]),
         Route(f"{PREFIX}/operations/{{op_id}}/worker", route(worker), methods=["POST"]),
+        Route(f"{PREFIX}/leave", route(leave), methods=["POST"]),
     ]
 
 

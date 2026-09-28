@@ -1,22 +1,28 @@
-"""Connect setup sessions (cremind-tag ``docs/connect-setup.md`` §8.1, §8.4,
-``docs/setup-api.md`` §1-2).
+"""Setup sessions: a signed-in profile (the Settings page or the CLI) starts
+one, and a program on another computer completes it from the session's
+launch link.
 
-A session is created by a signed-in profile (the Settings page or the CLI)
-and completed by Cremind Connect on the computer the gateway is plugged into:
+- ``enroll_host`` — the Cremind desktop app (or ``cremind tags host enroll``)
+  on the computer a gateway plugs into becomes one of the profile's gateway
+  computers; the link is ``cremind://tags/setup?…``::
 
-    waiting_for_connect --bind--> waiting_for_approval --approve (native, gateway)-->
-    waiting_for_confirmation --confirm (browser, same sign-in)--> redeeming
-    --redeem--> connecting --claim done + first heartbeat--> completed
+      waiting_for_connect --bind--> waiting_for_approval --approve (in the Cremind app)-->
+      waiting_for_confirmation --confirm (browser, same sign-in)--> redeeming
+      --redeem (a host credential by hash)--> completed
 
-``probe`` sessions stop at bind (they only tell the page which Connect
-answers on this computer); ``recover`` sessions redeem into a recovery of an
-existing private worker. Sessions live five minutes until redeemed, are
-single use, and carry only the SHA-256 of the launch-link token.
+- ``connect_gateway`` / ``recover`` / ``probe`` — the older Cremind Connect
+  (``cremind-connect://setup?…``), kept for the computers that still run it:
+  the same steps, a gateway approved natively, and redeem creating (or
+  recovering) a private worker that completes the session on its first
+  heartbeat after the claim. ``probe`` stops at bind.
 
-Connect authenticates with ``CremindSetup <session>.<token>`` and, from bind
-on, an Ed25519 proof by its installation key over the action, the session,
-the server nonce and the body (:func:`proof_message`). None of this
-authorises anything but these five calls.
+Sessions live five minutes until redeemed, are single use, and carry only
+the SHA-256 of the launch-link token. The other computer authenticates with
+``CremindSetup <session>.<token>`` and, from bind on, an Ed25519 proof by its
+installation key over the action, the session, the server nonce and the
+body (:func:`proof_message`). None of this authorises anything but these
+calls; the words both sides show (:func:`verification_phrase`) let the
+person check the browser and the computer talk about the same session.
 """
 
 from __future__ import annotations
@@ -47,7 +53,9 @@ SESSIONS = TagSetupSessionModel.__table__
 SESSION_TTL_MS = 5 * 60 * 1000.0
 SCHEME = "CremindSetup"
 LINK_SCHEME = "cremind-connect"
-OPERATIONS = ("connect_gateway", "recover", "probe")
+HOST_LINK = "cremind://tags/setup"
+ENROLL_HOST = "enroll_host"
+OPERATIONS = ("connect_gateway", "recover", "probe", ENROLL_HOST)
 PLATFORMS = ("windows", "macos", "linux", "other")
 PROOF_PREFIX = b"cremind-connect/v1/"
 PRE_REDEEM = ("waiting_for_connect", "waiting_for_approval", "waiting_for_confirmation", "redeeming")
@@ -129,9 +137,9 @@ def _ca_pin(origin: str) -> str | None:
         return None
 
 
-def launch_url(session_id: str, token: str, origin: str) -> str:
-    url = (f"{LINK_SCHEME}://setup?v=1&server={quote(origin, safe='')}"
-           f"&session={session_id}&token={token}")
+def launch_url(session_id: str, token: str, origin: str, operation: str = "connect_gateway") -> str:
+    base = HOST_LINK if operation == ENROLL_HOST else f"{LINK_SCHEME}://setup"
+    url = f"{base}?v=1&server={quote(origin, safe='')}&session={session_id}&token={token}"
     pin = _ca_pin(origin)
     return url + (f"&pin={pin}" if pin else "")
 
@@ -205,6 +213,7 @@ def session_json(row: Any) -> dict[str, Any]:
         "browser_confirmed": r.get("browser_confirmed_at") is not None,
         "companion_id": r.get("companion_id"),
         "operation_id": r.get("operation_id"),
+        "host_id": (r.get("result") or {}).get("host_id") if r["operation"] == ENROLL_HOST else None,
         "error": r.get("error"),
     }
 
@@ -266,7 +275,7 @@ async def create_session(profile: str, *, operation: Any, server_url: Any, compa
             "created_at": now, "updated_at": now, "expires_at": now + SESSION_TTL_MS,
         }])
         row = (await conn.execute(select(SESSIONS).where(SESSIONS.c.id == sid))).first()
-    return session_json(row), launch_url(sid, token, origin)
+    return session_json(row), launch_url(sid, token, origin, operation)
 
 
 async def _own_session(conn, profile: str, session_id: str) -> Any:
@@ -299,7 +308,7 @@ async def confirm_session(profile: str, session_id: str, *, authorization: str |
         if row.state in ("redeeming", "connecting", "completed") and row.browser_confirmed_at is not None:
             return session_json(row)
         if row.state != "waiting_for_confirmation":
-            raise TagError(409, "not_approved", "Approve in the Cremind Connect window first.")
+            raise TagError(409, "not_approved", "Approve on the other computer first.")
         await conn.execute(update(SESSIONS).where(SESSIONS.c.id == row.id, SESSIONS.c.state == row.state)
                            .values(state="redeeming", browser_confirmed_at=now, updated_at=now))
         row = (await conn.execute(select(SESSIONS).where(SESSIONS.c.id == row.id))).first()
@@ -319,7 +328,7 @@ async def cancel_session(profile: str, session_id: str) -> dict[str, Any]:
                 await cancel_waiting_recovery(conn, row.operation_id, now)
         elif row.redeemed_at is not None:
             raise TagError(409, "already_redeemed",
-                           "Connect already finished this step; remove the device to undo it.")
+                           "The other computer already finished this step; remove what it set up to undo it.")
         row = (await conn.execute(select(SESSIONS).where(SESSIONS.c.id == row.id))).first()
     return session_json(row)
 
@@ -338,7 +347,7 @@ async def active_sessions(profile: str) -> list[dict[str, Any]]:
     return out
 
 
-# ── bootstrap (Connect) ──
+# ── bootstrap (the other computer) ──
 
 
 def parse_authorization(header: str | None) -> tuple[str, str] | None:
@@ -375,7 +384,7 @@ async def _bootstrap_row(conn, header: str | None, session_id: str) -> Any:
 def _need_proof(row: Any, action: str, body: dict[str, Any]) -> None:
     if not check_proof(row.installation_pub or "", body.get("proof"),
                        proof_message(action, row.id, row.server_nonce or "", body)):
-        raise TagError(401, "invalid_proof", "The request was not signed by the bound Cremind Connect.")
+        raise TagError(401, "invalid_proof", "The request was not signed by the computer that answered this setup.")
 
 
 def _open_for(row: Any, now: float, *states: str) -> None:
@@ -417,7 +426,7 @@ async def bind(session_id: str, header: str | None, body: dict[str, Any]) -> dic
     async with get_tag_storage().engine.begin() as conn:
         row = await _bootstrap_row(conn, header, session_id)
         if row.installation_pub and row.installation_pub != inst["public_key"]:
-            raise TagError(409, "already_bound", "Another Cremind Connect already answered this setup.")
+            raise TagError(409, "already_bound", "Another computer already answered this setup.")
         if not check_proof(inst["public_key"], body.get("proof"), proof_message("bind", row.id, "", body)):
             raise TagError(401, "invalid_proof", "The bind request was not signed by that installation key.")
         if not row.installation_pub:
@@ -429,7 +438,8 @@ async def bind(session_id: str, header: str | None, body: dict[str, Any]) -> dic
                 verification_phrase=phrase,
                 computer={"name": inst["computer"], "platform": inst["platform"], "version": inst["version"]},
                 state="completed" if row.operation == "probe" else "waiting_for_approval", updated_at=now))
-            await touch_installation(conn, inst, now)
+            if row.operation != ENROLL_HOST:  # the older Cremind Connect's installations only
+                await touch_installation(conn, inst, now)
             row = (await conn.execute(select(SESSIONS).where(SESSIONS.c.id == row.id))).first()
         recover = None
         if row.operation == "recover" and row.companion_id:
@@ -497,11 +507,19 @@ async def approve(session_id: str, header: str | None, body: dict[str, Any]) -> 
         authority = await get_authority()
     except AuthorityUnavailable as exc:
         raise TagError(503, exc.code, exc.message) from None
-    gateway = _gateway(body)
     now = now_ms()
     async with get_tag_storage().engine.begin() as conn:
         row = await _bootstrap_row(conn, header, session_id)
         _need_proof(row, "approve", body)
+        if row.operation == ENROLL_HOST:
+            # The person approved setting up this computer, in the Cremind app on it.
+            if row.state == "waiting_for_confirmation":
+                return {"state": row.state}
+            _open_for(row, now, "waiting_for_approval")
+            await conn.execute(update(SESSIONS).where(SESSIONS.c.id == row.id).values(
+                native_approved_at=now, state="waiting_for_confirmation", updated_at=now))
+            return {"state": "waiting_for_confirmation"}
+        gateway = _gateway(body)
         if row.state == "waiting_for_confirmation" and (row.gateway or {}).get("device_id") == gateway["device_id"]:
             return {"state": row.state}
         _open_for(row, now, "waiting_for_approval")
@@ -526,10 +544,9 @@ async def redeem(session_id: str, header: str | None, body: dict[str, Any]) -> d
     creds_in = body.get("credentials") if isinstance(body.get("credentials"), dict) else {}
     hw_hash = str(creds_in.get("hardware_sha256") or "").lower()
     ct_hash = str(creds_in.get("content_sha256") or "").lower()
+    host_hash = str(body.get("credential_sha256") or "").lower()
     if not isinstance(key, str) or not 8 <= len(key) <= 64:
         raise TagError(422, "invalid_idempotency_key", "'idempotency_key' is required (8 to 64 characters).")
-    if not _HEX64.match(controller) or not _HEX64.match(hw_hash) or not _HEX64.match(ct_hash) or hw_hash == ct_hash:
-        raise TagError(422, "invalid_redeem", "'controller_pub' and two different credential hashes are required.")
     now = now_ms()
     async with get_tag_storage().engine.begin() as conn:
         row = await _bootstrap_row(conn, header, session_id)
@@ -541,6 +558,25 @@ async def redeem(session_id: str, header: str | None, body: dict[str, Any]) -> d
         _open_for(row, now)
         if row.state != "redeeming":
             raise TagError(409, "not_confirmed", "Waiting for the Cremind page to confirm.")
+        if row.operation == ENROLL_HOST:
+            if not _HEX64.match(host_hash):
+                raise TagError(422, "invalid_redeem", "'credential_sha256' is required (the SHA-256 of the "
+                                                      "computer's new credential secret).")
+            from app.tags.hosts import enroll_redeem
+
+            result = {
+                **await enroll_redeem(conn, row, host_hash, now),
+                "profile": {"name": row.owner_profile, "id": row.owner_profile_id},
+                "server": {"installation_id": authority.installation_id, "origin": row.server_origin,
+                           "authority_pub": authority.authority_pub.hex(),
+                           "authority_id": authority.authority_id.hex()},
+            }
+            await conn.execute(update(SESSIONS).where(SESSIONS.c.id == row.id).values(
+                state="completed", redeemed_at=now, redeem_key=key, result=result, updated_at=now))
+            return result
+        if not _HEX64.match(controller) or not _HEX64.match(hw_hash) or not _HEX64.match(ct_hash) \
+                or hw_hash == ct_hash:
+            raise TagError(422, "invalid_redeem", "'controller_pub' and two different credential hashes are required.")
         if row.operation == "connect_gateway":
             result = await redeem_connect(conn, row, controller, hw_hash, ct_hash, authority, now)
         elif row.operation == "recover":
@@ -565,7 +601,7 @@ async def redeem(session_id: str, header: str | None, body: dict[str, Any]) -> d
 async def fail(session_id: str, header: str | None, body: dict[str, Any]) -> dict[str, Any]:
     now = now_ms()
     code = str(body.get("code") or "connect_failed")[:64]
-    message = str(body.get("message") or "Cremind Connect could not finish the setup.")[:400]
+    message = str(body.get("message") or "The other computer could not finish the setup.")[:400]
     async with get_tag_storage().engine.begin() as conn:
         row = await _bootstrap_row(conn, header, session_id)
         _need_proof(row, "fail", body)
@@ -604,7 +640,7 @@ async def on_worker_heartbeat(conn, companion_id: str, now: float) -> None:
 
 
 __all__ = [
-    "OPERATIONS", "SCHEME", "active_sessions", "approve", "bind", "cancel_session", "confirm_session",
+    "ENROLL_HOST", "HOST_LINK", "OPERATIONS", "SCHEME", "active_sessions", "approve", "bind", "cancel_session", "confirm_session",
     "create_session", "fail", "fingerprint_token", "get_session", "launch_url", "on_worker_heartbeat",
     "parse_authorization", "poll", "proof_message", "redeem", "server_origin", "session_json",
     "verification_phrase",

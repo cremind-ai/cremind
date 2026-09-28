@@ -9,6 +9,8 @@
   components (admin)
 - ``PUT    /api/tags/hosts/{host_id}/access/{profile_id}`` ``{granted}`` -> ``{…}``: let a profile search and claim
   unclaimed hardware on the server's USB ports (admin)
+- ``DELETE /api/tags/hosts/{host_id}``                    -> ``{host, connections}``: remove one of this profile's
+  desktop gateway computers (its credential stops working; its connections stay, offline until moved)
 - ``POST   /api/tags/connections``                        ``{host_id, candidate_id, name?}`` -> 202 ``{operation}``:
   connect a gateway a search found
 - ``GET    /api/tags/operations/{op_id}`` / ``DELETE``    -> ``{operation}``: a search, connection or
@@ -92,6 +94,9 @@ def get_tags_hosts_routes() -> list[Route]:
         return JSONResponse(await hosts.set_access(_profile(request), request.path_params["host_id"],
                                                    request.path_params["profile_id"], body.get("granted")))
 
+    async def remove(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return JSONResponse(await hosts.remove_host(_profile(request), request.path_params["host_id"]))
+
     async def connect(request: Request, body: dict[str, Any]) -> JSONResponse:
         op = await hosts.start_connect(_profile(request), body)
         return JSONResponse({"operation": op}, status_code=202)
@@ -108,6 +113,7 @@ def get_tags_hosts_routes() -> list[Route]:
         Route("/api/tags/hosts/{host_id}/scan", once("host_scan", scan), methods=["POST"]),
         Route("/api/tags/hosts/{host_id}/prepare", once("host_prepare", prepare), methods=["POST"]),
         Route("/api/tags/hosts/{host_id}/access/{profile_id}", once("host_access", access), methods=["PUT"]),
+        Route("/api/tags/hosts/{host_id}", once("host_remove", remove), methods=["DELETE"]),
         Route("/api/tags/connections", once("connect", connect), methods=["POST"]),
         Route("/api/tags/operations/{op_id}", guarded(get_operation), methods=["GET"]),
         Route("/api/tags/operations/{op_id}", guarded(cancel_operation), methods=["DELETE"]),

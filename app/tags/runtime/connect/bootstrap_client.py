@@ -254,6 +254,16 @@ class BootstrapClient:
                 "credentials": {"hardware_sha256": hardware_sha256, "content_sha256": content_sha256}}
         return self._send("POST", "redeem", body=self._signed("redeem", body, self._nonce()))
 
+    def approve_host(self) -> dict[str, Any]:
+        """``enroll_host``: the person approved setting up this computer as a gateway computer."""
+        return self._send("POST", "approve", body=self._signed("approve", {}, self._nonce()))
+
+    def redeem_host(self, *, idempotency_key: str, credential_sha256: str) -> dict[str, Any]:
+        """``enroll_host``: ``{host_id, credential_id, host, profile, server}`` for the credential whose secret's
+        SHA-256 is ``credential_sha256`` (the secret stays here)."""
+        body = {"idempotency_key": idempotency_key, "credential_sha256": credential_sha256}
+        return self._send("POST", "redeem", body=self._signed("redeem", body, self._nonce()))
+
     def fail(self, code: str, message: str) -> dict[str, Any]:
         body = {"code": code[:64], "message": message[:400]}
         return self._send("POST", "fail", body=self._signed("fail", body, self._nonce()))
