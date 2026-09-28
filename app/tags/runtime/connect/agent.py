@@ -21,6 +21,13 @@ private worker does:
 - **Heartbeat generations** — every device the worker has talked to is
   reported with its live generation, which lets Cremind lift a restore's
   ``reconciling`` hold.
+- **Send gate checks** (:mod:`..daemon.gate`) — before the daemon sends a
+  cached screen or runs a command, the lease is renewed and the worker is
+  **reconciled** with Cremind's view (``GET state``): a tag Cremind revoked
+  (and has not bound again) or whose ownership generation moved past the one
+  this worker knows is blocked locally, so nothing left in the queue reaches
+  it. A lease that lapses (Cremind unreachable longer than its TTL) closes the
+  gate until the next pass.
 
 Keys: bridge maintenance keys (``mk``) and tag roots live in the worker's
 owner-only secret store; the vault holds a copy for a recovery on another
@@ -200,7 +207,10 @@ class ConnectAgent:
         self.paused = False
         self.removed = False
         self._lease_changed = asyncio.Event()
+        self.reconciled: dict[str, Any] | None = None
         self.state.devices.setdefault(ident.gateway_device_id.hex(), {"role": "gateway", "hw_id": ident.gateway_hw_id})
+        svc.gate.add_check("authorization lease", self._gate_lease)
+        svc.gate.add_check("reconciliation with Cremind", self.reconcile)
 
     # ------------------------------------------------------------------ lease
 
@@ -219,6 +229,8 @@ class ConnectAgent:
             except ConnectorError as exc:
                 log.info("agent: lease not renewed (%s); again in %.0f s", exc, LEASE_RETRY_S)
                 delay = LEASE_RETRY_S
+                if not self.lease_valid():
+                    self.svc.gate.close("the authorization lease lapsed")
             await asyncio.sleep(delay)
 
     async def renew_lease(self) -> dict[str, Any]:
@@ -257,6 +269,47 @@ class ConnectAgent:
         log.warning("agent: %s; this worker stops", why)
         if self.on_removed is not None:
             await self.on_removed()
+
+    # ------------------------------------------------------------------ send gate
+
+    async def _gate_lease(self) -> None:
+        await self.renew_lease()
+        if self.worker_state == "removed":
+            raise OperationFailed("removed", "Cremind removed this worker.")
+
+    async def reconcile(self) -> dict[str, Any]:
+        """``GET state``: block local tags Cremind revoked (and did not bind again) or moved past our generation."""
+        try:
+            state = await self.client.worker_state()
+        except ConnectorAuthError as exc:
+            if _is_business_refusal(exc):
+                raise ConnectorRejected(str(exc), status=exc.status, code=exc.code) from None
+            raise WorkerRemoved(str(exc)) from None
+        bindings = {str(b.get("device_id") or "").lower(): b for b in state.get("bindings") or []
+                    if isinstance(b, dict)}
+        revoked = {str(d).lower() for d in state.get("revoked") or []} - set(bindings)
+        blocked = []
+        for device_id, entry in list(self.state.devices.items()):
+            tag_id = entry.get("tag_id")
+            if entry.get("role") != "tag" or not isinstance(tag_id, int):
+                continue
+            binding = bindings.get(device_id)
+            known = entry.get("gen")
+            ahead = binding is not None and isinstance(known, int) and int(binding.get("generation") or 0) > known
+            if device_id not in revoked and not ahead:
+                continue
+            reason = "revoked" if device_id in revoked else "stale_generation"
+            detail = ("Cremind removed this tag while this worker was away" if reason == "revoked" else
+                      "the tag's ownership moved on while this worker was away")
+            effects = await self.svc.db.run(lambda t=tag_id, r=reason, d=detail: self.svc.store.block_tag(
+                t, r, d, status_code=int(Status.NOT_OWNER)))
+            self.svc.apply_effects(effects)
+            blocked.append(device_id)
+            log.warning("agent: tag %08X blocked before sending anything: %s", tag_id, detail)
+        self.worker_state = str(state.get("state") or self.worker_state)
+        self.paused = bool(state.get("paused"))
+        self.reconciled = {"at": self.clock(), "generation": state.get("generation"), "blocked": blocked}
+        return self.reconciled
 
     # ------------------------------------------------------------------ heartbeat
 

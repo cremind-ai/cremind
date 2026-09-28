@@ -586,13 +586,18 @@ class QueueStore:
             dropped = 0
             local = self._jobs(conn, "credential_id = ? AND state = 'active'", (credential_id,))
             owned = {t.tag_id for t in result.tags}
+            changed: set[int] = set()
             for job in local:
                 if job.delivery_id in outstanding:
                     continue
                 gone = job.tag_id not in owned
                 if rebuild or gone or (job.outcome is None and job.seq <= result.head_seq):
-                    dropped += len(self._drop(conn, [job], "cancelled", "cancelled", now_iso,
-                                              "no longer outstanding in Cremind"))
+                    tags = self._drop(conn, [job], "cancelled", "cancelled", now_iso, "no longer outstanding in Cremind")
+                    dropped += len(tags)
+                    changed.update(tags)
+            # A screen composed with those cards must not go out: compose the tag again before anything is sent.
+            for tag_id in changed:
+                self._mark_dirty(conn, tag_id, now_iso)
             # A delivery Cremind still lists although it ended here: the receipt was lost or refused
             # (e.g. an epoch moved in between) — send the terminal receipt again with today's epoch.
             resend = []
@@ -757,6 +762,18 @@ class QueueStore:
             conn.execute("UPDATE tag_views SET dirty = 0, force = 0, progress_pending = 0, updated_at = ?"
                          " WHERE tag_id = ? AND dirty_gen = ?", (now_iso, tag_id, dirty_gen))
             self._expire_override(conn, tag_id, now_ts)
+
+    def withdraw_unsent(self, tag_id: int, dirty_gen: int, detail: str) -> int:
+        """Nothing is left to show on a tag that never displayed a screen from here: its composed but
+        unsent revisions are withdrawn (``superseded``) instead of being sent, and the tag is left as it is."""
+        now_ts, now_iso = self._now()
+        with self.db.transaction() as conn:
+            cur = conn.execute("UPDATE revisions SET state = 'superseded', finished_at = ?, detail = ?"
+                               " WHERE tag_id = ? AND state = 'pending'", (now_iso, detail, tag_id))
+            conn.execute("UPDATE tag_views SET dirty = 0, force = 0, progress_pending = 0, updated_at = ?"
+                         " WHERE tag_id = ? AND dirty_gen = ?", (now_iso, tag_id, dirty_gen))
+            self._expire_override(conn, tag_id, now_ts)
+        return cur.rowcount
 
     # -- revisions ---------------------------------------------------------------------
 

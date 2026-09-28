@@ -159,7 +159,7 @@ class ScreenScheduler:
         await self.send_due()
         # A due revision only counts when it can be sent; otherwise the gateway connecting (or the pack
         # loading) wakes the scheduler, and the scan interval bounds the wait.
-        can_send = svc.gateway is not None and svc.gateway.connected and svc.fonts is not None
+        can_send = svc.gateway is not None and svc.gateway.connected and svc.fonts is not None and svc.may_send()
         due_ts = await svc.db.run(store.next_due_ts) if can_send else None
         for ts in (due_ts, await svc.db.run(store.next_expiry_ts)):
             if ts is not None:
@@ -219,10 +219,15 @@ class ScreenScheduler:
         if purpose == "blank":
             key = content_key("blank", panel, settings, [], pack_hex)
         current = inp.current
-        if current is None and not cards and not inp.carry and not view.force                 and purpose not in ("identify", "setup_code"):
+        unsent_only = current is not None and current.state == "pending" and not view.displayed_revision
+        if (current is None or unsent_only) and not cards and not inp.carry and not view.force                 and purpose not in ("identify", "setup_code"):
             # Nothing to show and nothing shown from this database yet (a fresh start, or white after
-            # clear_tag): leave the tag as it is rather than pushing an empty screen over it.
-            await svc.db.run(store.clear_dirty, tag_id, view.dirty_gen)
+            # clear_tag): leave the tag as it is rather than pushing an empty screen over it. A screen
+            # composed for cards Cremind has since ended (a sync after a restore) is withdrawn unsent.
+            if unsent_only:
+                await svc.db.run(store.withdraw_unsent, tag_id, view.dirty_gen, "its cards ended before it was sent")
+            else:
+                await svc.db.run(store.clear_dirty, tag_id, view.dirty_gen)
             return None
         if not view.force and current is not None and current.content_key == key:
             await svc.db.run(store.attach_to_current, tag_id, current, inp.carry, view.dirty_gen, key)
@@ -287,8 +292,8 @@ class ScreenScheduler:
     async def send_due(self) -> None:
         svc, store = self.svc, self.svc.store
         client = svc.gateway
-        if client is None or not client.connected or svc.fonts is None:
-            return
+        if client is None or not client.connected or svc.fonts is None or not svc.may_send():
+            return  # the send gate (daemon.gate) opening wakes the scheduler
         for rev in await svc.db.run(store.due_revisions):
             if not client.connected:
                 return

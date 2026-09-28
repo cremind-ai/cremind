@@ -153,6 +153,7 @@ class CommandExecutor:
 
     async def _run(self, row: CommandRow) -> None:
         svc = self.svc
+        await svc.gate.wait()  # nothing changes a device before the worker is current (daemon.gate)
         self.running[row.command_id] = row.kind
         timeout = None if row.expires_ts is None else max(1.0, row.expires_ts - svc.clock())
         if row.kind in OWNERSHIP_KINDS:

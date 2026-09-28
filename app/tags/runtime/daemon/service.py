@@ -15,7 +15,12 @@ thread):
 :class:`ScreenScheduler`    card sets -> composed revisions -> ``DELIVER_LAYOUT``
 :class:`GatewayEventHandler` gateway results -> revisions/receipts (commit, then ACK)
 :class:`OutboxSender`       per credential: receipts, accepted, previews, results
+:class:`SendGate`           holds screen sends and commands until the worker is current
 ==========================  ==========================================================
+
+Nothing composed or claimed before a restart leaves this process until the
+send gate (:mod:`.gate`) has seen the worker's identity, a fresh content sync
+and, for a protocol v2 worker, its lease and a reconciliation with Cremind.
 
 A revoked or invalid credential (401/403) stops only its own loops; a TLS
 misconfiguration pauses them and retries every ``tls_retry_s``. The gateway connection is retried with back-off until it answers; the
@@ -51,6 +56,7 @@ from .commands import OpWaiters
 from .content import ContentWorker
 from .crash import CrashPoints, SimulatedCrash
 from .events import GatewayEventHandler
+from .gate import SendGate
 from .hardware import HardwareWorker
 from .outbox import OutboxSender
 from .schema import open_database
@@ -158,6 +164,7 @@ class DaemonService:
         self.started_at = iso_now()
         self.scheduler = ScreenScheduler(self)
         self.handler = GatewayEventHandler(self)
+        self.gate = SendGate(self)
         self.content_workers: dict[str, ContentWorker] = {}
         self.hardware: HardwareWorker | None = None
         self.senders: dict[str, OutboxSender] = {}
@@ -221,6 +228,7 @@ class DaemonService:
             self._spawn(self.hardware.run(), "hardware")
         for credential_id, sender in self.senders.items():
             self._spawn(sender.run(), f"outbox {credential_id}")
+        self._spawn(self.gate.run(), "send gate")
         self._spawn(self.scheduler.run(), "scheduler")
         if opts.write_status:
             self._spawn(self._status_loop(), "status")
@@ -261,9 +269,9 @@ class DaemonService:
 
     async def run(self, *, until: Callable[[], Awaitable[bool]] | None = None, max_s: float | None = None) -> None:
         """Run until :meth:`stop`, a simulated crash, ``await until()`` turning true, or ``max_s`` seconds."""
-        await self.start()
         deadline = None if max_s is None else time.monotonic() + max_s
         try:
+            await self.start()  # inside the try: a start that fails half-way still closes what it opened
             while not self._stop.is_set():
                 if until is not None and await until():
                     self.caught_up = True
@@ -274,7 +282,7 @@ class DaemonService:
                     await asyncio.wait_for(self._stop.wait(), 0.05 if until is not None else 1.0)
         finally:
             with contextlib.suppress(Exception):
-                self.final_status = await asyncio.to_thread(self.status_snapshot)
+                self.final_status = await self.status_now()
             await self.close()
         if self._crashed is not None:
             raise self._crashed
@@ -348,7 +356,7 @@ class DaemonService:
                 await client.aclose()
         if self.options.write_status and self.db is not None and self._crashed is None:
             with contextlib.suppress(Exception):
-                await asyncio.to_thread(self._write_status, stopped=True)
+                await asyncio.to_thread(self._write_status, await self.status_now(), stopped=True)
         if self.db is not None:
             with contextlib.suppress(Exception):
                 self.db.close()
@@ -368,6 +376,13 @@ class DaemonService:
                 await asyncio.sleep(delay)
 
     # -- coordination ----------------------------------------------------------------------
+
+    def may_send(self) -> bool:
+        """Screens may go to the gateway: the send gate is open and a v2 worker's lease is current."""
+        if not self.gate.is_open:
+            return False
+        agent = self.agent
+        return agent is None or agent.lease_valid()
 
     def wake_scheduler(self) -> None:
         self.scheduler.wake()
@@ -464,9 +479,16 @@ class DaemonService:
 
     # -- status ----------------------------------------------------------------------------
 
-    def status_snapshot(self) -> dict[str, Any]:
+    async def status_now(self) -> dict[str, Any]:
+        """:meth:`status_snapshot` with the queue statistics read in a worker thread."""
+        stats = await self.db.run(self.store.queue_stats) if self.store is not None else {}
+        return self.status_snapshot(stats)
+
+    def status_snapshot(self, stats: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Built on the event loop: it reads state the loop's tasks change."""
         gateway = self.gateway
-        stats = self.store.queue_stats() if self.store is not None else {}
+        if stats is None:
+            stats = self.store.queue_stats() if self.store is not None else {}
         credentials: dict[str, Any] = {}
         for credential_id, worker in self.content_workers.items():
             credentials[credential_id] = {"kind": "content", "profile": worker.profile, "state": worker.state,
@@ -493,12 +515,12 @@ class DaemonService:
             "scheduler": {"composed": self.scheduler.composed, "sent": self.scheduler.sent,
                           "holds": {f"{k:08X}": v for k, v in self.scheduler.holds.items()}},
             "results": self.handler.results,
+            "gate": self.gate.as_json(),
             "queue": stats,
         }
 
-    def _write_status(self, *, stopped: bool = False) -> None:
-        snapshot = self.status_snapshot()
-        snapshot["running"] = not stopped
+    def _write_status(self, snapshot: dict[str, Any], *, stopped: bool = False) -> None:
+        snapshot = {**snapshot, "running": not stopped}
         path = self.options.data_dir / STATUS_FILE
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(snapshot, indent=1, default=str), encoding="utf-8")
@@ -507,7 +529,8 @@ class DaemonService:
     async def _status_loop(self) -> None:
         while True:
             try:
-                await asyncio.to_thread(self._write_status)
+                snapshot = await self.status_now()
+                await asyncio.to_thread(self._write_status, snapshot)
             except OSError as exc:
                 log.debug("daemon: status file not written: %s", exc)
             await asyncio.sleep(STATUS_EVERY_S)

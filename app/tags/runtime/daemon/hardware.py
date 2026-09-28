@@ -78,6 +78,8 @@ class HardwareWorker:
         self._inventory_wanted.set()
         self._heartbeat_wanted = asyncio.Event()
         self.inventory_done = asyncio.Event()
+        self.identified = asyncio.Event()
+        """``whoami`` named this companion (the send gate waits for it)."""
         self._claim_retry: dict[str, tuple[int, float]] = {}  # command id -> (failed claims, next try)
 
     def request_inventory(self) -> None:
@@ -136,6 +138,7 @@ class HardwareWorker:
                         raise ConnectorAuthError(f"credential {self.credential_id} is a {who.kind} credential, "
                                                  "not a hardware credential", status=403)
                     self.companion_id = who.companion_id
+                    self.identified.set()
                 body = await self.build_inventory()
                 result = await self.client.inventory(body)
                 self.inventories += 1

@@ -124,6 +124,8 @@ class ContentWorker:
     async def sync(self) -> None:
         stream = await self.svc.db.run(self.svc.store.get_stream, self.credential_id)
         result = await self.client.sync(stream.after_seq if stream is not None and stream.stream_id else None)
+        if stream is not None and stream.stream_id and result.stream_id != stream.stream_id:
+            self.svc.gate.close("Cremind's stream changed")
         outcome = await self.svc.db.run(self.svc.store.apply_sync, self.credential_id, result)
         self._forced_sync = self._requested_sync = False
         self.last_sync_ts = self.svc.clock()
@@ -145,6 +147,7 @@ class ContentWorker:
         if page.stream_id != stream.stream_id:
             log.warning("content: credential=%s stream changed %s -> %s (Cremind restored?): sync",
                         self.credential_id, stream.stream_id, page.stream_id)
+            self.svc.gate.close("Cremind's stream changed")
             self._forced_sync = True
             return 0, True
         self.svc.crash.hit("events_fetched")
