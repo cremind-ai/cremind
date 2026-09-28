@@ -12,7 +12,9 @@ app set up as a gateway computer). A worker reaches Cremind in process or
 connects **out** over HTTPS, keeps every delivery job in a
 durable SQLite queue, composes each tag's screen (multilingual text layout,
 [layout.md](layout.md)), sends it through the gateway, and tells Cremind what
-happened — stage by stage, until the tag reports that the panel refreshed.
+happened — stage by stage, until the tag reports that the panel refreshed. A
+gateway with tag links reaches the tags in its range itself; the worker then
+runs their bridge side (§5, "Tags on the gateway's own radio").
 
 ```
 Cremind ──sync/events──▶ jobs ─▶ card set per tag ─▶ composed screen (revision) ─▶ DELIVER_LAYOUT ─▶ gateway
@@ -290,6 +292,43 @@ While the tag is away, the step's timeout (15 min) re-sends the request with
 the **same** op id — the gateway answers from memory and queues nothing new, so
 the bridge holds one `CLEAR`, not one per timeout; only a gateway reboot sends
 under a new op id.
+
+**Tags on the gateway's own radio** (protocol.md §11). A gateway whose `HELLO`
+caps report `tag_links` (the nRF52840 gateways) connects to the tags in its
+range itself: a gateway alone is enough, and bridges only reach farther. The
+gateway renders nothing and holds no key; it relays whole messages. The bridge
+side of those tags runs in the worker, in
+`app/tags/runtime/gateway/radio.py` (`GatewayRadio`, attached to the gateway
+client as `client.radio`), and to the rest of the runtime it is one more bridge,
+at address `GATEWAY_ADDR` (0x0001):
+
+- **Routing.** `ASSIGN_TAG`, `UNASSIGN_TAG`, `DELIVER_LAYOUT`,
+  `CANCEL_DELIVERY` and `TAG_COMMAND` naming that address go to the engine,
+  and its outcomes come back through the client's ordered event pipeline as
+  the `AssignResult` / `StageEvent` / `ResultEvent` a bridge's would. These
+  events carry `boot_id` −1, so they are never acknowledged to the gateway,
+  and a handler that fails is retried like one for a retained event.
+- **Assignments.** They follow a bridge's rules, but `K_epoch` never leaves the
+  worker. They are held in RAM and loaded again from the inventory at every
+  start, with the key derived again from the secret store. At the same start,
+  what was sent to the radio without a result is sent again; the tag's stored
+  result keeps that idempotent.
+- **Checks and rendering.** A layout is checked as a bridge checks it at
+  `LAYOUT_COMMIT`, then rendered ahead with the tag's recorded geometry and the
+  daemon's font pack, so the session streams at once. It is rendered again if
+  the CAPS the tag reports differ.
+- **Sessions.** While a tag has jobs, a `SESSION` tunnel waits for it on the
+  gateway's radio, re-armed after each timeout. The gateway's firmware applies
+  the connection rules of §5.2. Once the tag's CAPS arrive, the engine runs a
+  bridge's session with every §10 rule, then closes the tunnel.
+- **Inventory.** The radio has an inventory row, `bridges` at `GATEWAY_ADDR`
+  under the gateway's device id, so its `hw_id` is the gateway's own
+  (`gw-<device id>`). A tag served this way names its gateway as its bridge:
+  discovery candidates, `pair_tag`, `move_tag` and `assign_tag` all take
+  `bridge_hw_id = gw-…`. The inventory reports the radio with the gateway's
+  entry (`tag_links`, `max_tags` 20, `assigned`), never among the bridges.
+- **Pairing and removal.** A tag pairs and is removed through `PAIR` tunnels
+  on the same radio (`bridge` `GATEWAY_ADDR`).
 
 ## 6. Hardware commands
 

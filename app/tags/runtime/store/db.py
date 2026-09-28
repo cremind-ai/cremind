@@ -21,7 +21,10 @@ Schema v1 — local inventory:
 - ``gateways``: one row per gateway ever seen (``hw_id``, port, boot id, fw).
 - ``bridges``: mesh nodes by device UUID (``hw_id`` = ``br-<uuid hex>``) with
   their unicast address, name, fw, active font pack id, flash size and whether
-  ``CONFIGURE_NODE`` succeeded.
+  ``CONFIGURE_NODE`` succeeded. A gateway that serves tags on its own radio
+  (docs/protocol.md §11) has a row here too, at ``GATEWAY_ADDR`` under the
+  gateway's device id: its ``hw_id`` is the gateway's (``gw-<device id hex>``),
+  so a tag assigned to it names its gateway.
 - ``tags``: enrolled tags — board, panel geometry and plane encoding, the
   reference of the secret in the secret store (never the secret, never
   ``K_epoch``, which is derived on demand), the current assignment
@@ -40,6 +43,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, cast
+
+from ..protocol.ids import GATEWAY_ADDR
 
 BUSY_TIMEOUT_MS = 5000
 
@@ -155,9 +160,14 @@ class BridgeRecord:
     updated_at: str = ""
 
     @property
+    def own_radio(self) -> bool:
+        """The gateway's own radio (docs/protocol.md §11), not a mesh node."""
+        return self.addr == GATEWAY_ADDR
+
+    @property
     def hw_id(self) -> str:
-        """Connector API identifier (docs/tags/connector-api.md)."""
-        return f"br-{self.uuid}"
+        """Connector API identifier (docs/tags/connector-api.md): the gateway's for its own radio."""
+        return f"gw-{self.uuid}" if self.own_radio else f"br-{self.uuid}"
 
 
 @dataclass(frozen=True, slots=True)

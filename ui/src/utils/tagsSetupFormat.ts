@@ -89,7 +89,7 @@ export function deviceStatePill(d: Pick<SetupDevice, 'state' | 'paused'>): Pill 
   return DEVICE_STATE[d.state] ?? { label: humanize(d.state), type: 'info' };
 }
 
-/** "3 of 20 tags" — a bridge's room for tags. */
+/** "3 of 20 tags" — a bridge's (or a gateway's own) room for tags. */
 export function capacityLabel(cap: SetupCapacity | null | undefined): string {
   if (!cap || !cap.max_tags) return '';
   return `${cap.assigned} of ${cap.max_tags} tags`;
@@ -146,12 +146,20 @@ export function humanize(code: string | null | undefined): string {
 export interface SetupReadiness {
   connected: TagConnection[];
   readyBridges: SetupDevice[];
+  /** Connected gateways that take a tag themselves: ready, and reaching tags on their own radio. */
+  tagGateways: TagConnection[];
   canAddBridge: boolean;
   addBridgeReason: string;
   canAddTag: boolean;
   addTagReason: string;
 }
 
+/**
+ * What can be added now. A tag needs something that can reach it: a connected
+ * gateway that reaches tags itself (newer gateways do), or a ready bridge (a
+ * bridge only carries updates farther). An older gateway reaches no tag
+ * itself, so its tags wait for a bridge.
+ */
 export function setupReadiness(connections: TagConnection[]): SetupReadiness {
   const live = connections.filter((c) => c.status !== 'removal_pending');
   const connected = live.filter((c) => c.status === 'connected' && !c.paused);
@@ -162,23 +170,68 @@ export function setupReadiness(connections: TagConnection[]): SetupReadiness {
     else if (live.every((c) => c.paused || c.status === 'paused')) addBridgeReason = 'Your gateway is paused. Resume it first.';
     else addBridgeReason = 'Your gateway is offline. Check that it is plugged in and that its computer is on.';
   }
+  const tagGateways = connected.filter((c) => c.gateway?.serves_tags === true && c.gateway.state === 'ready');
   const bridges = connected.flatMap((c) => c.bridges).filter((b) => b.state !== 'removal_pending');
   const readyBridges = bridges.filter((b) => b.state === 'ready' && !b.paused);
   let addTagReason = '';
-  if (!readyBridges.length) {
+  if (!readyBridges.length && !tagGateways.length) {
     if (!connected.length) addTagReason = addBridgeReason;
-    else if (!bridges.length) addTagReason = 'Add a bridge first.';
+    else if (connected.some((c) => c.gateway?.serves_tags === true)) addTagReason = 'Wait until the gateway shows Ready.';
+    else if (!bridges.length) addTagReason = 'Your gateway cannot reach tags itself. Add a bridge first.';
     else if (bridges.every((b) => b.paused)) addTagReason = 'Your bridges are paused. Resume one first.';
     else addTagReason = 'Wait until a bridge shows Ready.';
   }
   return {
     connected,
     readyBridges,
+    tagGateways,
     canAddBridge: connected.length > 0,
     addBridgeReason,
-    canAddTag: readyBridges.length > 0,
+    canAddTag: readyBridges.length > 0 || tagGateways.length > 0,
     addTagReason,
   };
+}
+
+/** Where a tag being added should be, in words: close to "your gateway or one of your bridges". */
+export function tagReach(r: Pick<SetupReadiness, 'tagGateways' | 'readyBridges'>): string {
+  const gateways = r.tagGateways.length;
+  if (gateways && r.readyBridges.length) {
+    return gateways > 1 ? 'one of your gateways or bridges' : 'your gateway or one of your bridges';
+  }
+  if (gateways) return gateways > 1 ? 'one of your gateways' : 'your gateway';
+  return 'one of your bridges';
+}
+
+/** The gateway or bridge a tag connects through, as the page names it (null: none, e.g. its bridge was removed). */
+export function tagParent(
+  t: Pick<SetupDevice, 'bridge_id'>,
+  c: Pick<TagConnection, 'name' | 'gateway' | 'bridges'>,
+): { kind: 'gateway' | 'bridge'; title: string; device: SetupDevice } | null {
+  if (!t.bridge_id) return null;
+  if (c.gateway?.id && t.bridge_id === c.gateway.id) return { kind: 'gateway', title: connectionTitle(c), device: c.gateway };
+  const b = c.bridges.find((x) => x.id === t.bridge_id);
+  return b ? { kind: 'bridge', title: setupDeviceTitle(b), device: b } : null;
+}
+
+/**
+ * A discovery candidate as people know it: the gateway — a bridge's search, or
+ * a tag the gateway's own radio heard — by its connection's title (with its
+ * computer, for a bridge's choice of gateway), a bridge by its name.
+ */
+export function candidateTitle(
+  c: Pick<DiscoveryCandidate, 'gateway_id' | 'bridge_id' | 'bridge_name' | 'bridge_kind'>,
+  role: 'bridge' | 'tag',
+  connections: TagConnection[],
+): string {
+  const conn = connections.find((x) => x.id === c.gateway_id);
+  if (role === 'bridge') {
+    if (!conn) return 'A gateway';
+    return conn.computer?.name ? `${connectionTitle(conn)} on ${conn.computer.name}` : connectionTitle(conn);
+  }
+  if (c.bridge_kind === 'gateway') return (c.bridge_name || '').trim() || (conn ? connectionTitle(conn) : 'Your gateway');
+  if (c.bridge_name) return c.bridge_name;
+  const b = connections.flatMap((x) => x.bridges).find((x) => x.id === c.bridge_id);
+  return b ? setupDeviceTitle(b) : 'A bridge';
 }
 
 // ── setup sessions ─────────────────────────────────────────────────────────
@@ -573,10 +626,10 @@ const ERROR_TEXT: Record<string, string> = {
   no_gateway: 'Connect a gateway first.',
   gateway_required: 'Choose which gateway to use.',
   gateway_offline: 'The gateway is offline. Check that it is plugged in and that its computer is on.',
-  no_ready_bridge: 'Add a bridge first, and wait until it shows Ready.',
+  no_ready_bridge: 'Your gateway cannot reach tags itself. Add a bridge first, and wait until it shows Ready.',
   device_owned: 'This device already belongs to another Cremind or profile. It has to be removed there (or reset) before it can be added here.',
-  candidate_not_eligible: 'That bridge cannot take this tag right now. Choose another one.',
-  bridge_full: 'That bridge has no room for more tags. Choose another bridge, or remove a tag from it first.',
+  candidate_not_eligible: 'That gateway or bridge cannot take this tag right now. Choose another one.',
+  bridge_full: 'That gateway or bridge has no room for more tags. Choose another one, or remove a tag from it first.',
   session_expired: 'This setup took too long and has expired. Start again.',
   fontpack_mismatch: 'This bridge needs a font update: connect it to a gateway computer with USB, then try again.',
   v1_firmware: 'This device has older software that simple setup does not support.',
@@ -621,11 +674,14 @@ const ERROR_TEXT: Record<string, string> = {
  * A refusal or failure in plain words. Known codes get our own sentence (the
  * server's may name internals); one of the gateway-computer problems gets its
  * sentence from `problemText`; an unknown code falls back to the server's
- * message, then to a generic line.
+ * message, then to a generic line. `near`: what a tag should be close to
+ * (`tagReach`), for a tag that was not found.
  */
 export function setupErrorMessage(
   code: string | null | undefined,
-  opts: { role?: 'gateway' | 'bridge' | 'tag'; fallback?: string | null; host?: HostFacts | null } = {},
+  opts: {
+    role?: 'gateway' | 'bridge' | 'tag'; fallback?: string | null; host?: HostFacts | null; near?: string;
+  } = {},
 ): string {
   const role = opts.role;
   switch (code) {
@@ -639,7 +695,10 @@ export function setupErrorMessage(
       return `The ${role ?? 'device'} did not accept this code. Check that the label belongs to this ${role ?? 'device'}, then try again.`;
     case 'not_found':
       if (role === 'bridge') return 'The bridge was not found. Check that it is plugged in and close to the gateway, then try again.';
-      if (role === 'tag') return 'The tag was not found. Tags check in about every 30 seconds: keep it close to a bridge and try again.';
+      if (role === 'tag') {
+        return `The tag was not found. Tags check in about every 30 seconds: keep it close to ${
+          opts.near || 'your gateway or one of your bridges'} and try again.`;
+      }
       return 'That was not found. It may have been removed meanwhile.';
     default: {
       if (code && ERROR_TEXT[code]) return ERROR_TEXT[code];

@@ -1,5 +1,5 @@
 ---
-description: "Set up your own Cremind Tag hardware: connect a USB gateway plugged into a gateway computer, add a bridge or an e-paper tag from the setup code on its label, send a test card, pause, move, remove, or move everything to another computer. No terminal needed — Settings → Tags does the same; this is the CLI."
+description: "Set up your own Cremind Tag hardware: connect a USB gateway plugged into a gateway computer, add an e-paper tag (it connects through the gateway itself or a bridge) or a bridge from the setup code on its label, send a test card, pause, move a tag to the gateway or another bridge, remove, or move everything to another computer. Settings → Tags does the same; this is the CLI."
 ---
 
 # `cremind tags devices` — set up your own gateways, bridges and tags
@@ -7,10 +7,15 @@ description: "Set up your own Cremind Tag hardware: connect a USB gateway plugge
 Cremind drives your gateway itself, over USB, from a **gateway computer**: the
 computer the Cremind server runs on, or one of your computers running the
 Cremind desktop app (see `cremind tags hosts`). Plug the gateway in there,
-connect it, then add bridges and tags from the QR or setup code printed on
+connect it, then add tags and bridges from the QR or setup code printed on
 their labels. Everything you set up here belongs to your profile only; no other
 profile (and no admin page) sees it. The web page does all of this too — the
 CLI is optional.
+
+A newer gateway (nRF52840) reaches the tags near it on its own radio, so a
+gateway alone is enough for them; **bridges only carry updates farther**. An
+older gateway cannot reach tags itself: every tag it serves needs a bridge.
+`cremind tags devices list` shows which one yours is.
 
 These commands never act on the USB ports of the computer the CLI runs on
 unless it is the gateway computer you name (or the only one there is): the
@@ -49,7 +54,10 @@ character; a typo is caught before anything is sent (`setup_code_invalid`).
 
 Your connections (gateways) with their bridges and tags: kind, name, short id,
 state (`pairing`, `ready`, `offline`, `recovery_pending`, `removal_pending`,
-`reconciling`), and bridge capacity or pending cards.
+`reconciling`), and in DETAIL: a bridge's capacity (`3/20 tags`); for a gateway
+`3/20 tags directly` when it reaches tags itself, or `tags need a bridge`; for a
+tag its pending cards and the gateway or bridge it connects through
+(`via Hall`).
 
 ### `cremind tags devices connect`
 
@@ -57,6 +65,8 @@ Connect a USB gateway plugged into a gateway computer. Cremind searches that
 computer's USB ports, shows the gateway it found (`Connect gateway …3C4D on
 Office PC?`), checks it again, sets up its worker there and claims it. Each
 step is printed; the connection keeps going on the server if you stop waiting.
+Once connected it prints the next step: `add tag` when the gateway reaches tags
+itself (a bridge is then only needed to reach farther), else `add bridge`.
 
 ```bash
 cremind tags devices connect --host "Office PC" --name "Hall gateway"
@@ -78,8 +88,11 @@ gateway of yours driven from another computer: use `recover`).
 
 ### `cremind tags devices add bridge|tag`
 
-Add a bridge (it joins a gateway) or a tag (a ready bridge hears it) from its
-label. Power the device first. A tag checks in about every 30 seconds, so
+Add a bridge (it joins a gateway) or a tag from its label. A tag is heard by
+your gateway itself, when it reaches tags, and by every ready bridge; it
+connects through the one that heard it (the strongest signal is recommended),
+and the output says which (`Tag ready. It connects through gateway 'Office
+gateway'.`). Power the device first. A tag checks in about every 30 seconds, so
 "waiting for the tag to wake" is normal.
 
 | Flag | Meaning |
@@ -87,7 +100,7 @@ label. Power the device first. A tag checks in about every 30 seconds, so
 | `--code-file` | the file holding the setup code (`-` = stdin) |
 | `--code-prompt` | type the code at a hidden prompt instead |
 | `--gateway` | bridges: which connection to join (needed when you have several) |
-| `--candidate` | tags: which search result to pair with when several bridges hear it |
+| `--candidate` | tags: which search result to pair with when several devices (your gateway, bridges) hear it — the output lists each one by name, e.g. `c1  gateway 'Office gateway'  rssi -55` |
 | `--name` | a name for the new device |
 | `--timeout` | seconds to wait |
 
@@ -113,20 +126,27 @@ connection. The pairing is kept.
 
 ### `cremind tags devices move <tag>`
 
-Serve a tag through another ready bridge of the same gateway, e.g. after its
-bridge was removed.
+Serve a tag through another place of the same gateway: the gateway itself (when
+it reaches tags on its own radio) or another ready bridge — e.g. after its
+bridge was removed, or to move it from the gateway to a bridge and back.
+
+```bash
+cremind tags devices move Kitchen --to Hall
+cremind tags devices move Kitchen --to gateway
+```
 
 | Flag | Meaning |
 |---|---|
-| `--bridge` | the bridge to use |
+| `--bridge` / `--to` | where it connects from now on: `gateway` (the tag's own gateway), or a ready bridge of that gateway by id, name or short id |
 
 ### `cremind tags devices remove <device>`
 
 Remove a tag, a bridge or a gateway. Cremind stops sending to it at once; the
 screen is cleared and the device's keys are removed when it is next reachable
 (**Removal pending** until then). A removed tag shows a fresh QR code for its
-next owner. Removing a bridge lists the tags it served; move them. Removing a
-gateway removes its bridges and tags too.
+next owner. Removing a bridge lists the tags it served; move them to your
+gateway (when it reaches tags itself) or another bridge. Removing a gateway
+removes its bridges and tags too, the ones it served itself included.
 
 | Flag | Meaning |
 |---|---|
@@ -160,11 +180,12 @@ pending** until each one does).
 | `recovery_required` | the gateway is yours but driven from another computer: `cremind tags devices recover` |
 | `already_claiming` | the gateway is being claimed and can no longer be cancelled; remove it afterwards |
 | `no_gateway` | connect a gateway first |
-| `no_ready_bridge` | add a bridge first — tags connect through a bridge |
+| `no_ready_bridge` | nothing can take a tag yet: your gateway cannot reach tags itself (an older gateway) and no bridge is ready — add a bridge first; or the gateway is paused — resume it |
+| `candidate_not_eligible` | that gateway or bridge cannot take the tag now (it stopped reaching tags, its bridge is not ready, or it belongs to another gateway): choose the tag's gateway or a ready bridge of it |
 | `gateway_required` | you have several gateways: pass `--gateway` |
 | `setup_code_invalid` / `setup_code_wrong_role` | a typo, or a bridge label used for a tag (or the reverse) |
 | `already_paired` | that device is already yours |
 | `device_owned` | the device is set up elsewhere; reset it to set it up again |
 | `session_expired` | a setup session lasts a few minutes; start again |
-| `bridge_full` | the bridge serves all the tags it can |
+| `bridge_full` | that gateway or bridge serves all the tags it can: pick another with `--candidate`, or move a tag off it (`move <tag> --to <gateway or bridge>`) |
 | `authority_unavailable` | this server lost the keys its devices trust — restore them from an encrypted backup made with `cremind backup create --include-tag-keys` |

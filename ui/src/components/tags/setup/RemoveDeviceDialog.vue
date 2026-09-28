@@ -2,9 +2,11 @@
 /**
  * Remove a gateway, bridge or tag (POST …/devices/{id}/unpair). Access is
  * revoked at once; cleaning up the device itself needs it to be reachable, so
- * it shows "Removal pending" until then. A bridge lists the tags that stop
- * receiving updates until they are added to another bridge or removed; a
- * gateway takes everything connected through it with it.
+ * it shows "Removal pending" until then. A bridge lists the tags that connect
+ * through it: they stop receiving updates until they are removed and added
+ * again, then connecting through the gateway (when it reaches tags itself) or
+ * another bridge. A gateway takes everything connected through it with it,
+ * the tags it served itself included.
  */
 import { computed, ref } from 'vue';
 import { ElButton, ElDialog, ElMessage } from 'element-plus';
@@ -42,6 +44,11 @@ const affectedTags = computed(() => {
     return t ? setupDeviceTitle(t) : 'A tag';
   });
 });
+
+/** Where a removed bridge's tags can connect once added again. */
+const otherPlace = computed(() => (props.connection?.gateway?.serves_tags === true
+  ? 'your gateway or another bridge'
+  : 'another bridge'));
 
 const counts = computed(() => {
   const c = props.connection;
@@ -92,10 +99,11 @@ function close() {
       <template v-else-if="kind === 'bridge'">
         <p>The bridge leaves your network.</p>
         <template v-if="affectedTags.length">
-          <p>These tags use it and stop receiving updates until you add them again through another bridge, or remove them:</p>
+          <p>These tags connect through it and stop receiving updates:</p>
           <ul class="affected">
             <li v-for="(t, i) in affectedTags" :key="i"><Icon icon="mdi:tablet-dashboard" aria-hidden="true" /> {{ t }}</li>
           </ul>
+          <p>To use them again, remove them and add them again: they then connect through {{ otherPlace }}.</p>
         </template>
         <p v-else>No tags use it.</p>
       </template>

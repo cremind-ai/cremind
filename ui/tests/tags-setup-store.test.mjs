@@ -163,7 +163,86 @@ test('connect gateway: search a computer, connect what it found, then the list i
   assert.equal(store.connections.length, 1)
   assert.equal(store.readiness.canAddBridge, true)
   assert.equal(store.readiness.canAddTag, false)
-  assert.equal(store.readiness.addTagReason, 'Add a bridge first.')
+  assert.equal(store.readiness.addTagReason, 'Your gateway cannot reach tags itself. Add a bridge first.')
+})
+
+test('a gateway that reaches tags itself takes a tag with no bridge; an older one still needs a bridge', async () => {
+  const { env, M, store } = await setup()
+  const gateway = (extra = {}) => device('gateway', 'gw-1', { serves_tags: true, capacity: { max_tags: 20, assigned: 0 }, ...extra })
+  let list = listAnswer([connection({ gateway: gateway() })])
+  env.route('/api/tags/connections', () => json(list))
+  const read = async (connections) => {
+    list = listAnswer(connections)
+    await store.loadConnections()
+    return store.readiness
+  }
+
+  let r = await read([connection({ gateway: gateway() })])
+  assert.equal(r.canAddTag, true, 'no bridge needed')
+  assert.equal(r.addTagReason, '')
+  assert.deepEqual(r.tagGateways.map((c) => c.id), ['comp-1'])
+  assert.equal(M.tagReach(r), 'your gateway')
+
+  // An older gateway reaches no tag itself: a bridge first.
+  r = await read([connection({ gateway: device('gateway', 'gw-1', { serves_tags: false }) })])
+  assert.equal(r.canAddTag, false)
+  assert.equal(r.addTagReason, 'Your gateway cannot reach tags itself. Add a bridge first.')
+  assert.equal(M.tagReach(r), 'one of your bridges')
+  r = await read([connection({ gateway: device('gateway', 'gw-1', { serves_tags: false }), bridges: [device('bridge', 'br-1')] })])
+  assert.equal(r.canAddTag, true)
+
+  // Paused, offline or still setting up: the same reasons Add bridge gives.
+  r = await read([connection({ gateway: gateway(), paused: true, status: 'paused' })])
+  assert.equal(r.canAddTag, false)
+  assert.equal(r.addTagReason, 'Your gateway is paused. Resume it first.')
+  assert.equal(r.addTagReason, r.addBridgeReason)
+  r = await read([connection({ gateway: gateway(), status: 'offline' })])
+  assert.equal(r.addTagReason, 'Your gateway is offline. Check that it is plugged in and that its computer is on.')
+  r = await read([connection({ gateway: gateway(), status: 'setting_up' })])
+  assert.equal(r.addTagReason, 'Wait until the gateway is connected.')
+  // It reaches tags, but is not ready yet (checked again after a restore).
+  r = await read([connection({ gateway: gateway({ state: 'reconciling' }) })])
+  assert.equal(r.canAddTag, false)
+  assert.equal(r.addTagReason, 'Wait until the gateway shows Ready.')
+
+  // Both: the tag can be near either.
+  r = await read([connection({ gateway: gateway(), bridges: [device('bridge', 'br-1')] })])
+  assert.equal(M.tagReach(r), 'your gateway or one of your bridges')
+  assert.equal(M.setupErrorMessage('not_found', { role: 'tag', near: M.tagReach(r) }),
+    'The tag was not found. Tags check in about every 30 seconds: keep it close to your gateway or one of your bridges and try again.')
+})
+
+test('where a tag connects, in the words the page uses: the gateway by its connection, a bridge by its name', async () => {
+  const { M } = await setup()
+  const hall = device('bridge', 'br-1', { name: 'Hall' })
+  const conn = connection({ bridges: [hall] })
+  const cand = (extra = {}) => ({
+    id: 'c1', gateway_id: 'comp-1', bridge_id: 'br-1', bridge_kind: 'bridge', bridge_name: null, rssi: -50,
+    seen_at: 'z', capacity: null, eligible: true, reason: null, ...extra,
+  })
+  // The gateway's own radio heard the tag: named as its connection (the server's name first).
+  assert.equal(M.candidateTitle(cand({ bridge_kind: 'gateway', bridge_id: 'gw-1', bridge_name: 'Office gateway' }), 'tag', [conn]), 'Office gateway')
+  assert.equal(M.candidateTitle(cand({ bridge_kind: 'gateway', bridge_id: 'gw-1' }), 'tag', [conn]), 'Desk gateway')
+  // A bridge by its name; an older server sends no bridge_kind (its candidates were bridges).
+  assert.equal(M.candidateTitle(cand(), 'tag', [conn]), 'Hall')
+  assert.equal(M.candidateTitle(cand({ bridge_kind: undefined, bridge_name: 'Porch' }), 'tag', [conn]), 'Porch')
+  assert.equal(M.candidateTitle(cand({ bridge_id: 'gone' }), 'tag', [conn]), 'A bridge')
+  // A bridge's search: the gateway with its computer.
+  assert.equal(M.candidateTitle(cand({ bridge_kind: 'gateway', bridge_id: null }), 'bridge', [conn]), 'Desk gateway on DESKTOP-ABC')
+
+  // A tag's parent: its gateway or one of the connection's bridges.
+  const parent = (t) => { const p = M.tagParent(t, conn); return p && { kind: p.kind, title: p.title } }
+  assert.deepEqual(parent({ bridge_id: 'gw-1' }), { kind: 'gateway', title: 'Desk gateway' })
+  assert.deepEqual(parent({ bridge_id: 'br-1' }), { kind: 'bridge', title: 'Hall' })
+  assert.equal(parent({ bridge_id: null }), null)
+
+  // Refusals say gateway or bridge, never only bridge.
+  assert.equal(M.setupErrorMessage('no_ready_bridge'),
+    'Your gateway cannot reach tags itself. Add a bridge first, and wait until it shows Ready.')
+  assert.equal(M.setupErrorMessage('candidate_not_eligible'),
+    'That gateway or bridge cannot take this tag right now. Choose another one.')
+  assert.equal(M.setupErrorMessage('bridge_full'),
+    'That gateway or bridge has no room for more tags. Choose another one, or remove a tag from it first.')
 })
 
 test('what a search means, and the words for each problem a gateway computer can have', async () => {

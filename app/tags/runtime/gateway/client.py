@@ -47,6 +47,19 @@ is queued after every HELLO, so handlers see "the gateway rebooted" in order wit
 the events around it. Subscriptions (:meth:`GatewayClient.subscribe`,
 :meth:`GatewayClient.expect`) observe events as they arrive and never gate the
 ACK.
+
+The gateway's own radio (docs/protocol.md §11)
+==============================================
+
+A gateway whose caps report ``tag_links`` serves the tags in its range itself:
+with a :class:`~app.tags.runtime.gateway.radio.GatewayRadio` attached
+(``client.radio``), ``ASSIGN_TAG``, ``UNASSIGN_TAG``, ``DELIVER_LAYOUT``,
+``CANCEL_DELIVERY`` (of its deliveries) and ``TAG_COMMAND`` naming
+``bridge = GATEWAY_ADDR`` go to it instead of the gateway, and its outcomes
+(``AssignResult``, ``StageEvent``, ``ResultEvent``, ``TagSeen``) come through the
+same pipeline as the gateway's events (:meth:`GatewayClient.inject`), with
+``boot_id`` :data:`LOCAL_BOOT`: a failing handler is retried like a retained
+event's, and nothing is acknowledged to the gateway.
 """
 
 from __future__ import annotations
@@ -55,16 +68,28 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..protocol import cbor_msgs
-from ..protocol.ids import LAYOUT_HARD_MAX, MESH_DEFAULT_TTL, TAG_KEY_LEN, SerialMsg, Status, TagCommand
+from ..protocol.ids import (
+    GATEWAY_ADDR,
+    LAYOUT_HARD_MAX,
+    MESH_DEFAULT_TTL,
+    TAG_KEY_LEN,
+    SerialMsg,
+    Status,
+    TagCommand,
+    TunnelMode,
+)
 from ..protocol.serial_frame import Frame
 from .errors import GatewayError, StatusError
 from .events import GatewayEvent, SessionStarted, parse_event
 from .link import DEFAULT_ATTEMPTS, HOST_WINDOW, REQUEST_TIMEOUT_S, SecureOptions, SerialLink, TransportFactory
 from .opid import OpIdGenerator
 from .results import Ack, BridgeInfo, DeviceInfo, HelloInfo, IdentifyInfo, NodeInfo, to_status
+
+if TYPE_CHECKING:
+    from .radio import GatewayRadio
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +98,8 @@ EventTypes = type[GatewayEvent] | tuple[type[GatewayEvent], ...] | None
 
 ACK_BATCH = 8
 MAX_PIPELINE = 10_000  # non-retained events beyond this are dropped while a handler is stuck
+LOCAL_BOOT = -1
+"""``boot_id`` of the events the host makes itself (the gateway's own radio): never acknowledged."""
 
 
 class EventSubscription:
@@ -83,9 +110,13 @@ class EventSubscription:
         self._types = types
         self._queue: asyncio.Queue[GatewayEvent] = asyncio.Queue(maxsize)
         self.dropped = 0
+        self.where: Callable[[GatewayEvent], bool] | None = None
+        """Narrows the subscription further (e.g. one tunnel's events, once its id is known)."""
 
     def _offer(self, event: GatewayEvent) -> None:
         if self._types is not None and not isinstance(event, self._types):
+            return
+        if self.where is not None and not self.where(event):
             return
         try:
             self._queue.put_nowait(event)
@@ -187,6 +218,8 @@ class GatewayClient:
         self._last_boot_id: int | None = None
         self.stats: dict[str, int] = {"events": 0, "retained": 0, "duplicates": 0, "acks": 0, "handler_failures": 0,
                                       "bad_events": 0, "dropped": 0}
+        self.radio: GatewayRadio | None = None
+        """The gateway's own radio as a bridge (docs/protocol.md §11); see the module docstring."""
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -197,6 +230,8 @@ class GatewayClient:
         return await self.link.open()
 
     async def close(self) -> None:
+        if self.radio is not None:
+            await self.radio.close()
         await self.link.close()
         for task in (self._pump_task, self._ack_task):
             if task is not None:
@@ -304,6 +339,15 @@ class GatewayClient:
         event = SessionStarted(boot_id=hello.boot_id, hello=hello, previous_boot_id=previous_boot)
         self._observe(event)
         self._pipeline.put_nowait(event)
+        if self.radio is not None:
+            self.radio.on_session(event)
+
+    def inject(self, event: GatewayEvent) -> None:
+        """Queue an event the host made itself (``boot_id`` :data:`LOCAL_BOOT`, the gateway's own radio) through
+        the ordered pipeline: observers see it now, handlers in order; never acknowledged to the gateway."""
+        self.stats["events"] += 1
+        self._observe(event)
+        self._pipeline.put_nowait(event)
 
     def _matching_handlers(self, event: GatewayEvent) -> list[EventHandler]:
         return [h for h, types in self._handlers if types is None or isinstance(event, types)]
@@ -312,7 +356,9 @@ class GatewayClient:
         while True:
             event = await self._pipeline.get()
             try:
-                if event.retained:
+                if event.retained and event.boot_id == LOCAL_BOOT:
+                    await self._handle_retained(event)  # the host's own outcome: retried, never acknowledged
+                elif event.retained:
                     boot, seq = event.boot_id or 0, event.seq or 0
                     if seq > self._handled.get(boot, 0):
                         await self._handle_retained(event)
@@ -446,16 +492,24 @@ class GatewayClient:
         """Cached bridge info; fresher data follows as ``BridgeInfoEvent``s."""
         return [BridgeInfo.from_map(i) for i in (await self._checked(SerialMsg.GET_INVENTORY)).get("items", [])]
 
+    def _own_radio(self, bridge: int) -> GatewayRadio | None:
+        """The engine behind ``bridge`` when it names the gateway's own radio (docs/protocol.md §11)."""
+        return self.radio if bridge == GATEWAY_ADDR else None
+
     async def assign_tag(self, bridge: int, tag_id: int, epoch: int, key: bytes, *, op_id: int | None = None) -> Ack:
         """Give ``K_epoch`` for ``(tag, epoch)`` to a bridge; the outcome is an ``AssignResult`` event."""
         if len(key) != TAG_KEY_LEN:
             raise ValueError(f"K_epoch must be {TAG_KEY_LEN} bytes")
         op = self._op(op_id)
+        if (radio := self._own_radio(bridge)) is not None:
+            return radio.assign(op, tag_id, epoch, key)
         return await self._ack(SerialMsg.ASSIGN_TAG,
                                {"op_id": op, "bridge": bridge, "tag_id": tag_id, "epoch": epoch, "key": key}, op)
 
     async def unassign_tag(self, bridge: int, tag_id: int, epoch: int, *, op_id: int | None = None) -> Ack:
         op = self._op(op_id)
+        if (radio := self._own_radio(bridge)) is not None:
+            return radio.unassign(op, tag_id, epoch)
         return await self._ack(SerialMsg.UNASSIGN_TAG,
                                {"op_id": op, "bridge": bridge, "tag_id": tag_id, "epoch": epoch}, op)
 
@@ -470,6 +524,9 @@ class GatewayClient:
         if len(layout) > LAYOUT_HARD_MAX:
             raise ValueError(f"layout of {len(layout)} bytes exceeds LAYOUT_HARD_MAX")
         op = self._op(op_id)
+        if (radio := self._own_radio(bridge)) is not None:
+            return await radio.deliver(op, tag_id=tag_id, epoch=epoch, revision=revision, update_id=update_id,
+                                       fontpack_id=fontpack_id, layout=layout)
         return await self._ack(SerialMsg.DELIVER_LAYOUT, {
             "op_id": op, "bridge": bridge, "tag_id": tag_id, "epoch": epoch, "revision": revision,
             "update_id": update_id, "fontpack_id": fontpack_id, "layout": layout}, op)
@@ -477,12 +534,16 @@ class GatewayClient:
     async def cancel_delivery(self, update_id: int, *, op_id: int | None = None) -> Ack:
         """Cancel a queued/pending delivery; a cancelled one ends with ``ResultEvent`` CANCELLED."""
         op = self._op(op_id)
+        if self.radio is not None and self.radio.owns(update_id):
+            return self.radio.cancel(op, update_id)
         return await self._ack(SerialMsg.CANCEL_DELIVERY, {"op_id": op, "update_id": update_id}, op)
 
     async def tag_command(self, *, bridge: int, tag_id: int, epoch: int, cmd: TagCommand | int,
                           op_id: int | None = None) -> Ack:
         """Send a tag command; the outcome is a ``ResultEvent`` whose ``update_id`` is ``op_id``."""
         op = self._op(op_id)
+        if (radio := self._own_radio(bridge)) is not None:
+            return radio.command(op, tag_id=tag_id, epoch=epoch, cmd=int(cmd))
         return await self._ack(SerialMsg.TAG_COMMAND,
                                {"op_id": op, "bridge": bridge, "tag_id": tag_id, "epoch": epoch, "cmd": int(cmd)}, op)
 
@@ -519,18 +580,23 @@ class GatewayClient:
         return await self._ack(SerialMsg.PROVISION, fields, op)
 
     async def discover(self, *, bridge: int, duration_s: int, tag_id: int, op_id: int | None = None) -> Ack:
-        """``DISCOVER``: bridges listen for a v2 tag in setup mode (``bridge`` 0 = every bridge,
-        ``tag_id`` 0 = any); ``Discovered`` events follow."""
+        """``DISCOVER``: bridges listen for a v2 tag in setup mode (``bridge`` 0 = every bridge and the gateway's
+        own radio, ``GATEWAY_ADDR`` = its own radio only; ``tag_id`` 0 = any); ``Discovered`` events follow."""
         op = self._op(op_id)
         return await self._ack(SerialMsg.DISCOVER, {"op_id": op, "bridge": bridge, "duration_s": duration_s,
                                                     "tag_id": tag_id}, op)
 
-    async def tunnel_open(self, *, bridge: int, tag_id: int, duration_s: int, op_id: int | None = None) -> int:
+    async def tunnel_open(self, *, bridge: int, tag_id: int, duration_s: int, op_id: int | None = None,
+                          mode: TunnelMode = TunnelMode.PAIR) -> int:
         """``TUNNEL_OPEN`` to a bridge's own endpoint (``tag_id`` 0) or through it to a tag; returns the
-        tunnel id. ``TunnelEvent``\\ s follow (``OPEN`` with the endpoint's ``ident2`` first)."""
+        tunnel id. ``TunnelEvent``\\ s follow (``OPEN`` with the endpoint's ``ident2`` first). ``bridge``
+        ``GATEWAY_ADDR``: a tag on the gateway's own radio; ``mode`` ``SESSION`` there carries the tag's frame
+        session (``OPEN`` with its CAPS value, docs/protocol.md §11)."""
         op = self._op(op_id)
-        response = await self.link.request(SerialMsg.TUNNEL_OPEN, {"op_id": op, "bridge": bridge, "tag_id": tag_id,
-                                                                   "duration_s": duration_s})
+        fields: dict[str, Any] = {"op_id": op, "bridge": bridge, "tag_id": tag_id, "duration_s": duration_s}
+        if mode != TunnelMode.PAIR:
+            fields["mode"] = int(mode)
+        response = await self.link.request(SerialMsg.TUNNEL_OPEN, fields)
         status = to_status(response["status"])
         if status not in (Status.OK, Status.ACCEPTED):
             raise StatusError(SerialMsg.TUNNEL_OPEN, status, response.get("detail"), response.get("text"))
@@ -556,4 +622,4 @@ def any_of(*predicates: Callable[[GatewayEvent], bool]) -> Callable[[GatewayEven
     return lambda event: any(p(event) for p in predicates)
 
 
-__all__ = ["EventHandler", "EventSubscription", "EventWaiter", "GatewayClient", "any_of", "matches"]
+__all__ = ["LOCAL_BOOT", "EventHandler", "EventSubscription", "EventWaiter", "GatewayClient", "any_of", "matches"]

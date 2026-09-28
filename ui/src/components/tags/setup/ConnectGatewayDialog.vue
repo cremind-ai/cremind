@@ -5,7 +5,9 @@
  * Cremind searches that computer's USB ports → the gateway it found (the
  * only free one preselected; one of yours driven from elsewhere can be moved
  * here) → Cremind connects it: checks it again, sets up its worker, claims
- * it → "Gateway connected".
+ * it → "Gateway connected", with Add tag first when the gateway reaches tags
+ * on its own radio (a bridge is then only needed to reach farther), else Add
+ * bridge.
  *
  * Every step runs on the server, so closing the dialog loses nothing: a
  * connection still running shows on the page with Continue, and resumes from
@@ -33,6 +35,7 @@ const props = defineProps<{ modelValue: boolean; hostId?: string | null; resumeO
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void;
   (e: 'add-bridge'): void;
+  (e: 'add-tag'): void;
   /** A gateway of this profile was moved here: follow its devices. */
   (e: 'recovering', recoveryId: string): void;
 }>();
@@ -64,9 +67,12 @@ const connection = computed(() => {
   const id = connectionOp.value?.companion_id;
   return id ? store.connections.find((c) => c.id === id) ?? null : null;
 });
+/** The connected gateway reaches the tags near it on its own radio: tags come next, bridges only to reach farther. */
+const servesTags = computed(() => connection.value?.gateway?.serves_tags === true);
 const doneText = computed(() => {
   const gateway = connection.value ? connectionTitle(connection.value) : 'The gateway';
-  return `${gateway} is connected through ${hostName(host.value)}. Cremind keeps your tags updated from there.`;
+  const text = `${gateway} is connected through ${hostName(host.value)}. Cremind keeps your tags updated from there.`;
+  return servesTags.value ? `${text} It reaches the tags near it itself; add a bridge only to reach farther.` : text;
 });
 const title = computed(() => (step.value === 'choose' ? 'Connect a gateway' : `Connect a gateway to ${hostName(host.value)}`));
 
@@ -173,6 +179,11 @@ async function cancelConnection() {
 function addBridge() {
   close();
   emit('add-bridge');
+}
+
+function addTag() {
+  close();
+  emit('add-tag');
 }
 
 /** The dialog closes through the parent's v-model: what runs on the server goes on. */
@@ -297,7 +308,12 @@ function beforeClose(_done: () => void) {
       <ElResult icon="success" title="Gateway connected" :sub-title="doneText">
         <template #extra>
           <div class="done-actions">
-            <ElButton type="primary" @click="addBridge"><Icon icon="mdi:plus" class="btn-icon" /> Add bridge</ElButton>
+            <ElButton v-if="store.readiness.canAddTag" :type="servesTags ? 'primary' : undefined" @click="addTag">
+              <Icon icon="mdi:plus" class="btn-icon" /> Add tag
+            </ElButton>
+            <ElButton :type="servesTags ? undefined : 'primary'" @click="addBridge">
+              <Icon icon="mdi:plus" class="btn-icon" /> Add bridge
+            </ElButton>
             <ElButton @click="close">Done</ElButton>
           </div>
         </template>

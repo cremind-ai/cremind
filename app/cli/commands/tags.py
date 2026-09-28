@@ -101,8 +101,9 @@ _CLEAR_FAILED_ADMIN_HINT = (
 )
 ASSIGN_FAILED = "assign_failed"
 _ASSIGN_FAILED_HINT = (
-    "assign_failed: the tag's bridge could not take it (bridge_full: every slot of its table is taken). "
-    "Ask the admin to assign it to another bridge (cremind tags hardware assign <tag> --bridge <bridge>)."
+    "assign_failed: the bridge (or gateway) serving the tag could not take it (bridge_full: every slot of its "
+    "table is taken). Ask the admin to assign it to another bridge (cremind tags hardware assign <tag> --bridge "
+    "<bridge>); a tag you set up yourself moves with cremind tags devices move <tag> --to <gateway or bridge>."
 )
 _ASSIGN_FAILED_ADMIN_HINT = (
     "assign_failed: the bridge could not take the tag — its assign_tag command's ERROR says why "

@@ -1,9 +1,10 @@
 /**
  * Adding a bridge or a tag from its label (connect-setup.md §8.2, §8.3), as
- * the Add bridge / Add tag dialogs run it: the setup code → a discovery (the
- * gateway, or every ready bridge, listens for that device) → pair at once
- * when exactly one candidate can take it, else let the person choose → follow
- * the pairing until the device is ready.
+ * the Add bridge / Add tag dialogs run it: the setup code → a discovery (a
+ * bridge: its gateway listens; a tag: the gateway itself, when it reaches tags
+ * on its own radio, and every ready bridge) → pair at once when exactly one
+ * candidate can take it, else let the person choose → follow the pairing
+ * until the device is ready.
  *
  * The code text lives here only while the dialog is open: `reset()` (on
  * close and on unmount) drops it. The server gets the normalized code; the
@@ -14,7 +15,7 @@ import { useTagsSetupStore } from '../stores/tagsSetup';
 import { TagsApiError } from '../services/tagsApi';
 import type { ParsedSetupCode } from '../utils/setupCode';
 import {
-  discoveryDecision, sortCandidates, setupErrorMessage,
+  discoveryDecision, sortCandidates, setupErrorMessage, tagReach,
 } from '../utils/tagsSetupFormat';
 
 export type PairingStep = 'code' | 'searching' | 'choose' | 'pairing' | 'done' | 'problem';
@@ -45,6 +46,10 @@ export function useDevicePairing(role: 'bridge' | 'tag') {
   const pairing = computed(() => (pairingId.value ? store.pairings[pairingId.value] ?? null : null));
   const decision = computed(() => (discovery.value ? discoveryDecision(discovery.value) : null));
   const candidates = computed(() => (discovery.value ? sortCandidates(discovery.value) : []));
+  /** What a tag should be close to: "your gateway or one of your bridges". */
+  const near = computed(() => tagReach(store.readiness));
+  const say = (code: string | null | undefined, fallback?: string | null) =>
+    setupErrorMessage(code, { role, fallback, near: near.value });
 
   const step = computed<PairingStep>(() => {
     if (failure.value) return 'problem';
@@ -69,29 +74,25 @@ export function useDevicePairing(role: 'bridge' | 'tag') {
     const p = pairing.value;
     if (p?.state === 'cancelled') return { title: 'Pairing cancelled', text: 'Nothing was added.', action: 'retry' };
     if (p?.state === 'failed') {
-      return {
-        title: `The ${role} was not added`,
-        text: setupErrorMessage(p.error?.code, { role, fallback: p.error?.message }),
-        action: 'retry',
-      };
+      return { title: `The ${role} was not added`, text: say(p.error?.code, p.error?.message), action: 'retry' };
     }
     const d = decision.value;
-    if (d?.kind === 'not_found') return { title: `No ${role} found`, text: setupErrorMessage('not_found', { role }), action: 'search' };
+    if (d?.kind === 'not_found') return { title: `No ${role} found`, text: say('not_found'), action: 'search' };
     if (d?.kind === 'unavailable') {
       return {
         title: `Found the ${role}, but it cannot be added yet`,
-        text: setupErrorMessage(d.reason ?? 'candidate_not_eligible', { role }),
+        text: say(d.reason ?? 'candidate_not_eligible'),
         action: 'search',
       };
     }
     if (d?.kind === 'failed') {
-      return { title: 'The search stopped', text: setupErrorMessage(d.error?.code, { role, fallback: d.error?.message }), action: 'retry' };
+      return { title: 'The search stopped', text: say(d.error?.code, d.error?.message), action: 'retry' };
     }
     return { title: 'The search was cancelled', text: 'Nothing was added.', action: 'retry' };
   });
 
   function describe(e: unknown): { code: string | null; message: string } {
-    if (e instanceof TagsApiError) return { code: e.code, message: setupErrorMessage(e.code, { role, fallback: e.message }) };
+    if (e instanceof TagsApiError) return { code: e.code, message: say(e.code, e.message) };
     return { code: null, message: 'Cremind could not be reached. Check the connection and try again.' };
   }
 
@@ -224,6 +225,7 @@ export function useDevicePairing(role: 'bridge' | 'tag') {
     step,
     problem,
     lookingFor,
+    near,
     find,
     pair,
     cancel,

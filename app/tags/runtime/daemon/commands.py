@@ -304,6 +304,13 @@ class CommandExecutor:
 
     async def _bridge(self, hw_id: Any) -> BridgeRecord:
         text = str(hw_id)
+        if text.startswith("gw-"):  # the gateway itself: its own radio (docs/protocol.md §11)
+            if text != self.svc.gateway_hw_id:
+                raise CommandError(f"gateway {text} is not the one this companion drives")
+            radio = await self.svc.db.run(self.svc.radio_bridge)
+            if radio is None:
+                raise CommandError(f"gateway {text} serves no tag on its own radio")
+            return radio
         if not text.startswith("br-"):
             raise CommandError(f"not a bridge id: {text!r}")
         uuid = normalize_uuid(text[3:])

@@ -20,7 +20,7 @@ import pytest
 
 from app.tags.runtime.connect.setup_flow import CONTROLLER_SCHEMA, write_private
 from app.tags.runtime.connect.workerdir import WorkerSpec, load_worker, write_worker
-from app.tags.runtime.protocol.ids import NodeRole, OwnerState
+from app.tags.runtime.protocol.ids import GATEWAY_ADDR, NodeRole, OwnerState
 from app.tags.runtime.secrets import FileBackend, SecretStore
 from app.tags.runtime.secure import identity
 from app.tags.runtime.secure.codes import SetupPayload, parse_code
@@ -276,6 +276,146 @@ def test_recovery_on_a_replacement_computer(paths: Any) -> None:
                 assert local is not None and local.epoch > first_epoch
 
     asyncio.run(scenario())
+
+
+def radio_config(fontpack: bytes | None = None) -> SimConfig:
+    """A gateway with tag links and no bridge at all (docs/protocol.md §11)."""
+    return SimConfig(seed=SEED, time_scale=200, protocol=2, fontpack=fontpack, bridges=[],
+                     tags=[TagSpec.generate(SEED, 0, protocol=2)])
+
+
+async def pair_on_the_gateway(sim: Simulator, fake: Any) -> tuple[str, str, int]:
+    """Claim the gateway and pair the tag on its own radio; returns (gateway hw id, tag device id, tag id)."""
+    gw = sim.gateway.secure
+    assert gw is not None
+    await run_op(fake, "claim_gateway", {"device_id": gw.device_id.hex(), "ik": gw.keys.ik_pub.hex(), "gen": 0,
+                                         "mode": "claim"})
+    gateway_hw = f"gw-{gw.device_id.hex()}"
+    await until(lambda: any(g.get("hw_id") == gateway_hw and g.get("tag_links") == 2
+                            for inv in fake.inventories for g in inv.get("gateways", [])), 60, "tag links reported")
+    tag_label = label(sim, "tag")
+    cand = await discover(fake, "tag", tag_label, [gateway_hw])
+    assert cand["bridge_hw_id"] == gateway_hw  # heard by the gateway's own radio
+    await run_op(fake, "pair_tag", {"role": "tag", "short_id": tag_label.short_id, "tag_id": tag_label.short_id,
+                                    "bridge_hw_id": gateway_hw, "bridge_id": "g1", "name": "Desk"},
+                 secret=tag_label.secret)
+    tag = sim.tag(tag_label.short_id)
+    assert tag.secure is not None
+    return gateway_hw, tag.secure.device_id.hex(), tag_label.short_id
+
+
+def test_a_gateway_alone_pairs_and_clears_a_tag_on_its_own_radio(paths: Any) -> None:
+    """No bridge: the tag pairs through a PAIR tunnel on the gateway's radio, the worker keeps its K_epoch and
+    clears it through a SESSION tunnel; the inventory reports the gateway's tag links and its tag."""
+
+    async def scenario() -> None:
+        async with Simulator(radio_config()) as sim:
+            gw = sim.gateway.secure
+            assert gw is not None
+            fake = FakeV2Cremind()
+            directory = paths.worker_dir("w1")
+            make_worker(directory, fake, gw.device_id, gw.keys.ik_pub)
+            async with worker(directory, sim, paths, fake) as run:
+                gateway_hw, tag_device, tag_id = await pair_on_the_gateway(sim, fake)
+                tag = sim.tag(tag_id)
+                assert tag.secure is not None and tag.secure.record.state == OwnerState.OWNED
+                assert fake.bindings[tag_device]["state"] == "ready"
+                local = await run.svc.db.run(run.svc.db.find_tag, tag_id)
+                assert local is not None and local.bridge_addr == GATEWAY_ADDR and local.epoch >= 1
+                assert tag.nvs.stored_epoch == local.epoch  # the clear under the new epoch went through
+                assert fake.vault_latest(tag_device)["state"]["bridge"] == gateway_hw
+                radio = sim.gateway.radio
+                assert radio is not None and radio.counters["connections"] >= 2  # PAIR, then the clear's session
+                await until(lambda: any(g.get("hw_id") == gateway_hw and g.get("assigned") == 1
+                                        for inv in fake.inventories for g in inv.get("gateways", [])), 60,
+                            "the gateway's tag in the inventory")
+                last = fake.inventories[-1]
+                assert all(b["hw_id"] != gateway_hw for b in last["bridges"])  # the radio is no bridge
+                assert not any(d.get("kind") == "bridge" for hb in fake.heartbeats for d in hb.get("devices", []))
+
+    asyncio.run(scenario())
+
+
+def test_a_tag_on_the_gateways_radio_is_removed_with_its_fresh_code_shown(paths: Any,
+                                                                          dev_fonts: tuple[Any, bytes]) -> None:
+    """The release (two stages through PAIR tunnels on the gateway's radio) and the setup-code screen the host
+    renders itself and streams through a SESSION tunnel."""
+    fonts, pack = dev_fonts
+
+    async def scenario() -> None:
+        async with Simulator(radio_config(pack)) as sim:
+            gw = sim.gateway.secure
+            assert gw is not None
+            fake = FakeV2Cremind()
+            directory = paths.worker_dir("w1")
+            make_worker(directory, fake, gw.device_id, gw.keys.ik_pub)
+            async with worker(directory, sim, paths, fake, fonts) as run:
+                _gateway_hw, tag_device, tag_id = await pair_on_the_gateway(sim, fake)
+                local = await run.svc.db.run(run.svc.db.find_tag, tag_id)
+                assert local is not None
+                await run_op(fake, "unpair", {"device_id": tag_device, "role": "tag", "hw_id": f"{tag_id:08X}",
+                                              "generation": 1, "epoch": local.epoch})
+                tag = sim.tag(tag_id)
+                assert tag.secure is not None and tag.secure.record.state == OwnerState.RELEASED
+                assert await run.svc.db.run(run.svc.db.find_tag, tag_id) is None
+                fresh = label(sim, "tag")
+                assert tag.displayed_digest == expected_radio_setup_screen(sim, tag_id, fonts, fresh)
+
+    asyncio.run(scenario())
+
+
+def test_screens_on_the_gateways_radio_survive_a_worker_restart(paths: Any, dev_fonts: tuple[Any, bytes]) -> None:
+    """Content reaches a tag on the gateway's radio; a screen sent while the tag is away is lost with the worker
+    (the radio keeps its jobs in RAM) and goes out again after the restart, under the assignment the new worker
+    loaded from its inventory (K_epoch derived again)."""
+    fonts, pack = dev_fonts
+
+    async def scenario() -> None:
+        async with Simulator(radio_config(pack)) as sim:
+            gw = sim.gateway.secure
+            assert gw is not None
+            fake = FakeV2Cremind()
+            directory = paths.worker_dir("w1")
+            make_worker(directory, fake, gw.device_id, gw.keys.ik_pub)
+            async with worker(directory, sim, paths, fake, fonts) as run:
+                gateway_hw, _tag_device, tag_id = await pair_on_the_gateway(sim, fake)
+                local = await run.svc.db.run(run.svc.db.find_tag, tag_id)
+                assert local is not None
+                hw = f"{tag_id:08X}"
+                fake.add_tag(hw, owner="anna", epoch=local.epoch, bridge_hw_id=gateway_hw)
+                first = fake.add_job("anna", hw, title="Before the restart")
+                await until(lambda: fake.delivery(first)["stage"] == "displayed", 90, "the first screen")
+                shown = sim.tag(tag_id).displayed_digest
+                sim.tag(tag_id).out_of_range = True  # the next screen cannot reach the tag
+                second = fake.add_job("anna", hw, title="After the restart")
+                await until(lambda: fake.delivery(second)["stage"] in ("gateway_received", "bridge_received"), 60,
+                            "the second screen sent")
+            assert sim.tag(tag_id).displayed_digest == shown
+            sim.tag(tag_id).out_of_range = False
+            async with worker(directory, sim, paths, fake, fonts) as run:
+                await until(lambda: fake.delivery(second)["stage"] == "displayed", 90, "the second screen")
+                assert sim.tag(tag_id).displayed_digest != shown
+                radio = run.svc.gateway.radio
+                assert radio is not None and tag_id in radio.assignments  # loaded again at start
+
+    asyncio.run(scenario())
+
+
+def expected_radio_setup_screen(sim: Simulator, tag_id: int, fonts: Any, payload: SetupPayload) -> bytes:
+    """The digest of the setup-code screen as the host renders it for a tag on the gateway's radio."""
+    import hashlib
+
+    from app.tags.runtime.compose.api import TagPanel
+    from app.tags.runtime.compose.screen import compose_setup_code
+    from app.tags.runtime.layout.fonts import FontContext
+    from app.tags.runtime.render.reference import Panel, render_frame
+
+    spec = sim.tag(tag_id).spec
+    screen = compose_setup_code(TagPanel(tag_id, spec.width, spec.height, spec.planes, spec.plane_flags, 0, ""),
+                                fonts, payload.code(), payload.qr_text())
+    frame = render_frame(screen.layout, Panel(spec.width, spec.height, spec.planes, spec.plane_flags),
+                         FontContext.for_fontset(fonts).pack)
+    return hashlib.sha256(b"".join(frame.planes)).digest()
 
 
 def test_a_released_tag_pairs_again_with_its_fresh_code(paths: Any, dev_fonts: tuple[Any, bytes]) -> None:

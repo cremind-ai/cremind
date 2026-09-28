@@ -38,6 +38,15 @@ tunnels, one per bridge and one message in flight per tunnel (``EVT_TUNNEL``
 nodes outside the CDB are ignored. Where the protocol text leaves a choice, the
 simulator follows the gateway firmware (apps/gateway/src/core/gw_secure.c,
 gw_tunnel.c).
+
+With ``tag_links`` (v2, the nRF52840 gateways: 2) the gateway also serves tags
+on its own radio (docs/protocol.md §11, :mod:`app.tags.runtime.sim.gateway_radio`):
+its caps report ``tag_links``, ``DISCOVER`` reaches its own radio too (``bridge``
+0 or ``GATEWAY_ADDR``), and ``TUNNEL_OPEN`` with ``bridge`` ``GATEWAY_ADDR``
+connects to the tag itself (``mode`` ``PAIR`` or ``SESSION``). While a connection
+attempt has the mesh suspended, mesh sends, configurations and removals wait for
+the resume and ``PROVISION`` answers ``PROVISIONING_ACTIVE``; no attempt starts
+while a node is provisioned, configured or removed (gateway-firmware.md §16.4).
 """
 
 from __future__ import annotations
@@ -66,6 +75,7 @@ from ..protocol.ids import (
     OwnerState,
     SerialMsg,
     Status,
+    TunnelMode,
     TunnelState,
 )
 from ..protocol.layout import layout_digest
@@ -102,7 +112,9 @@ from ..secure.messages import FRAG_CLOSE, Reassembler, SecureFrameError, fragmen
 from .bridge import SimBridge
 from .core import SimClock, TaskSet
 from .device import DeviceEndpoint, Reply
+from .gateway_radio import SimGatewayRadio
 from .mesh import GATEWAY_ADDR, UNSEGMENTED_MAX, MeshNetwork, pack_pdu
+from .radio import Air
 from .v2 import SECURE_MESSAGES, LinkSessions, SecureSerial, device_state, load_device_state, outcome_fields
 
 log = logging.getLogger(__name__)
@@ -205,7 +217,8 @@ class SimGateway:
 
     def __init__(self, *, clock: SimClock, mesh: MeshNetwork, rng: random.Random, bridges: list[SimBridge],
                  delivery_queue: int = 4, mesh_ops: int = 8, rx_buffers: int = 4,
-                 processing_delay_s: float = 0.0, secure: SecureDevice | None = None) -> None:
+                 processing_delay_s: float = 0.0, secure: SecureDevice | None = None, air: Air | None = None,
+                 tag_links: int = 0) -> None:
         self.clock = clock
         self.mesh = mesh
         self.rng = rng
@@ -247,9 +260,14 @@ class SimGateway:
         self._reported: OrderedDict[int, None] = OrderedDict()  # update_ids whose EVT_RESULT was emitted
         self._ops_in_flight = 0
         self._provisioning = False
+        self._node_ops: set[int] = set()  # op_ids of running CONFIGURE_NODE / REMOVE_NODE
         self._tasks = TaskSet("gateway")
         self._worker: asyncio.Task[None] | None = None
         self.on_state_change: list[Any] = []  # callables(): the simulator saves its state file
+        # Tags on the gateway's own radio (docs/protocol.md §11): v2 gateways with tag links.
+        self.radio: SimGatewayRadio | None = None
+        if secure is not None and air is not None and tag_links > 0:
+            self.radio = SimGatewayRadio(self, air, links=tag_links)
 
     # -- lifecycle ----------------------------------------------------------------------
 
@@ -309,12 +327,15 @@ class SimGateway:
         self._assign_waiters.clear()
         self._ops_in_flight = 0
         self._provisioning = False
+        self._node_ops.clear()
         self._seg_lock = asyncio.Lock()
         if self.sessions is not None:  # v2: sessions, the challenge, tunnels and discovery bookkeeping are RAM
             self.sessions.clear()
             self._tunnels.clear()
             self._discovered.clear()
             self._discover_until.clear()
+        if self.radio is not None:
+            self.radio.reset()
         self._worker = self._tasks.spawn(self._delivery_worker(), "delivery worker")
         self._query_known_bridges()
 
@@ -325,11 +346,16 @@ class SimGateway:
     # -- helpers ----------------------------------------------------------------------------
 
     def _caps(self) -> dict[str, Any]:
-        return {"max_frame": SERIAL_MAX_FRAME, "credits": self.endpoint.rx_buffers, "max_bridges": MAX_BRIDGES,
+        caps = {"max_frame": SERIAL_MAX_FRAME, "credits": self.endpoint.rx_buffers, "max_bridges": MAX_BRIDGES,
                 "max_tags": MAX_TAGS, "role": NodeRole.GATEWAY, "board": Board.NRF52840DK_GATEWAY}
+        if self.radio is not None:
+            caps["tag_links"] = self.radio.links
+        return caps
 
     def all_counters(self) -> dict[str, int]:
         merged = self.counters + self.endpoint.counters
+        if self.radio is not None:
+            merged.update({f"radio_{k}": v for k, v in self.radio.counters.items()})
         merged["queue_depth"] = len(self._queue)
         merged["nodes"] = len(self.cdb)
         return {k: min(int(v), 0xFFFFFFFF) for k, v in merged.items() if v >= 0}
@@ -352,17 +378,25 @@ class SimGateway:
         return None
 
     async def _send(self, dst: int, msg: FixedMessage) -> bool:
-        """Send with §3.2 rule 1: one outstanding segmented send, a failed ``end`` retried 3 times."""
+        """Send with §3.2 rule 1: one outstanding segmented send, a failed ``end`` retried 3 times. While the own
+        radio's attempt has the mesh suspended (§11), nothing is handed to the mesh."""
         if len(pack_pdu(msg)) <= UNSEGMENTED_MAX:
+            await self._mesh_resumed()
             return await self.mesh.send(GATEWAY_ADDR, dst, msg)
         async with self._seg_lock:
             for attempt in range(1 + SEND_RETRIES):
                 if attempt:
                     self.counters["mesh_send_retries"] += 1
+                await self._mesh_resumed()
                 if await self.mesh.send(GATEWAY_ADDR, dst, msg):
                     return True
             self.counters["mesh_send_failures"] += 1
             return False
+
+    async def _mesh_resumed(self) -> None:
+        if self.radio is not None and self.radio.suspended:
+            self.counters["sends_waited_for_resume"] += 1
+            await self.radio.resumed.wait()
 
     # -- serial requests ---------------------------------------------------------------------
 
@@ -512,17 +546,24 @@ class SimGateway:
     # -- protocol v2: discovery and tunnels (connect-setup.md 5.2, 6) ---------------------------
 
     def _discover(self, f: dict[str, Any]) -> dict[str, Any]:
-        """``DISCOVER``: the mesh ``DISCOVER`` to the bridge (0: every configured one) and a window per bridge in
-        which its ``DISCOVERED`` become ``EVT_DISCOVERED`` (``duration_s`` 0 closes it)."""
+        """``DISCOVER``: the mesh ``DISCOVER`` to the bridge (0: every configured one, and the own radio) and a
+        window per bridge in which its ``DISCOVERED`` become ``EVT_DISCOVERED`` (``duration_s`` 0 closes it);
+        ``GATEWAY_ADDR``: the own radio only (§11.2)."""
         duration, bridge, tag_id = f["duration_s"], f["bridge"], f["tag_id"]
         if duration > DISCOVER_MAX_S:
             return {"status": Status.INVALID, "text": f"duration_s > {DISCOVER_MAX_S}"}
-        if bridge:
+        if bridge == GATEWAY_ADDR:
+            if self.radio is None:
+                return {"status": Status.NOT_FOUND, "text": "the gateway serves no tag on its own radio"}
+            targets: list[int] = []
+        elif bridge:
             if (error := self._node_ok(bridge)) is not None:
                 return error
             targets = [bridge]
         else:
             targets = sorted(addr for addr, node in self.cdb.items() if node.configured)
+        if self.radio is not None and bridge in (0, GATEWAY_ADDR):
+            self.radio.discover(duration, tag_id)
         until = self.clock.now_ms() + duration * 1000.0 + DISCOVER_GRACE_MS if duration else 0.0
         for addr in targets:
             self._discover_until[addr] = until
@@ -531,25 +572,37 @@ class SimGateway:
         return {"status": Status.ACCEPTED}
 
     def _on_discovered(self, src: int, msg: MeshDiscovered) -> None:
-        now, key = self.clock.now_ms(), (src, msg.tag_id)
-        if now > self._discover_until.get(src, 0.0):
+        if self.clock.now_ms() > self._discover_until.get(src, 0.0):
             self.counters["discovered_unasked"] += 1  # no window open: candidates are asked for, never kept
             return
+        self._report_discovered(src, msg.tag_id, msg.rssi, msg.flags)
+
+    def _report_discovered(self, src: int, tag_id: int, rssi: int, flags: int) -> None:
+        """``EVT_DISCOVERED``, at most one per (bridge, tag) per ``DISCOVERED_MIN_INTERVAL_MS`` (the own radio is
+        the bridge ``GATEWAY_ADDR``)."""
+        now, key = self.clock.now_ms(), (src, tag_id)
         if now - self._discovered.get(key, -DISCOVERED_MIN_INTERVAL_MS) < DISCOVERED_MIN_INTERVAL_MS:
             self.counters["discovered_suppressed"] += 1
             return
         self._discovered[key] = now
-        self._emit(SerialMsg.EVT_DISCOVERED, {"bridge": src, "tag_id": msg.tag_id, "rssi": msg.rssi,
-                                              "flags": msg.flags}, retained=False)
+        self._emit(SerialMsg.EVT_DISCOVERED, {"bridge": src, "tag_id": tag_id, "rssi": max(-128, min(127, rssi)),
+                                              "flags": flags}, retained=False)
 
     def _alloc_tunnel(self) -> int:
+        """A fresh non-zero id, shared by mesh tunnels and the own radio's."""
         for _ in range(0xFFFF):
             self._next_tunnel = self._next_tunnel % 0xFFFF + 1
-            if self._next_tunnel not in self._tunnels:
+            if self._next_tunnel not in self._tunnels and not (self.radio and self.radio.owns(self._next_tunnel)):
                 return self._next_tunnel
         raise RuntimeError("no free tunnel id")
 
     def _tunnel_open(self, f: dict[str, Any]) -> dict[str, Any]:
+        if f["bridge"] == GATEWAY_ADDR:
+            if self.radio is None:
+                return {"status": Status.UNSUPPORTED, "text": "the gateway serves no tag on its own radio"}
+            return self.radio.open(f)
+        if f.get("mode", TunnelMode.PAIR) != TunnelMode.PAIR:
+            return {"status": Status.INVALID, "text": "a SESSION tunnel runs on the gateway's own radio only"}
         if (error := self._node_ok(f["bridge"])) is not None:
             return error
         duration = f["duration_s"]
@@ -567,6 +620,8 @@ class SimGateway:
         return {"status": Status.OK, "tunnel": tunnel.tunnel}
 
     def _tunnel_send(self, tunnel_id: int, data: bytes) -> dict[str, Any]:
+        if self.radio is not None and self.radio.owns(tunnel_id):
+            return self.radio.send(tunnel_id, data)
         tunnel = self._tunnels.get(tunnel_id)
         if tunnel is None:
             return {"status": Status.NOT_FOUND}
@@ -582,6 +637,8 @@ class SimGateway:
         return {"status": Status.OK}
 
     def _tunnel_close(self, tunnel_id: int) -> dict[str, Any]:
+        if self.radio is not None and self.radio.owns(tunnel_id):
+            return self.radio.close(tunnel_id)
         tunnel = self._tunnels.get(tunnel_id)
         if tunnel is None:
             return {"status": Status.NOT_FOUND}
@@ -668,7 +725,7 @@ class SimGateway:
             await self.clock.sleep_ms(1000.0)
 
     def _provision(self, f: dict[str, Any]) -> dict[str, Any]:
-        if self._provisioning:
+        if self._provisioning or self.mesh_suspended:
             return {"status": Status.PROVISIONING_ACTIVE}
         existing = next((n for n in self.cdb.values() if n.uuid == f["uuid"]), None)
         if existing is None and len(self.cdb) >= MAX_BRIDGES:
@@ -707,7 +764,12 @@ class SimGateway:
             self._provisioning = False
 
     async def _configure(self, op_id: int, addr: int, relay: bool, ttl: int) -> None:
-        await self.clock.sleep_ms(CONFIGURE_MS)
+        self._node_ops.add(op_id)
+        try:
+            await self._mesh_resumed()
+            await self.clock.sleep_ms(CONFIGURE_MS)
+        finally:
+            self._node_ops.discard(op_id)
         node, bridge = self.cdb.get(addr), self._bridge_at(addr)
         status = Status.OK
         if node is None or bridge is None:
@@ -722,7 +784,12 @@ class SimGateway:
             await self._refresh_info(addr)
 
     async def _remove(self, op_id: int, addr: int) -> None:
-        await self.clock.sleep_ms(REMOVE_MS)
+        self._node_ops.add(op_id)
+        try:
+            await self._mesh_resumed()
+            await self.clock.sleep_ms(REMOVE_MS)
+        finally:
+            self._node_ops.discard(op_id)
         bridge = self._bridge_at(addr)
         if bridge is not None:
             bridge.reset_node()
@@ -765,10 +832,12 @@ class SimGateway:
 
     @property
     def mesh_suspended(self) -> bool:
-        return False
+        """The own radio's connection attempt has the mesh suspended (§5.2 window, §11.3)."""
+        return self.radio is not None and self.radio.suspended
 
     async def wait_mesh_resumed(self) -> None:
-        return None
+        if self.radio is not None:
+            await self.radio.resumed.wait()
 
     def mesh_accepts(self, msg: FixedMessage) -> bool:
         return True

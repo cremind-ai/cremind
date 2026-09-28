@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
- * Add tag (connect-setup.md §8.3): the tag's setup code → every ready bridge
- * listens for it ("Waiting for the tag to wake" is normal: a tag checks in
- * about every 30 s) → with exactly one bridge that can take it the tag is
- * paired at once, else the person chooses (recommended preselected) → "Tag
+ * Add tag (connect-setup.md §8.3): the tag's setup code → the gateway itself,
+ * when it reaches tags on its own radio, and every ready bridge listen for it
+ * ("Waiting for the tag to wake" is normal: a tag checks in about every 30 s)
+ * → with exactly one device that can take it the tag is paired at once, else
+ * the person chooses where it connects (recommended preselected) → "Tag
  * ready", with Send test.
  *
  * The profile's first tag: when Tags are off for this profile, the success
@@ -29,7 +30,7 @@ const tagsStore = useTagsStore();
 const setup = useTagsSetupStore();
 const {
   codeText, parsed, name, codeError, choiceError, discovery, pairing, candidates, chosen, busy, stopping, step,
-  problem, lookingFor, find, pair, cancel, again, resume, reset,
+  problem, lookingFor, near, find, pair, cancel, again, resume, reset,
 } = useDevicePairing('tag');
 
 const codeInput = ref<InstanceType<typeof SetupCodeInput> | null>(null);
@@ -133,7 +134,7 @@ function beforeClose(_done: () => void) {
       <template #code>
         <p class="intro-text">
           Find the label on the back of the tag. Scan its QR code, upload a photo of it, or type the
-          code. Keep the tag close to one of your bridges.
+          code. Keep the tag close to {{ near }}.
         </p>
         <SetupCodeInput
           ref="codeInput"

@@ -66,11 +66,14 @@ export interface SetupDevice {
   last_contact_at: string | null;
   battery_mv: number | null;
   rssi: number | null;
-  /** Bridges. */
+  /** Bridges, and a gateway that serves tags itself: how many tags it can hold, and how many use it. */
   capacity?: SetupCapacity | null;
+  /** Gateways: true when it reaches the tags near it on its own radio (newer gateways), so a tag needs no
+   *  bridge; false when its tags need a bridge. Null for bridges and tags (absent from an older server). */
+  serves_tags?: boolean | null;
   /** Bridges: false = its font pack is not the one Connect uses. */
   fontpack_ok?: boolean | null;
-  /** Tags: the bridge it is assigned to. */
+  /** Tags: the device it connects through — one of the connection's bridges, or its gateway. */
   bridge_id?: string | null;
   /** Tags. */
   delivery?: SetupDeliveryStatus | null;
@@ -161,14 +164,19 @@ export interface DiscoveryCandidate {
   id: string;
   /** The companion (connection) id of the gateway that heard it. */
   gateway_id: string;
-  /** Tags: the ready bridge that heard it in setup mode. */
+  /** Tags: the device that heard it in setup mode — a ready bridge, or the gateway itself (`bridge_kind`). */
   bridge_id: string | null;
+  /** What heard the device: `gateway` (a bridge's search, or a tag the gateway's own radio heard) or `bridge`.
+   *  Absent from an older server, whose tag candidates were all bridges. */
+  bridge_kind?: 'gateway' | 'bridge' | null;
+  /** A bridge's name, or the gateway's (the connection title). */
   bridge_name: string | null;
   rssi: number | null;
   seen_at: string;
+  /** Tags: the bridge's, or the gateway's own, room for tags. */
   capacity: SetupCapacity | null;
   eligible: boolean;
-  /** Why not eligible: `bridge_full`, … */
+  /** Why not eligible: `bridge_full` (that gateway or bridge holds all the tags it can), … */
   reason: string | null;
 }
 
@@ -480,7 +488,9 @@ export async function cancelSetupSession(
 }
 
 /** 422 `setup_code_invalid` / `setup_code_wrong_role`; 409 `no_gateway`,
- *  `gateway_required`, `gateway_offline`, `no_ready_bridge`, `device_owned`. */
+ *  `gateway_required`, `gateway_offline`, `no_ready_bridge` (a tag: nothing can take it — the gateway
+ *  cannot reach tags itself and no bridge is ready, or the gateway is paused), `device_owned`. A tag's
+ *  search listens on every ready bridge and on the gateway's own radio when it serves tags. */
 export async function startDiscovery(
   agentUrl: string,
   token: string,
@@ -496,7 +506,7 @@ export async function getDiscovery(agentUrl: string, token: string, id: string):
   return res.discovery;
 }
 
-/** 409 `candidate_not_eligible` (e.g. the bridge filled up meanwhile). */
+/** 409 `candidate_not_eligible` / `bridge_full` (e.g. that gateway or bridge filled up meanwhile). */
 export async function startPairing(
   agentUrl: string,
   token: string,

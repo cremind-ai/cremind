@@ -268,6 +268,9 @@ async def _bump(conn, tag_id: str, now: float, **values: Any):
 
 
 async def _bridge_row(conn, tag_row, bridge_id: str | None):
+    """The bridge an admin claim/assign names (one of the tag's companion),
+    else the tag's current parent — a bridge, or its gateway for a tag served
+    on the gateway's own radio — else the companion's only bridge."""
     if bridge_id:
         row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == bridge_id))).first()
         if row is None or row.kind != "bridge" or row.companion_id != tag_row.companion_id:
@@ -295,19 +298,38 @@ def bridge_capacity(info: Any) -> int | None:
     return value
 
 
+def serves_tags(info: Any) -> bool:
+    """A gateway that connects to tags on its own radio (protocol.md §11): its
+    inventory reported ``tag_links`` > 0 (the last known value). 0 (older
+    firmware, the nRF52832 gateway) or never reported: its tags need a bridge."""
+    value = info.get("tag_links") if isinstance(info, dict) else None
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def parent_capacity(kind: Any, info: Any) -> int | None:
+    """The ``max_tags`` of a tag's parent — a bridge's assignment table, or
+    how many tags a gateway serves on its own radio (only while it serves
+    tags) — or ``None`` (unknown)."""
+    if kind == "gateway" and not serves_tags(info):
+        return None
+    return bridge_capacity(info)
+
+
 async def _bridge_with_room(conn, bridge, tag_id: str):
     """The bridge row, locked (after the tag row, the order every writer
     uses) so two claims cannot both take its last slot. 409 ``bridge_full``
     when its assignment table (``max_tags`` from its inventory) already holds
     that many of Cremind's tags, owned or not, other than ``tag_id``; unknown
-    capacity allows."""
+    capacity allows. A tag's current parent may be its gateway (a tag set up
+    on the gateway's own radio): the gateway's capacity is checked the same
+    way."""
     locked = (await conn.execute(
         select(DEVICES).where(DEVICES.c.id == bridge.id).with_for_update()
     )).first()
     if locked is None:
         raise TagError(422, "bridge_not_found", "No bridge with that id on the tag's companion.")
     bridge = locked
-    max_tags = bridge_capacity(bridge.info)
+    max_tags = parent_capacity(bridge.kind, bridge.info)
     if max_tags is None:
         return bridge
     assigned = int((await conn.execute(select(func.count()).select_from(DEVICES).where(
@@ -315,8 +337,9 @@ async def _bridge_with_room(conn, bridge, tag_id: str):
     ))).scalar_one() or 0)
     if assigned >= max_tags:
         label = bridge.name or bridge.hw_id
+        what = "Gateway" if bridge.kind == "gateway" else "Bridge"
         raise TagError(409, "bridge_full",
-                       f"Bridge '{label}' is full: it holds {assigned} of {max_tags} tags. "
+                       f"{what} '{label}' is full: it holds {assigned} of {max_tags} tags. "
                        "Assign the tag to another bridge, or move or forget a tag this bridge no longer needs.",
                        bridge={"id": bridge.id, "name": bridge.name or "", "max_tags": max_tags,
                                "assigned": assigned})

@@ -423,6 +423,36 @@ three wrong setup proofs in a row end the session and skip the next wake window.
 - `REKEY` and `RELEASE` of a bridge or tag are accepted from any controller whose
   grant is valid (the reference device's rule; recovery rekeys with a new
   controller). The v2 firmware version reported is 0.2.0.
+- **The gateway's own radio** (protocol.md §11, `app/tags/runtime/sim/gateway_radio.py`;
+  `SimConfig.gateway_tag_links`, default 2, 0 turns it off). A v2 gateway's caps
+  report `tag_links`, and it is a scanner and central in the simulated air like
+  a bridge (every tag heard, a fixed RSSI per pair).
+  - **Discovery.** `DISCOVER` with `bridge` 0 or `GATEWAY_ADDR` also opens its
+    own window; a v2 tag advertising setup mode becomes `EVT_DISCOVERED
+    {bridge: 1}`.
+  - **Opening a tunnel.** `TUNNEL_OPEN` with `bridge` `GATEWAY_ADDR` is refused
+    `INVALID` for tag id 0, a `duration_s` outside 1..255, or an unknown mode.
+    It is refused `BUSY` when a tunnel to that tag is open or 8 are open. A
+    `SESSION` tunnel through a bridge is `INVALID`.
+  - **Connecting.** The tunnel waits for the tag's advertisement, then connects
+    under the bridge's §5.2 rules:
+    - one attempt at a time, with the mesh suspended meanwhile (mesh messages
+      to the gateway wait, and so do its own sends, configurations and
+      removals; `PROVISION` is answered `PROVISIONING_ACTIVE`);
+    - the suspend rate limit, and the per-tag back-off with one quick retry;
+    - never while it provisions, configures or removes a node;
+    - its own segmented send first;
+    - two connections at most, a second one only while the first has nothing
+      left to write.
+  - **Relaying.** `OPEN` carries `IDENT` (`PAIR`) or `CAPS` (`SESSION`) with the
+    advertisement's RSSI. The relay moves whole messages, and a `SESSION`
+    message's type byte picks `CTRL` or `DATA`. `TUNNEL_SEND` queues two
+    messages (`BUSY` beyond that and before `OPEN`), and down-link records are
+    paced 4 per connection event.
+  - **Closing.** `TIMEOUT` when the tag was not reached in `duration_s` or
+    nothing moved for `duration_s` + 5 s; `DISCONNECTED`; `INVALID` on a §5.3
+    violation; `UNSUPPORTED` for a tag without `IDENT`. `TUNNEL_CLOSE` is
+    silent. A reboot ends every tunnel.
 
 ### What is not modelled (v2)
 

@@ -2,7 +2,9 @@
 /**
  * Add bridge (connect-setup.md §8.2): which gateway it joins (asked only when
  * there are several) → the bridge's setup code → the gateway listens for it
- * → pair (at once when exactly one gateway heard it) → "Bridge ready".
+ * → pair (at once when exactly one gateway heard it) → "Bridge ready". A
+ * bridge carries updates to tags farther from the gateway (an older gateway,
+ * which reaches no tag itself, needs one for every tag).
  *
  * A bridge whose fonts do not match gets "This bridge needs a font update:
  * connect it to this computer with USB" instead of a technical error.
@@ -125,7 +127,7 @@ function beforeClose(_done: () => void) {
       </template>
 
       <template #done>
-        <ElResult icon="success" title="Bridge ready" :sub-title="`${title} is added. Next, add the tags it should look after.`">
+        <ElResult icon="success" title="Bridge ready" :sub-title="`${title} is added. Tags near it can connect through it now.`">
           <template #extra>
             <div class="done-actions">
               <ElButton type="primary" @click="addTag">

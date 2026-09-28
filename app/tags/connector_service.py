@@ -259,7 +259,8 @@ async def result(grant: dict[str, Any], command_id: str, body: dict[str, Any]) -
 
 async def _profile_tags(profile: str, companion_id: str) -> list[dict[str, Any]]:
     devices = await get_tag_storage().list_devices(companion_id=companion_id)
-    bridges = {d["id"]: d["hw_id"] for d in devices if d["kind"] == "bridge"}
+    # A tag's parent: a bridge, or the gateway itself for a tag it serves on its own radio.
+    parents = {d["id"]: d["hw_id"] for d in devices if d["kind"] in ("bridge", "gateway")}
     out = []
     for d in devices:
         if d["kind"] != "tag" or d["owner_profile"] != profile:
@@ -268,7 +269,7 @@ async def _profile_tags(profile: str, companion_id: str) -> list[dict[str, Any]]
             "tag_id": d["hw_id"],
             "name": d["name"],
             "epoch": d["epoch"],
-            "bridge_hw_id": bridges.get(d["bridge_device_id"] or ""),
+            "bridge_hw_id": parents.get(d["bridge_device_id"] or ""),
             "width": d["width"],
             "height": d["height"],
             "planes": d["planes"],

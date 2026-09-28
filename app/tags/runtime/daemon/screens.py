@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..compose.api import ActiveCard, ComposedScreen, ScreenSettings, TagPanel
 from ..gateway.errors import FrameTooLargeError, GatewayError
-from ..protocol.ids import LAYOUT_SERIAL_MAX, Status
+from ..protocol.ids import GATEWAY_ADDR, LAYOUT_SERIAL_MAX, Status
 from ..protocol.layout import layout_digest
 from .store import ComposeInput, RevisionRow, status_name
 
@@ -311,7 +311,7 @@ class ScreenScheduler:
         elif view is not None and view.blocked_reason:
             reason = f"blocked: {view.blocked_reason}"
         elif not tag.bridge_addr or tag.epoch < 1:
-            reason = "not assigned to a bridge yet"
+            reason = "not assigned to a bridge or the gateway yet"
         elif view is not None and view.epoch > tag.epoch:
             reason = f"waiting for assign_tag (Cremind epoch {view.epoch}, assigned {tag.epoch})"
         elif view is not None and view.clear_required and rev.purpose not in ("identify", "setup_code"):
@@ -360,7 +360,9 @@ class ScreenScheduler:
                                                f"DELIVER_LAYOUT answered {status_name(status)}"
                                                + (f": {ack.text}" if ack.text else "")))
         elif status == Status.NOT_FOUND:
-            detail = f"the gateway does not know bridge {tag.bridge_addr:#06x} (re-syncing the assignment)"
+            detail = ("the gateway no longer serves tags on its own radio (re-syncing the assignment)"
+                      if tag.bridge_addr == GATEWAY_ADDR else
+                      f"the gateway does not know bridge {tag.bridge_addr:#06x} (re-syncing the assignment)")
             effects = await svc.db.run(lambda: store.block_tag(rev.tag_id, "bridge_not_found", detail,
                                                                status_code=int(status), epoch=tag.epoch,
                                                                fail_jobs=False))

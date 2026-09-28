@@ -1,10 +1,15 @@
 """The worker's end of a v2 mesh tunnel (docs/connect-setup.md §5.2, §6, §7.2).
 
 A tunnel runs from the gateway through one bridge to that bridge's own secure
-endpoint (``tag_id`` 0) or on to a tag's ``PAIR`` characteristic. The first
-message up a tunnel is the endpoint's ``ident2``; after that every message is
-``kind | body`` (:class:`~app.tags.runtime.protocol.ids.PairKind`): the Noise IK
-handshake, then sealed secure messages, and a ``CLOSE {status}``::
+endpoint (``tag_id`` 0) or on to a tag's ``PAIR`` characteristic — or, with
+``bridge`` ``GATEWAY_ADDR``, to a tag on the gateway's own radio (docs/protocol.md
+§11). The first message up a tunnel is the endpoint's ``ident2``; after that every
+message is ``kind | body`` (:class:`~app.tags.runtime.protocol.ids.PairKind`): the
+Noise IK handshake, then sealed secure messages, and a ``CLOSE {status}``. A
+``SESSION`` tunnel on the gateway's own radio carries a tag's frame session
+instead: :meth:`Tunnel.wait_opened` returns its CAPS value, and every later message
+is one of its ``CTRL`` / ``DATA`` / ``STATUS`` messages
+(:mod:`app.tags.runtime.gateway.radio`)::
 
     async with await Tunnel.open(gateway, bridge=addr, tag_id=0, duration_s=60) as tunnel:
         ident = await tunnel.wait_open()
@@ -23,7 +28,7 @@ import contextlib
 import logging
 from typing import Any
 
-from ..protocol.ids import Link, PairKind, SerialFlag, SerialMsg, Status, TunnelState
+from ..protocol.ids import Link, PairKind, SerialFlag, SerialMsg, Status, TunnelMode, TunnelState
 from ..protocol.msgs import Ident2
 from ..secure.channel import SecureChannel, SecureChannelError
 from ..secure.messages import SecureFrameError, pair_message, parse_pair_message
@@ -55,16 +60,21 @@ class Tunnel:
         self.bridge = bridge
         self.tag_id = tag_id
         self._events = events
+        # Only this tunnel's events from now on: another tunnel streaming at once must not fill the queue.
+        events.where = lambda e: isinstance(e, TunnelEvent) and e.tunnel == tunnel
         self.ident: Ident2 | None = None
         self.channel: SecureChannel | None = None
         self.closed_status: Status | int | None = None
+        self.open_rssi: int | None = None
+        """The gateway's own radio: the RSSI of the advertisement it connected on (``OPEN``)."""
 
     @classmethod
     async def open(cls, gateway: GatewayClient, *, bridge: int, tag_id: int, duration_s: int,
-                   op_id: int | None = None) -> Tunnel:
+                   op_id: int | None = None, mode: TunnelMode = TunnelMode.PAIR) -> Tunnel:
         events = gateway.subscribe(types=TunnelEvent, maxsize=EVENT_QUEUE)  # before the OPEN can arrive
         try:
-            tunnel = await gateway.tunnel_open(bridge=bridge, tag_id=tag_id, duration_s=duration_s, op_id=op_id)
+            tunnel = await gateway.tunnel_open(bridge=bridge, tag_id=tag_id, duration_s=duration_s, op_id=op_id,
+                                               mode=mode)
         except BaseException:
             events.close()
             raise
@@ -93,16 +103,23 @@ class Tunnel:
                     raise TunnelError(f"tunnel {self.tunnel} closed: {_name(event.status)}", event.status)
                 return event
 
-    async def wait_open(self, timeout: float = 60.0) -> Ident2:
-        """The endpoint's ``ident2`` (a sleeping tag answers when it next wakes)."""
+    async def wait_opened(self, timeout: float = 60.0) -> bytes:
+        """The ``OPEN`` event's data: the endpoint's ``ident2``, or a ``SESSION`` tunnel's CAPS value (a sleeping
+        tag answers when it next wakes)."""
         try:
             event = await self._event(timeout)
         except TimeoutError:
             raise TunnelError(f"tunnel {self.tunnel}: the endpoint did not answer", Status.TIMEOUT) from None
         if event.state != TunnelState.OPEN or event.data is None:
             raise TunnelError(f"tunnel {self.tunnel}: expected OPEN, got state {event.state}", Status.INVALID)
+        self.open_rssi = event.rssi
+        return event.data
+
+    async def wait_open(self, timeout: float = 60.0) -> Ident2:
+        """The endpoint's ``ident2`` (a sleeping tag answers when it next wakes)."""
+        data = await self.wait_opened(timeout)
         try:
-            self.ident = Ident2.unpack(event.data)
+            self.ident = Ident2.unpack(data)
         except ValueError as exc:
             raise TunnelError(f"tunnel {self.tunnel}: malformed ident2 ({exc})", Status.INVALID) from None
         return self.ident

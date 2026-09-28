@@ -93,6 +93,7 @@ async def pause(client, device_id: str, paused: bool) -> dict[str, Any]:
 
 
 async def move(client, device_id: str, bridge_id: str) -> dict[str, Any]:
+    """A tag onto ``bridge_id``: its own gateway (while that reaches tags itself) or a ready bridge of it."""
     return _obj(await client.post_json(f"/api/tags/devices/{_seg(device_id)}/move",
                                        {"bridge_id": bridge_id, "idempotency_key": _key()}))
 

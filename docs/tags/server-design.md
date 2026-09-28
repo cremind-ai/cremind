@@ -43,7 +43,7 @@ All timestamps are epoch **milliseconds** (`Float`). JSON columns are plain `JSO
 |---|---|---|
 | `tag_companions` | `id` str36; `name`; `created_by`; `created_at`; `updated_at`; `last_seen_at`?; `version`?; `host`?; `heartbeat` JSON? | one row per PC runtime |
 | `tag_credentials` | `id` str40 (= public credential id `tagc_…`); `companion_id` FK→companions CASCADE; `kind` (`hardware`/`content`); `profile`? FK→profiles.name CASCADE (content only); `secret_sha256` str64; `label`; `created_by`; `created_at`; `last_used_at`?; `revoked_at`? | excluded from backup dumps entirely |
-| `tag_devices` | `id` str36; `companion_id` FK CASCADE; `kind` (`gateway`/`bridge`/`tag`); `hw_id` str64; `name`; `owner_profile`? FK→profiles.name SET NULL; `bridge_device_id`? FK→tag_devices SET NULL; `epoch` int=0; `rotation` int=0; `board`?, `panel`?, `width`?, `height`?, `planes`?; `fw`?; `info` JSON; `status` str32 = `unclaimed`; `battery_mv`?; `rssi`?; `last_contact_at`?; `desired_revision` int=0; `displayed_revision` int=0; `displayed_digest`?; `clear_required` bool=false; `claimed_at`?; `created_at`; `updated_at` | `UNIQUE(companion_id, kind, hw_id)` |
+| `tag_devices` | `id` str36; `companion_id` FK CASCADE; `kind` (`gateway`/`bridge`/`tag`); `hw_id` str64; `name`; `owner_profile`? FK→profiles.name SET NULL; `bridge_device_id`? FK→tag_devices SET NULL; `epoch` int=0; `rotation` int=0; `board`?, `panel`?, `width`?, `height`?, `planes`?; `fw`?; `info` JSON; `status` str32 = `unclaimed`; `battery_mv`?; `rssi`?; `last_contact_at`?; `desired_revision` int=0; `displayed_revision` int=0; `displayed_digest`?; `clear_required` bool=false; `claimed_at`?; `created_at`; `updated_at` | `UNIQUE(companion_id, kind, hw_id)`; a tag's `bridge_device_id` is its **parent** (below) |
 | `tag_streams` | `profile` PK FK CASCADE; `stream_id` str36; `next_seq` bigint=0; `projected_seq` bigint=0; `next_delivery_seq` bigint=0; `state` JSON (periodic-content hashes); `updated_at` | per-profile head row; row lock orders commits |
 | `tag_events` | `id` str36; `profile` FK CASCADE; `seq` bigint; `kind` str64; `durability` (`durable`/`checkpoint`); `replace_key`?; `source_type`; `source_id`?; `payload` JSON; `created_at`; `expires_at` | `UNIQUE(profile, seq)`; the journal |
 | `tag_deliveries` | `id` **bigint** (explicit, = connector `delivery_id` = serial `update_id`); `profile` FK CASCADE; `seq` bigint; `companion_id`? FK SET NULL; `tag_device_id` FK CASCADE; `epoch` int; `event_id`? FK SET NULL; `kind`; `priority` int; `replace_key`?; `resolves`?; `card` JSON; `stage` str32 = `queued`; `outcome`?; `status_code`?; `revision`?; `digest`?; `detail`?; `timing` JSON?; `stage_times` JSON; `created_at`; `updated_at`; `expires_at`; `finished_at`? | `UNIQUE(profile, seq)`, `ix_tag_deliveries_device_created`, `ix_tag_deliveries_stage` |
@@ -55,6 +55,19 @@ All timestamps are epoch **milliseconds** (`Float`). JSON columns are plain `JSO
 The migration creates tables guarded by inspector checks (copy
 `20260927_userdocs_research.py`), creates indexes guarded, and inserts the
 `tag_counters` row. Never `batch_alter_table` on existing tables.
+
+**The parent of a tag.** `tag_devices.bridge_device_id` names the device a tag
+is served through: a **bridge**, or the tag's own **gateway** when that gateway
+serves tags on its own radio (its inventory reports `tag_links` > 0 — the
+nRF52840 gateways, protocol.md §11; the worker then runs the tag's session
+itself). The column is a plain self-reference, so either kind fits; the
+gateway's `info` keeps `tag_links`, `max_tags` and `assigned` like a bridge's
+table. Everything that names a tag's parent to a worker — the `assign_tag` an
+epoch raise re-queues, `sync` `tags[].bridge_hw_id`, inventory
+`assignments[].bridge_hw_id` — sends the parent's `hw_id`, a gateway's `gw-…`
+one included. Simple setup (`docs/tags/setup-api.md`) pairs and moves tags onto
+either; the admin's claim/assign name bridges only, but keep a tag on its
+gateway when it already lives there.
 
 ## 3. Journal
 

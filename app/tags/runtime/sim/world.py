@@ -105,6 +105,9 @@ class SimConfig:
     mesh_timing: MeshTiming = field(default_factory=MeshTiming)
     state_file: Path | None = None
     protocol: int = 1  # 2: a v2 gateway and (by default) v2 bridges (docs/connect-setup.md)
+    gateway_tag_links: int = 2
+    """A v2 gateway's own tag connections (docs/protocol.md §11; the nRF52840 gateways' 2); 0: it reaches tags
+    through bridges only. A v1 gateway never serves tags itself."""
 
 
 class FaultSpecError(ValueError):
@@ -202,7 +205,8 @@ class Simulator:
         self.gateway = SimGateway(clock=self.clock, mesh=self.mesh, rng=rng_stream(seed, "gateway"),
                                   bridges=self.bridges, delivery_queue=config.delivery_queue,
                                   rx_buffers=config.rx_buffers, processing_delay_s=config.processing_delay_s,
-                                  secure=gateway_secure)
+                                  secure=gateway_secure, air=self.air,
+                                  tag_links=config.gateway_tag_links if gateway_secure is not None else 0)
         self.tags: dict[int, SimTag] = {}
         for tag_spec in config.tags:
             rng = rng_stream(seed, "tag", tag_spec.tag_id)

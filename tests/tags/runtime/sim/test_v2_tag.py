@@ -39,9 +39,11 @@ SEED = 91
 
 def config(*, tags: int = 1, fontpack: bytes | None = None, seed: int = SEED) -> SimConfig:
     # time_scale 200: a tag ends a pairing session after TAG_SESSION_TIMEOUT_MS (20 s) without progress, 0.1 s here.
+    # These tests pair tags through the bridge: the gateway's own radio (protocol.md §11) stays out of them
+    # (test_v2_gateway_radio.py covers it).
     return SimConfig(seed=seed, time_scale=200, protocol=2, fontpack=fontpack,
                      bridges=[BridgeSpec(provisioned=False)],
-                     tags=[TagSpec.generate(seed, i, protocol=2) for i in range(tags)])
+                     tags=[TagSpec.generate(seed, i, protocol=2) for i in range(tags)], gateway_tag_links=0)
 
 
 class World:

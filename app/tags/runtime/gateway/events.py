@@ -181,7 +181,9 @@ class TagSeen(GatewayEvent):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TunnelEvent(GatewayEvent):
     """v2 ``EVT_TUNNEL`` (docs/connect-setup.md §5.2): the endpoint answered (``OPEN``, ``data`` = its
-    ``ident2``), one reassembled message from it (``DATA``), or the tunnel ``CLOSED`` (``status`` says why)."""
+    ``ident2``, or a ``SESSION`` tunnel's CAPS value), one reassembled message from it (``DATA``), or the tunnel
+    ``CLOSED`` (``status`` says why). On the gateway's own radio ``OPEN`` carries the ``rssi`` of the
+    advertisement it connected on (docs/protocol.md §11)."""
 
     TYPE: ClassVar[SerialMsg] = SerialMsg.EVT_TUNNEL
     tunnel: int
@@ -190,6 +192,7 @@ class TunnelEvent(GatewayEvent):
     state: int
     data: bytes | None = None
     status: Status | int | None = None
+    rssi: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -276,7 +279,8 @@ def parse_event(type_code: int, payload: bytes, boot_id: int | None) -> GatewayE
             data = f.get("data")
             return TunnelEvent(**common, tunnel=f["tunnel"], bridge=f["bridge"], tag_id=f["tag_id"], state=f["state"],
                                data=bytes(data) if data is not None else None,
-                               status=to_status(f["status"]) if f.get("status") is not None else None)
+                               status=to_status(f["status"]) if f.get("status") is not None else None,
+                               rssi=f.get("rssi"))
         case SerialMsg.EVT_DISCOVERED:
             return Discovered(**common, bridge=f["bridge"], tag_id=f["tag_id"], rssi=f["rssi"], flags=f["flags"])
     return UnknownEvent(boot_id=boot_id, raw=f, type_code=type_code)  # pragma: no cover - EVENTS covers all

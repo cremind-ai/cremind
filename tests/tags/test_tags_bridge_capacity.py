@@ -269,3 +269,49 @@ def test_hardware_inventory_shows_each_bridges_capacity_and_count(tagenv) -> Non
     assert "max_tags" not in tag and "assigned_count" not in tag
     denied = run(find_handler(get_tags_hardware_routes(), "/api/tags/hardware", "GET")(make_request("p1")))
     assert denied.status_code == 403
+
+
+# ── (5) a gateway serving tags on its own radio ─────────────────────────────
+
+
+def test_a_gateway_serving_tags_itself_is_a_parent_like_a_bridge(tagenv) -> None:
+    """A tag's parent may be its gateway (simple setup pairs tags on the
+    gateway's own radio). The admin inventory counts it; claim and the
+    ``bridge_full`` bookkeeping treat it as they treat a bridge."""
+    hw = hardware(tagenv, tags=("T1", "T2"), bridges=())
+    gw = scalar(tagenv, "SELECT id FROM tag_devices WHERE kind = 'gateway' AND companion_id = :c", c=hw["companion_id"])
+    gateway = lambda **radio: connector("inventory", "POST", hw["auth"],  # noqa: E731
+                                        body={"gateways": [{"hw_id": "gw-1", **radio}]})
+    assert "tag_links" not in info(tagenv, gw)  # never reported: it serves no tag
+    assert gateway(tag_links=2, max_tags=1, assigned=0).status_code == 200
+    assert {k: info(tagenv, gw)[k] for k in ("tag_links", "max_tags", "assigned", "port")} == {
+        "tag_links": 2, "max_tags": 1, "assigned": 0, "port": "COM7"}
+    gateway(tag_links="2", max_tags=0)  # bad values keep the last good ones
+    gateway()  # absent: unknown, kept
+    assert (info(tagenv, gw)["tag_links"], info(tagenv, gw)["max_tags"]) == (2, 1)
+
+    with tagenv.engine.begin() as c:
+        c.execute(text("UPDATE tag_devices SET bridge_device_id = :g WHERE id IN (:a, :b)"),
+                  {"g": gw, "a": hw["tags"]["T1"], "b": hw["tags"]["T2"]})
+    devices = {d["id"]: d for d in body_of(admin("/api/tags/hardware", "GET"))["devices"]}
+    assert devices[gw]["max_tags"] == 1 and devices[gw]["assigned_count"] == 2
+    # A claim without a bridge keeps the tag on its gateway and checks the gateway's room.
+    with pytest.raises(TagError) as exc:
+        run(service.claim_tag(hw["tags"]["T1"], owner="p1", requested_by="admin"))
+    assert exc.value.code == "bridge_full" and exc.value.message.startswith("Gateway 'gw-1' is full")
+    with tagenv.engine.begin() as c:
+        c.execute(text("UPDATE tag_devices SET bridge_device_id = NULL WHERE id = :b"), {"b": hw["tags"]["T2"]})
+    out = run(service.claim_tag(hw["tags"]["T1"], owner="p1", requested_by="admin"))
+    assert out["device"]["bridge_device_id"] == gw
+    cmd = assign_command(tagenv, "T1")
+    assert json.loads(cmd["args"])["bridge_hw_id"] == "gw-1"
+    # Its refusal is recorded on the gateway, as a bridge's would be.
+    run(tagenv.store.complete_command(hw["companion_id"], cmd["id"], status="failed",
+                                      result={"error": "bridge_full", "max_tags": 5}, error=None))
+    assert device(tagenv, hw["tags"]["T1"])["status"] == "assign_failed"
+    assert device(tagenv, hw["tags"]["T1"])["bridge_device_id"] is None
+    assert info(tagenv, gw)["max_tags"] == 5
+    # A gateway that serves no tag carries no capacity in the admin list.
+    gateway(tag_links=0)
+    devices = {d["id"]: d for d in body_of(admin("/api/tags/hardware", "GET"))["devices"]}
+    assert "max_tags" not in devices[gw] and "assigned_count" not in devices[gw]

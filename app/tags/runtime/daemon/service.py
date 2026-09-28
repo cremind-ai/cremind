@@ -22,6 +22,13 @@ Nothing composed or claimed before a restart leaves this process until the
 send gate (:mod:`.gate`) has seen the worker's identity, a fresh content sync
 and, for a protocol v2 worker, its lease and a reconciliation with Cremind.
 
+A gateway with tag links serves the tags in its range itself (docs/protocol.md
+§11): the gateway client carries a :class:`~app.tags.runtime.gateway.radio.GatewayRadio`
+that renders with this daemon's font pack and the tags' recorded geometry, and
+appears as the bridge at ``GATEWAY_ADDR`` (its inventory row names the gateway).
+It keeps its jobs in RAM, so at start the daemon loads its assignments again and
+re-delivers what was sent to it.
+
 A revoked or invalid credential (401/403) stops only its own loops; a TLS
 misconfiguration pauses them and retries every ``tls_retry_s``. The gateway connection is retried with back-off until it answers; the
 link then reconnects by itself. Durability boundaries call
@@ -51,7 +58,10 @@ from ..gateway.client import GatewayClient
 from ..gateway.errors import GatewayError
 from ..gateway.events import SessionStarted
 from ..gateway.opid import OpIdGenerator
-from ..store.db import Database, GatewayRecord
+from ..gateway.radio import GatewayRadio
+from ..protocol.ids import GATEWAY_ADDR
+from ..render.reference import GlyphSource, Panel
+from ..store.db import BridgeRecord, Database, GatewayRecord
 from .commands import OpWaiters
 from .content import ContentWorker
 from .crash import CrashPoints, SimulatedCrash
@@ -214,7 +224,10 @@ class DaemonService:
             client_options = {"reconnect": True, "name": "cremind tags tools daemon", "op_ids": self.op_ids,
                               **opts.gateway_options}
             self.gateway = GatewayClient(opts.gateway_url, **client_options)
+            self.gateway.radio = GatewayRadio(self.gateway, glyphs=self._radio_glyphs, pack_id=self._radio_pack_id,
+                                              panel_of=self._radio_panel)
             self.gateway.add_event_handler(self.handler)
+            await self._load_radio()
             self._spawn(self._connect_gateway(), "gateway connect")
         for credential in opts.content_credentials:
             client = self._client(credential)
@@ -367,6 +380,67 @@ class DaemonService:
         if self.db is not None:
             with contextlib.suppress(Exception):
                 self.db.close()
+
+    # -- the gateway's own radio (docs/protocol.md §11) -----------------------------------------------
+
+    def _radio_glyphs(self) -> GlyphSource | None:
+        if self.fonts is None:
+            return None
+        from ..layout.fonts import FontContext
+
+        return FontContext.for_fontset(self.fonts).pack
+
+    def _radio_pack_id(self) -> bytes | None:
+        return self.fonts.pack_id if self.fonts is not None else None
+
+    def _radio_panel(self, tag_id: int) -> Panel | None:
+        """The tag's recorded native geometry (the radio renders ahead with it; a worker thread calls this)."""
+        tag = self.db.find_tag(tag_id)
+        return Panel(tag.width, tag.height, tag.planes, tag.plane_flags) if tag is not None else None
+
+    async def _load_radio(self) -> None:
+        """The radio's assignments of before this start (``K_epoch`` derived again from the secret store), and
+        what was sent to it without a result: sent again (the tag's stored result keeps that idempotent)."""
+        assert self.gateway is not None and self.gateway.radio is not None
+        radio = self.gateway.radio
+        for tag in await self.db.run(self.db.list_tags, bridge_addr=GATEWAY_ADDR):
+            if not tag.epoch or self.secrets is None:
+                continue
+            try:
+                key = await asyncio.to_thread(self.secrets.k_epoch, tag.tag_id, tag.epoch, tag.secret_ref)
+            except Exception as exc:  # the tag is held (NOT_ASSIGNED) until Cremind assigns it again
+                log.warning("daemon: tag %08X on the gateway's radio has no usable key: %s", tag.tag_id, exc)
+                continue
+            radio.load(tag.tag_id, tag.epoch, key)
+        requeued = await self.db.run(self.store.requeue_sent, GATEWAY_ADDR)
+        if requeued:
+            log.info("daemon: %d screen(s) for tags on the gateway's radio go out again", requeued)
+
+    def radio_bridge(self) -> BridgeRecord | None:
+        """The inventory row of the gateway's own radio (bridge ``GATEWAY_ADDR``, ``hw_id`` = the gateway's),
+        written when the gateway reports tag links; ``None`` when it serves no tag itself."""
+        gateway = self.gateway
+        radio = gateway.radio if gateway is not None else None
+        hw_id = self.gateway_hw_id or ""
+        uuid = hw_id.removeprefix("gw-")
+        if radio is None or not radio.enabled or not hw_id.startswith("gw-") or len(uuid) != 32:
+            return None
+        assert gateway is not None
+        hello = gateway.hello_info
+        # No gateway_hw_id: the row IS the gateway (its uuid is the gateway's device id), and the gateways row may
+        # not be written yet when a search runs right after a session began.
+        record = BridgeRecord(uuid, addr=GATEWAY_ADDR, fw=hello.fw if hello else None,
+                              board=hello.caps.board if hello and isinstance(hello.caps.board, int) else None,
+                              fontpack_id=self.fonts.pack_id.hex() if self.fonts is not None else None,
+                              configured=True)
+        current = self.db.find_bridge(addr=GATEWAY_ADDR)
+        if current is None or (current.uuid, current.fw, current.board, current.fontpack_id) != (
+                record.uuid, record.fw, record.board, record.fontpack_id):
+            if current is not None and current.uuid != record.uuid:
+                self.db.delete_bridge(addr=GATEWAY_ADDR)  # another gateway on this worker's port before
+            current = self.db.upsert_bridge(record)
+        self.note_capacity(current.hw_id, dict(radio.capacity()))
+        return current
 
     async def _connect_gateway(self) -> None:
         assert self.gateway is not None

@@ -46,7 +46,8 @@ added to its bridge (see Troubleshooting).
 it (owned or not) and its assignment table holds 10 — an nRF52832 bridge holds
 10, an nRF52840 20. A bare `3` means the bridge has not reported its capacity.
 In `--json`, a bridge carries `assigned_count` and `max_tags` (`null` when
-unknown).
+unknown); so does a gateway that serves tags on its own radio (its `info`
+reports `tag_links` > 0 — tags set up that way live on the gateway itself).
 
 ### `cremind tags hardware status`
 

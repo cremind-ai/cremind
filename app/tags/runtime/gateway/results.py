@@ -86,6 +86,9 @@ class Caps:
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
     assigned_count: int | None = None
     """A bridge's caps only: the tags assigned on the bridge itself (its ``CAPS_STATUS.assigned``)."""
+    tag_links: int = 0
+    """A gateway's caps only: tag connections its own radio holds at once; 0 = it serves no tag itself
+    (docs/protocol.md §11)."""
 
     @classmethod
     def from_map(cls, caps: Mapping[str, Any] | None) -> Caps:
@@ -97,7 +100,7 @@ class Caps:
             except ValueError:
                 pass
         return cls(caps.get("max_frame"), caps.get("credits"), caps.get("max_bridges"), caps.get("max_tags"),
-                   role, caps.get("board"), dict(caps), caps.get("assigned_count"))
+                   role, caps.get("board"), dict(caps), caps.get("assigned_count"), int(caps.get("tag_links") or 0))
 
 
 @dataclass(frozen=True, slots=True)

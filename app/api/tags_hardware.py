@@ -11,7 +11,8 @@ owns which tag. Timestamps are epoch milliseconds; errors are ``{"error",
   ``assign_tag`` failed reads ``assign_failed`` — assign it to another bridge
   or release it. Each bridge carries ``max_tags`` (its assignment-table
   capacity, ``null`` when not reported) and ``assigned_count`` (the tags
-  Cremind has assigned to it, owned or not))
+  Cremind has assigned to it, owned or not); so does a gateway that serves
+  tags on its own radio (its inventory reports ``tag_links`` > 0))
 - ``POST   /api/tags/hardware/companions``                  ``{name}`` -> 201 ``{companion, credential, secret, authorization}``
 - ``POST   /api/tags/hardware/companions/{id}/rotate``      -> ``{credential, secret, authorization, revoked}``
 - ``DELETE /api/tags/hardware/companions/{id}``             -> ``{deleted: true}``
@@ -90,14 +91,15 @@ def get_tags_hardware_routes(config_storage=None) -> list[Route]:
             c["credentials"] = [h for h in hardware if h["companion_id"] == c["id"]]
         devices = await s.list_devices(include_private=False)
         pending = await s.pending_counts([d["id"] for d in devices if d["kind"] == "tag"])
-        on_bridge = Counter(d["bridge_device_id"] for d in devices
+        # A tag's parent: a bridge, or a gateway serving tags on its own radio.
+        on_parent = Counter(d["bridge_device_id"] for d in devices
                             if d["kind"] == "tag" and d["bridge_device_id"])
         for d in devices:
             if d["kind"] == "tag":
                 d["pending_count"] = pending.get(d["id"], 0)
-            elif d["kind"] == "bridge":
-                d["max_tags"] = service.bridge_capacity(d["info"])
-                d["assigned_count"] = on_bridge.get(d["id"], 0)
+            elif d["kind"] == "bridge" or (d["kind"] == "gateway" and service.serves_tags(d["info"])):
+                d["max_tags"] = service.parent_capacity(d["kind"], d["info"])
+                d["assigned_count"] = on_parent.get(d["id"], 0)
         active = await s.list_commands(statuses=COMMAND_ACTIVE, limit=200, include_private=False)
         recent = await s.list_commands(limit=50, include_private=False)
         seen = {c["id"] for c in active}

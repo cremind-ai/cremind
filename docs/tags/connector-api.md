@@ -36,7 +36,8 @@ Errors use `{"error": "<code>", "detail": "..."}` with HTTP 400/401/403/404/409/
 ### `POST inventory`
 Upsert what the runtime physically manages.
 ```json
-{"gateways": [{"hw_id": "gw-<uuid>", "fw": "0.1.0", "board": 1, "boot_id": 123, "port": "COM7"}],
+{"gateways": [{"hw_id": "gw-<uuid>", "fw": "0.1.0", "board": 1, "boot_id": 123, "port": "COM7",
+               "tag_links": 2, "max_tags": 20, "assigned": 1}],
  "bridges":  [{"hw_id": "br-<mesh-uuid>", "addr": 2, "fw": "0.1.0", "board": 3, "fontpack_id": "a1b2c3d4e5f60718", "flash_size": 67108864,
                "max_tags": 20, "assigned": 7}],
  "tags":     [{"tag_id": "1A2B3C4D", "board": 16, "panel": 1, "width": 400, "height": 300, "planes": 1, "fw": "0.1.0", "epoch": 5}]}
@@ -61,6 +62,17 @@ gateway holds for it when the gateway does not report that count; both are
 left out while the gateway has not reported the bridge. Cremind keeps them in the
 bridge's `info` (a missing or bad value keeps the last good one) and refuses to
 claim or assign a tag onto a bridge that is full.
+
+A gateway that serves the tags in its range itself (protocol.md §11) reports
+`tag_links` (its caps: tag connections its own radio holds at once) with
+`max_tags` (how many tags it serves itself, 20) and `assigned` (how many it
+serves now). `tag_links: 0` means it serves no tag itself (older firmware, the
+nRF52832 gateway); the three are left out before the runtime has talked to the
+gateway, and Cremind then keeps the last known values. Such a gateway is a
+possible parent of a tag everywhere a bridge is: `bridge_hw_id` may be the
+gateway's own `hw_id` (`gw-…`) in `assignments`, discovery candidates,
+`pair_tag`, `move_tag` and `assign_tag`. Its radio never appears among the
+`bridges`.
 → `{"devices": [...device rows...], "assignments": [{"tag_id", "owner_profile", "bridge_hw_id", "epoch", "rotation"}]}`
 
 ### `POST heartbeat`
@@ -94,7 +106,8 @@ bridge's table is full (`ASSIGN_SET NO_RESOURCES`) reports `{"status":
 Kinds: `scan_unprovisioned {duration_s}`, `provision_bridge {uuid, name}`,
 `configure_bridge {hw_id}`, `remove_bridge {hw_id}`,
 `assign_tag {tag_id, bridge_hw_id, epoch}` (runtime derives `K_epoch`, sends
-`ASSIGN_TAG`, then `UNASSIGN_TAG` to the previous bridge),
+`ASSIGN_TAG`, then `UNASSIGN_TAG` to the previous bridge; `bridge_hw_id` may be
+the gateway's own for a tag on its radio),
 `clear_tag {tag_id, epoch}`, `identify {hw_id}`, `refresh_tag {tag_id}`,
 `install_fontpack {bridge_hw_id}` (operator-assisted),
 `collect_diagnostics {}`.

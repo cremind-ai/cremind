@@ -1238,6 +1238,20 @@ class QueueStore:
                              (self.op_ids.next(), now_ts, rev["tag_id"], rev["revision"]))
         return True
 
+    def requeue_sent(self, bridge_addr: int) -> int:
+        """Revisions sent to ``bridge_addr`` without a result go out again with a new op id. The gateway's own
+        radio (docs/protocol.md §11) keeps its jobs in this process's RAM: a restart loses them, and the tag's
+        stored result keeps a re-delivery idempotent."""
+        now_ts, _ = self._now()
+        with self.db.transaction() as conn:
+            rows = conn.execute("SELECT tag_id, revision FROM revisions WHERE state = 'sent' AND bridge_addr = ?",
+                                (bridge_addr,)).fetchall()
+            for r in rows:
+                conn.execute("UPDATE revisions SET state = 'pending', op_id = ?, next_attempt_ts = ?,"
+                             " detail = 'restarted; re-delivering' WHERE tag_id = ? AND revision = ?",
+                             (self.op_ids.next(), now_ts, r["tag_id"], r["revision"]))
+        return len(rows)
+
     def resend_stuck(self, timeout_s: float) -> int:
         """Sent revisions without any result for ``timeout_s``: send again with a new op id
         (a result the gateway dropped from its retention ring is recovered this way, §1.2)."""

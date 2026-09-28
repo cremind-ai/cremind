@@ -8,7 +8,10 @@
   assignments for it) and enrolled tags with their panel and the highest
   ``epoch`` this companion used or the tag's epoch floor (a ``STALE_EPOCH``'s
   ``stored_epoch``) — Cremind keeps ``max(stored, reported)`` so it never
-  assigns an epoch a tag refuses.
+  assigns an epoch a tag refuses. A gateway that serves tags on its own radio
+  (docs/protocol.md §11) reports ``tag_links``, ``max_tags`` and ``assigned``
+  with its own entry (``tag_links`` 0: none; left out before its first
+  session); its radio's inventory row is not a bridge.
 - **Heartbeat** every ``heartbeat_s``: companion version/host/start, queue
   depth and the oldest job's age, and per device battery, RSSI, last contact,
   displayed revision/digest and a status (``ok|pending|offline|error``).
@@ -169,6 +172,7 @@ class HardwareWorker:
         gateway = svc.gateway
         if gateway is None or not gateway.connected:
             return
+        await svc.db.run(svc.radio_bridge)  # the gateway's own radio (§11), when it has tag links
         try:
             nodes = await asyncio.wait_for(gateway.list_nodes(), 10)
             infos = {i.addr: i for i in await asyncio.wait_for(gateway.get_inventory(), 10)}
@@ -196,7 +200,7 @@ class HardwareWorker:
         floors = await svc.db.run(svc.store.epoch_floors)
         bridge_items = []
         for b in bridges:
-            if b.addr is None:
+            if b.addr is None or b.own_radio:
                 continue
             item: dict[str, Any] = {"hw_id": b.hw_id, "addr": b.addr, "fw": b.fw, "board": b.board,
                                     "fontpack_id": b.fontpack_id, "flash_size": b.flash_size}
@@ -204,15 +208,33 @@ class HardwareWorker:
             # (Cremind keeps the last good values when they are left out).
             item.update({k: v for k, v in svc.bridge_capacity.get(b.hw_id, {}).items() if v is not None})
             bridge_items.append(item)
+        gateway_items = []
+        for g in gateways:
+            entry: dict[str, Any] = {"hw_id": g.hw_id, "fw": g.fw, "board": g.board, "boot_id": g.boot_id,
+                                     "port": g.port}
+            entry.update(self._radio_fields(g.hw_id))
+            gateway_items.append(entry)
         return {
-            "gateways": [{"hw_id": g.hw_id, "fw": g.fw, "board": g.board, "boot_id": g.boot_id, "port": g.port}
-                         for g in gateways],
+            "gateways": gateway_items,
             "bridges": bridge_items,
             # epoch: the highest epoch used here, or the tag's epoch floor (a STALE_EPOCH's stored_epoch, §10)
             # when that is higher; Cremind keeps max(stored, reported) and assigns above it.
             "tags": [{"tag_id": t.hw_id, "board": t.board, "panel": t.panel, "width": t.width, "height": t.height,
                       "planes": t.planes, "fw": t.fw, "epoch": max(t.epoch, floors.get(t.tag_id, 0))} for t in tags],
         }
+
+    def _radio_fields(self, hw_id: str) -> dict[str, int]:
+        """The gateway's own radio (§11): ``tag_links`` (0 = it serves no tag itself) with ``max_tags`` and
+        ``assigned`` — for the gateway this worker drives, once a session told its caps (left out before)."""
+        svc = self.svc
+        gateway = svc.gateway
+        hello = gateway.hello_info if gateway is not None else None
+        if hello is None or hw_id != svc.gateway_hw_id:
+            return {}
+        radio = gateway.radio if gateway is not None else None
+        if not hello.caps.tag_links or radio is None:
+            return {"tag_links": 0}
+        return {"tag_links": hello.caps.tag_links, **radio.capacity()}
 
     # -- heartbeat -------------------------------------------------------------------------
 
@@ -271,7 +293,7 @@ class HardwareWorker:
             devices.append(item)
         connected = svc.gateway is not None and svc.gateway.connected
         for bridge in await svc.db.run(svc.db.list_bridges):
-            if bridge.addr is not None:
+            if bridge.addr is not None and not bridge.own_radio:
                 devices.append({"hw_id": bridge.hw_id, "kind": "bridge", "status": "ok" if connected else "offline"})
         if svc.gateway_hw_id:
             devices.append({"hw_id": svc.gateway_hw_id, "kind": "gateway", "status": "ok" if connected else "offline"})

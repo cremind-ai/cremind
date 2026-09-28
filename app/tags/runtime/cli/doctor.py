@@ -192,8 +192,10 @@ async def _gateway_check(report: Report, url: str | None, pack_id: bytes | None,
     except (GatewayError, OSError, TimeoutError) as exc:
         report.add("gateway", "fail", f"{url}: {exc or type(exc).__name__}")
         return
+    links = info.caps.tag_links  # the gateway's own radio (protocol.md §11)
     report.add("gateway", "ok", f"{url}: fw {info.fw} ({info.build}), boot {info.boot_id:08x}, "
-                                f"{len(bridges)} bridge(s)")
+                                f"{len(bridges)} bridge(s)"
+                                + (f", reaches tags itself ({links} at once)" if links else ""))
     for bridge in bridges:
         active = bridge.fontpack_id.hex() if bridge.fontpack_id and any(bridge.fontpack_id) else None
         name = f"bridge {bridge.addr:#06x}"

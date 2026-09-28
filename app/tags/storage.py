@@ -406,9 +406,10 @@ async def _settle_assign(conn: AsyncConnection, device: Any, args: dict[str, Any
     """An ``assign_tag`` result at the tag's current epoch. A failure marks
     the tag ``assign_failed`` until an admin assigns it elsewhere or releases
     it; ``bridge_full`` also drops the tag from that bridge (it holds no slot
-    there) and records the bridge's ``max_tags`` when the result names it.
-    A success clears an earlier ``assign_failed``. Locks: the device (held),
-    then the bridge."""
+    there) and records the bridge's ``max_tags`` when the result names it —
+    the same for a gateway serving tags on its own radio (``bridge_hw_id``
+    names the gateway then). A success clears an earlier ``assign_failed``.
+    Locks: the device (held), then the bridge (or gateway)."""
     if int(device.epoch or 0) != int(epoch):
         return
     if status == "succeeded":
@@ -423,7 +424,7 @@ async def _settle_assign(conn: AsyncConnection, device: Any, args: dict[str, Any
         bridge_hw = args.get("bridge_hw_id")
         if max_tags is not None and isinstance(bridge_hw, str):
             bridge = (await conn.execute(select(DEVICES).where(
-                DEVICES.c.companion_id == device.companion_id, DEVICES.c.kind == "bridge",
+                DEVICES.c.companion_id == device.companion_id, DEVICES.c.kind.in_(("bridge", "gateway")),
                 DEVICES.c.hw_id == bridge_hw,
             ).with_for_update())).first()
             if bridge is not None:
@@ -631,7 +632,9 @@ async def _raise_epoch(conn: AsyncConnection, row: Any, reported: int, now: floa
     stored one). Work still owed under the old epoch — the owner's assignment,
     a pending clear — is re-queued at ``reported + 1`` and the tag's active
     deliveries move with it; otherwise the stored epoch simply becomes the
-    reported one."""
+    reported one. The assignment names the tag's parent by its hardware id:
+    a bridge's, or the gateway's (``gw-…``) for a tag it serves on its own
+    radio."""
     needs_assign = bool(row.owner_profile) and row.bridge_device_id is not None
     needs_clear = bool(row.clear_required)
     if not (needs_assign or needs_clear) or reported >= MAX_EPOCH:
@@ -1023,7 +1026,11 @@ class TagStorage:
         otherwise be assigned an epoch the tag refuses (``STALE_EPOCH``). When
         the report is ahead of an epoch Cremind still has work queued under
         (an owned tag's assignment, a pending clear), that work is re-queued
-        one epoch above the report, exactly as ``assign`` / ``release`` would."""
+        one epoch above the report, exactly as ``assign`` / ``release`` would.
+
+        A gateway reports ``tag_links`` (> 0: it serves tags on its own radio;
+        0: it does not; absent: unknown, the last known value stays) with
+        ``max_tags`` / ``assigned`` for that radio; see :func:`_inventory_values`."""
         now = now_ms()
         wanted: list[tuple[str, str, dict[str, Any]]] = []
         for kind, key, id_field in (("tag", "tags", "tag_id"), ("bridge", "bridges", "hw_id"),
@@ -1705,6 +1712,14 @@ def _inventory_values(kind: str, item: dict[str, Any]) -> dict[str, Any]:
         for key in ("boot_id", "port"):
             if key in item:
                 info[key] = _small(item[key])
+        # Tags on the gateway's own radio (protocol.md §11): ``tag_links`` > 0
+        # serves them, with ``max_tags`` / ``assigned`` like a bridge's table;
+        # an explicit ``tag_links`` 0 serves none. Absent (the worker has not
+        # talked to the gateway yet, e.g. right after a restart) or a bad value
+        # keeps the last known one — a gateway that never reported serves none.
+        for key, lo in (("tag_links", 0), ("max_tags", 1), ("assigned", 0)):
+            if _bounded(item.get(key), lo, 255) is not None:
+                info[key] = item[key]
     elif kind == "bridge":
         for key in ("addr", "fontpack_id", "flash_size"):
             if key in item:

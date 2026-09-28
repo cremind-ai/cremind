@@ -84,6 +84,8 @@ KEYS: dict[str, KeySpec] = {
     "proof": KeySpec(Kind.BSTR, size=16), "owner": KeySpec(Kind.BSTR, size=16),
     "controller_match": KeySpec(Kind.BOOL), "root_proof": KeySpec(Kind.BSTR, size=16),
     "release_stage": _U, "op_key": KeySpec(Kind.BSTR, size=32),
+    # tags on the gateway's own radio (docs/protocol.md 11)
+    "mode": _U, "tag_links": _U,
 }
 
 # Message fields from the docs of spec serial.message_types; "?" marks an
@@ -127,7 +129,7 @@ REQUESTS: dict[SerialMsg, tuple[str, ...]] = {
     SerialMsg.MAINT_AUTH: ("proof",),
     SerialMsg.DISCOVER: ("op_id", "bridge", "duration_s", "tag_id"),
     SerialMsg.RECOMMISSION: ("grant?", "sig?"),
-    SerialMsg.TUNNEL_OPEN: ("op_id", "bridge", "tag_id", "duration_s"),
+    SerialMsg.TUNNEL_OPEN: ("op_id", "bridge", "tag_id", "duration_s", "mode?"),
     SerialMsg.TUNNEL_SEND: ("tunnel", "data"),
     SerialMsg.TUNNEL_CLOSE: ("tunnel",),
     SerialMsg.FACTORY_SETUP: ("data",),
@@ -171,7 +173,7 @@ EVENTS: dict[SerialMsg, tuple[str, ...]] = {
                            "digest", "battery_mv", "timing", "flags", "stored_epoch"),
     SerialMsg.EVT_BRIDGE_INFO: ("addr", "fw", "fontpack_id", "caps", "assigned", "counters"),
     SerialMsg.EVT_TAG_SEEN: ("bridge", "tag_id", "rssi", "battery_mv", "flags"),
-    SerialMsg.EVT_TUNNEL: ("tunnel", "bridge", "tag_id", "state", "data?", "status?"),
+    SerialMsg.EVT_TUNNEL: ("tunnel", "bridge", "tag_id", "state", "data?", "status?", "rssi?"),
     SerialMsg.EVT_DISCOVERED: ("bridge", "tag_id", "rssi", "flags"),
 }
 

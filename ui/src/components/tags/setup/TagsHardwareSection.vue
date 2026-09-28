@@ -1,10 +1,13 @@
 <script setup lang="ts">
 /**
  * Settings → Tags, "Your hardware" (simple setup): the gateway computers
- * Cremind drives gateways from, the three ways in — Connect gateway, Add
- * bridge (once a gateway is connected), Add tag (once a bridge is ready) —
- * setups still running (Continue / Cancel, also after a page refresh), and the
- * profile's gateways, bridges and tags with what can be done to each.
+ * Cremind drives gateways from, the three ways in — Connect gateway, Add tag
+ * (once the gateway reaches tags itself, or a bridge is ready), Add bridge
+ * (once a gateway is connected; needed only to reach farther, or for every
+ * tag of an older gateway that reaches no tag itself) — setups still running
+ * (Continue / Cancel, also after a page refresh), and the profile's gateways,
+ * bridges and tags with what can be done to each. A tag connects through its
+ * gateway or one of its bridges.
  *
  * Plain words only: no serial ports, mesh addresses, epochs or credential
  * ids; a device id appears only as a short suffix when a device has no name.
@@ -21,7 +24,7 @@ import type { PairingResume } from '../../../composables/useDevicePairing';
 import {
   batteryLevel, capacityFull, capacityLabel, connectionStatusPill, connectionTitle, deliveryLabel,
   deviceStatePill, isOperationTerminal, isWaitingForWake, isoToMs, plugInstruction, setupDeviceTitle,
-  setupErrorMessage, type PendingSetup, type Pill, type RowAction,
+  setupErrorMessage, tagParent, type PendingSetup, type Pill, type RowAction,
 } from '../../../utils/tagsSetupFormat';
 import { formatRelativeTime } from '../../../utils/relativeTime';
 import TagPreviewImage from '../TagPreviewImage.vue';
@@ -72,11 +75,11 @@ const connectReason = computed(() => {
 });
 const emptyPlug = computed(() => plugInstruction(firstHost.value, 'your gateway'));
 const multiGateway = computed(() => connections.value.length > 1);
-/** The one next step, highlighted: connect, then a bridge, then tags. */
+/** The one next step, highlighted: connect, then tags — a bridge first only when the gateway reaches no tag itself. */
 const nextStep = computed(() => {
   if (!readiness.value.canAddBridge && !connections.value.length) return 'connect';
-  if (readiness.value.canAddBridge && !setup.bridges.length) return 'bridge';
-  return readiness.value.canAddTag ? 'tag' : '';
+  if (readiness.value.canAddTag) return 'tag';
+  return readiness.value.canAddBridge && !setup.bridges.length ? 'bridge' : '';
 });
 
 // ── dialogs ──
@@ -179,12 +182,20 @@ function pauseActions(d: SetupDevice, paused: boolean): RowAction[] {
   ];
 }
 
+/** How many tags a gateway serves on its own radio: "3 of 20 tags directly" (blank when it reaches none itself). */
+function directTags(c: TagConnection): string {
+  const cap = c.gateway?.serves_tags ? c.gateway.capacity : null;
+  if (!cap || !cap.max_tags) return '';
+  return `${capacityFull(cap) ? 'Full: ' : ''}${cap.assigned} of ${cap.max_tags} tags directly`;
+}
+
 function gatewayRow(c: TagConnection) {
   const bridges = c.bridges.length;
   const tags = c.tags.length;
   const meta = [
     c.computer?.name ? `On ${c.computer.name}` : '',
     `${bridges === 1 ? '1 bridge' : `${bridges} bridges`} · ${tags === 1 ? '1 tag' : `${tags} tags`}`,
+    directTags(c),
     c.status === 'offline' ? lastContact(c.last_seen_at, 'Last seen') : '',
   ];
   let note: { tone: 'warning' | 'danger' | 'info'; text: string } | null = null;
@@ -231,20 +242,34 @@ function activityPill(d: SetupDevice): Pill | null {
   return { label: 'Waiting for the tag to wake', type: 'info' };
 }
 
-function tagRow(t: SetupDevice) {
+function tagRow(t: SetupDevice, c: TagConnection) {
   const battery = batteryLevel(t.battery_mv);
   const leaving = t.state === 'removal_pending';
+  // Its gateway or bridge, named when there is a choice (bridges, or several gateways).
+  const parent = tagParent(t, c);
+  const via = parent && (setup.bridges.length || multiGateway.value) ? `Via ${parent.title}` : '';
   const meta = leaving
     ? [lastContact(t.last_contact_at)]
-    : [battery?.label ?? '', lastContact(t.last_contact_at), deliveryLabel(t.delivery, t.paused)];
+    : [battery?.label ?? '', lastContact(t.last_contact_at), deliveryLabel(t.delivery, t.paused), via];
   const ready = t.state === 'ready' && !t.paused;
+  // A tag whose bridge is gone (or going) reaches nothing until it is added again.
+  const stranded = t.state === 'ready' && !!t.id && t.bridge_id !== undefined
+    && (!parent || (parent.kind === 'bridge' && parent.device.state === 'removal_pending'));
   const note = leaving
     ? { tone: 'info' as const, text: 'Removal finishes the next time the tag wakes.' }
-    : battery?.low
-      ? { tone: 'warning' as const, text: 'The battery is low. Replace it soon.' }
-      : t.delivery?.status === 'failed'
-        ? { tone: 'warning' as const, text: 'The last update did not arrive. Keep the tag near its bridge; it is tried again.' }
-        : null;
+    : stranded
+      ? {
+        tone: 'warning' as const,
+        text: 'It has no gateway or bridge to connect through, so it gets no updates. Remove it and add it again.',
+      }
+      : battery?.low
+        ? { tone: 'warning' as const, text: 'The battery is low. Replace it soon.' }
+        : t.delivery?.status === 'failed'
+          ? {
+            tone: 'warning' as const,
+            text: `The last update did not arrive. Keep the tag near its ${parent?.kind === 'gateway' ? 'gateway' : 'bridge'}; it is tried again.`,
+          }
+          : null;
   const actions: RowAction[] = leaving || !t.id ? [] : [
     {
       key: 'test', label: 'Send test', icon: 'mdi:send-outline', inline: true, disabled: !ready,
@@ -368,8 +393,8 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
       <div>
         <span class="section-title">Your hardware</span>
         <p class="section-sub">
-          The gateway plugs into a computer running Cremind, bridges carry updates around your home, and
-          tags show them.
+          The gateway plugs into a computer running Cremind and reaches the tags near it; bridges carry
+          updates farther around your home, and tags show them.
         </p>
       </div>
     </template>
@@ -462,7 +487,7 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
           <HardwareDeviceRow
             v-for="t in setup.tags"
             :key="rowKey(t.device)"
-            v-bind="tagRow(t.device)"
+            v-bind="tagRow(t.device, t.connection)"
             :busy="busyFor(t.device)"
             @action="(k: string) => onAction(k, t.device, t.connection)"
           >
@@ -502,6 +527,7 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
       :host-id="connectHost"
       :resume-operation-id="connectResume"
       @add-bridge="openAddBridge()"
+      @add-tag="openAddTag()"
       @recovering="(id: string) => openRecover(null, { recoveryId: id })"
     />
     <AddBridgeDialog v-model="bridgeOpen" :resume="bridgeResume" @add-tag="openAddTag()" />

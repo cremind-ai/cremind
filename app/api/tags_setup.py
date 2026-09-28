@@ -14,7 +14,8 @@ another profile's ids answer 404.
 - ``GET    /api/tags/pairings/{id}`` / ``DELETE``  -> ``{pairing}``
 - ``POST   /api/tags/devices/{id}/unpair``         ``{force?}`` -> ``{operation, device}``
 - ``POST   /api/tags/devices/{id}/pause`` / ``resume`` -> ``{device}``
-- ``POST   /api/tags/devices/{id}/move``           ``{bridge_id}`` -> ``{operation}``
+- ``POST   /api/tags/devices/{id}/move``           ``{bridge_id}`` -> ``{operation}`` (a tag onto its gateway,
+  while that serves tags on its own radio, or a ready bridge of it)
 - ``POST   /api/tags/devices/{id}/test``           -> 201 ``{delivery}``
 - ``POST   /api/tags/recoveries``                  ``{companion_id, server_url}`` -> 201 ``{recovery, session, launch_url}``
 - ``GET    /api/tags/recoveries/{id}``             -> ``{recovery}``

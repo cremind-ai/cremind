@@ -16,6 +16,10 @@ starting it again brings the same worker back on its own.
 A gateway the older Cremind Connect ran moves in the same way when the host
 starts: the same connection, keys and pairing (the gateway is not claimed
 again), and Cremind Connect lets go of it.
+
+A gateway alone is enough for the tags near it (docs/protocol.md §11): with
+no bridge anywhere, Add tag's search hears the tag on the gateway's own radio,
+and the pairing assigns and clears it there.
 """
 
 from __future__ import annotations
@@ -177,6 +181,87 @@ def test_the_server_drives_a_gateway_plugged_into_it(tagenv, tmp_path) -> None:
                 assert again["companion_id"] == companion_id and host.host_id == host_id, "the same computer"
                 status, out = await acall(setup_routes, "GET", "/api/tags/connections", req("admin"))
                 assert [c["id"] for c in out["connections"]] == [companion_id]
+            finally:
+                await asyncio.to_thread(host.stop, "test done")
+
+    asyncio.run(scenario())
+
+
+def test_a_gateway_alone_sets_up_a_tag_without_any_bridge(tagenv, tmp_path) -> None:
+    from app.api.tags_hosts import get_tags_hosts_routes
+    from app.api.tags_setup import get_tags_setup_routes
+    from app.tags import operations
+    from app.tags.hosting.paths import RuntimePaths
+    from app.tags.runtime.protocol.ids import OwnerState
+    from app.tags.runtime.sim import SimConfig, Simulator, TagSpec
+
+    routes = get_tags_hosts_routes()
+    setup_routes = get_tags_setup_routes()
+
+    async def scenario() -> None:
+        config = SimConfig(seed=13, time_scale=200, protocol=2, bridges=[], tags=[TagSpec.generate(13, 0, protocol=2)])
+        async with Simulator(config) as sim:
+            paths = RuntimePaths(tmp_path / ".tag-runtime")
+            host = simulated_host(paths, sim)
+            loop = asyncio.get_running_loop()
+            assert await asyncio.to_thread(host.start, loop), (host.state, host.reason)
+            try:
+                host_id = host.host_id
+                await until(lambda: reported(host_id), "the host's first status report")
+                [cand] = (await search(routes, host_id))["candidates"]
+                op = await connect(routes, host_id, cand["id"], "Office gateway")
+                assert op["state"] == "succeeded", op
+                companion_id = op["companion_id"]
+
+                async def serving() -> dict | None:
+                    """The connection, once its gateway reported that it reaches tags itself."""
+                    _, out = await acall(setup_routes, "GET", "/api/tags/connections", req("admin"))
+                    conns = [c for c in out["connections"] if c["id"] == companion_id]
+                    return conns[0] if conns and conns[0]["gateway"]["serves_tags"] else None
+
+                conn = await until(serving, "the gateway's tag links in the inventory")
+                assert conn["bridges"] == [] and conn["gateway"]["capacity"] == {"max_tags": 20, "assigned": 0}
+
+                # Add tag: the search hears it on the gateway's own radio.
+                code = next(c["code"] for c in sim.setup_codes() if c["role"] == "tag")
+                status, out = await acall(setup_routes, "POST", "/api/tags/discovery",
+                                          req("admin", body={"role": "tag", "setup_code": code}))
+                assert status == 201, out
+                disc_id = out["discovery"]["id"]
+
+                async def found() -> dict | None:
+                    _, out = await acall(setup_routes, "GET", "/api/tags/discovery/{op_id}",
+                                         req("admin", path={"op_id": disc_id}))
+                    return out["discovery"] if out["discovery"]["candidates"] else None
+
+                disc = await until(found, "the tag heard by the gateway")
+                [tag_cand] = disc["candidates"]
+                assert tag_cand["bridge_kind"] == "gateway" and tag_cand["bridge_id"] == conn["gateway"]["id"]
+                assert tag_cand["eligible"] and disc["recommended"] == tag_cand["id"]
+                status, out = await acall(setup_routes, "POST", "/api/tags/pairings",
+                                          req("admin", body={"discovery_id": disc_id, "candidate_id": tag_cand["id"],
+                                                             "name": "Desk"}))
+                assert status == 201, out
+                pairing_id = out["pairing"]["id"]
+
+                async def paired() -> dict | None:
+                    view = await operations.get_pairing("admin", pairing_id)
+                    return view if view["state"] in ("succeeded", "failed", "cancelled") else None
+
+                done = await until(paired, "the pairing", timeout=150)
+                assert done["state"] == "succeeded", done
+
+                # The tag lives on the gateway: owned, assigned and cleared through its radio; no mesh anywhere.
+                _, out = await acall(setup_routes, "GET", "/api/tags/connections", req("admin"))
+                [conn] = [c for c in out["connections"] if c["id"] == companion_id]
+                [tag] = conn["tags"]
+                assert tag["bridge_id"] == conn["gateway"]["id"] and tag["state"] == "ready", tag
+                assert conn["gateway"]["capacity"]["assigned"] == 1
+                sim_tag = sim.tag(config.tags[0].tag_id)
+                assert sim_tag.secure is not None and sim_tag.secure.record.state == OwnerState.OWNED
+                assert sim_tag.nvs.stored_epoch >= 1, "cleared under its first epoch"
+                radio = sim.gateway.radio
+                assert radio is not None and radio.counters["connections"] >= 2
             finally:
                 await asyncio.to_thread(host.stop, "test done")
 

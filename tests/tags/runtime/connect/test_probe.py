@@ -199,9 +199,11 @@ def test_windows_access_denied_means_in_use() -> None:
 def test_the_port_is_always_closed(v2: tuple[FakeV2Gateway, str]) -> None:
     _gateway, url = v2
     closed: list[bool] = []
+    ports: list[Any] = []  # held: a collected pyserial port closes itself (__del__), which is not the probe's close
 
     def opener(device: str) -> Any:
         port = probe.open_port(device)
+        ports.append(port)
         original = port.close
 
         def close() -> None:

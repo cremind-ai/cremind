@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
  * The steps of adding a bridge or a tag, shared by the Add dialogs: looking
- * for the device, choosing where it goes when more than one gateway / bridge
- * heard it, pairing progress, and what went wrong. The code step and the
+ * for the device, choosing where it goes when more than one device heard it
+ * (a bridge: gateways; a tag: the gateway itself, when it reaches tags, and
+ * bridges), pairing progress, and what went wrong. The code step and the
  * success content belong to the dialog (slots `code` and `done`).
  */
 import { computed, nextTick, ref, watch } from 'vue';
@@ -12,8 +13,8 @@ import { useTagsSetupStore } from '../../../stores/tagsSetup';
 import type { DiscoveryCandidate, Pairing } from '../../../services/tagsSetupApi';
 import type { PairingStep } from '../../../composables/useDevicePairing';
 import {
-  capacityFull, capacityLabel, connectionTitle, operationProgressLabel, setupDeviceTitle,
-  setupErrorMessage, shortSuffix, signalLabel,
+  candidateTitle, capacityFull, capacityLabel, operationProgressLabel, setupErrorMessage, shortSuffix,
+  signalLabel, tagReach,
 } from '../../../utils/tagsSetupFormat';
 
 const props = defineProps<{
@@ -56,28 +57,25 @@ const activeIndex = computed(() => {
 const headingText = computed(() => {
   switch (props.step) {
     case 'searching': return props.role === 'tag' ? 'Looking for your tag…' : 'Searching for your bridge…';
-    case 'choose': return props.role === 'tag' ? 'Choose a bridge for this tag' : 'Choose a gateway for this bridge';
+    case 'choose': return props.role === 'tag' ? 'Choose where this tag connects' : 'Choose a gateway for this bridge';
     case 'pairing': return props.role === 'tag' ? 'Adding your tag…' : 'Adding your bridge…';
     case 'problem': return props.problem?.title ?? '';
     default: return '';
   }
 });
 
-/** A candidate as people know it: the bridge (tags) or gateway (bridges) that heard the device. */
+/** What a tag should be close to: "your gateway or one of your bridges". */
+const reach = computed(() => tagReach(store.readiness));
+
+/** A candidate as people know it: the gateway by its connection's title, a bridge by its name. */
 function candidateName(c: DiscoveryCandidate): string {
-  if (props.role === 'tag') {
-    if (c.bridge_name) return c.bridge_name;
-    const b = store.bridges.find((x) => x.device.id === c.bridge_id);
-    return b ? setupDeviceTitle(b.device) : 'A bridge';
-  }
-  const conn = store.connections.find((x) => x.id === c.gateway_id);
-  if (!conn) return 'A gateway';
-  return conn.computer?.name ? `${connectionTitle(conn)} on ${conn.computer.name}` : connectionTitle(conn);
+  return candidateTitle(c, props.role, store.connections);
 }
 
 function candidateMeta(c: DiscoveryCandidate): string {
   const full = c.reason === 'bridge_full' || capacityFull(c.capacity);
-  const parts = [signalLabel(c.rssi)];
+  // A tag's choice mixes the gateway itself and bridges: say which each one is.
+  const parts = [props.role === 'tag' ? (c.bridge_kind === 'gateway' ? 'Gateway' : 'Bridge') : '', signalLabel(c.rssi)];
   if (props.role === 'tag' && (c.capacity || full)) parts.push(full ? 'No room for more tags' : capacityLabel(c.capacity));
   if (!c.eligible && !full) {
     // The sentence without its advice ("Choose another one."): the list is the choice.
@@ -126,8 +124,8 @@ watch(() => props.step, async (s) => {
         <p class="step-text" aria-live="polite">
           <Icon icon="mdi:loading" class="spin" aria-hidden="true" />
           <template v-if="role === 'tag'">
-            Waiting for the tag to wake (tags check in about every 30 seconds). Keep it close to one of
-            your bridges.
+            Waiting for the tag to wake (tags check in about every 30 seconds). Keep it close to
+            {{ reach }}.
           </template>
           <template v-else>
             Keep the bridge plugged in and close to the gateway. This can take a minute.
@@ -139,13 +137,13 @@ watch(() => props.step, async (s) => {
       <template v-else-if="step === 'choose'">
         <p class="step-text">
           {{ role === 'tag'
-            ? 'More than one bridge can hear your tag. Choose the one it should use:'
+            ? 'More than one of your devices can hear your tag. Choose the one it should connect through:'
             : 'More than one gateway can hear your bridge. Choose the one it should join:' }}
         </p>
         <ElRadioGroup
           :model-value="chosen ?? ''"
           class="choices"
-          :aria-label="role === 'tag' ? 'Bridge for this tag' : 'Gateway for this bridge'"
+          :aria-label="role === 'tag' ? 'Where this tag connects' : 'Gateway for this bridge'"
           @update:model-value="(v) => emit('update:chosen', v ? String(v) : null)"
         >
           <ElRadio v-for="c in candidates" :key="c.id" :value="c.id" :disabled="!c.eligible" class="choice" border>

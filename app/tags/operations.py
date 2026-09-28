@@ -2,9 +2,15 @@
 §8-§10, ``docs/tags/setup-api.md``).
 
 Profile side: the Connection view, discovery, pairing, unpair (Remove),
-pause/resume, moving a tag to another bridge, test cards, recovery.
-Worker side (connector v2): the authorization lease, reconciliation state,
-operation details and progress, grant signing, the recovery vault.
+pause/resume, moving a tag to its gateway or another bridge, test cards,
+recovery. Worker side (connector v2): the authorization lease, reconciliation
+state, operation details and progress, grant signing, the recovery vault.
+
+A tag's **parent** (``tag_devices.bridge_device_id``) is a bridge, or its own
+gateway when that gateway serves tags on its own radio (its inventory reports
+``tag_links`` > 0, protocol.md §11): the worker then runs the tag's session
+itself and the gateway's radio is one more place a tag can live. A gateway
+that does not (older firmware) needs bridges for every tag.
 
 An operation reaches its worker as a ``run_operation`` command on the
 existing long-poll queue. The worker reports stages with
@@ -32,7 +38,7 @@ from app.tags.ownership import (
     BINDINGS, INSTALLATIONS, OPERATIONS, PRIVATE, REVOCATIONS, RUN_OPERATION, companion_status, owns,
     profile_uuid, queue_operation, tombstone,
 )
-from app.tags.service import TagError, bridge_capacity
+from app.tags.service import TagError, bridge_capacity, parent_capacity, serves_tags
 from app.tags.storage import (
     ACTIVE_STAGES, COMMANDS, COMPANIONS, CREDENTIALS, DELIVERIES, DEVICES, begin_write,
     cancel_device_deliveries, device_json, get_tag_storage, insert_command, notify_commands, now_ms,
@@ -46,6 +52,8 @@ DISCOVERY_SLACK_MS = 20_000
 OPEN_STATES = ("queued", "running", "pending_device")
 FINAL_STATES = ("succeeded", "failed", "cancelled")
 WAITING = "waiting_for_connect"
+# A gateway binding the worker can act through (claimed; ready once it has reported in).
+GATEWAY_READY = ("paired", "ready")
 _PAIR_KINDS = {"bridge": "pair_bridge", "tag": "pair_tag"}
 _HEX32 = set("0123456789abcdef")
 VAULT_KEEP = 3
@@ -84,7 +92,9 @@ def _delivery_status(dev: dict[str, Any], pending: int) -> str:
 
 def device_view(binding: Any, dev: dict[str, Any] | None, *, companion: Any, now: float,
                 pending: int = 0, assigned: int = 0, affected: list[str] | None = None) -> dict[str, Any]:
-    """The contract's Device object for one binding (+ its device row)."""
+    """The contract's Device object for one binding (+ its device row).
+    ``assigned``: the tags whose parent it is (a bridge, or a gateway serving
+    tags on its own radio); ``affected``: a bridge's tags, by device id."""
     d = dev or {}
     state = binding.state
     if state in ("paired", "ready"):
@@ -104,13 +114,19 @@ def device_view(binding: Any, dev: dict[str, Any] | None, *, companion: Any, now
         "board": binding.board if binding.board is not None else d.get("board"),
         "last_contact_at": iso(d["last_contact_at"]) if d.get("last_contact_at") else None,
         "battery_mv": d.get("battery_mv"), "rssi": d.get("rssi"),
-        "capacity": None, "fontpack_ok": None, "bridge_id": None, "delivery": None, "affected_tag_ids": None,
+        "capacity": None, "serves_tags": None, "fontpack_ok": None, "bridge_id": None, "delivery": None,
+        "affected_tag_ids": None,
     }
     if binding.role == "bridge":
         max_tags = bridge_capacity(info)
         out["capacity"] = {"max_tags": max_tags, "assigned": assigned} if max_tags else None
         out["fontpack_ok"] = info.get("fontpack_ok") if isinstance(info.get("fontpack_ok"), bool) else None
         out["affected_tag_ids"] = affected or []
+    elif binding.role == "gateway":
+        # Tags on its own radio: newer gateways reach the tags near them themselves.
+        out["serves_tags"] = serves_tags(info)
+        max_tags = parent_capacity("gateway", info)
+        out["capacity"] = {"max_tags": max_tags, "assigned": assigned} if max_tags else None
     elif binding.role == "tag":
         out["bridge_id"] = d.get("bridge_device_id")
         out["delivery"] = {
@@ -142,14 +158,15 @@ async def _connection(conn, comp: Any, now: float) -> dict[str, Any]:
                                    .order_by(BINDINGS.c.created_at))).all()
     devs = await _devices_by_id(conn, [b.tag_device_id for b in bindings if b.tag_device_id])
     pending = await _pending_counts(conn, [b.tag_device_id for b in bindings if b.role == "tag" and b.tag_device_id])
-    on_bridge: dict[str, list[str]] = {}
+    # The tags each parent serves: a bridge's, or the gateway's own (its radio).
+    on_parent: dict[str, list[str]] = {}
     for b in bindings:
         if b.role == "tag" and b.tag_device_id and devs.get(b.tag_device_id, {}).get("bridge_device_id"):
-            on_bridge.setdefault(devs[b.tag_device_id]["bridge_device_id"], []).append(b.tag_device_id)
+            on_parent.setdefault(devs[b.tag_device_id]["bridge_device_id"], []).append(b.tag_device_id)
     views = {"gateway": None, "bridge": [], "tag": []}
     for b in bindings:
         dev = devs.get(b.tag_device_id or "")
-        affected = on_bridge.get(b.tag_device_id or "", [])
+        affected = on_parent.get(b.tag_device_id or "", [])
         view = device_view(b, dev, companion=comp, now=now, pending=pending.get(b.tag_device_id or "", 0),
                            assigned=len(affected), affected=affected)
         if b.role == "gateway":
@@ -272,7 +289,61 @@ async def _usable_companions(conn, profile: str, profile_id: str) -> list[Any]:
 async def _ready_gateway(conn, comp: Any) -> bool:
     row = (await conn.execute(select(BINDINGS.c.state).where(
         BINDINGS.c.companion_id == comp.id, BINDINGS.c.role == "gateway"))).first()
-    return row is not None and row.state in ("paired", "ready")
+    return row is not None and row.state in GATEWAY_READY
+
+
+async def _serving_gateway(conn, comp: Any) -> Any:
+    """The worker's gateway device row when the gateway itself can take a tag:
+    its binding is ready and it serves tags on its own radio. ``None``
+    otherwise (whether a paused connection counts is the caller's call)."""
+    binding = (await conn.execute(select(BINDINGS.c.state, BINDINGS.c.tag_device_id).where(
+        BINDINGS.c.companion_id == comp.id, BINDINGS.c.role == "gateway"))).first()
+    if binding is None or binding.state not in GATEWAY_READY or not binding.tag_device_id:
+        return None
+    row = (await conn.execute(select(DEVICES).where(DEVICES.c.id == binding.tag_device_id))).first()
+    return row if row is not None and serves_tags(row.info) else None
+
+
+async def _can_parent(conn, comp: Any, parent: Any) -> bool:
+    """``parent`` (a device row) can take a tag of this worker now: one of its
+    bridges that is ready, or its gateway while that serves tags itself."""
+    if parent is None or parent.companion_id != comp.id:
+        return False
+    if parent.kind == "bridge":
+        state = (await conn.execute(select(BINDINGS.c.state).where(
+            BINDINGS.c.tag_device_id == parent.id))).scalar_one_or_none()
+        return state == "ready"
+    if parent.kind == "gateway":
+        gateway = await _serving_gateway(conn, comp)
+        return gateway is not None and gateway.id == parent.id
+    return False
+
+
+async def _tags_on(conn, parent_id: str) -> list[str]:
+    """The tags whose parent is ``parent_id`` (a bridge or a gateway)."""
+    return list((await conn.execute(select(DEVICES.c.id).where(
+        DEVICES.c.bridge_device_id == parent_id, DEVICES.c.kind == "tag"))).scalars().all())
+
+
+async def _taken(conn, parent_id: str, *, besides: str | None = None) -> int:
+    """How many tags ``parent_id`` serves (other than ``besides``)."""
+    conds = [DEVICES.c.bridge_device_id == parent_id, DEVICES.c.kind == "tag"]
+    if besides is not None:
+        conds.append(DEVICES.c.id != besides)
+    return int((await conn.execute(select(func.count()).select_from(DEVICES).where(*conds))).scalar_one() or 0)
+
+
+async def _reserved(conn, companion_id: str, parent_id: str) -> int:
+    """Tag pairings onto ``parent_id`` still running whose tag has no device row
+    yet (once the device took its grant, its row counts in :func:`_taken`)."""
+    rows = (await conn.execute(select(OPERATIONS.c.args).where(
+        OPERATIONS.c.kind == "pair_tag", OPERATIONS.c.state.in_(OPEN_STATES),
+        OPERATIONS.c.companion_id == companion_id, OPERATIONS.c.binding_id.is_(None)))).scalars().all()
+    return sum(1 for args in rows if isinstance(args, dict) and args.get("bridge_id") == parent_id)
+
+
+def _full_message(parent: Any) -> str:
+    return "That gateway has no room for more tags." if parent.kind == "gateway" else "That bridge is full."
 
 
 # ── discovery ──
@@ -289,6 +360,9 @@ def discovery_json(row: Any, now: float | None = None) -> dict[str, Any]:
                       default=None)
     finished = r["state"] in FINAL_STATES or float(r["expires_at"]) <= now or bool(result.get("finished"))
     error_code = (r.get("error") or {}).get("code")
+    # What heard the device: the gateway (a bridge's search always) or a bridge.
+    # A search stored before the gateway could take tags only had bridges.
+    default_kind = "gateway" if args.get("role") == "bridge" else "bridge"
     if r["state"] == "cancelled":
         state = "cancelled"
     elif r["state"] == "failed" and not candidates and error_code not in (None, "not_found"):
@@ -302,8 +376,9 @@ def discovery_json(row: Any, now: float | None = None) -> dict[str, Any]:
     return {
         "id": r["id"], "role": args.get("role"), "short_id": f"{int(args.get('short_id') or 0):08X}",
         "state": state, "started_at": iso(r["created_at"]), "expires_at": iso(r["expires_at"]),
-        "candidates": [{k: c.get(k) for k in ("id", "gateway_id", "bridge_id", "bridge_name", "rssi", "seen_at",
-                                               "capacity", "eligible", "reason")} for c in candidates],
+        "candidates": [{**{k: c.get(k) for k in ("id", "gateway_id", "bridge_id", "bridge_name", "rssi", "seen_at",
+                                                  "capacity", "eligible", "reason")},
+                        "bridge_kind": c.get("bridge_kind") or default_kind} for c in candidates],
         "recommended": recommended["id"] if recommended else None,
         "error": r.get("error"),
     }
@@ -353,17 +428,24 @@ async def start_discovery(profile: str, body: dict[str, Any]) -> dict[str, Any]:
                 raise TagError(409, "gateway_paused", "The gateway is paused; resume it first.")
             targets.append({"companion_id": chosen[0].id, "bridges": []})
         else:
-            for comp in comps:
-                if comp.paused:
-                    continue
+            # Every place a tag can live listens: the gateway's own radio when it
+            # serves tags (its hw id, first), and every ready bridge.
+            running = [c for c in comps if not c.paused]
+            for comp in running:
                 bridges = (await conn.execute(select(BINDINGS.c.tag_device_id).where(
                     BINDINGS.c.companion_id == comp.id, BINDINGS.c.role == "bridge", BINDINGS.c.state == "ready",
                 ))).scalars().all()
-                if bridges:
-                    hw = (await conn.execute(select(DEVICES.c.hw_id).where(DEVICES.c.id.in_(list(bridges))))).scalars().all()
-                    targets.append({"companion_id": comp.id, "bridges": sorted(hw)})
+                hw = sorted((await conn.execute(select(DEVICES.c.hw_id).where(
+                    DEVICES.c.id.in_(list(bridges))))).scalars().all()) if bridges else []
+                gateway = await _serving_gateway(conn, comp)
+                places = ([gateway.hw_id] if gateway is not None else []) + hw
+                if places:
+                    targets.append({"companion_id": comp.id, "bridges": places})
             if not targets:
-                raise TagError(409, "no_ready_bridge", "Add a bridge first: tags connect through a bridge.")
+                # The code stays no_ready_bridge (clients know it); the words say what is missing.
+                raise TagError(409, "no_ready_bridge", "Your gateway is paused: resume it first." if not running else
+                               "Your gateway cannot reach tags itself: add a bridge first, and wait until it "
+                               "shows Ready.")
         op_id = str(uuid.uuid4())
         args = {"role": role, "short_id": payload.short_id, "duration_s": duration,
                 "companions": [t["companion_id"] for t in targets], "targets": targets}
@@ -453,9 +535,10 @@ async def start_pairing(profile: str, body: dict[str, Any]) -> dict[str, Any]:
         if cand is None:
             raise TagError(404, "not_found", "No such candidate in that search.")
         if not cand.get("eligible"):
+            full = "That gateway cannot take another tag." if cand.get("bridge_kind") == "gateway" else \
+                "That bridge cannot take another tag."
             raise TagError(409, "candidate_not_eligible",
-                           "That bridge cannot take another tag." if cand.get("reason") == "bridge_full"
-                           else "That candidate cannot be used.")
+                           full if cand.get("reason") == "bridge_full" else "That candidate cannot be used.")
         if view["state"] == "cancelled" or disc.secret_sealed is None:
             raise TagError(409, "discovery_closed", "Search again: this search is closed.")
         args = disc.args or {}
@@ -470,20 +553,21 @@ async def start_pairing(profile: str, body: dict[str, Any]) -> dict[str, Any]:
         if role == "bridge":
             op_args.update({"uuid": cand.get("uuid"), "gateway_device_id": comp.gateway_device_id})
         else:
-            bridge = (await conn.execute(select(DEVICES).where(DEVICES.c.id == cand.get("bridge_id")))).first()
-            if bridge is None or bridge.companion_id != comp.id:
-                raise TagError(409, "candidate_not_eligible", "That bridge is no longer available.")
-            max_tags = bridge_capacity(bridge.info)
+            # The tag's parent: the bridge that heard it, or the gateway's own radio. Locked, so two
+            # pairings cannot both take its last slot.
+            parent = (await conn.execute(select(DEVICES).where(
+                DEVICES.c.id == cand.get("bridge_id")).with_for_update())).first()
+            if not await _can_parent(conn, comp, parent):
+                raise TagError(409, "candidate_not_eligible",
+                               "That gateway can no longer reach tags itself. Search again."
+                               if cand.get("bridge_kind") == "gateway" else "That bridge is no longer available.")
+            max_tags = parent_capacity(parent.kind, parent.info)
             if max_tags is not None:
-                taken = int((await conn.execute(select(func.count()).select_from(DEVICES).where(
-                    DEVICES.c.bridge_device_id == bridge.id, DEVICES.c.kind == "tag"))).scalar_one() or 0)
-                reserved = int((await conn.execute(select(func.count()).select_from(OPERATIONS).where(
-                    OPERATIONS.c.kind == "pair_tag", OPERATIONS.c.state.in_(OPEN_STATES),
-                    OPERATIONS.c.companion_id == comp.id))).scalar_one() or 0)
-                if taken + reserved >= max_tags:
-                    raise TagError(409, "bridge_full", "That bridge is full.", bridge={"id": bridge.id})
-            op_args.update({"tag_id": int(args.get("short_id") or 0), "bridge_hw_id": bridge.hw_id,
-                            "bridge_id": bridge.id})
+                taken = await _taken(conn, parent.id)
+                if taken + await _reserved(conn, comp.id, parent.id) >= max_tags:
+                    raise TagError(409, "bridge_full", _full_message(parent), bridge={"id": parent.id})
+            op_args.update({"tag_id": int(args.get("short_id") or 0), "bridge_hw_id": parent.hw_id,
+                            "bridge_id": parent.id})
         row = await queue_operation(conn, kind=_PAIR_KINDS[role], profile=profile, profile_id=profile_id,
                                     companion_id=comp.id, args=op_args, now=now, parent_id=disc.id,
                                     secret_sealed=seal_secret(authority, secret, op_id, profile_id), op_id=op_id,
@@ -605,8 +689,9 @@ async def unpair(profile: str, device_row_id: str, body: dict[str, Any]) -> dict
         binding = (await conn.execute(select(BINDINGS).where(BINDINGS.c.id == binding.id))).first()
         comp = (await conn.execute(select(COMPANIONS).where(COMPANIONS.c.id == comp.id))).first()
         dev_json = device_json(dev) if dev is not None else None
+        assigned = await _taken(conn, dev.id) if dev is not None and binding.role != "tag" else 0
         out = {"operation": operation_json(op), "device": device_view(binding, dev_json, companion=comp, now=now,
-                                                                       affected=affected)}
+                                                                       assigned=assigned, affected=affected)}
     notify_commands(wake)
     return out
 
@@ -631,39 +716,39 @@ async def set_paused(profile: str, device_row_id: str, paused: bool) -> dict[str
         binding = (await conn.execute(select(BINDINGS).where(BINDINGS.c.id == binding.id))).first()
         comp = (await conn.execute(select(COMPANIONS).where(COMPANIONS.c.id == comp.id))).first()
         dev = await _devices_by_id(conn, [device_row_id])
-        return {"device": device_view(binding, dev.get(device_row_id), companion=comp, now=now)}
+        served = await _tags_on(conn, device_row_id) if binding.role != "tag" else []
+        return {"device": device_view(binding, dev.get(device_row_id), companion=comp, now=now,
+                                      assigned=len(served), affected=served)}
 
 
 async def move_tag(profile: str, device_row_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Assign one of the profile's tags to another ready bridge of the same
-    gateway (after its bridge was removed, or by choice)."""
+    """Serve one of the profile's tags through another place of the same
+    gateway: the gateway itself, while it serves tags on its own radio, or a
+    ready bridge (after its bridge was removed, or by choice)."""
     require_simple_setup()
     bridge_id = body.get("bridge_id")
     if not isinstance(bridge_id, str):
-        raise TagError(422, "invalid_bridge", "'bridge_id' is required.")
+        raise TagError(422, "invalid_bridge", "'bridge_id' is required: the gateway or bridge the tag should use.")
     now = now_ms()
     async with get_tag_storage().engine.begin() as conn:
         await begin_write(conn)
         profile_id = await _profile_ids(conn, profile)
         binding, comp = await _owned_binding_by_device_row(conn, profile, profile_id, device_row_id)
         if binding.role != "tag" or binding.state not in ("ready", "paired"):
-            raise TagError(409, "not_movable", "Only a ready tag can move to another bridge.")
-        bridge = (await conn.execute(select(DEVICES).where(DEVICES.c.id == bridge_id))).first()
-        bb = (await conn.execute(select(BINDINGS).where(BINDINGS.c.tag_device_id == bridge_id))).first()
-        if bridge is None or bridge.companion_id != comp.id or bb is None or bb.state != "ready":
-            raise TagError(409, "candidate_not_eligible", "Choose a ready bridge on the same gateway.")
-        max_tags = bridge_capacity(bridge.info)
-        if max_tags is not None:
-            taken = int((await conn.execute(select(func.count()).select_from(DEVICES).where(
-                DEVICES.c.bridge_device_id == bridge.id, DEVICES.c.kind == "tag",
-                DEVICES.c.id != device_row_id))).scalar_one() or 0)
-            if taken >= max_tags:
-                raise TagError(409, "bridge_full", "That bridge is full.")
+            raise TagError(409, "not_movable", "Only a ready tag can be moved.")
+        # Locked, so two moves cannot both take the target's last slot.
+        target = (await conn.execute(select(DEVICES).where(DEVICES.c.id == bridge_id).with_for_update())).first()
+        if not await _can_parent(conn, comp, target):
+            raise TagError(409, "candidate_not_eligible",
+                           "Choose the tag's gateway (if it can reach tags itself) or a ready bridge of that gateway.")
+        max_tags = parent_capacity(target.kind, target.info)
+        if max_tags is not None and await _taken(conn, target.id, besides=device_row_id) >= max_tags:
+            raise TagError(409, "bridge_full", _full_message(target), bridge={"id": target.id})
         dev = (await conn.execute(select(DEVICES).where(DEVICES.c.id == device_row_id))).first()
         op = await queue_operation(conn, kind="move_tag", profile=profile, profile_id=profile_id,
                                    companion_id=comp.id, binding_id=binding.id, now=now,
                                    args={"device_id": binding.device_id, "tag_id": int(binding.short_id or 0),
-                                         "hw_id": dev.hw_id, "bridge_hw_id": bridge.hw_id, "bridge_id": bridge.id,
+                                         "hw_id": dev.hw_id, "bridge_hw_id": target.hw_id, "bridge_id": target.id,
                                          "epoch": int(dev.epoch or 0)})
     notify_commands([comp.id])
     return {"operation": operation_json(op)}
@@ -813,6 +898,8 @@ async def worker_operation(grant: dict[str, Any], op_id: str) -> dict[str, Any]:
             raise TagError(503, exc.code, exc.message) from None
     args = dict(op.args or {})
     if op.kind == "discovery":
+        # ``bridges``: the hw ids to listen on — ready bridges, and the gateway's own ``gw-…`` id
+        # when it serves tags on its own radio.
         target = next((t for t in args.get("targets") or [] if t.get("companion_id") == comp.id), {})
         args = {"role": args.get("role"), "short_id": args.get("short_id"), "duration_s": args.get("duration_s"),
                 "bridges": target.get("bridges") or []}
@@ -834,25 +921,25 @@ async def _discovery_progress(conn, op: Any, comp: Any, body: dict[str, Any], no
             if uuid_hex is None or v2.short_id(bytes.fromhex(uuid_hex)) != int(args.get("short_id") or -1):
                 continue
             key = ("bridge", comp.id, uuid_hex)
-            cand = {"gateway_id": comp.id, "bridge_id": None, "bridge_name": None, "uuid": uuid_hex,
-                    "capacity": None, "eligible": True, "reason": None}
+            cand = {"gateway_id": comp.id, "bridge_id": None, "bridge_kind": "gateway", "bridge_name": None,
+                    "uuid": uuid_hex, "capacity": None, "eligible": True, "reason": None}
         else:
             if _u32(item.get("tag_id")) != int(args.get("short_id") or -1):
                 continue
-            bridge = (await conn.execute(select(DEVICES).where(
-                DEVICES.c.companion_id == comp.id, DEVICES.c.kind == "bridge",
+            # What heard it: a ready bridge, or the gateway's own radio (``bridge_hw_id`` = the
+            # gateway's ``gw-…`` id) while the gateway serves tags.
+            parent = (await conn.execute(select(DEVICES).where(
+                DEVICES.c.companion_id == comp.id, DEVICES.c.kind.in_(("bridge", "gateway")),
                 DEVICES.c.hw_id == str(item.get("bridge_hw_id") or "")))).first()
-            if bridge is None:
+            if not await _can_parent(conn, comp, parent):
                 continue
-            bb = (await conn.execute(select(BINDINGS.c.state).where(BINDINGS.c.tag_device_id == bridge.id))).first()
-            if bb is None or bb.state != "ready":
-                continue
-            max_tags = bridge_capacity(bridge.info)
-            taken = int((await conn.execute(select(func.count()).select_from(DEVICES).where(
-                DEVICES.c.bridge_device_id == bridge.id, DEVICES.c.kind == "tag"))).scalar_one() or 0)
+            max_tags = parent_capacity(parent.kind, parent.info)
+            taken = await _taken(conn, parent.id)
             full = max_tags is not None and taken >= max_tags
-            key = ("tag", comp.id, bridge.id)
-            cand = {"gateway_id": comp.id, "bridge_id": bridge.id, "bridge_name": bridge.name or None,
+            key = ("tag", comp.id, parent.id)
+            # A gateway is named as the page names its connection.
+            name = (parent.name or (comp.name if parent.kind == "gateway" else "")) or None
+            cand = {"gateway_id": comp.id, "bridge_id": parent.id, "bridge_kind": parent.kind, "bridge_name": name,
                     "capacity": {"max_tags": max_tags, "assigned": taken} if max_tags else None,
                     "eligible": not full, "reason": "bridge_full" if full else None}
         existing = next((c for c in candidates if tuple(c.get("_key") or ()) == key), None)

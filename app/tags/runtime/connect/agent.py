@@ -529,10 +529,12 @@ class ConnectAgent:
                         await ctx.check_open()
                         next_poll = self.clock() + DISCOVERY_POLL_S
         else:
+            await self.svc.db.run(self.svc.radio_bridge)  # the gateway's own radio listens too (protocol.md §11)
             bridges = [b for b in (await self._bridges_by_hw(args.get("bridges") or [])) if b.addr]
-            # Every bridge is asked to listen, and asked again every ``discover_every_s`` while the search
-            # lasts: a DISCOVER lost in the mesh (or a window that ended early) must not lose the search. A
-            # busy bridge (finishing a tunnel or a frame session) answers BUSY and is asked again soon.
+            # Every bridge (and the gateway's own radio, bridge GATEWAY_ADDR) is asked to listen, and asked again
+            # every ``discover_every_s`` while the search lasts: a DISCOVER lost in the mesh (or a window that
+            # ended early) must not lose the search. A busy bridge (finishing a tunnel or a frame session)
+            # answers BUSY and is asked again soon.
             addrs: list[int] = [b.addr for b in bridges if b.addr] or [0]
             next_ask = {addr: 0.0 for addr in addrs}
             with gw.subscribe(types=Discovered) as sub:
@@ -567,11 +569,12 @@ class ConnectAgent:
         return {"found": found}
 
     async def _bridges_by_hw(self, hw_ids: list[str]) -> list[BridgeRecord]:
+        """The inventory rows of ``hw_ids``: bridges (``br-``), and the gateway itself (``gw-``: its own radio)."""
         out = []
         for hw in hw_ids:
-            uuid = str(hw).removeprefix("br-")
+            uuid = str(hw).removeprefix("br-").removeprefix("gw-")
             bridge = await self.svc.db.run(lambda u=uuid: self.svc.db.find_bridge(uuid=u))
-            if bridge is not None:
+            if bridge is not None and bridge.hw_id == str(hw):
                 out.append(bridge)
         return out
 
@@ -693,13 +696,12 @@ class ConnectAgent:
         device = ident.device_id
         ref = await asyncio.to_thread(svc.secrets.set_tag_root, tag_id, root)
         record = await self._enroll_local(tag_id, ident, profile, ref, str(args.get("name") or ""))
-        self.state.put(device.hex(), role="tag", hw_id=record.hw_id, gen=gen, tag_id=tag_id,
-                       bridge=f"br-{bridge.uuid}")
+        self.state.put(device.hex(), role="tag", hw_id=record.hw_id, gen=gen, tag_id=tag_id, bridge=bridge.hw_id)
         await ctx.forget_staged_key("root", tag_id.to_bytes(4, "little"))
         await ctx.progress(stage="clearing")
         epoch = await self._assign_and_clear(ctx, record, bridge)
         await self.vault_write(device.hex(), {"role": "tag", "gen": gen, "root": root.hex(), "tag_id": tag_id,
-                                              "bridge": f"br-{bridge.uuid}", "epoch": epoch, "board": ident.board},
+                                              "bridge": bridge.hw_id, "epoch": epoch, "board": ident.board},
                                stage="committed", generation=gen)
         svc.request_inventory()
         await ctx.finish(device={"gen": gen, "epoch": epoch, "board": ident.board, "panel": record.panel,
@@ -708,13 +710,20 @@ class ConnectAgent:
         return {"hw_id": record.hw_id, "epoch": epoch, "gen": gen}
 
     async def _bridge(self, hw_id: str) -> BridgeRecord:
+        """The bridge a tag connects through: a bridge (``br-``) or the gateway itself (``gw-``, its own radio)."""
+        if hw_id.startswith("gw-"):
+            radio = await self.svc.db.run(self.svc.radio_bridge)
+            if radio is None or radio.hw_id != hw_id:
+                raise OperationFailed("not_found", "This gateway cannot reach tags itself.")
+            return radio
         bridge = await self.svc.db.run(lambda: self.svc.db.find_bridge(uuid=hw_id.removeprefix("br-")))
-        if bridge is None or bridge.addr is None:
+        if bridge is None or bridge.addr is None or bridge.own_radio:
             raise OperationFailed("not_found", "That bridge is not in this gateway's mesh.")
         return bridge
 
     async def _tag_tunnel(self, ctx: OpContext, bridge_addr: int | None, tag_id: int) -> Tunnel:
-        """A tunnel to the tag through its bridge, retried while the tag sleeps (it advertises every 30 s)."""
+        """A tunnel to the tag through its bridge (or on the gateway's own radio), retried while the tag sleeps
+        (it advertises every 30 s)."""
         assert bridge_addr is not None
         deadline = self.clock() + TAG_WAKE_S * 2
         while True:
@@ -725,8 +734,8 @@ class ConnectAgent:
                 await ctx.check_open()
                 if self.clock() >= deadline or exc.status not in (Status.TIMEOUT, Status.BUSY, Status.NOT_FOUND,
                                                                   Status.CONNECT_FAILED, Status.DISCONNECTED):
-                    raise OperationFailed("timeout", "The tag did not answer. Wake it (press its button or move "
-                                                     "it closer to the bridge) and try again.") from None
+                    raise OperationFailed("timeout", "The tag did not answer. Wake it (press its button, or move "
+                                                     "it closer to your gateway or bridge) and try again.") from None
                 await asyncio.sleep(2.0)
                 continue
             assert tunnel.ident is not None
@@ -813,7 +822,7 @@ class ConnectAgent:
                                attempts=3)
         found = self.state.by_hw_id(tag.hw_id)
         if found is not None:
-            self.state.put(found[0], bridge=f"br-{bridge.uuid}")
+            self.state.put(found[0], bridge=bridge.hw_id)
         svc.request_inventory()
         await ctx.finish(device={"epoch": epoch})
         return {"epoch": epoch}
@@ -905,7 +914,7 @@ class ConnectAgent:
                 return
             if (rev is not None and rev.state in ("failed", "uncertain")) or self.clock() >= deadline:
                 raise OperationFailed("timeout", "The tag did not show its new setup code, so it stays set up. "
-                                                 "Try removing it again when it is near its bridge.")
+                                                 "Try removing it again when it is near its gateway or bridge.")
             if self.clock() >= next_check:
                 await ctx.check_open()
                 next_check = self.clock() + DISCOVERY_POLL_S

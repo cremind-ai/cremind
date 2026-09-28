@@ -687,6 +687,333 @@ def test_remove_a_tag_and_a_bridge(tagenv) -> None:
     assert scalar(tagenv, "SELECT cleanup FROM tag_revocations WHERE device_id = :d", d=tag.device_id) == "abandoned"
 
 
+# ---------------------------------------------------------------- tags on the gateway's own radio
+
+
+def gw_hw(ctx) -> str:
+    """The gateway's hardware id, as its worker reports it (``gw-<device id>``)."""
+    return "gw-" + ctx.gateway.device_id
+
+
+def report_gateway(ctx, **radio) -> dict:
+    """The worker's inventory of its gateway; ``tag_links`` > 0 (with ``max_tags`` /
+    ``assigned``) when the gateway serves tags on its own radio."""
+    status, out = ctx.worker.call("POST", "/inventory", body={"gateways": [{"hw_id": gw_hw(ctx), "fw": "0.3.0",
+                                                                             **radio}]})
+    assert status == 200, out
+    return out
+
+
+def connection_view(profile: str = "p1") -> dict:
+    prof, _, _ = _routes()
+    status, view = call(prof, "GET", "/api/tags/connections", req(profile))
+    assert status == 200, view
+    [conn] = view["connections"]
+    return conn
+
+
+def row_of(env, device: Device) -> str:
+    return scalar(env, "SELECT tag_device_id FROM tag_bindings WHERE device_id = :d", d=device.device_id)
+
+
+def parent_of(env, tag_row: str) -> str | None:
+    return scalar(env, "SELECT bridge_device_id FROM tag_devices WHERE id = :i", i=tag_row)
+
+
+def on_gateway(ctx, tag: Device, rssi: int = -55) -> dict:
+    """A worker's discovery report: the gateway's own radio heard ``tag``."""
+    return {"tag_id": tag.short_id, "bridge_hw_id": gw_hw(ctx), "rssi": rssi}
+
+
+def discover_tag(ctx, tag: Device, reports: list[dict]) -> dict:
+    """Search for ``tag``; the worker reports ``reports``. Returns the discovery."""
+    prof, _, _ = _routes()
+    status, disc = call(prof, "POST", "/api/tags/discovery",
+                        req("p1", body={"role": "tag", "setup_code": setup_code("tag", tag.short_id)}))
+    assert status == 201, disc
+    status, out = ctx.worker.call("POST", "/operations/{operation_id}/progress",
+                                  path_params={"operation_id": disc["discovery"]["id"]},
+                                  body={"candidates": reports, "state": "succeeded"})
+    assert status == 200, out
+    status, disc = call(prof, "GET", "/api/tags/discovery/{op_id}", req("p1", path={"op_id": disc["discovery"]["id"]}))
+    assert status == 200, disc
+    return disc["discovery"]
+
+
+def test_a_gateway_that_reaches_tags_itself_pairs_a_tag_without_a_bridge(tagenv) -> None:
+    ctx = connect_gateway(tagenv)
+    finish_claim(tagenv, ctx)
+    gw_row = row_of(tagenv, ctx.gateway)
+    conn = connection_view()
+    assert conn["gateway"]["serves_tags"] is False and conn["gateway"]["capacity"] is None
+    report_gateway(ctx, tag_links=2, max_tags=20, assigned=0)
+    conn = connection_view()
+    assert conn["gateway"]["serves_tags"] is True
+    assert conn["gateway"]["capacity"] == {"max_tags": 20, "assigned": 0}
+    assert conn["bridges"] == []
+
+    # The search listens on the gateway's own radio: no bridge needed.
+    prof, _, _ = _routes()
+    tag = Device("tag")
+    status, disc = call(prof, "POST", "/api/tags/discovery",
+                        req("p1", body={"role": "tag", "setup_code": setup_code("tag", tag.short_id)}))
+    assert status == 201, disc
+    disc_id = disc["discovery"]["id"]
+    status, op = ctx.worker.call("GET", "/operations/{operation_id}", path_params={"operation_id": disc_id})
+    assert op["operation"]["args"]["bridges"] == [gw_hw(ctx)]
+    status, out = ctx.worker.call("POST", "/operations/{operation_id}/progress", path_params={"operation_id": disc_id},
+                                  body={"candidates": [on_gateway(ctx, tag)], "state": "succeeded"})
+    assert status == 200, out
+    status, disc = call(prof, "GET", "/api/tags/discovery/{op_id}", req("p1", path={"op_id": disc_id}))
+    [cand] = disc["discovery"]["candidates"]
+    assert cand["bridge_kind"] == "gateway" and cand["bridge_id"] == gw_row
+    assert cand["bridge_name"] == "DESKTOP-A gateway"  # as the page titles the connection
+    assert cand["capacity"] == {"max_tags": 20, "assigned": 0} and cand["eligible"] is True
+    assert disc["discovery"]["recommended"] == cand["id"]
+
+    status, pairing = call(prof, "POST", "/api/tags/pairings",
+                           req("p1", body={"discovery_id": disc_id, "candidate_id": cand["id"], "name": "Desk"}))
+    assert status == 201, pairing
+    op_id = pairing["pairing"]["id"]
+    status, op = ctx.worker.call("GET", "/operations/{operation_id}", path_params={"operation_id": op_id})
+    args = op["operation"]["args"]
+    assert (args["tag_id"], args["bridge_hw_id"], args["bridge_id"]) == (tag.short_id, gw_hw(ctx), gw_row)
+    status, g = grant_for(ctx.worker, op_id, tag, "pair", ik=tag.ik)
+    assert status == 200, g
+    for body in ({"stage": "paired", "device": {"gen": 1, "epoch": 1}}, {"stage": "done", "state": "succeeded"}):
+        status, out = ctx.worker.call("POST", "/operations/{operation_id}/progress",
+                                      path_params={"operation_id": op_id}, body=body)
+        assert status == 200, out
+    tag_row = row_of(tagenv, tag)
+    assert parent_of(tagenv, tag_row) == gw_row
+
+    # The connection lists the tag under its gateway, which counts it.
+    conn = connection_view()
+    assert conn["bridges"] == [] and [t["id"] for t in conn["tags"]] == [tag_row]
+    assert conn["tags"][0]["bridge_id"] == conn["gateway"]["id"] == gw_row
+    assert conn["tags"][0]["state"] == "ready" and conn["tags"][0]["name"] == "Desk"
+    assert conn["gateway"]["capacity"] == {"max_tags": 20, "assigned": 1}
+
+    # The worker learns the tag lives on the gateway's radio: sync and inventory name its gw- id.
+    status, synced = ctx.worker.call("POST", "/sync", body={"cursor": None}, kind="content")
+    assert status == 200 and synced["tags"][0]["bridge_hw_id"] == gw_hw(ctx)
+    inv = report_gateway(ctx, tag_links=2, max_tags=20, assigned=1)
+    assert [(a["tag_id"], a["bridge_hw_id"]) for a in inv["assignments"]] == [(f"{tag.short_id:08X}", gw_hw(ctx))]
+    # A tag epoch ahead of Cremind's re-queues its assignment — on the gateway.
+    status, out = ctx.worker.call("POST", "/inventory", body={
+        "gateways": [{"hw_id": gw_hw(ctx), "tag_links": 2, "max_tags": 20}],
+        "tags": [{"tag_id": f"{tag.short_id:08X}", "epoch": 5}]})
+    assert status == 200, out
+    [assign] = [json.loads(r["args"]) for r in rows(tagenv, "SELECT args FROM tag_commands WHERE kind = 'assign_tag'")]
+    assert assign == {"tag_id": f"{tag.short_id:08X}", "bridge_hw_id": gw_hw(ctx), "epoch": 6}
+    # The gateway refusing it (full) is recorded on the gateway, as a bridge's would be.
+    cmd = scalar(tagenv, "SELECT id FROM tag_commands WHERE kind = 'assign_tag'")
+    status, out = ctx.worker.call("POST", "/commands/{command_id}/result", path_params={"command_id": cmd},
+                                  body={"status": "failed", "result": {"error": "bridge_full", "max_tags": 12}})
+    assert status == 200, out
+    assert scalar(tagenv, "SELECT status FROM tag_devices WHERE id = :i", i=tag_row) == "assign_failed"
+    assert parent_of(tagenv, tag_row) is None
+    gw_info = scalar(tagenv, "SELECT info FROM tag_devices WHERE id = :i", i=gw_row)
+    assert (gw_info if isinstance(gw_info, dict) else json.loads(gw_info))["max_tags"] == 12
+
+
+def test_a_gateway_that_cannot_reach_tags_itself_still_needs_a_bridge(tagenv) -> None:
+    ctx = connect_gateway(tagenv)
+    finish_claim(tagenv, ctx)
+    gw_row = row_of(tagenv, ctx.gateway)
+    prof, _, _ = _routes()
+    tag = Device("tag")
+    search = req("p1", body={"role": "tag", "setup_code": setup_code("tag", tag.short_id)})
+
+    report_gateway(ctx)  # an older runtime never reports tag_links: no tag on the gateway's radio
+    assert connection_view()["gateway"]["serves_tags"] is False
+    status, out = call(prof, "POST", "/api/tags/discovery", search)
+    assert status == 409 and out["error"] == "no_ready_bridge"
+    assert out["message"] == ("Your gateway cannot reach tags itself: add a bridge first, and wait until it "
+                              "shows Ready.")
+
+    # It follows what the gateway reports. Absent (the worker has not talked to the gateway yet)
+    # or a bad value keeps the last known one; an explicit 0 means it serves no tag.
+    report_gateway(ctx, tag_links=2, max_tags=20, assigned=0)
+    for unknown in ({}, {"tag_links": None}, {"tag_links": -1}, {"tag_links": "2"}, {"tag_links": True},
+                    {"tag_links": 300, "max_tags": 0, "assigned": -1}):
+        report_gateway(ctx, **unknown)
+        gateway = connection_view()["gateway"]
+        assert gateway["serves_tags"] is True and gateway["capacity"] == {"max_tags": 20, "assigned": 0}, unknown
+    report_gateway(ctx, tag_links=0)
+    assert connection_view()["gateway"]["serves_tags"] is False
+    assert connection_view()["gateway"]["capacity"] is None
+
+    # A paused gateway takes no tag, even one that reaches tags itself.
+    report_gateway(ctx, tag_links=2, max_tags=20)
+    status, out = call(prof, "POST", "/api/tags/devices/{device_id}/pause",
+                       req("p1", path={"device_id": gw_row}, body={}))
+    assert status == 200 and out["device"]["serves_tags"] is True and out["device"]["paused"] is True
+    status, out = call(prof, "POST", "/api/tags/discovery", search)
+    assert status == 409 and out["error"] == "no_ready_bridge" and out["message"] == \
+        "Your gateway is paused: resume it first."
+    call(prof, "POST", "/api/tags/devices/{device_id}/resume", req("p1", path={"device_id": gw_row}, body={}))
+
+    # With a bridge, a gateway that does not serve tags is no place for one: a report naming it is ignored.
+    report_gateway(ctx, tag_links=0)
+    ctx.bridge = Device("bridge")
+    _, bridge_row = _pair(tagenv, ctx, "bridge", ctx.bridge)
+    disc = discover_tag(ctx, tag, [on_gateway(ctx, tag, rssi=-40),
+                                   {"tag_id": tag.short_id, "bridge_hw_id": "br-" + ctx.bridge.device_id, "rssi": -70}])
+    status, op = ctx.worker.call("GET", "/operations/{operation_id}", path_params={"operation_id": disc["id"]})
+    assert op["operation"]["args"]["bridges"] == ["br-" + ctx.bridge.device_id]
+    [cand] = disc["candidates"]
+    assert (cand["bridge_kind"], cand["bridge_id"]) == ("bridge", bridge_row)
+
+
+def test_the_gateway_and_a_bridge_both_hear_the_tag(tagenv) -> None:
+    ctx = connect_gateway(tagenv)
+    finish_claim(tagenv, ctx)
+    report_gateway(ctx, tag_links=2, max_tags=1)
+    gw_row = row_of(tagenv, ctx.gateway)
+    ctx.bridge = Device("bridge")
+    _, bridge_row = _pair(tagenv, ctx, "bridge", ctx.bridge)
+    br = "br-" + ctx.bridge.device_id
+    prof, _, _ = _routes()
+
+    first = Device("tag")
+    disc = discover_tag(ctx, first, [on_gateway(ctx, first, rssi=-45), {"tag_id": first.short_id, "bridge_hw_id": br,
+                                                                         "rssi": -70}])
+    status, op = ctx.worker.call("GET", "/operations/{operation_id}", path_params={"operation_id": disc["id"]})
+    assert op["operation"]["args"]["bridges"] == [gw_hw(ctx), br]
+    by_kind = {c["bridge_kind"]: c for c in disc["candidates"]}
+    assert set(by_kind) == {"gateway", "bridge"} and all(c["eligible"] for c in disc["candidates"])
+    assert by_kind["gateway"]["bridge_id"] == gw_row and by_kind["bridge"]["bridge_id"] == bridge_row
+    assert by_kind["bridge"]["bridge_name"] == "Kitchen"
+    assert disc["recommended"] == by_kind["gateway"]["id"]  # the strongest signal
+    status, pairing = call(prof, "POST", "/api/tags/pairings", req("p1", body={
+        "discovery_id": disc["id"], "candidate_id": by_kind["gateway"]["id"]}))
+    assert status == 201, pairing
+    # Pairing onto the gateway holds its only slot until the tag takes its grant.
+    second = Device("tag")
+    disc2 = discover_tag(ctx, second, [on_gateway(ctx, second, rssi=-40)])
+    status, out = call(prof, "POST", "/api/tags/pairings", req("p1", body={
+        "discovery_id": disc2["id"], "candidate_id": disc2["candidates"][0]["id"]}))
+    assert status == 409 and out["error"] == "bridge_full"
+    assert out["message"] == "That gateway has no room for more tags."
+    op_id = pairing["pairing"]["id"]
+    status, g = grant_for(ctx.worker, op_id, first, "pair", ik=first.ik)
+    assert status == 200, g
+    ctx.worker.call("POST", "/operations/{operation_id}/progress", path_params={"operation_id": op_id},
+                    body={"stage": "done", "state": "succeeded"})
+    assert parent_of(tagenv, row_of(tagenv, first)) == gw_row
+
+    # Full: the gateway is listed but cannot take it; the bridge is recommended though weaker.
+    disc3 = discover_tag(ctx, second, [on_gateway(ctx, second, rssi=-40), {"tag_id": second.short_id,
+                                                                           "bridge_hw_id": br, "rssi": -80}])
+    by_kind = {c["bridge_kind"]: c for c in disc3["candidates"]}
+    assert by_kind["gateway"]["eligible"] is False and by_kind["gateway"]["reason"] == "bridge_full"
+    assert by_kind["gateway"]["capacity"] == {"max_tags": 1, "assigned": 1}
+    assert disc3["recommended"] == by_kind["bridge"]["id"]
+    status, out = call(prof, "POST", "/api/tags/pairings", req("p1", body={
+        "discovery_id": disc3["id"], "candidate_id": by_kind["gateway"]["id"]}))
+    assert status == 409 and out["error"] == "candidate_not_eligible"
+    assert out["message"] == "That gateway cannot take another tag."
+    _, second_row = _pair(tagenv, ctx, "tag", second, name="Hall",
+                          candidate={"tag_id": second.short_id, "bridge_hw_id": br, "rssi": -80})
+    assert parent_of(tagenv, second_row) == bridge_row
+    conn = connection_view()
+    assert conn["gateway"]["capacity"] == {"max_tags": 1, "assigned": 1}
+    assert conn["bridges"][0]["capacity"]["assigned"] == 1
+    assert {t["bridge_id"] for t in conn["tags"]} == {gw_row, bridge_row}
+
+
+def test_move_a_tag_from_the_gateway_to_a_bridge_and_back(tagenv) -> None:
+    ctx = connect_gateway(tagenv)
+    finish_claim(tagenv, ctx)
+    report_gateway(ctx, tag_links=2, max_tags=20)
+    gw_row = row_of(tagenv, ctx.gateway)
+    tag = Device("tag")
+    _, tag_row = _pair(tagenv, ctx, "tag", tag, candidate=on_gateway(ctx, tag))
+    assert parent_of(tagenv, tag_row) == gw_row
+    ctx.bridge = Device("bridge")
+    _, bridge_row = _pair(tagenv, ctx, "bridge", ctx.bridge)
+    prof, _, _ = _routes()
+
+    def move(target: str, profile: str = "p1", device: str = tag_row) -> tuple[int, dict]:
+        return call(prof, "POST", "/api/tags/devices/{device_id}/move",
+                    req(profile, path={"device_id": device}, body={"bridge_id": target}))
+
+    def finish(op_id: str) -> dict:
+        status, op = ctx.worker.call("GET", "/operations/{operation_id}", path_params={"operation_id": op_id})
+        assert status == 200, op
+        status, out = ctx.worker.call("POST", "/operations/{operation_id}/progress",
+                                      path_params={"operation_id": op_id}, body={"state": "succeeded"})
+        assert status == 200, out
+        return op["operation"]["args"]
+
+    status, out = move(bridge_row)
+    assert status == 200, out
+    args = finish(out["operation"]["id"])
+    assert (args["bridge_hw_id"], args["bridge_id"]) == ("br-" + ctx.bridge.device_id, bridge_row)
+    assert parent_of(tagenv, tag_row) == bridge_row
+    conn = connection_view()
+    assert conn["gateway"]["capacity"]["assigned"] == 0 and conn["bridges"][0]["capacity"]["assigned"] == 1
+    status, out = move(gw_row)
+    assert status == 200, out
+    args = finish(out["operation"]["id"])
+    assert (args["bridge_hw_id"], args["bridge_id"]) == (gw_hw(ctx), gw_row)
+    assert parent_of(tagenv, tag_row) == gw_row
+    assert connection_view()["gateway"]["capacity"]["assigned"] == 1
+
+    # Not onto a full gateway (the tag already on it does not count against itself) …
+    other = Device("tag")
+    on_bridge = {"tag_id": other.short_id, "bridge_hw_id": "br-" + ctx.bridge.device_id, "rssi": -60}
+    _, other_row = _pair(tagenv, ctx, "tag", other, name="Hall", candidate=on_bridge)
+    report_gateway(ctx, tag_links=2, max_tags=1)
+    status, out = move(gw_row, device=other_row)
+    assert status == 409 and out["error"] == "bridge_full"
+    assert out["message"] == "That gateway has no room for more tags."
+    assert move(gw_row)[0] == 200
+    # … nor onto a gateway that no longer reaches tags, nor another profile's hardware.
+    report_gateway(ctx, tag_links=0)
+    status, out = move(gw_row, device=other_row)
+    assert status == 409 and out["error"] == "candidate_not_eligible"
+    theirs = connect_gateway(tagenv, "p2")
+    finish_claim(tagenv, theirs)
+    report_gateway(theirs, tag_links=2, max_tags=20)
+    status, out = move(row_of(tagenv, theirs.gateway), device=other_row)
+    assert status == 409 and out["error"] == "candidate_not_eligible"
+    assert move(bridge_row, profile="p2")[0] == 404
+
+
+def test_removal_counts_only_the_tags_of_the_removed_device(tagenv) -> None:
+    ctx = connect_gateway(tagenv)
+    finish_claim(tagenv, ctx)
+    report_gateway(ctx, tag_links=2, max_tags=20)
+    gw_row = row_of(tagenv, ctx.gateway)
+    ctx.bridge = Device("bridge")
+    _, bridge_row = _pair(tagenv, ctx, "bridge", ctx.bridge)
+    near, far = Device("tag"), Device("tag")
+    _, near_row = _pair(tagenv, ctx, "tag", near, name="Desk", candidate=on_gateway(ctx, near))
+    _, far_row = _pair(tagenv, ctx, "tag", far, name="Porch",
+                       candidate={"tag_id": far.short_id, "bridge_hw_id": "br-" + ctx.bridge.device_id, "rssi": -70})
+    conn = connection_view()
+    assert conn["bridges"][0]["affected_tag_ids"] == [far_row]
+    assert conn["gateway"]["capacity"]["assigned"] == 1 and conn["gateway"]["affected_tag_ids"] is None
+    prof, _, _ = _routes()
+    # Removing the bridge strands only its own tag; the gateway's keeps working.
+    status, out = call(prof, "POST", "/api/tags/devices/{device_id}/unpair",
+                       req("p1", path={"device_id": bridge_row}, body={}))
+    assert status == 200 and out["device"]["affected_tag_ids"] == [far_row]
+    assert out["device"]["capacity"]["assigned"] == 1
+    assert scalar(tagenv, "SELECT status FROM tag_devices WHERE id = :i", i=far_row) == "needs_bridge"
+    assert scalar(tagenv, "SELECT status FROM tag_devices WHERE id = :i", i=near_row) == "ok"
+    # Removing the gateway takes the whole connection, the tags it served itself included.
+    status, out = call(prof, "POST", "/api/tags/devices/{device_id}/unpair",
+                       req("p1", path={"device_id": gw_row}, body={}))
+    assert status == 200, out
+    assert out["device"]["kind"] == "gateway" and out["device"]["state"] == "removal_pending"
+    assert out["device"]["affected_tag_ids"] is None
+    states = {r["device_id"]: r["state"] for r in rows(tagenv, "SELECT device_id, state FROM tag_bindings")}
+    assert states[near.device_id] == states[far.device_id] == states[ctx.gateway.device_id] == "removal_pending"
+
+
 # ---------------------------------------------------------------- recovery and the vault
 
 

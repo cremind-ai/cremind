@@ -30,9 +30,10 @@ body): a retry with the same key returns the first answer (409
  "state": "pairing|paired|ready|offline|recovery_pending|removal_pending|reconciling",
  "paused": false, "generation": 1, "fw": "0.2.0", "board": 19,
  "last_contact_at": "…"|null, "battery_mv": 2900|null, "rssi": -61|null,
- "capacity": {"max_tags": 20, "assigned": 3}|null,           // bridges
+ "capacity": {"max_tags": 20, "assigned": 3}|null,           // bridges; a gateway that serves tags itself
+ "serves_tags": true|false|null,                             // gateways (null for bridges and tags)
  "fontpack_ok": true|null,                                   // bridges
- "bridge_id": "d0c2…"|null,                                  // tags
+ "bridge_id": "d0c2…"|null,                                  // tags: the bridge, or the gateway, it connects through
  "delivery": {"pending_count": 2, "displayed_revision": 17, "desired_revision": 18,
               "clear_required": false, "status": "ok|pending|clear_pending|failed"}|null,  // tags
  "affected_tag_ids": ["d0c3…"]|null}                         // bridges: tags assigned to it
@@ -40,6 +41,18 @@ body): a retry with the same key returns the first answer (409
 
 `state` `offline` is derived: paired or ready, but no contact for 2 minutes
 (gateway: no worker heartbeat; bridge/tag: no report).
+
+**Where a tag lives.** A tag's parent (`bridge_id`) is a bridge, or its own
+gateway: a gateway whose worker reports `tag_links` > 0 in its inventory
+(protocol.md §11, the nRF52840 gateways) connects to tags on its own radio —
+its worker runs the tag's session itself — so it `serves_tags` and carries a
+`capacity` (`max_tags`: how many tags it serves itself; `assigned`: how many
+tags have it as their parent). Bridges then only extend the range. A gateway
+that reported `tag_links` 0 (older firmware; the nRF52832 gateway), or never
+reported it, has `serves_tags: false` and `capacity: null`: every tag it
+serves needs a bridge. An inventory without `tag_links` (the worker has not
+talked to the gateway yet) keeps the last known values. A gateway's
+`affected_tag_ids` stays `null`: removing it removes its whole connection.
 
 **Connection** (one per gateway = one worker)
 
@@ -99,6 +112,7 @@ computer). Sessions expire 5 minutes after creation unless redeemed.
 | GET / DELETE | `/api/tags/pairings/{id}` | → `{pairing}` |
 | POST | `/api/tags/devices/{id}/unpair` | `{}` → `{operation, device}` |
 | POST | `/api/tags/devices/{id}/pause` / `resume` | `{}` → `{device}` (gateway: the whole connection) |
+| POST | `/api/tags/devices/{id}/move` | `{bridge_id}` → `{operation}`: a ready tag onto its own gateway (while that `serves_tags`) or a ready bridge of that gateway; 409 `not_movable`, `candidate_not_eligible`, `bridge_full` |
 | POST | `/api/tags/devices/{id}/test` | `{}` → 201 `{delivery}` (a test card) |
 | POST | `/api/tags/recoveries` | `{companion_id, server_url}` → 201 `{recovery, session, launch_url}` |
 | GET | `/api/tags/recoveries/{id}` | → `{recovery}` |
@@ -109,14 +123,24 @@ computer). Sessions expire 5 minutes after creation unless redeemed.
 {"id": "…", "role": "tag", "short_id": "1A2B3C4D",
  "state": "scanning|found|not_found|failed|cancelled", "started_at": "…", "expires_at": "…",
  "candidates": [{"id": "c1", "gateway_id": "<companion id>", "bridge_id": "<device id>"|null,
-                 "bridge_name": "Hall"|null, "rssi": -61, "seen_at": "…",
+                 "bridge_kind": "gateway|bridge", "bridge_name": "Hall"|null, "rssi": -61, "seen_at": "…",
                  "capacity": {"max_tags": 20, "assigned": 3}|null, "eligible": true, "reason": null|"bridge_full"}],
  "recommended": "c1"|null, "error": {"code", "message"}|null}
 ```
 
-For a bridge a candidate is the gateway that heard its beacon; for a tag, a
-ready bridge of the profile that heard it in setup mode. `recommended` is the
-strongest recent signal among eligible candidates.
+For a bridge a candidate is the gateway that heard its beacon (`bridge_kind`
+`gateway`, `bridge_id` null). For a tag, a candidate is what heard it in setup
+mode: a ready bridge of the profile (`bridge_kind` `bridge`), or the gateway's
+own radio when the gateway serves tags (`bridge_kind` `gateway`, `bridge_id`
+the gateway's device id, `bridge_name` its name — the connection title the page
+shows, `capacity` the gateway's). The search listens on every such place: the
+worker's discovery arguments list the gateway's own `gw-…` hardware id among
+the `bridges`, and the worker reports `{tag_id, bridge_hw_id, rssi}` with that
+id for a tag its radio heard. A candidate whose device serves all the tags it
+can is listed with `eligible: false`, `reason: "bridge_full"`. `recommended` is
+the strongest recent signal among eligible candidates. Pairing onto the gateway
+gives the worker `{tag_id, bridge_hw_id: <gateway hw id>, bridge_id: <gateway
+device id>}` and makes the gateway the tag's parent.
 
 **Pairing**: an Operation plus `"role"`, `"first_tag": bool` (the profile's
 first tag: the page offers "Send this profile's activity", on by default).
@@ -127,8 +151,15 @@ first tag: the page offers "Send this profile's activity", on by default).
 Error codes: `simple_setup_disabled` (403), `setup_code_invalid`,
 `setup_code_wrong_role` (422), `no_gateway`, `gateway_required`,
 `gateway_offline`, `no_ready_bridge` (409), `device_owned` (409),
-`candidate_not_eligible` (409), `not_found` (404), `session_expired` (410),
-`not_approved`, `already_redeemed` (409).
+`candidate_not_eligible` (409), `bridge_full` (409), `not_found` (404),
+`session_expired` (410), `not_approved`, `already_redeemed` (409).
+
+`no_ready_bridge` (a tag's search): nothing can take a tag — no unpaused
+gateway serves tags itself and none has a ready bridge. The message says which:
+"Your gateway cannot reach tags itself: add a bridge first, and wait until it
+shows Ready." or "Your gateway is paused: resume it first." (`no_gateway`:
+no gateway is connected at all). `bridge_full`: the chosen gateway or bridge
+holds as many tags as it can (a pairing still running onto it counts).
 
 ## 2. Bootstrap API `/api/tag-setup/v1/` (Connect, during a session)
 

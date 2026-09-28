@@ -3,8 +3,10 @@ hardware (Settings → Tags, "Your hardware").
 
 Mirrors the Settings page: connect a USB gateway plugged into a gateway
 computer (Cremind drives it from there — see ``cremind tags hosts``), add
-bridges and tags from their setup codes, and pause, move, test, remove or
-recover them onto another computer. The CLI is optional — the Settings page
+tags and bridges from their setup codes, and pause, move, test, remove or
+recover them onto another computer. A tag connects through the gateway itself
+when the gateway reaches tags on its own radio (newer gateways), or through a
+bridge, which carries updates farther. The CLI is optional — the Settings page
 does all of it. It never acts on the USB ports of the computer it runs on
 unless that is the gateway computer named (or the only one there is).
 
@@ -43,14 +45,18 @@ _HINTS = {
     **HOST_HINTS,
     "simple_setup_disabled": "The admin has not turned on hardware setup from Settings → Tags on this server.",
     "no_gateway": "Connect a gateway first: cremind tags devices connect",
-    "no_ready_bridge": "Add a bridge first: cremind tags devices add bridge --code-file <label.txt>",
+    "no_ready_bridge": "Connect a gateway first (or resume a paused one); if your gateway cannot reach tags itself, "
+                       "add a bridge: cremind tags devices add bridge --code-file <label.txt>",
+    "candidate_not_eligible": "Choose the tag's gateway (when it reaches tags itself) or a ready bridge of that "
+                              "gateway: cremind tags devices list",
     "gateway_required": "Name the gateway: --gateway <connection>. List them: cremind tags devices list",
     "setup_code_invalid": "Check the code on the label (25 characters; 0/O and 1/I/L are the same).",
     "setup_code_wrong_role": "This label belongs to another kind of device.",
     "already_paired": "It is already set up: cremind tags devices list",
     "device_owned": "That device is set up elsewhere. Reset it (see its documentation) to set it up again.",
     "session_expired": "The setup expired. Start again.",
-    "bridge_full": "Pick a bridge with room, or move a tag off this one: cremind tags devices move",
+    "bridge_full": "Pick another gateway or bridge with room, or move a tag off this one: "
+                   "cremind tags devices move <tag> --to <gateway or bridge>",
     "authority_unavailable": "This server lost the keys its devices trust; restore them from an encrypted backup "
                              "made with --include-tag-keys.",
 }
@@ -79,16 +85,56 @@ def _devices(view: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-async def _device(client: Any, ref: str, *, kind: Optional[str] = None) -> dict[str, Any]:
-    from app.cli.client import tags_setup as api
+def _places(view: dict[str, Any]) -> dict[str, str]:
+    """Device id -> how the gateway or bridge a tag connects through is named: a
+    gateway by its name (its connection's), a bridge by its name or short id."""
+    names: dict[str, str] = {}
+    for conn in _rows(view.get("connections")):
+        gateway = conn.get("gateway") if isinstance(conn.get("gateway"), dict) else {}
+        if gateway.get("id"):
+            names[gateway["id"]] = str(gateway.get("name") or conn.get("name") or "the gateway")
+        for b in _rows(conn.get("bridges")):
+            if b.get("id"):
+                names[b["id"]] = str(b.get("name") or b.get("short_id") or "a bridge")
+    return names
 
-    items = [d for d in _devices(await api.connections(client)) if kind is None or d.get("kind") == kind]
+
+def _find(items: list[dict[str, Any]], ref: str, *, what: str = "device") -> dict[str, Any]:
+    """One of ``items`` by id, name, short id or device id prefix (8+ characters)."""
     low = ref.strip().lower()
     for d in items:
         if str(d.get("device_id") or "").startswith(low) and len(low) >= 8:
             return d
-    return _match(items, ref, what=kind or "device", list_cmd="cremind tags devices list",
-                  fields=("name", "short_id"))
+    return _match(items, ref, what=what, list_cmd="cremind tags devices list", fields=("name", "short_id"))
+
+
+async def _device(client: Any, ref: str, *, kind: Optional[str] = None) -> dict[str, Any]:
+    from app.cli.client import tags_setup as api
+
+    items = [d for d in _devices(await api.connections(client)) if kind is None or d.get("kind") == kind]
+    return _find(items, ref, what=kind or "device")
+
+
+def _candidate_name(c: dict[str, Any], kind: str) -> str:
+    """A search result as people know it: the gateway (a bridge's search, or a tag
+    the gateway hears on its own radio) or the bridge that heard the device."""
+    if kind == "bridge" or c.get("bridge_kind") == "gateway":
+        return f"gateway '{c.get('bridge_name') or c.get('gateway_id')}'"
+    return f"bridge '{c.get('bridge_name') or c.get('bridge_id')}'"
+
+
+def _serves_tags(ctx: typer.Context, companion_id: Any) -> bool:
+    """Whether that connection's gateway reaches tags on its own radio (False when unknown)."""
+    from app.cli.client import tags_setup as api
+
+    async def fetch(client: Any) -> dict[str, Any]:
+        try:
+            return await api.connections(client)
+        except Exception:  # noqa: BLE001 - only the next-step line depends on it
+            return {}
+
+    conn = next((c for c in _rows(_call(ctx, fetch).get("connections")) if c.get("id") == companion_id), None)
+    return bool(((conn or {}).get("gateway") or {}).get("serves_tags"))
 
 
 async def _connection(client: Any, ref: Optional[str]) -> dict[str, Any]:
@@ -141,18 +187,27 @@ def devices_list(ctx: typer.Context) -> None:
         sys.stdout.write("No hardware yet. Plug a gateway into a gateway computer (cremind tags hosts list) and "
                          "run: cremind tags devices connect\n")
         return
+    places = _places(out)
     table = Table(mode, "ID", "KIND", "NAME", "SHORT ID", "STATE", "CONNECTION", "DETAIL")
     for d in devices:
+        kind, cap = d.get("kind"), d.get("capacity") or {}
         detail = ""
-        if d.get("kind") == "bridge" and d.get("capacity"):
-            detail = f"{d['capacity'].get('assigned')}/{d['capacity'].get('max_tags')} tags"
-        elif d.get("kind") == "tag" and d.get("delivery"):
-            detail = f"{d['delivery'].get('pending_count')} pending"
+        if kind == "bridge" and cap:
+            detail = f"{cap.get('assigned')}/{cap.get('max_tags')} tags"
+        elif kind == "gateway" and d.get("serves_tags"):
+            # Newer gateways reach the tags near them on their own radio.
+            detail = f"{cap.get('assigned')}/{cap.get('max_tags')} tags directly" if cap else "reaches tags itself"
+        elif kind == "gateway" and d.get("serves_tags") is False:
+            detail = "tags need a bridge"
+        elif kind == "tag":
+            parts = [f"{d['delivery'].get('pending_count')} pending" if d.get("delivery") else "",
+                     f"via {places[d['bridge_id']]}" if d.get("bridge_id") in places else ""]
+            detail = ", ".join(p for p in parts if p)
         if d.get("paused"):
             detail = (detail + ", paused").lstrip(", ")
-        table.add_row(str(d.get("id") or ""), str(d.get("kind") or ""), _cell(mode, d.get("name")),
+        table.add_row(str(d.get("id") or ""), str(kind or ""), _cell(mode, d.get("name")),
                       str(d.get("short_id") or ""), str(d.get("state") or ""),
-                      _cell(mode, d.get("connection_name")), detail)
+                      _cell(mode, d.get("connection_name")), _cell(mode, detail))
     table.render()
 
 
@@ -230,8 +285,14 @@ def devices_connect(
         known = ERROR_PROBLEM.get(str(code or ""))
         _fail("the gateway was not connected: " + (problem_text(known, computer) if known else
                                                     str((op.get("error") or {}).get("message") or op.get("state"))))
-    sys.stdout.write(f"Gateway connected through {host_name(computer)}. "
-                     "Next: cremind tags devices add bridge --code-file <label.txt>\n")
+    if _serves_tags(ctx, op.get("companion_id")):
+        sys.stdout.write(f"Gateway connected through {host_name(computer)}. It reaches the tags near it itself. "
+                         "Next: cremind tags devices add tag --code-file <label.txt> (add a bridge only to reach "
+                         "tags farther away)\n")
+    else:
+        sys.stdout.write(f"Gateway connected through {host_name(computer)}. It does not report that it reaches tags "
+                         "itself, so tags need a bridge. Next: cremind tags devices add bridge --code-file "
+                         "<label.txt>\n")
 
 
 @devices_app.command("add")
@@ -244,11 +305,13 @@ def devices_add(
     code_prompt: bool = typer.Option(False, "--code-prompt", help="Type the setup code at a hidden prompt."),
     gateway: Optional[str] = typer.Option(None, "--gateway", help="Bridges: the connection (gateway) to join."),
     candidate: Optional[str] = typer.Option(None, "--candidate", help="Tags: the search result to pair with "
-                                                                      "(when several bridges hear the tag)."),
+                                                                      "(when several devices — your gateway, "
+                                                                      "bridges — hear the tag)."),
     name: Optional[str] = typer.Option(None, "--name", help="A name for the new device."),
     timeout: int = typer.Option(300, "--timeout", help="Seconds to wait for the device."),
 ) -> None:
-    """Add a bridge or a tag from the setup code on its label."""
+    """Add a tag or a bridge from the setup code on its label (a tag connects through your gateway itself, when it
+    reaches tags, or through a bridge)."""
     from app.cli.client import tags_setup as api
     from app.cli.output import print_json
 
@@ -265,14 +328,18 @@ def devices_add(
     disc = _wait(ctx, lambda c: api.get_discovery(c, disc["id"]),
                  lambda o: (o.get("discovery") or {}).get("state") != "scanning", timeout, None).get("discovery") or {}
     if disc.get("state") != "found":
-        _fail(f"nothing found ({disc.get('state')}). Check the device is powered and near a "
-              f"{'gateway' if kind == 'bridge' else 'bridge'}.")
-    eligible = [c for c in _rows(disc.get("candidates")) if c.get("eligible")]
+        _fail(f"nothing found ({disc.get('state')}). Check the device is powered and near "
+              f"{'the gateway' if kind == 'bridge' else 'your gateway or a bridge'}.")
+    candidates = _rows(disc.get("candidates"))
+    eligible = [c for c in candidates if c.get("eligible")]
+    if candidate is None and not eligible:
+        reason = next((str(c["reason"]) for c in candidates if c.get("reason")), "not eligible")
+        _fail(f"found it, but nothing that hears it can take it ({reason})."
+              + (f" {_HINTS[reason]}" if reason in _HINTS else ""))
     pick = candidate or (eligible[0]["id"] if len(eligible) == 1 else None)
     if pick is None:
-        lines = "\n".join(f"  {c.get('id')}  {c.get('bridge_name') or c.get('gateway_id')}  rssi {c.get('rssi')}"
-                          for c in eligible)
-        _fail(f"several bridges hear it (recommended: {disc.get('recommended')}); choose with --candidate:\n{lines}")
+        lines = "\n".join(f"  {c.get('id')}  {_candidate_name(c, kind)}  rssi {c.get('rssi')}" for c in eligible)
+        _fail(f"several devices hear it (recommended: {disc.get('recommended')}); choose with --candidate:\n{lines}")
     out = _call(ctx, lambda c: api.start_pairing(c, disc["id"], pick, name), hints=_HINTS)
     pairing = out.get("pairing") or {}
     final = _wait(ctx, lambda c: api.get_pairing(c, pairing["id"]),
@@ -284,7 +351,9 @@ def devices_add(
     p = final.get("pairing") or {}
     if p.get("state") != "succeeded":
         _fail(f"{kind} not added: {((p.get('error') or {}).get('message') or p.get('state'))}")
-    sys.stdout.write(f"{kind.capitalize()} ready.\n")
+    chosen = next((c for c in candidates if c.get("id") == pick), None)
+    via = f" It connects through {_candidate_name(chosen, kind)}." if kind == "tag" and chosen else ""
+    sys.stdout.write(f"{kind.capitalize()} ready.{via}\n")
 
 
 @devices_app.command("cancel")
@@ -332,8 +401,8 @@ def devices_remove(
         return
     affected = ((out.get("device") or {}).get("affected_tag_ids") or [])
     if affected:
-        sys.stdout.write(f"{len(affected)} tag(s) used this bridge; move them: cremind tags devices move <tag> "
-                         "--bridge <bridge>\n")
+        sys.stdout.write(f"{len(affected)} tag(s) used this bridge; move them to your gateway (if it reaches tags "
+                         "itself) or another bridge: cremind tags devices move <tag> --to <gateway or bridge>\n")
     sys.stdout.write("Removed from Cremind." + ("" if force else " Cleanup finishes when the device is reachable.")
                      + "\n")
 
@@ -371,16 +440,27 @@ def devices_resume(
 def devices_move(
     ctx: typer.Context,
     tag: str = typer.Argument(..., help="The tag."),
-    bridge: str = typer.Option(..., "--bridge", help="The ready bridge (same gateway) to use."),
+    to: str = typer.Option(..., "--bridge", "--to", help="Where it connects from now on: `gateway` (the tag's own "
+                                                         "gateway, when it reaches tags itself) or a ready bridge of "
+                                                         "that gateway (id, name or short id)."),
 ) -> None:
-    """Serve a tag through another bridge."""
+    """Serve a tag through its gateway or another bridge of the same gateway."""
     from app.cli.client import tags_setup as api
     from app.cli.output import print_json
 
     async def go(client: Any) -> dict[str, Any]:
-        t = await _device(client, tag, kind="tag")
-        b = await _device(client, bridge, kind="bridge")
-        return await api.move(client, t["id"], b["id"])
+        items = _devices(await api.connections(client))
+        t = _find([d for d in items if d.get("kind") == "tag"], tag, what="tag")
+        # Only the tag's own connection: its gateway and that gateway's bridges.
+        places = [d for d in items
+                  if d.get("kind") in ("gateway", "bridge") and d.get("connection") == t.get("connection")]
+        if to.strip().lower() == "gateway":
+            target = next((d for d in places if d.get("kind") == "gateway"), None)
+            if target is None:
+                _fail("the tag's gateway is not listed: cremind tags devices list")
+        else:
+            target = _find(places, to, what="gateway or bridge of the tag's connection")
+        return await api.move(client, t["id"], target["id"])
 
     print_json(_call(ctx, go, hints=_HINTS))
 
