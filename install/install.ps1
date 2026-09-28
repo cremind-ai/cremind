@@ -305,6 +305,8 @@ param(
     [switch] $Purge,
     # With -Purge: delete the profiles' working directories too (kept by default).
     [switch] $PurgeWorkspaces,
+    # Only the Cremind Tag gateway runtime (see "-RuntimeOnly" below).
+    [switch] $RuntimeOnly,
     # Skip the prompt_toolkit TUI bootstrap and fall back to the legacy
     # numbered prompts. CI/debugging only — interactive users benefit
     # from the TUI's keyboard navigation and version picker.
@@ -429,6 +431,21 @@ function Write-Utf8NoBomFile {
 # (profiles.working_dir; before per-profile folders,
 # server_config.user_working_dir) is NEVER touched; when it resolves inside
 # the System Dir, -Purge takes it along with the rest of the System Dir.
+# -RuntimeOnly: the Cremind Tag gateway runtime alone, for a desktop gateway
+# computer whose Cremind runs elsewhere (this computer's own Docker install,
+# which cannot see its USB ports, or another machine): a venv with
+# ``cremind[tags]`` under the Install Dir (``<INSTALL_DIR>\tag-host\venv``) and
+# nothing else — no .env, no database, no APP_URL rewrite, no server start, no
+# boot service, no PATH change. The Cremind app runs ``cremind tags host``
+# from it. A newer runtime already there is kept (never downgraded).
+if ($RuntimeOnly) {
+    $Mode = 'native'; $Unattended = $true; $NoTui = $true; $NoLaunch = $true
+    $BootService = $false; $NoBootService = $true; $Ssl = 'none'
+    $ModifyPath = $false; $NoModifyPath = $true
+    if (-not $NoAutoInstallPython) { $AutoInstallPython = $true }
+    if (-not $Deployment) { $Deployment = 'local' }
+}
+
 if ($Uninstall) {
     if ($Keep -and $Purge) {
         Write-Host "Pass at most one of -Keep / -Purge." -ForegroundColor Red
@@ -1394,6 +1411,10 @@ $BootstrapFile = Join-Path $CremindSystemDir 'bootstrap.toml'
 $ServerLogFile = Join-Path $CremindSystemDir 'server.log'
 $BinDir        = Join-Path $CremindSystemDir 'bin'
 $UvExe         = Join-Path $BinDir 'uv.exe'
+# -RuntimeOnly: its own venv, apart from any Cremind installed here.
+if ($RuntimeOnly) {
+    $VenvDir = Join-Path (Join-Path $CremindInstallDir 'tag-host') 'venv'
+}
 
 # Paths in the Install Dir (scratch — safely deletable on uninstall -Keep)
 $LogFile       = Join-Path $CremindInstallDir 'install.log'
@@ -4688,7 +4709,9 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
         $NodeMajor = [int]((& node -e 'console.log(process.versions.node.split(".")[0])' 2>$null) | Select-Object -First 1)
     } catch { $NodeMajor = $null }
 }
-if ($null -eq $NodeMajor) {
+if ($RuntimeOnly) {
+    # The gateway runtime needs no channel sidecars.
+} elseif ($null -eq $NodeMajor) {
     Write-Info "Node.js: not found - the WhatsApp and Zalo channels need Node 20+ (https://nodejs.org). Everything else works without it."
 } elseif ($NodeMajor -lt 20) {
     Write-Info "Node.js: v$NodeMajor found, but the WhatsApp and Zalo channels need Node 20+."
@@ -4915,12 +4938,36 @@ if ($Channel -eq 'dev') {
         }
     }
 
-    if (Test-Path $VenvDir) {
+    $RuntimeKept = $false
+    if ($RuntimeOnly) {
+        # The gateway runtime: the same release, with the ``tags`` extra.
+        if ($InstallSpec -match '^https?://') { $InstallSpec = "cremind[tags] @ $InstallSpec" }
+        elseif ($InstallSpec -like 'cremind==*') { $InstallSpec = 'cremind[tags]==' + $InstallSpec.Substring(9) }
+        else { $InstallSpec = 'cremind[tags]' }
+        # Never downgrade a newer runtime already here.
+        $VenvPythonExe = Join-Path $VenvDir 'Scripts\python.exe'
+        $Wanted = if ($Version) { $Version } else { $ElectronVersion }
+        if ((Test-Path $VenvCremind) -and $Wanted) {
+            $Have = ''
+            try { $Have = (& $VenvCremind version 2>$null).Split(' ')[-1] } catch {}
+            if ($Have) {
+                & $VenvPythonExe -c "import sys`nfrom pip._vendor.packaging.version import Version as V`nsys.exit(0 if V(sys.argv[1]) >= V(sys.argv[2]) else 1)" $Have $Wanted 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Info "Gateway runtime $Have is already here (not older than $Wanted); keeping it."
+                    $RuntimeKept = $true
+                }
+            }
+        }
+    }
+    if ($RuntimeKept) {
+        # nothing to install
+    } elseif (Test-Path $VenvDir) {
         Write-Info "Existing install detected at $VenvDir — upgrading in place."
         Invoke-NativeLogged { & $VenvPip install --upgrade pip }
         Invoke-NativeLogged { & $VenvPip install --upgrade $InstallSpec }
     } else {
         Write-Info "Creating venv at $VenvDir"
+        New-Item -ItemType Directory -Force -Path (Split-Path $VenvDir -Parent) | Out-Null
         Invoke-NativeLogged { & $Python -m venv $VenvDir }
         Write-Info "Installing cremind from $InstallSourceLabel (this may take a few minutes)"
         Invoke-NativeLogged { & $VenvPip install --upgrade pip }
@@ -4931,6 +4978,27 @@ if ($Channel -eq 'dev') {
     try { $InstalledVersion = (& $VenvCremind version 2>$null).Split(' ')[-1] } catch {}
     if (-not $InstalledVersion) { $InstalledVersion = '?' }
     Write-Ok "Installed cremind $InstalledVersion"
+}
+
+if ($RuntimeOnly) {
+    # The gateway runtime is all this run installs: record it (the Cremind
+    # app reads it apart from any backend) and stop before .env, the
+    # database and the server.
+    $RuntimeDir = Split-Path $VenvDir -Parent
+    if ($Channel -eq 'dev') {
+        $RuntimeDir = Join-Path $CremindInstallDir 'tag-host'
+        Write-Info "Dev: the gateway runtime is the checkout's .venv - set CREMIND_TAG_HOST_EXE=$VenvCremind for the app."
+    }
+    New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+    $RuntimeDoc = [ordered]@{
+        schema = 'cremind/tag-host-runtime@1'; version = $InstalledVersion; venv = $VenvDir
+        installed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    # No BOM: every reader of this file is a JSON parser.
+    [System.IO.File]::WriteAllText((Join-Path $RuntimeDir 'runtime.json'), ($RuntimeDoc | ConvertTo-Json -Compress),
+        (New-Object System.Text.UTF8Encoding($false)))
+    Write-Ok "Gateway runtime ready: $VenvDir"
+    exit 0
 }
 
 # ── shim & PATH ───────────────────────────────────────────────────────────

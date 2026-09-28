@@ -379,6 +379,43 @@ Both installers ask **how** Cremind will be reached:
 container-friendly defaults) for one release; new scripts should use
 `custom` directly.
 
+## Cremind Tag gateways and containers
+
+A Cremind Tag gateway is a USB device. Cremind drives it from the computer it
+plugs into — its **gateway computer** (Settings → Tags → Gateway computers):
+
+- **Native install:** the computer Cremind runs on is a gateway computer
+  already; plug the gateway in there.
+- **Docker Desktop (Windows, macOS):** containers cannot see the host's USB
+  ports. Make this computer a gateway computer instead: Settings → Tags →
+  *Set up a gateway computer* → *Set up this computer* in the Cremind app. The
+  app installs the gateway runtime on its own (`--runtime-only` below: a venv
+  with `cremind[tags]` under the Install Dir — no second server, no database)
+  and keeps it running; the container is left as it is.
+- **Docker on Linux:** either the same, or hand the device to the container.
+  Add a `docker-compose.override.yml` next to `docker-compose.yml` and
+  recreate the container (`docker compose up -d`):
+
+  ```yaml
+  services:
+    cremind:
+      devices:
+        # The gateway's stable name: ls -l /dev/serial/by-id/
+        - "/dev/serial/by-id/usb-Cremind_Tag_Gateway_XXXX-if00:/dev/ttyACM0"
+      group_add:
+        - "dialout"   # or the numeric gid that owns the device on the host
+  ```
+
+  A gateway plugged in after the container started is not seen until it is
+  recreated; `device_cgroup_rules: ["c 166:* rmw"]` with a bind mount of
+  `/dev/serial` lets it follow re-plugs.
+- **Kubernetes:** pods rarely sit on the machine the gateway plugs into — use a
+  gateway computer (the Cremind app, or `cremind tags host` on any computer
+  with Python 3.13).
+
+`cremind tags hosts list` (or the Settings page) shows, per computer, whether
+its USB ports are usable and why not.
+
 ## Flags (sh)
 
 | Flag | Description |
@@ -412,6 +449,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--reinstall`                        | Wipe the existing venv (native) or regenerate compose+.env (docker). |
 | `--uninstall [--keep\|--purge]`      | Uninstall. `--keep` removes the binaries and install scratch and keeps your data; `--purge` deletes everything Cremind installed **except the profiles' working directories** (see [Uninstalling](#uninstalling)). Neither: asks. |
 | `--purge-workspaces`                 | (with `--uninstall`; implies `--purge`) Delete the profiles' working directories too. Asks you to type `delete` on a terminal; without one the flag is the confirmation. |
+| `--runtime-only`                     | Only the Cremind Tag gateway runtime, for a gateway computer whose Cremind runs elsewhere (see [Cremind Tag gateways and containers](#cremind-tag-gateways-and-containers)): a venv with `cremind[tags]` at `<Install Dir>/tag-host/venv` and `runtime.json` beside it. No `.env`, database, server, boot service or PATH change; implies `--unattended`. A newer runtime already there is kept. |
 
 ## Flags (ps1)
 
@@ -446,6 +484,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-Reinstall`                        | Wipe the existing venv or regenerate compose+.env. |
 | `-Uninstall [-Keep\|-Purge]`        | Uninstall. `-Keep` keeps your data; `-Purge` deletes everything Cremind installed **except the profiles' working directories** (see [Uninstalling](#uninstalling)). Neither: asks. |
 | `-PurgeWorkspaces`                  | (with `-Uninstall`; implies `-Purge`) Delete the profiles' working directories too. Asks you to type `delete` in an interactive console; without one the switch is the confirmation. |
+| `-RuntimeOnly`                      | Only the Cremind Tag gateway runtime (see `--runtime-only`): `<Install Dir>\tag-host\venv` with `cremind[tags]`, nothing else. |
 
 ## Shared catalog
 

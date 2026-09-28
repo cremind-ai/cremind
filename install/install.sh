@@ -303,6 +303,8 @@ NO_TUI="${CREMIND_NO_TUI:-0}"
 # below (after flag parsing) and exits before any install-side setup.
 # UNINSTALL_MODE is read from --keep / --purge; empty = interactive prompt.
 UNINSTALL=0
+# 1 = only the Cremind Tag gateway runtime (see "--runtime-only" below).
+RUNTIME_ONLY=0
 UNINSTALL_MODE=""        # keep | purge | empty (interactive)
 # --purge-workspaces: a purge deletes the profiles' working directories too.
 # Without it a purge keeps them (see the uninstall flow).
@@ -428,6 +430,7 @@ while [ $# -gt 0 ]; do
         --purge)                  UNINSTALL_MODE="purge"; shift ;;
         --purge-workspaces)       PURGE_WORKSPACES=1; shift ;;
         --no-tui)                 NO_TUI=1; shift ;;
+        --runtime-only)           RUNTIME_ONLY=1; shift ;;
         --help|-h)
             sed -n '1,/^set -e/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -e/d'
             exit 0
@@ -438,6 +441,22 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# ── --runtime-only ────────────────────────────────────────────────────────
+# The Cremind Tag gateway runtime alone, for a desktop gateway computer whose
+# Cremind runs elsewhere (this computer's own Docker install, which cannot see
+# its USB ports, or another machine): a venv with ``cremind[tags]`` under the
+# Install Dir (``<INSTALL_DIR>/tag-host/venv``) and nothing else — no .env, no
+# database, no APP_URL rewrite, no server start, no boot service, no PATH
+# change. The Cremind app runs ``cremind tags host`` from it. A newer runtime
+# already there is kept (never downgraded).
+if [ "$RUNTIME_ONLY" -eq 1 ]; then
+    MODE="native"; UNATTENDED=1; NO_TUI=1; NO_LAUNCH=1
+    BOOT_SERVICE=0; BOOT_EXPLICIT=1; SSL_MODE="none"; SSL_EXPLICIT=1
+    MODIFY_PATH=0
+    [ -n "$AUTO_INSTALL_PYTHON" ] || AUTO_INSTALL_PYTHON=1
+    [ -n "$DEPLOYMENT" ] || DEPLOYMENT="local"
+fi
 
 # ── --uninstall flow ──────────────────────────────────────────────────────
 # Inline uninstaller. Runs before banner / catalog / TUI setup so the
@@ -1359,6 +1378,10 @@ ENV_FILE="$CREMIND_SYSTEM_DIR/.env"
 BOOTSTRAP_FILE="$CREMIND_SYSTEM_DIR/bootstrap.toml"
 BIN_DIR="$CREMIND_SYSTEM_DIR/bin"
 UV_BIN="$BIN_DIR/uv"
+# --runtime-only: its own venv, apart from any Cremind installed here.
+if [ "$RUNTIME_ONLY" -eq 1 ]; then
+    VENV_DIR="$CREMIND_INSTALL_DIR/tag-host/venv"
+fi
 
 # Paths in the Install Dir (scratch — safely deletable on uninstall --keep)
 LOG_FILE="$CREMIND_INSTALL_DIR/install.log"
@@ -4665,7 +4688,7 @@ check_node_for_sidecars() {
             ;;
     esac
 }
-check_node_for_sidecars
+[ "$RUNTIME_ONLY" -eq 1 ] || check_node_for_sidecars
 
 # Print the manual-install hint shown when auto-install is declined or fails.
 print_python_manual_hint() {
@@ -4894,12 +4917,35 @@ else
             ;;
     esac
 
-    if [ -d "$VENV_DIR" ]; then
+    RUNTIME_KEPT=0
+    if [ "$RUNTIME_ONLY" -eq 1 ]; then
+        # The gateway runtime: the same release, with the ``tags`` extra.
+        case "$INSTALL_SPEC" in
+            http*)      INSTALL_SPEC="cremind[tags] @ $INSTALL_SPEC" ;;
+            cremind==*) INSTALL_SPEC="cremind[tags]==${INSTALL_SPEC#cremind==}" ;;
+            *)          INSTALL_SPEC="cremind[tags]" ;;
+        esac
+        # Never downgrade a newer runtime already here.
+        if [ -x "$VENV_DIR/bin/cremind" ]; then
+            have="$("$VENV_DIR/bin/cremind" version 2>/dev/null | awk '{print $2}')"
+            want="${VERSION_SPEC:-$ELECTRON_VERSION}"
+            if [ -n "$have" ] && [ -n "$want" ] && "$VENV_DIR/bin/python" -c "import sys
+from pip._vendor.packaging.version import Version as V
+sys.exit(0 if V(sys.argv[1]) >= V(sys.argv[2]) else 1)" "$have" "$want" 2>/dev/null; then
+                info "Gateway runtime $have is already here (not older than $want); keeping it."
+                RUNTIME_KEPT=1
+            fi
+        fi
+    fi
+    if [ "$RUNTIME_KEPT" -eq 1 ]; then
+        :
+    elif [ -d "$VENV_DIR" ]; then
         info "Existing install detected at $VENV_DIR — upgrading in place."
         "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG_FILE" 2>&1
         "$VENV_DIR/bin/pip" install --upgrade "$INSTALL_SPEC" >>"$LOG_FILE" 2>&1
     else
         info "Creating venv at $VENV_DIR"
+        mkdir -p "$(dirname "$VENV_DIR")"
         "$PYTHON" -m venv "$VENV_DIR" >>"$LOG_FILE" 2>&1
         info "Installing cremind from $INSTALL_SOURCE_LABEL (this may take a few minutes)"
         "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG_FILE" 2>&1
@@ -4908,6 +4954,22 @@ else
 
     INSTALLED_VERSION="$("$VENV_DIR/bin/cremind" version 2>/dev/null | awk '{print $2}' || echo "?")"
     ok "Installed cremind $INSTALLED_VERSION"
+fi
+
+if [ "$RUNTIME_ONLY" -eq 1 ]; then
+    # The gateway runtime is all this run installs: record it (the Cremind
+    # app reads it apart from any backend) and stop before .env, the
+    # database and the server.
+    RUNTIME_DIR="$(dirname "$VENV_DIR")"
+    if [ "$CHANNEL" = "dev" ]; then
+        RUNTIME_DIR="$CREMIND_INSTALL_DIR/tag-host"
+        info "Dev: the gateway runtime is the checkout's .venv — set CREMIND_TAG_HOST_EXE=$VENV_DIR/bin/cremind for the app."
+    fi
+    mkdir -p "$RUNTIME_DIR"
+    printf '{"schema": "cremind/tag-host-runtime@1", "version": "%s", "venv": "%s", "installed_at": "%s"}\n' \
+        "$INSTALLED_VERSION" "$VENV_DIR" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUNTIME_DIR/runtime.json"
+    ok "Gateway runtime ready: $VENV_DIR"
+    exit 0
 fi
 
 # ── shim & PATH ───────────────────────────────────────────────────────────

@@ -120,8 +120,67 @@ jobs:
       - name: Run pytest
         run: uv run pytest
 
-  wheel:
+  # Cremind Tag's font asset bundle: every gateway computer installs it (tag
+  # screens are composed there). app/tags/runtime/fonts/bundle.json pins it by
+  # pack id and SHA-256; it is published once per pack as the asset of the
+  # release ``fonts-<pack_id>``. When that release is missing, rebuild the
+  # pack from the pinned font sources, prove the archive matches the pin byte
+  # for byte (scripts/tags/build_font_bundle.py --check), and publish it — so
+  # no Cremind release can point gateway computers at a bundle that is not
+  # there.
+  fonts:
     needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Is the pinned font bundle published?
+        id: pin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pack="$(python3 -c 'import json; print(json.load(open("app/tags/runtime/fonts/bundle.json"))["pack_id"])')"
+          echo "pack=$pack" >> "$GITHUB_OUTPUT"
+          if gh release view "fonts-$pack" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "published=1" >> "$GITHUB_OUTPUT"
+            echo "fonts-$pack is already published"
+          fi
+
+      - name: Set up Python 3.13
+        if: steps.pin.outputs.published != '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        if: steps.pin.outputs.published != '1'
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build the bundle and prove it matches the pin
+        if: steps.pin.outputs.published != '1'
+        run: |
+          uv sync --all-groups
+          uv run cremind tags tools fonts fetch
+          uv run cremind tags tools fonts build --profile full
+          uv run python scripts/tags/build_font_bundle.py --check
+
+      - name: Publish fonts-${{ steps.pin.outputs.pack }}
+        if: steps.pin.outputs.published != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "fonts-${{ steps.pin.outputs.pack }}" dist/fonts/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "Cremind Tag font bundle ${{ steps.pin.outputs.pack }}" \
+            --notes "The font asset bundle Cremind Tag gateway computers install (tag screens are drawn with it). Pinned by app/tags/runtime/fonts/bundle.json; licences inside."
+
+  wheel:
+    needs: [test, fonts]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed for creating the GitHub prerelease

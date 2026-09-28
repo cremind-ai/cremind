@@ -94,18 +94,26 @@ def _source(tmp: Path, lock: dict[str, Any] | None, say: Callable[[str], None]) 
     if env:
         say(f"Using the font bundle named by {BUNDLE_ENV}.")
         return _materialise(env, tmp, None)
-    if lock and lock.get("url"):
-        say(f"Downloading font pack {lock['pack_id']} ({int(lock.get('size') or 0) // (1 << 20)} MB)…")
-        return _materialise(str(lock["url"]), tmp, str(lock.get("sha256") or "") or None)
     checkout = _checkout_pack(str((lock or {}).get("profile") or "full"))
-    if checkout is not None:
+    # A checkout that already built the pinned pack (or any pack, without a pin) needs no download.
+    if checkout is not None and (lock is None or _pack_id(checkout[0]) == str(lock.get("pack_id"))):
         from app.tags.runtime.resources import make_font_assets
 
         pack_dir, cache = checkout
         say(f"Using the font pack built in this checkout ({pack_dir}).")
         make_font_assets(pack_dir, cache, tmp / "assets")
         return tmp / "assets"
+    if lock and lock.get("url"):
+        say(f"Downloading font pack {lock['pack_id']} ({int(lock.get('size') or 0) // (1 << 20)} MB)…")
+        return _materialise(str(lock["url"]), tmp, str(lock.get("sha256") or "") or None)
     return None
+
+
+def _pack_id(pack_dir: Path) -> str | None:
+    try:
+        return str(json.loads((pack_dir / "fontpack.json").read_text(encoding="utf-8")).get("pack_id") or "") or None
+    except (OSError, ValueError):
+        return None
 
 
 def _checkout_pack(profile: str) -> tuple[Path, Path] | None:

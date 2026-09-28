@@ -36,11 +36,13 @@ REQUIRED_LOCKFILES = (
 )
 
 # Data files the Cremind Tag runtime reads: the pinned protocol contract
-# (verified against its manifest, and the source of the generated bindings).
+# (verified against its manifest, and the source of the generated bindings),
+# and the pin of the font bundle gateway computers install.
 REQUIRED_DATA = (
     "app/tags/runtime/protocol/pinned/contract.json",
     "app/tags/runtime/protocol/pinned/spec.yaml",
     "app/tags/runtime/protocol/pinned/fixtures/fontpack_test.ctfp",
+    "app/tags/runtime/fonts/bundle.json",
 )
 
 
