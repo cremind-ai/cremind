@@ -1546,11 +1546,14 @@ def hardware_set_defaults(
     _render_defaults(mode, out)
 
 
-# Simple device setup through Cremind Connect: `cremind tags devices …`
-# (app/cli/commands/tags_devices.py; imported last — it reuses the helpers above).
+# Simple device setup: `cremind tags devices …` and the gateway computers it
+# runs on, `cremind tags hosts …` (app/cli/commands/tags_devices.py,
+# tags_hosts.py; imported last — they reuse the helpers above).
 from app.cli.commands.tags_devices import devices_app  # noqa: E402
+from app.cli.commands.tags_hosts import hosts_app  # noqa: E402
 
 tags_app.add_typer(devices_app, name="devices")
+tags_app.add_typer(hosts_app, name="hosts")
 
 # Host-side hardware tools (firmware, enrollment, bridge fonts, simulator):
 # `cremind tags tools …` hands everything after `tools` to app.tags.runtime.cli.

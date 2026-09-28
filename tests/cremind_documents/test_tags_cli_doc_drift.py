@@ -27,10 +27,12 @@ BUNDLED = Path(__file__).resolve().parents[2] / "app" / "cremind_documents" / "b
 DOC = BUNDLED / "[cli]cremind tags.md"
 HARDWARE_DOC = BUNDLED / "[cli]cremind tags hardware.md"
 DEVICES_DOC = BUNDLED / "[cli]cremind tags devices.md"
+HOSTS_DOC = BUNDLED / "[cli]cremind tags hosts.md"
 TOOLS_DOC = BUNDLED / "[cli]cremind tags tools.md"
-ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC, TOOLS_DOC]
+ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC, HOSTS_DOC, TOOLS_DOC]
 HARDWARE_GROUP = "hardware"
 DEVICES_GROUP = "devices"
+HOSTS_GROUP = "hosts"
 TOOLS_GROUP = "tools"
 
 
@@ -54,7 +56,8 @@ def _walk(app, prefix: str):
 
 def _doc_for(path: str) -> Path:
     group = path.split(" ")[2]
-    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC, TOOLS_GROUP: TOOLS_DOC}.get(group, DOC)
+    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC, HOSTS_GROUP: HOSTS_DOC,
+            TOOLS_GROUP: TOOLS_DOC}.get(group, DOC)
 
 
 @pytest.mark.parametrize("doc", ALL_DOCS, ids=lambda d: d.name)
@@ -91,7 +94,8 @@ def test_every_subcommand_and_flag_is_documented_in_the_right_doc():
                         assert flag in text, f"flag {flag} of `{path}` is undocumented"
     for expected in ("cremind tags list", "cremind tags display", "cremind tags deliveries list",
                      "cremind tags credentials create", "cremind tags hardware claim",
-                     "cremind tags hardware set-defaults"):
+                     "cremind tags hardware set-defaults", "cremind tags devices connect",
+                     "cremind tags hosts scan", "cremind tags hosts access"):
         assert expected in seen
 
 
@@ -256,3 +260,85 @@ def test_the_documented_limits_match_the_server():
     assert service.PINNED_TTL_MIN_S == 60 and service.PINNED_TTL_MAX_S == 7 * 24 * 3600
     assert "1 minute to 7 days" in text
     assert service.PINNED_TTL_DEFAULT_S == 24 * 3600 and "| `--ttl` | 1 day |" in text
+
+
+def test_the_setup_and_host_client_calls_only_real_server_routes():
+    """Each `app.cli.client.tags_setup` wrapper's method + path must match a
+    route of the setup or gateway-computer API, so a renamed endpoint fails
+    here and not in a user's terminal."""
+    import asyncio
+
+    import app.cli.client.tags_setup as c
+    from app.api.tags_hosts import get_tags_hosts_routes
+    from app.api.tags_setup import get_tags_setup_routes
+
+    routes = [
+        (method, re.compile("^" + re.sub(r"\{[^}]+\}", "[^/]+", r.path) + "$"))
+        for r in [*get_tags_setup_routes(), *get_tags_hosts_routes()]
+        for method in (r.methods or ()) if method != "HEAD"
+    ]
+    seen: list[tuple[str, str]] = []
+
+    class _Client:
+        async def get_json(self, path, *, params=None):
+            seen.append(("GET", path))
+            return {}
+
+        async def _body(self, method, path):
+            seen.append((method, path))
+            return {}
+
+        async def post_json(self, path, body=None, *, params=None):
+            return await self._body("POST", path)
+
+        async def put_json(self, path, body=None, *, params=None):
+            return await self._body("PUT", path)
+
+        async def patch_json(self, path, body=None, *, params=None):
+            return await self._body("PATCH", path)
+
+        async def delete(self, path, body=None, *, params=None):
+            return await self._body("DELETE", path)
+
+    samples = {"session_id": "s1", "operation": "connect_gateway", "server_url": "https://x", "role": "tag",
+               "setup_code": "CODE", "discovery_id": "d1", "candidate_id": "c1", "pairing_id": "p1",
+               "device_id": "dev1", "paused": True, "bridge_id": "b1", "recovery_id": "r1", "host_id": "h1",
+               "profile_id": "pid1", "granted": True, "operation_id": "o1"}
+
+    async def go():
+        cl = _Client()
+        for name, fn in inspect.getmembers(c, inspect.iscoroutinefunction):
+            if name.startswith("_") or fn.__module__ != c.__name__:
+                continue
+            params = [p for p in inspect.signature(fn).parameters.values()
+                      if p.name != "client" and p.default is inspect.Parameter.empty
+                      and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+            await fn(cl, *[samples[p.name] for p in params])
+
+    asyncio.run(go())
+    for expected in (("GET", "/api/tags/hosts"), ("POST", "/api/tags/hosts/h1/scan"),
+                     ("PUT", "/api/tags/hosts/h1/access/pid1"), ("POST", "/api/tags/connections"),
+                     ("GET", "/api/tags/operations/o1"), ("DELETE", "/api/tags/operations/o1")):
+        assert expected in seen, expected
+    unmatched = [(m, path) for m, path in seen if not any(m == rm and rx.match(path) for rm, rx in routes)]
+    assert not unmatched, f"the CLI calls endpoints the server does not serve: {unmatched}"
+
+
+def test_the_setup_docs_no_longer_ask_for_cremind_connect():
+    """Cremind drives gateways itself: no doc tells anyone to install Cremind Connect."""
+    for doc in (DEVICES_DOC, HOSTS_DOC):
+        text = " ".join(_doc_text(doc).split()).lower()
+        assert "install cremind connect" not in text and "cremind-connect://" not in text, doc.name
+        assert "installers" not in text, doc.name
+
+
+def test_every_hint_the_devices_and_hosts_cli_print_is_explained_in_their_docs():
+    from app.cli.commands import tags  # noqa: F401 - the parent group first: it registers its sub-apps
+    from app.cli.commands import tags_devices, tags_hosts
+
+    documented = _doc_text(DEVICES_DOC) + _doc_text(HOSTS_DOC)
+    for code in {**tags_hosts.HINTS, **tags_devices._HINTS}:
+        assert f"`{code}`" in documented, f"the CLI hints at {code!r} but no doc explains it"
+    devices = " ".join(_doc_text(DEVICES_DOC).split())  # prose is wrapped; compare it unwrapped
+    for title, _ in tags_hosts.PROBLEMS.values():
+        assert title in devices, title

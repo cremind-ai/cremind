@@ -1,10 +1,12 @@
 """`cremind tags devices ...` — set up and manage this profile's own Cremind Tag
-hardware through Cremind Connect (Settings → Tags, "Hardware").
+hardware (Settings → Tags, "Your hardware").
 
-Mirrors the Settings page: connect a USB gateway (a Cremind Connect window on
-the computer the gateway is plugged into asks for approval), add bridges and
-tags from their setup codes, and pause, move, test, remove or recover them.
-The CLI is optional — the Settings page does all of it.
+Mirrors the Settings page: connect a USB gateway plugged into a gateway
+computer (Cremind drives it from there — see ``cremind tags hosts``), add
+bridges and tags from their setup codes, and pause, move, test, remove or
+recover them onto another computer. The CLI is optional — the Settings page
+does all of it. It never acts on the USB ports of the computer it runs on
+unless that is the gateway computer named (or the only one there is).
 
 Setup codes are secrets printed on labels: they are read from a file
 (``--code-file``, ``-`` for stdin) or a hidden prompt (``--code-prompt``),
@@ -19,23 +21,26 @@ from __future__ import annotations
 
 import sys
 import time
-import webbrowser
 from typing import Any, Optional
-from urllib.parse import urlsplit
 
 import typer
 
 from app.cli.commands._helpers import graceful_errors
 from app.cli.commands.tags import _call, _cell, _fail, _match, _mode, _rows
+from app.cli.commands.tags_hosts import (
+    ERROR_PROBLEM, HINTS as HOST_HINTS, candidate_line, host_name, problem_text, resolve_host, run_scan,
+    scan_problem, wait_operation,
+)
 
 devices_app = typer.Typer(
     name="devices",
-    help="Set up your own gateways, bridges and tags with Cremind Connect: connect, add, pause, remove, recover.",
+    help="Set up your own gateways, bridges and tags: connect, add, pause, remove, move to another computer.",
     no_args_is_help=True,
 )
 
 _POLL_S = 1.5
 _HINTS = {
+    **HOST_HINTS,
     "simple_setup_disabled": "The admin has not turned on hardware setup from Settings → Tags on this server.",
     "no_gateway": "Connect a gateway first: cremind tags devices connect",
     "no_ready_bridge": "Add a bridge first: cremind tags devices add bridge --code-file <label.txt>",
@@ -44,20 +49,11 @@ _HINTS = {
     "setup_code_wrong_role": "This label belongs to another kind of device.",
     "already_paired": "It is already set up: cremind tags devices list",
     "device_owned": "That device is set up elsewhere. Reset it (see its documentation) to set it up again.",
-    "not_approved": "Approve in the Cremind Connect window first.",
-    "session_expired": "The setup expired (5 minutes). Start again.",
+    "session_expired": "The setup expired. Start again.",
     "bridge_full": "Pick a bridge with room, or move a tag off this one: cremind tags devices move",
     "authority_unavailable": "This server lost the keys its devices trust; restore them from an encrypted backup "
                              "made with --include-tag-keys.",
 }
-
-
-def _server_origin(ctx: typer.Context, server: Optional[str]) -> str:
-    raw = server or ctx.obj["cfg"].server
-    parts = urlsplit(raw)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        _fail(f"--server must be an http(s) address, got '{raw}'")
-    return f"{parts.scheme}://{parts.netloc}"
 
 
 def _read_code(code_file: Optional[str], code_prompt: bool) -> str:
@@ -106,18 +102,6 @@ async def _connection(client: Any, ref: Optional[str]) -> dict[str, Any]:
     return _match(conns, ref, what="connection", list_cmd="cremind tags devices list", fields=("name",))
 
 
-def _open_link(url: str, *, open_it: bool) -> None:
-    sys.stdout.write("Opening Cremind Connect on this computer…\n" if open_it else
-                     "Open this link on the computer the gateway is plugged into:\n")
-    if not open_it:
-        sys.stdout.write(f"  {url}\n")
-        return
-    try:
-        webbrowser.open(url)
-    except Exception:  # noqa: BLE001
-        sys.stdout.write(f"  (could not open it automatically — open: {url})\n")
-
-
 def _wait(ctx: typer.Context, fetch, done, timeout: float, show) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last = None
@@ -133,42 +117,6 @@ def _wait(ctx: typer.Context, fetch, done, timeout: float, show) -> dict[str, An
         if time.monotonic() > deadline:
             _fail("timed out waiting; check again with: cremind tags devices status <id>")
         time.sleep(_POLL_S)
-
-
-def _connect_flow(ctx: typer.Context, operation: str, server: Optional[str], open_link: bool, yes: bool,
-                  timeout: float, companion_id: Optional[str] = None) -> dict[str, Any]:
-    from app.cli.client import tags_setup as api
-
-    origin = _server_origin(ctx, server)
-    if operation == "recover":
-        out = _call(ctx, lambda c: api.start_recovery(c, companion_id or "", origin), hints=_HINTS)
-    else:
-        out = _call(ctx, lambda c: api.create_session(c, operation, origin), hints=_HINTS)
-    session = out.get("session") or {}
-    sid = session.get("id")
-    _open_link(str(out.get("launch_url") or ""), open_it=open_link)
-    sys.stdout.write("Waiting for Cremind Connect (approve in its window)…\n")
-    state = _wait(ctx, lambda c: api.get_session(c, sid),
-                  lambda o: (o.get("session") or {}).get("state") in (
-                      "waiting_for_confirmation", "completed", "cancelled", "expired", "failed"),
-                  timeout, None).get("session") or {}
-    if state.get("state") != "waiting_for_confirmation":
-        _fail(f"setup ended: {state.get('state')} {((state.get('error') or {}).get('message') or '')}".rstrip())
-    computer = (state.get("computer") or {}).get("name") or "this computer"
-    gateway = (state.get("gateway") or {}).get("short_id") or ""
-    sys.stdout.write(f"\nComputer: {computer}\nGateway:  …{gateway}\n"
-                     f"Words:    {state.get('verification_phrase')}\n\n")
-    if not yes and not typer.confirm("Does the Cremind Connect window show the same words?", default=False):
-        _call(ctx, lambda c: api.cancel_session(c, sid))
-        _fail("cancelled.")
-    _call(ctx, lambda c: api.confirm_session(c, sid), hints=_HINTS)
-    final = _wait(ctx, lambda c: api.get_session(c, sid),
-                  lambda o: (o.get("session") or {}).get("state") in ("completed", "cancelled", "expired", "failed"),
-                  timeout, lambda o: {"redeeming": "Setting up…", "connecting": "Connecting to your gateway…"}.get(
-                      (o.get("session") or {}).get("state"))).get("session") or {}
-    if final.get("state") != "completed":
-        _fail(f"setup ended: {final.get('state')} {((final.get('error') or {}).get('message') or '')}".rstrip())
-    return {"session": final, **({"recovery": out.get("recovery")} if operation == "recover" else {})}
 
 
 # ── readers ────────────────────────────────────────────────────────────────
@@ -190,7 +138,8 @@ def devices_list(ctx: typer.Context) -> None:
         sys.stdout.write("Hardware setup is not enabled on this server.\n")
     devices = _devices(out)
     if not devices:
-        sys.stdout.write("No hardware yet. Plug in a gateway and run: cremind tags devices connect\n")
+        sys.stdout.write("No hardware yet. Plug a gateway into a gateway computer (cremind tags hosts list) and "
+                         "run: cremind tags devices connect\n")
         return
     table = Table(mode, "ID", "KIND", "NAME", "SHORT ID", "STATE", "CONNECTION", "DETAIL")
     for d in devices:
@@ -211,15 +160,15 @@ def devices_list(ctx: typer.Context) -> None:
 @graceful_errors
 def devices_status(
     ctx: typer.Context,
-    ref: str = typer.Argument(..., help="A setup session, search, pairing or recovery id."),
+    ref: str = typer.Argument(..., help="A connection, search, pairing, recovery or setup session id."),
 ) -> None:
-    """Show one setup session, device search, pairing or recovery."""
+    """Show one gateway connection or computer search, device search, pairing, recovery or setup session."""
     from app.cli.client import tags_setup as api
     from app.cli.client._base import APIError
     from app.cli.output import print_json
 
     async def go(client: Any) -> dict[str, Any]:
-        for fetch in (api.get_session, api.get_pairing, api.get_discovery, api.get_recovery):
+        for fetch in (api.get_operation, api.get_pairing, api.get_discovery, api.get_recovery, api.get_session):
             try:
                 return await fetch(client, ref)
             except APIError as e:
@@ -230,21 +179,6 @@ def devices_status(
     print_json(_call(ctx, go, hints=_HINTS))
 
 
-@devices_app.command("installers")
-@graceful_errors
-def devices_installers(ctx: typer.Context) -> None:
-    """Where to download Cremind Connect for each operating system."""
-    from app.cli.client import tags_setup as api
-    from app.cli.output import print_json
-
-    out = _call(ctx, api.installers)
-    if _mode(ctx).json:
-        print_json(out)
-        return
-    for platform, item in sorted((out.get("downloads") or {}).items()):
-        sys.stdout.write(f"{platform:16} {item.get('url')}\n")
-
-
 # ── writers ────────────────────────────────────────────────────────────────
 
 
@@ -252,20 +186,52 @@ def devices_installers(ctx: typer.Context) -> None:
 @graceful_errors
 def devices_connect(
     ctx: typer.Context,
-    server: Optional[str] = typer.Option(None, "--server", help="The address Cremind Connect should use "
-                                                                "(default: the CLI's server)."),
-    open_link: bool = typer.Option(True, "--open/--no-open", help="Open the Connect link on this computer."),
-    yes: bool = typer.Option(False, "--yes", help="Do not ask whether the words match (you checked them)."),
-    timeout: int = typer.Option(300, "--timeout", help="Seconds to wait (the setup itself expires after 300)."),
+    host: Optional[str] = typer.Option(None, "--host", help="The gateway computer it is plugged into (id or name; "
+                                                            "optional when there is only one)."),
+    candidate: Optional[str] = typer.Option(None, "--candidate", help="A gateway `cremind tags hosts scan` found "
+                                                                      "(when it found several)."),
+    name: Optional[str] = typer.Option(None, "--name", help="A name for the gateway."),
+    yes: bool = typer.Option(False, "--yes", help="Connect the gateway found without asking."),
+    timeout: int = typer.Option(120, "--timeout", help="Seconds to wait for the search and for the connection."),
 ) -> None:
-    """Connect a USB gateway plugged into this computer (Cremind Connect asks for approval)."""
+    """Connect a USB gateway plugged into a gateway computer (Cremind drives it from there)."""
+    from app.cli.client import tags_setup as api
     from app.cli.output import print_json
 
-    out = _connect_flow(ctx, "connect_gateway", server, open_link, yes, timeout)
+    computer = _call(ctx, lambda c: resolve_host(c, host), hints=_HINTS)
+    candidate_id = candidate
+    if candidate_id is None:
+        found = run_scan(ctx, computer, timeout)
+        problem = scan_problem(found)
+        if found.get("state") != "succeeded" or problem:
+            _fail(problem_text(problem, computer) if problem else
+                  f"the search did not finish: {(found.get('error') or {}).get('message') or found.get('state')}")
+        usable = [c for c in _rows(found.get("candidates")) if c.get("state") == "usable"]
+        if not usable:
+            first = _rows(found.get("candidates"))[0]
+            known = ERROR_PROBLEM.get(str(first.get("state") or ""))
+            _fail(problem_text(known, computer) if known else candidate_line(first))
+        if len(usable) > 1:
+            listed = "\n".join(f"  {c.get('id')}  {candidate_line(c)}" for c in usable)
+            _fail(f"several gateways on {host_name(computer)}; pick one with --candidate:\n{listed}")
+        chosen = usable[0]
+        if not yes and not typer.confirm(f"Connect {candidate_line(chosen)} on {host_name(computer)}?",
+                                         default=True):
+            _fail("cancelled.")
+        candidate_id = str(chosen["id"])
+    started = _call(ctx, lambda c: api.connect_gateway(c, computer["id"], candidate_id, name=name),
+                    hints=_HINTS).get("operation") or {}
+    op = wait_operation(ctx, str(started.get("id")), timeout, show=not _mode(ctx).json, hints=_HINTS)
     if _mode(ctx).json:
-        print_json(out)
+        print_json({"operation": op})
         return
-    sys.stdout.write("Gateway connected. Next: cremind tags devices add bridge --code-file <label.txt>\n")
+    if op.get("state") != "succeeded":
+        code = (op.get("error") or {}).get("code")
+        known = ERROR_PROBLEM.get(str(code or ""))
+        _fail("the gateway was not connected: " + (problem_text(known, computer) if known else
+                                                    str((op.get("error") or {}).get("message") or op.get("state"))))
+    sys.stdout.write(f"Gateway connected through {host_name(computer)}. "
+                     "Next: cremind tags devices add bridge --code-file <label.txt>\n")
 
 
 @devices_app.command("add")
@@ -325,19 +291,20 @@ def devices_add(
 @graceful_errors
 def devices_cancel(
     ctx: typer.Context,
-    ref: str = typer.Argument(..., help="A setup session or pairing id."),
+    ref: str = typer.Argument(..., help="A gateway connection, search, pairing or setup session id."),
 ) -> None:
-    """Cancel an unfinished setup session or pairing."""
+    """Cancel an unfinished gateway connection, search, pairing or setup session."""
     from app.cli.client import tags_setup as api
     from app.cli.client._base import APIError
     from app.cli.output import print_json
 
     async def go(client: Any) -> dict[str, Any]:
-        try:
-            return await api.cancel_pairing(client, ref)
-        except APIError as e:
-            if getattr(e, "status", None) != 404:
-                raise
+        for cancel in (api.cancel_operation, api.cancel_pairing):
+            try:
+                return await cancel(client, ref)
+            except APIError as e:
+                if getattr(e, "status", None) != 404:
+                    raise
         return await api.cancel_session(client, ref)
 
     print_json(_call(ctx, go, hints=_HINTS))
@@ -439,21 +406,45 @@ def devices_test(
 @graceful_errors
 def devices_recover(
     ctx: typer.Context,
-    connection: str = typer.Argument(..., help="The connection (gateway) to move to this computer."),
-    server: Optional[str] = typer.Option(None, "--server", help="The address Cremind Connect should use."),
-    open_link: bool = typer.Option(True, "--open/--no-open", help="Open the Connect link on this computer."),
-    yes: bool = typer.Option(False, "--yes", help="Do not ask whether the words match."),
-    timeout: int = typer.Option(300, "--timeout", help="Seconds to wait."),
+    connection: str = typer.Argument(..., help="The connection (gateway) to move."),
+    host: Optional[str] = typer.Option(None, "--host", help="The gateway computer it is plugged into now (id or "
+                                                            "name; optional when there is only one)."),
+    yes: bool = typer.Option(False, "--yes", help="Move it without asking."),
+    timeout: int = typer.Option(120, "--timeout", help="Seconds to wait for the search and for the move."),
 ) -> None:
-    """Recover a gateway and its devices on this (replacement) computer."""
+    """Move a gateway, with its bridges and tags, to another gateway computer (plug it in there first)."""
+    from app.cli.client import tags_setup as api
     from app.cli.output import print_json
 
     conn = _call(ctx, lambda c: _connection(c, connection))
-    out = _connect_flow(ctx, "recover", server, open_link, yes, timeout, companion_id=conn.get("id"))
-    if _mode(ctx).json:
-        print_json(out)
+    title = str(conn.get("name") or connection)
+    computer = _call(ctx, lambda c: resolve_host(c, host), hints=_HINTS)
+    device = (conn.get("gateway") or {}).get("device_id")
+    found = run_scan(ctx, computer, timeout)
+    ours = next((c for c in _rows(found.get("candidates")) if c.get("device_id") == device), None)
+    if ours is None:
+        problem = scan_problem(found)
+        _fail(problem_text(problem, computer) if problem and problem != "no_gateway" else
+              f"{title} is not plugged into {host_name(computer)}. Plug it in there, then run this again.")
+    if ours.get("state") == "already_connected":
+        sys.stdout.write(f"{title} already works through {host_name(computer)}; nothing to move.\n")
         return
-    sys.stdout.write("Recovery started; devices move over as they wake: cremind tags devices list\n")
+    if ours.get("state") != "recovery_required":
+        known = ERROR_PROBLEM.get(str(ours.get("state") or ""))
+        _fail(problem_text(known, computer) if known else candidate_line(ours))
+    if not yes and not typer.confirm(f"Move {title} and its bridges and tags to {host_name(computer)}? The computer it "
+                                     "used until now loses access at once.", default=False):
+        _fail("cancelled.")
+    started = _call(ctx, lambda c: api.connect_gateway(c, computer["id"], str(ours["id"]), recover=True),
+                    hints=_HINTS).get("operation") or {}
+    op = wait_operation(ctx, str(started.get("id")), timeout, show=not _mode(ctx).json, hints=_HINTS)
+    if _mode(ctx).json:
+        print_json({"operation": op})
+        return
+    if op.get("state") != "succeeded":
+        _fail(f"{title} was not moved: {(op.get('error') or {}).get('message') or op.get('state')}")
+    sys.stdout.write(f"{title} now works through {host_name(computer)}. Bridges and tags move over as they wake: "
+                     f"cremind tags devices status {op.get('recovery_id')}\n")
 
 
 __all__ = ["devices_app"]

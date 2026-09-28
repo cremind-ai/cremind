@@ -79,7 +79,7 @@ skipped.
 
 ## Cremind Tag recovery keys
 
-Hardware a profile set up with Cremind Connect trusts this server's grant key,
+Hardware a profile set up from Settings → Tags trusts this server's grant key,
 and its recovery data is encrypted under a server key. Both are files outside
 the database and are **not** in an ordinary backup. `--include-tag-keys` adds
 them — only to an encrypted backup (it needs `--passphrase` or
