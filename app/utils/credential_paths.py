@@ -39,7 +39,7 @@ is the caller's job.
 import os
 from typing import Callable, Optional
 
-CREDENTIAL_DIR_NAMES = frozenset({"coding-cli", "codex-home", "cli-wizards", ".tag-authority"})
+CREDENTIAL_DIR_NAMES = frozenset({"coding-cli", "codex-home", "cli-wizards", ".tag-authority", ".tag-runtime"})
 
 # Relative to the system dir. ``storage/userdocs`` is where the indexes lived
 # before the rename; an install that has not been relocated yet (or one whose

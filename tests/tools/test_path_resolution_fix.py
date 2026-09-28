@@ -100,3 +100,15 @@ def test_report_path_absolute_when_outside_base(tmp_path):
     # Outside base → returns the absolute path (no "../.." string).
     assert _report_path(outside, base) == outside.replace(os.sep, "/")
     assert ".." not in _report_path(outside, base)
+
+
+@pytest.mark.parametrize("name", [".tag-runtime", ".tag-authority", "coding-cli", ".TAG-RUNTIME"])
+def test_credential_folders_are_refused_even_under_the_working_directory(tmp_path, name):
+    base = tmp_path / "sys"
+    secret = base / name / "workers" / "w1" / "secrets.json"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="holds credentials"):
+        _safe_resolve(str(base), f"{name}/workers/w1/secrets.json")
+    with pytest.raises(ValueError, match="holds credentials"):
+        _safe_resolve(str(base), str(secret))

@@ -27,7 +27,7 @@ def system_dir(tmp_path, monkeypatch) -> Path:
 def _client(monkeypatch) -> tuple[TestClient, list[tuple]]:
     seen: list[tuple] = []
 
-    async def fake_run_create(passphrase, include_workspaces=True):
+    async def fake_run_create(passphrase, include_workspaces=True, include_tag_authority=False):
         seen.append((passphrase, include_workspaces))
 
     monkeypatch.setattr(api_backup, "require_admin", lambda request: None)

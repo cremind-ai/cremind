@@ -81,6 +81,11 @@ _TOP_LEVEL_EXCLUDES: tuple[tuple[str, ...], ...] = (
     # never in an ordinary backup. An ENCRYPTED backup can carry them when
     # asked (BackupOptions.include_tag_authority).
     (".tag-authority",),
+    # Cremind Tag's hardware runtime (app/tags/hosting/paths.py): this
+    # computer's gateway workers — controller keys, connector credentials,
+    # durable queues. They belong to the computer, never travel in a backup,
+    # and a restore reconciles with the workers that are still here.
+    (".tag-runtime",),
 )
 
 # Each profile's own manual pages: ``storage/cremind_documents/profiles/<uuid>``

@@ -320,6 +320,19 @@ def _safe_resolve(
     else:
         target = os.path.realpath(os.path.join(base, raw.lstrip("/\\")))
 
+    # Directories that hold credentials (coding agents' OAuth homes, Cremind
+    # Tag's authority keys and hardware runtime) are refused wherever they
+    # sit, as the file API refuses them — even under a working directory that
+    # contains the system folder.
+    from app.utils.credential_paths import CREDENTIAL_DIR_NAMES
+
+    folded = {name.casefold() for name in CREDENTIAL_DIR_NAMES}
+    if any(part.casefold() in folded for part in os.path.normpath(target).split(os.sep)):
+        raise ValueError(
+            f"Access denied: '{relative_path}' is inside a folder that holds credentials. "
+            "Cremind never reads or writes it through file tools."
+        )
+
     # Every profile's Documentation search index (their files' text) lives in
     # the system folder, which is a working directory for some profiles.
     from app.config.settings import BaseConfig
