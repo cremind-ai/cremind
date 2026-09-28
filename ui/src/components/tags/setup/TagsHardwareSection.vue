@@ -1,8 +1,8 @@
 <script setup lang="ts">
 /**
- * Settings → Tags, "Your hardware" (simple setup, cremind-tag
- * docs/connect-setup.md): this computer, the three ways in — Connect gateway,
- * Add bridge (once a gateway is connected), Add tag (once a bridge is ready) —
+ * Settings → Tags, "Your hardware" (simple setup): the gateway computers
+ * Cremind drives gateways from, the three ways in — Connect gateway, Add
+ * bridge (once a gateway is connected), Add tag (once a bridge is ready) —
  * setups still running (Continue / Cancel, also after a page refresh), and the
  * profile's gateways, bridges and tags with what can be done to each.
  *
@@ -20,12 +20,12 @@ import type { SetupDevice, TagConnection } from '../../../services/tagsSetupApi'
 import type { PairingResume } from '../../../composables/useDevicePairing';
 import {
   batteryLevel, capacityFull, capacityLabel, connectionStatusPill, connectionTitle, deliveryLabel,
-  deviceStatePill, isOperationTerminal, isWaitingForWake, isoToMs, setupDeviceTitle,
+  deviceStatePill, isOperationTerminal, isWaitingForWake, isoToMs, plugInstruction, setupDeviceTitle,
   setupErrorMessage, type PendingSetup, type Pill, type RowAction,
 } from '../../../utils/tagsSetupFormat';
 import { formatRelativeTime } from '../../../utils/relativeTime';
 import TagPreviewImage from '../TagPreviewImage.vue';
-import ThisComputerCard from './ThisComputerCard.vue';
+import GatewayComputers from './GatewayComputers.vue';
 import HardwareDeviceRow from './HardwareDeviceRow.vue';
 import ConnectGatewayDialog from './ConnectGatewayDialog.vue';
 import AddBridgeDialog from './AddBridgeDialog.vue';
@@ -41,6 +41,7 @@ const tagsStore = useTagsStore();
 
 const connectOpen = ref(false);
 const connectResume = ref<string | null>(null);
+const connectHost = ref<string | null>(null);
 const bridgeOpen = ref(false);
 const bridgeResume = ref<PairingResume | null>(null);
 const tagOpen = ref(false);
@@ -50,7 +51,7 @@ const removeDevice = ref<SetupDevice | null>(null);
 const removeConnection = ref<TagConnection | null>(null);
 const recoverOpen = ref(false);
 const recoverConnection = ref<TagConnection | null>(null);
-const recoverSession = ref<string | null>(null);
+const recoverOperation = ref<string | null>(null);
 const recoverRecovery = ref<string | null>(null);
 const reconnectOpen = ref(false);
 const reconnectConnection = ref<TagConnection | null>(null);
@@ -59,6 +60,14 @@ const busy = ref('');
 
 const readiness = computed(() => setup.readiness);
 const connections = computed(() => setup.connections);
+/** Where a gateway can be connected: a computer this profile may use (null: none yet). */
+const firstHost = computed(() => setup.usableHosts[0] ?? null);
+const connectReason = computed(() => {
+  if (!setup.hostsLoaded || setup.usableHosts.length) return '';
+  if (!setup.hosts.length) return 'This server does not report a gateway computer yet. Update Cremind.';
+  return setup.hosts.find((h) => h.access.reason)?.access.reason ?? 'No computer can drive a gateway for this profile yet.';
+});
+const emptyPlug = computed(() => plugInstruction(firstHost.value, 'your gateway'));
 const multiGateway = computed(() => connections.value.length > 1);
 /** The one next step, highlighted: connect, then a bridge, then tags. */
 const nextStep = computed(() => {
@@ -69,8 +78,9 @@ const nextStep = computed(() => {
 
 // ── dialogs ──
 
-function openConnect(resumeId: string | null = null) {
+function openConnect(resumeId: string | null = null, hostId: string | null = null) {
   connectResume.value = resumeId;
+  connectHost.value = hostId;
   connectOpen.value = true;
 }
 function openAddBridge(resume: PairingResume | null = null) {
@@ -81,9 +91,9 @@ function openAddTag(resume: PairingResume | null = null) {
   tagResume.value = resume;
   tagOpen.value = true;
 }
-function openRecover(connection: TagConnection | null, resume: { sessionId?: string; recoveryId?: string } = {}) {
+function openRecover(connection: TagConnection | null, resume: { operationId?: string; recoveryId?: string } = {}) {
   recoverConnection.value = connection;
-  recoverSession.value = resume.sessionId ?? null;
+  recoverOperation.value = resume.operationId ?? null;
   recoverRecovery.value = resume.recoveryId ?? null;
   recoverOpen.value = true;
 }
@@ -98,7 +108,7 @@ function openRemove(device: SetupDevice, connection: TagConnection) {
 async function continuePending(p: PendingSetup) {
   switch (p.kind) {
     case 'connect': openConnect(p.id); break;
-    case 'recover': openRecover(null, { sessionId: p.id }); break;
+    case 'move': openRecover(null, { operationId: p.id }); break;
     case 'recover_gateway': openRecover(null, { recoveryId: p.id }); break;
     case 'pair_bridge': openAddBridge({ kind: 'pairing', id: p.id }); break;
     case 'pair_tag': openAddTag({ kind: 'pairing', id: p.id }); break;
@@ -115,15 +125,19 @@ async function continuePending(p: PendingSetup) {
 }
 
 function pendingCancellable(p: PendingSetup): boolean {
-  return p.kind === 'connect' || p.kind === 'recover' || p.kind === 'pair_bridge' || p.kind === 'pair_tag';
+  if (p.kind === 'connect' || p.kind === 'move') {
+    // Not once the gateway is being claimed (it is removed afterwards instead).
+    return !setup.activeHostOps.find((o) => o.id === p.id)?.companion_id;
+  }
+  return p.kind === 'pair_bridge' || p.kind === 'pair_tag';
 }
 
 async function cancelPending(p: PendingSetup) {
   busy.value = `pending:${p.id}`;
   try {
-    if (p.kind === 'connect' || p.kind === 'recover') await setup.cancelSession(p.id);
+    if (p.kind === 'connect' || p.kind === 'move') await setup.cancelHostOp(p.id);
     else await setup.cancelPairing(p.id);
-    await setup.loadConnections();
+    await Promise.all([setup.loadConnections(), setup.loadHosts()]);
     ElMessage.success('Cancelled');
   } catch (e) {
     failed(e);
@@ -164,15 +178,21 @@ function gatewayRow(c: TagConnection) {
     c.status === 'offline' ? lastContact(c.last_seen_at, 'Last seen') : '',
   ];
   let note: { tone: 'warning' | 'danger' | 'info'; text: string } | null = null;
-  if (c.status === 'offline') note = { tone: 'warning', text: 'Updates wait until the gateway is plugged in and Cremind Connect runs on its computer.' };
-  else if (c.status === 'recovery_pending') note = { tone: 'info', text: 'Some devices are still moving to this gateway\'s new computer. They finish when they wake up.' };
+  if (c.status === 'offline') {
+    note = { tone: 'warning', text: c.computer?.name
+      ? `Updates wait until the gateway is back on ${c.computer.name}.`
+      : 'Updates wait until the gateway is plugged back in.' };
+  } else if (c.status === 'recovery_pending') note = { tone: 'info', text: 'Some devices are still moving to this gateway\'s new computer. They finish when they wake up.' };
   else if (c.status === 'removal_pending') note = { tone: 'info', text: 'Removal finishes as soon as the gateway can be reached.' };
   else if (c.status === 'setting_up') note = { tone: 'info', text: 'Finishing setup…' };
   const paused = c.paused || c.gateway.paused;
   const actions: RowAction[] = c.status === 'removal_pending' ? [] : [
     ...(c.status === 'offline' ? [
       { key: 'reconnect', label: 'Reconnect', icon: 'mdi:connection', inline: true, primary: true },
-      { key: 'recover', label: 'Recover on this computer', icon: 'mdi:laptop' },
+      { key: 'recover', label: 'Move to another computer', icon: 'mdi:swap-horizontal' },
+    ] : !c.host_id && c.status !== 'setting_up' ? [
+      // Still set up with the older Cremind Connect: Cremind can take it over.
+      { key: 'recover', label: 'Move to a gateway computer', icon: 'mdi:swap-horizontal' },
     ] : []),
     ...pauseActions(c.gateway, paused),
   ];
@@ -186,7 +206,7 @@ function bridgeRow(b: SetupDevice, c: TagConnection) {
     b.state === 'offline' ? lastContact(b.last_contact_at) : '',
   ];
   const note = b.fontpack_ok === false
-    ? { tone: 'warning' as const, text: 'This bridge needs a font update: connect it to this computer with USB.' }
+    ? { tone: 'warning' as const, text: 'This bridge needs a font update: connect it to a gateway computer with USB.' }
     : b.state === 'removal_pending'
       ? { tone: 'info' as const, text: 'Removal finishes as soon as the bridge can be reached.' }
       : null;
@@ -338,13 +358,13 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
       <div>
         <span class="section-title">Your hardware</span>
         <p class="section-sub">
-          The gateway plugs into a computer, bridges carry updates around your home, and tags show
-          them.
+          The gateway plugs into a computer running Cremind, bridges carry updates around your home, and
+          tags show them.
         </p>
       </div>
     </template>
 
-    <ThisComputerCard :profile="profile" :now="now" />
+    <GatewayComputers :now="now" @connect="(id: string) => openConnect(null, id)" />
 
     <div v-if="setup.pending.length" class="pending" role="status" aria-label="Setups in progress">
       <div v-for="p in setup.pending" :key="`${p.kind}:${p.id}`" class="pending-row">
@@ -365,9 +385,15 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
 
     <div class="primary-actions">
       <div class="primary-action">
-        <ElButton :type="nextStep === 'connect' ? 'primary' : undefined" @click="openConnect()">
+        <ElButton
+          :type="nextStep === 'connect' ? 'primary' : undefined"
+          :disabled="!!connectReason"
+          :aria-describedby="connectReason ? 'connect-reason' : undefined"
+          @click="openConnect()"
+        >
           <Icon icon="mdi:usb-port" class="btn-icon" aria-hidden="true" /> Connect gateway
         </ElButton>
+        <p v-if="connectReason" id="connect-reason" class="reason">{{ connectReason }}</p>
       </div>
       <div class="primary-action">
         <ElButton
@@ -449,26 +475,32 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
 
     <div v-else-if="setup.loaded" class="empty">
       <Icon icon="mdi:usb-port" class="empty-icon" aria-hidden="true" />
-      <p>
-        No gateway yet. Plug your gateway into this computer, then choose
-        <strong>Connect gateway</strong>.
+      <p v-if="firstHost">
+        No gateway yet. {{ emptyPlug.before }}<strong>{{ emptyPlug.name }}</strong>{{ emptyPlug.after }}
+        Then choose <strong>Connect gateway</strong>.
       </p>
+      <p v-else>No gateway yet.</p>
     </div>
 
-    <ConnectGatewayDialog v-model="connectOpen" :resume-session-id="connectResume" @add-bridge="openAddBridge()" />
+    <ConnectGatewayDialog
+      v-model="connectOpen"
+      :host-id="connectHost"
+      :resume-operation-id="connectResume"
+      @add-bridge="openAddBridge()"
+      @recovering="(id: string) => openRecover(null, { recoveryId: id })"
+    />
     <AddBridgeDialog v-model="bridgeOpen" :resume="bridgeResume" @add-tag="openAddTag()" />
     <AddTagDialog v-model="tagOpen" :resume="tagResume" />
     <RemoveDeviceDialog v-model="removeOpen" :device="removeDevice" :connection="removeConnection" />
     <RecoverDialog
       v-model="recoverOpen"
       :connection="recoverConnection"
-      :resume-session-id="recoverSession"
+      :resume-operation-id="recoverOperation"
       :resume-recovery-id="recoverRecovery"
     />
     <ReconnectGatewayDialog
       v-model="reconnectOpen"
       :connection="reconnectConnection"
-      :profile="profile"
       @recover="(c: TagConnection) => openRecover(c)"
     />
   </ElCard>

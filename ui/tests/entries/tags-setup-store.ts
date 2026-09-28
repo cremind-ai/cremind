@@ -5,5 +5,6 @@ export { createPinia, setActivePinia } from 'pinia';
 export { FAST_POLL_MS, SLOW_POLL_MS, useTagsSetupStore } from '../../src/stores/tagsSetup';
 export { useSettingsStore } from '../../src/stores/settings';
 export {
-  connectStep, discoveryDecision, isWaitingForWake, operationProgressLabel, pendingSetups,
+  CONNECT_STAGES, candidateView, connectStageIndex, discoveryDecision, hostBlock, hostOpProgressLabel,
+  isWaitingForWake, operationProgressLabel, pendingSetups, plugInstruction, problemText, scanDecision,
 } from '../../src/utils/tagsSetupFormat';

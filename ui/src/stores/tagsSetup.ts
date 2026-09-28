@@ -4,11 +4,17 @@ import { useSettingsStore } from './settings';
 import { TagsApiError } from '../services/tagsApi';
 import {
   IdempotencyKeys,
+  cancelHostOperation,
+  connectGateway as apiConnectGateway,
+  getHostOperation,
+  getHosts,
+  prepareHost as apiPrepareHost,
+  scanHost as apiScanHost,
+  setHostAccess as apiSetHostAccess,
   cancelPairing as apiCancelPairing,
   cancelSetupSession,
   confirmSetupSession,
   createSetupSession,
-  getConnectDownloads,
   getConnections,
   getDiscovery,
   getPairing,
@@ -20,10 +26,10 @@ import {
   setupServerUrl,
   startDiscovery as apiStartDiscovery,
   startPairing as apiStartPairing,
-  startRecovery as apiStartRecovery,
   unpairDevice,
-  type ConnectDownloads,
   type Discovery,
+  type GatewayHost,
+  type HostOperation,
   type Pairing,
   type Recovery,
   type SetupComputer,
@@ -48,18 +54,19 @@ export const SLOW_POLL_MS = 15_000;
  * - `unsupported`: an older server without these endpoints (404/405).
  */
 export type SetupAvailability = 'unknown' | 'available' | 'disabled' | 'unsupported';
-export type FollowKind = 'session' | 'discovery' | 'pairing' | 'recovery';
+export type FollowKind = 'session' | 'discovery' | 'pairing' | 'recovery' | 'hostop';
 
 const DISCOVERY_DONE = ['not_found', 'failed', 'cancelled'];
 
 /**
- * Simple hardware setup for the signed-in profile (Settings → Tags): its
- * gateways (one Cremind Connect worker each) with their bridges and tags, the
- * computers they run on, and the setups still running on the server.
+ * Simple hardware setup for the signed-in profile (Settings → Tags): the
+ * gateway computers it may use (the computer Cremind runs on, its own
+ * desktop computers), its gateways with their bridges and tags, and the
+ * setups still running on the server.
  *
  * Polling: the page runs `tick()` through useVisiblePoll at `pollIntervalMs` —
- * every 15 s for the list, every 1.5 s while a dialog `follow()`s a session,
- * discovery, pairing or recovery. A followed item that reaches its end is
+ * every 15 s for the lists, every 1.5 s while a dialog `follow()`s a search,
+ * connection, preparation, session, discovery, pairing or recovery. A followed item that reaches its end is
  * dropped from the fast set and the list is re-read at once, so a new device
  * shows up without waiting for the slow poll.
  *
@@ -80,13 +87,16 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
   const computers = ref<SetupComputer[]>([]);
   const activeSessions = ref<SetupSession[]>([]);
   const activeOperations = ref<SetupOperation[]>([]);
-  const downloads = ref<ConnectDownloads | null>(null);
+  const hosts = ref<GatewayHost[]>([]);
+  const activeHostOps = ref<HostOperation[]>([]);
+  const hostsLoaded = ref(false);
 
   // The latest answer for everything a dialog follows or created, by id.
   const sessions = ref<Record<string, SetupSession>>({});
   const discoveries = ref<Record<string, Discovery>>({});
   const pairings = ref<Record<string, Pairing>>({});
   const recoveries = ref<Record<string, Recovery>>({});
+  const hostOps = ref<Record<string, HostOperation>>({});
   /** Followed items the server no longer knows: id → `expired` | `not_found`. */
   const lost = ref<Record<string, 'expired' | 'not_found'>>({});
   const following = ref<string[]>([]);
@@ -98,7 +108,9 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
 
   const pollIntervalMs = computed(() => (following.value.length ? FAST_POLL_MS : SLOW_POLL_MS));
   const readiness = computed(() => setupReadiness(connections.value));
-  const pending = computed(() => pendingSetups(activeSessions.value, activeOperations.value));
+  const pending = computed(() => pendingSetups(activeOperations.value, activeHostOps.value));
+  /** The computers this profile may connect a gateway on. */
+  const usableHosts = computed(() => hosts.value.filter((h) => h.access.can_use));
   const bridges = computed(() => connections.value.flatMap((c) => c.bridges.map((device) => ({ device, connection: c }))));
   const tags = computed(() => connections.value.flatMap((c) => c.tags.map((device) => ({ device, connection: c }))));
 
@@ -112,7 +124,10 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     computers.value = [];
     activeSessions.value = [];
     activeOperations.value = [];
-    downloads.value = null;
+    hosts.value = [];
+    activeHostOps.value = [];
+    hostsLoaded.value = false;
+    hostOps.value = {};
     sessions.value = {};
     discoveries.value = {};
     pairings.value = {};
@@ -158,20 +173,29 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     }
   }
 
+  /** The gateway computers. Never throws: a failure keeps the last list. */
+  async function loadHosts(): Promise<void> {
+    const tok = token();
+    if (!tok) return;
+    try {
+      const answer = await getHosts(url(), tok);
+      if (token() !== tok) return;
+      hosts.value = answer.hosts ?? [];
+      activeHostOps.value = answer.active ?? [];
+      hostsLoaded.value = true;
+    } catch (e) {
+      if (token() !== tok) return;
+      // An older server has no gateway computers.
+      if (e instanceof TagsApiError && (e.status === 404 || e.status === 405) && !e.code) hostsLoaded.value = true;
+    }
+  }
+
   /** One read of a discovery (to learn its role before resuming it). */
   async function loadDiscovery(id: string): Promise<Discovery> {
     const tok = token();
     const d = await getDiscovery(url(), tok, id);
     if (token() === tok) discoveries.value[id] = d;
     return d;
-  }
-
-  async function loadDownloads(): Promise<ConnectDownloads | null> {
-    if (downloads.value) return downloads.value;
-    const tok = token();
-    const answer = await getConnectDownloads(url(), tok);
-    if (token() === tok) downloads.value = answer;
-    return answer;
   }
 
   // ── following (fast polling while a dialog waits) ──
@@ -193,6 +217,11 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     if (kind === 'session' && !sessions.value[id]) {
       const s = activeSessions.value.find((x) => x.id === id);
       if (s) sessions.value[id] = s;
+      return;
+    }
+    if (kind === 'hostop') {
+      const h = activeHostOps.value.find((x) => x.id === id);
+      if (h && !hostOps.value[id]) hostOps.value[id] = h;
       return;
     }
     const op = activeOperations.value.find((x) => x.id === id);
@@ -243,6 +272,11 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
         if (token() !== tok) return;
         pairings.value[id] = p;
         if (isOperationTerminal(p.state)) settled(kind, id);
+      } else if (kind === 'hostop') {
+        const h = await getHostOperation(url(), tok, id);
+        if (token() !== tok) return;
+        hostOps.value[id] = h;
+        if (isOperationTerminal(h.state)) settled(kind, id);
       } else {
         const r = await getRecovery(url(), tok, id);
         if (token() !== tok) return;
@@ -272,11 +306,11 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     listSoon = false;
     await Promise.allSettled([
       ...keysNow.map((key) => pollOne(key, tok)),
-      ...(listDue ? [loadConnections()] : []),
+      ...(listDue ? [loadConnections(), loadHosts()] : []),
     ]);
     if (listSoon && token() === tok) {
       listSoon = false;
-      await loadConnections();
+      await Promise.allSettled([loadConnections(), loadHosts()]);
     }
   }
 
@@ -348,15 +382,59 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     return p;
   }
 
-  async function startRecovery(companionId: string) {
+  // ── gateway computers ──
+
+  /** Search a computer's USB ports for gateways (follow the operation). */
+  async function scanHost(hostId: string): Promise<HostOperation> {
     const tok = token();
-    const body = { companion_id: companionId, server_url: setupServerUrl(url()) };
-    const res = await keys.run(`recovery:${companionId}`, body, (key) => apiStartRecovery(url(), tok, body, key));
+    const h = await keys.run(`scan:${hostId}`, { hostId }, (key) => apiScanHost(url(), tok, hostId, key));
+    if (token() === tok) hostOps.value[h.id] = h;
+    return h;
+  }
+
+  /** Connect the gateway a search found — or, with `recover`, move the
+   *  connection that drives it to this computer (follow the operation). */
+  async function connectCandidate(
+    hostId: string, candidateId: string, opts: { name?: string; recover?: boolean } = {},
+  ): Promise<HostOperation> {
+    const tok = token();
+    const clean = (opts.name ?? '').trim();
+    const body = {
+      host_id: hostId,
+      candidate_id: candidateId,
+      ...(clean ? { name: clean } : {}),
+      ...(opts.recover ? { recover: true } : {}),
+    };
+    const h = await keys.run(`connect:${candidateId}`, body, (key) => apiConnectGateway(url(), tok, body, key));
+    if (token() === tok) hostOps.value[h.id] = h;
+    return h;
+  }
+
+  /** Admin: prepare the gateway components on the server (follow the operation). */
+  async function prepareHost(hostId: string): Promise<HostOperation> {
+    const tok = token();
+    const h = await keys.run(`prepare:${hostId}`, { hostId }, (key) => apiPrepareHost(url(), tok, hostId, key));
+    if (token() === tok) hostOps.value[h.id] = h;
+    return h;
+  }
+
+  async function cancelHostOp(id: string): Promise<HostOperation> {
+    const tok = token();
+    const h = await keys.run(`cancel-hostop:${id}`, {}, (key) => cancelHostOperation(url(), tok, id, key));
     if (token() === tok) {
-      recoveries.value[res.recovery.id] = res.recovery;
-      sessions.value[res.session.id] = res.session;
+      hostOps.value[id] = h;
+      if (isOperationTerminal(h.state)) settled('hostop', id);
     }
-    return { recovery: res.recovery, session: res.session, launchUrl: res.launch_url };
+    return h;
+  }
+
+  /** Admin: let another profile use the server's USB ports, or stop it. */
+  async function setHostAccess(hostId: string, profileId: string, granted: boolean) {
+    const tok = token();
+    const res = await keys.run(`access:${hostId}:${profileId}`, { granted },
+      (key) => apiSetHostAccess(url(), tok, hostId, profileId, granted, key));
+    if (token() === tok) void loadHosts();
+    return res;
   }
 
   async function unpair(deviceId: string) {
@@ -396,7 +474,11 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     computers,
     activeSessions,
     activeOperations,
-    downloads,
+    hosts,
+    hostsLoaded,
+    activeHostOps,
+    usableHosts,
+    hostOps,
     sessions,
     discoveries,
     pairings,
@@ -410,8 +492,8 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     tags,
     reset,
     loadConnections,
+    loadHosts,
     loadDiscovery,
-    loadDownloads,
     follow,
     unfollow,
     isFollowing,
@@ -423,7 +505,11 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     startDiscovery,
     startPairing,
     cancelPairing,
-    startRecovery,
+    scanHost,
+    connectCandidate,
+    prepareHost,
+    cancelHostOp,
+    setHostAccess,
     unpair,
     setPaused,
     sendTest,

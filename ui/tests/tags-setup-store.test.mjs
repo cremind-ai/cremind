@@ -1,15 +1,17 @@
 // The simple-setup store (Settings → Tags): what it polls and when, and how
 // the two main flows move through the server's states.
 //
-// Connect gateway: a setup session goes waiting_for_connect → (Connect binds)
-// waiting_for_approval → (native approval) waiting_for_confirmation → (this
-// page confirms) redeeming → connecting → completed. Add tag: a discovery
-// scans until it finds the tag; with exactly one bridge that can take it the
-// page pairs at once, and the pairing runs (waiting for the tag to wake) until
-// it succeeds. While a dialog follows either, polling is fast (1.5 s) and
-// reads only what is followed; when it ends the store stops following it,
-// drops back to the 15 s list poll and re-reads the list at once so the new
-// device appears. Nothing survives a profile switch.
+// Connect gateway: the page searches a gateway computer's USB ports (a
+// `host_scan` operation: queued → running → succeeded with what it found),
+// then connects the gateway found there (a `host_connect`: checking →
+// registering → claiming → succeeded once the worker claimed it and reported
+// in). Add tag: a discovery scans until it finds the tag; with exactly one
+// bridge that can take it the page pairs at once, and the pairing runs
+// (waiting for the tag to wake) until it succeeds. While a dialog follows
+// any of them, polling is fast (1.5 s) and reads only what is followed; when
+// it ends the store stops following it, drops back to the 15 s list poll and
+// re-reads the lists at once so the new device appears. Nothing survives a
+// profile switch.
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -44,6 +46,29 @@ function connection(extra = {}) {
   }
 }
 
+function host(extra = {}) {
+  return {
+    id: 'h-srv', kind: 'server', name: 'Office PC', platform: 'windows', version: '0.0.19', online: true,
+    last_seen_at: '2026-09-28T10:00:00.000Z', state: 'running', reason: null,
+    readiness: { state: 'ready', components: [] }, usb: { available: true, container: false, reason: null },
+    gateways: [], access: { can_use: true, reason: null, can_manage: true, profiles: [] }, connections: 0, ...extra,
+  }
+}
+
+function hostOp(kind, state, extra = {}) {
+  return {
+    id: kind === 'host_scan' ? 'scan-1' : 'conn-1', kind, state, stage: state === 'queued' ? 'queued' : 'started',
+    stage_detail: null, host_id: 'h-srv', error: null, created_at: 'x', updated_at: 'y', expires_at: 'z', ...extra,
+  }
+}
+
+function candidate(id, state, extra = {}) {
+  return {
+    id, device_id: id.padEnd(32, '0'), short_id: `${id.toUpperCase()}000000`.slice(0, 8), fw: '0.2.0', proto: 2,
+    board: 19, state, message: '', companion_id: null, expires_at: 'z', ...extra,
+  }
+}
+
 function listAnswer(connections = [], active = {}) {
   return {
     simple_setup: true, connections, computers: [],
@@ -70,79 +95,137 @@ function sequence(field, answers) {
   return () => json({ [field]: answers[Math.min(i++, answers.length - 1)] })
 }
 
-test('connect gateway: fast polling follows the session through every state, then the list is re-read', async () => {
+test('connect gateway: search a computer, connect what it found, then the list is re-read', async () => {
   const { env, M, store } = await setup()
   let list = listAnswer()
-  env.route('/api/tags/connections', () => json(list))
-  env.route('/api/tags/setup-sessions', () => json({
-    session: session('waiting_for_connect'), launch_url: 'cremind-connect://setup?v=1&session=ses-1&token=t',
-  }, 201))
-  const phrase = 'amber orbit lantern tidal'
-  const computer = { installation_id: 'inst-1', name: 'DESKTOP-ABC', platform: 'windows', version: '0.2.0' }
-  const gateway = { device_id: 'f'.repeat(32), short_id: '9C8B7A65', fw: '0.2.0', usable: true }
-  env.route('/api/tags/setup-sessions/ses-1', sequence('session', [
-    session('waiting_for_connect'),
-    session('waiting_for_approval', { computer, verification_phrase: phrase }),
-    session('waiting_for_confirmation', { computer, verification_phrase: phrase, gateway, native_approved: true }),
-    session('connecting', { computer, gateway, native_approved: true, browser_confirmed: true, companion_id: 'comp-1' }),
-    session('completed', { computer, gateway, native_approved: true, browser_confirmed: true, companion_id: 'comp-1' }),
+  env.route('/api/tags/connections', (_url, init) => (init.method === 'POST'
+    ? json({ operation: hostOp('host_connect', 'queued', { candidate_id: 'hc_1' }) }, 202)
+    : json(list)))
+  env.route('/api/tags/hosts', () => json({ hosts: [host()], active: [] }))
+  env.route('/api/tags/hosts/h-srv/scan', () => json({ operation: hostOp('host_scan', 'queued') }, 202))
+  const found = candidate('hc_1', 'usable', { message: 'Ready to connect.' })
+  env.route('/api/tags/operations/scan-1', sequence('operation', [
+    hostOp('host_scan', 'running', { stage: 'scanning', stage_detail: "Looking at this computer's USB ports" }),
+    hostOp('host_scan', 'succeeded', { stage: 'done', candidates: [found], ports: [] }),
   ]))
-  env.route('/api/tags/setup-sessions/ses-1/confirm', () => json({
-    session: session('redeeming', { computer, gateway, native_approved: true, browser_confirmed: true }),
-  }))
+  env.route('/api/tags/operations/conn-1', sequence('operation', [
+    hostOp('host_connect', 'running', { stage: 'checking', stage_detail: 'Checking the gateway', candidate_id: 'hc_1' }),
+    hostOp('host_connect', 'running', { stage: 'claiming', stage_detail: 'Connecting to the gateway…', candidate_id: 'hc_1', companion_id: 'comp-1' }),
+    hostOp('host_connect', 'succeeded', { stage: 'done', candidate_id: 'hc_1', companion_id: 'comp-1' }),
+  ]))
 
-  await store.loadConnections()
+  await Promise.all([store.loadConnections(), store.loadHosts()])
   assert.equal(store.availability, 'available')
+  assert.equal(store.hostsLoaded, true)
+  assert.deepEqual(store.usableHosts.map((h) => h.id), ['h-srv'])
   assert.equal(store.pollIntervalMs, M.SLOW_POLL_MS)
-  assert.equal(store.readiness.canAddBridge, false)
   assert.equal(store.readiness.addBridgeReason, 'Connect a gateway first.')
 
-  const { session: created, launchUrl } = await store.startSession('connect_gateway')
-  assert.equal(launchUrl, 'cremind-connect://setup?v=1&session=ses-1&token=t')
-  const post = env.callsTo('/api/tags/setup-sessions').find((c) => c.init.method === 'POST')
-  assert.deepEqual(JSON.parse(post.init.body), { operation: 'connect_gateway', server_url: AGENT })
+  const scan = await store.scanHost('h-srv')
+  const post = env.callsTo('/api/tags/hosts/h-srv/scan')[0]
+  assert.equal(post.init.method, 'POST')
   assert.ok(post.init.headers['Idempotency-Key'])
-
-  store.follow('session', created.id)
+  store.follow('hostop', scan.id)
   assert.equal(store.pollIntervalMs, M.FAST_POLL_MS)
-  const listCalls = () => env.callsTo('/api/tags/connections').length
+  const listCalls = () => env.callsTo('/api/tags/connections').filter((c) => c.init.method === 'GET').length
   const before = listCalls()
 
-  const states = []
-  for (let i = 0; i < 3; i += 1) {
-    await store.tick()
-    states.push(store.sessions['ses-1'].state)
-  }
-  assert.deepEqual(states, ['waiting_for_connect', 'waiting_for_approval', 'waiting_for_confirmation'])
-  assert.equal(M.connectStep(store.sessions['ses-1']), 'confirm')
-  assert.equal(store.sessions['ses-1'].verification_phrase, phrase)
-  assert.equal(listCalls(), before, 'fast ticks read only the followed session')
-
-  const confirmed = await store.confirmSession('ses-1')
-  assert.equal(confirmed.state, 'redeeming')
-  assert.equal(store.sessions['ses-1'].state, 'redeeming')
-  const confirm = env.callsTo('/confirm')[0]
-  assert.equal(confirm.init.method, 'POST')
-  assert.ok(confirm.init.headers['Idempotency-Key'])
-
   await store.tick()
-  assert.equal(store.sessions['ses-1'].state, 'connecting')
-  assert.equal(M.connectStep(store.sessions['ses-1']), 'finish')
-  assert.equal(store.isFollowing('session', 'ses-1'), true)
+  assert.deepEqual(M.scanDecision(store.hostOps['scan-1']), { kind: 'searching' })
+  assert.equal(M.hostOpProgressLabel(store.hostOps['scan-1']), "Looking at this computer's USB ports…")
+  assert.equal(listCalls(), before, 'fast ticks read only what is followed')
+  await store.tick()
+  const decision = M.scanDecision(store.hostOps['scan-1'])
+  assert.equal(decision.kind, 'found')
+  assert.equal(decision.preselect, 'hc_1', 'the only free gateway is preselected')
+  assert.equal(store.isFollowing('hostop', 'scan-1'), false, 'a finished search is no longer followed')
 
-  // Completed: no longer followed, back to the slow poll, and the list is
+  const started = await store.connectCandidate('h-srv', decision.preselect, { name: ' Office gateway ' })
+  const connect = env.callsTo('/api/tags/connections').find((c) => c.init.method === 'POST')
+  assert.deepEqual(JSON.parse(connect.init.body), { host_id: 'h-srv', candidate_id: 'hc_1', name: 'Office gateway' })
+  assert.ok(connect.init.headers['Idempotency-Key'])
+  store.follow('hostop', started.id)
+  await store.tick()
+  assert.equal(M.connectStageIndex(store.hostOps['conn-1']), 1)
+  await store.tick()
+  assert.equal(M.connectStageIndex(store.hostOps['conn-1']), 3)
+
+  // Connected: no longer followed, back to the slow poll, and the list is
   // re-read in the same tick so the new gateway shows up.
   list = listAnswer([connection()])
+  const listBefore = listCalls()
   await store.tick()
-  assert.equal(store.sessions['ses-1'].state, 'completed')
-  assert.equal(M.connectStep(store.sessions['ses-1']), 'done')
-  assert.equal(store.isFollowing('session', 'ses-1'), false)
+  assert.equal(store.hostOps['conn-1'].state, 'succeeded')
+  assert.equal(M.connectStageIndex(store.hostOps['conn-1']), M.CONNECT_STAGES.length)
+  assert.equal(store.isFollowing('hostop', 'conn-1'), false)
   assert.equal(store.pollIntervalMs, M.SLOW_POLL_MS)
-  assert.equal(listCalls(), before + 1)
+  assert.equal(listCalls(), listBefore + 1)
   assert.equal(store.connections.length, 1)
   assert.equal(store.readiness.canAddBridge, true)
   assert.equal(store.readiness.canAddTag, false)
   assert.equal(store.readiness.addTagReason, 'Add a bridge first.')
+})
+
+test('what a search means, and the words for each problem a gateway computer can have', async () => {
+  const { M } = await setup()
+  const done = (ports) => ({ state: 'succeeded', candidates: [], ports, error: null })
+  assert.deepEqual(M.scanDecision(done([])), { kind: 'problem', problem: 'no_gateway' })
+  assert.deepEqual(M.scanDecision(done([{ reason: 'no_access', detail: '' }])), { kind: 'problem', problem: 'usb_access_denied' })
+  assert.deepEqual(M.scanDecision(done([{ reason: 'busy', detail: '' }])), { kind: 'problem', problem: 'gateway_busy' })
+  assert.deepEqual(M.scanDecision(done([{ reason: 'v1_firmware', detail: '' }])), { kind: 'problem', problem: 'unsupported_firmware' })
+  assert.deepEqual(M.scanDecision({ state: 'failed', error: { code: 'host_offline', message: 'x' } }),
+    { kind: 'problem', problem: 'host_offline' })
+
+  // Free gateways first (the only free one preselected); one of yours driven from elsewhere offers recovery.
+  const found = M.scanDecision({
+    state: 'succeeded', candidates: [candidate('b', 'owned_elsewhere'), candidate('a', 'usable')], ports: [], error: null,
+  })
+  assert.deepEqual(found.candidates.map((c) => c.id), ['a', 'b'])
+  assert.equal(found.preselect, 'a')
+  assert.equal(M.candidateView(candidate('r', 'recovery_required')).action, 'recover')
+  assert.equal(M.candidateView(candidate('o', 'owned_elsewhere')).problem, 'owned_elsewhere')
+  assert.equal(M.candidateView(candidate('u', 'usable')).action, 'connect')
+
+  // Each problem has its own title and a way forward, naming the computer — never a port.
+  const office = host({ platform: 'linux' })
+  const titles = ['no_gateway', 'usb_access_denied', 'gateway_busy', 'unsupported_firmware', 'components_unavailable',
+    'host_offline', 'owned_elsewhere', 'recovery_required'].map((p) => M.problemText(p, office).title)
+  assert.deepEqual(titles, ['No gateway detected', 'USB access denied', 'Gateway busy in another application',
+    'Unsupported firmware', 'Required components unavailable', 'Computer offline', 'Gateway owned elsewhere',
+    'Recovery required'])
+  assert.match(M.problemText('no_gateway', office).text, /Office PC's USB ports/)
+  assert.match(M.problemText('usb_access_denied', office).text, /dialout/)
+  assert.match(M.problemText('usb_access_denied', host({ usb: { available: false, container: true, reason: null } })).text,
+    /container/)
+  assert.equal(M.problemText('components_unavailable', office).action, 'prepare')
+  assert.equal(M.problemText('components_unavailable', host({ access: { can_use: true, reason: null, can_manage: false } })).action,
+    null)
+  assert.deepEqual(M.plugInstruction(office),
+    { before: 'Plug the gateway into ', name: 'Office PC', after: ', where Cremind is running.' })
+
+  // A computer that cannot search says why.
+  assert.equal(M.hostBlock(host()), null)
+  assert.equal(M.hostBlock(host({ online: false })).title, 'Computer offline')
+  assert.equal(M.hostBlock(host({ state: 'unavailable' })).action, 'prepare')
+  assert.equal(M.hostBlock(host({ usb: { available: false, container: true, reason: null } })).title, 'USB access denied')
+})
+
+test('a connection still running shows as a setup to continue, also after a refresh', async () => {
+  const { env, store } = await setup()
+  env.route('/api/tags/connections', () => json(listAnswer()))
+  env.route('/api/tags/hosts', () => json({
+    hosts: [host()],
+    active: [
+      hostOp('host_connect', 'running', { stage: 'claiming', stage_detail: 'Connecting to the gateway…', companion_id: 'comp-1' }),
+      hostOp('host_scan', 'running'),
+    ],
+  }))
+  await Promise.all([store.loadConnections(), store.loadHosts()])
+  assert.deepEqual(store.pending.map((p) => [p.kind, p.id, p.title, p.detail]),
+    [['connect', 'conn-1', 'Connecting a gateway', 'Connecting to the gateway…']])
+  // Continued from the banner: its last known state shows at once.
+  store.follow('hostop', 'conn-1')
+  assert.equal(store.hostOps['conn-1'].stage, 'claiming')
 })
 
 test('add tag: scanning → found with one bridge → pair at once → waiting for the tag to wake → ready', async () => {
@@ -295,16 +378,22 @@ test('simple setup off (or an older server): the page gets told, and polling sto
 test('nothing crosses profiles: a switch clears the store and drops answers for the old token', async () => {
   const { env, settings, store } = await setup()
   const slow = deferred()
+  const slowHosts = deferred()
   env.route('/api/tags/connections', () => slow.promise)
+  env.route('/api/tags/hosts', () => slowHosts.promise)
   const pending = store.loadConnections()
+  const pendingHosts = store.loadHosts()
   store.follow('session', 'ses-1')
 
   settings.authToken = 'tok-bob'
   store.reset('bob')
   slow.resolve(json(listAnswer([connection()])))
-  await pending
+  slowHosts.resolve(json({ hosts: [host()], active: [hostOp('host_connect', 'running')] }))
+  await Promise.all([pending, pendingHosts])
   await flush()
   assert.equal(store.connections.length, 0, "ann's gateways never show for bob")
+  assert.equal(store.hosts.length, 0, "nor ann's computers")
+  assert.equal(store.pending.length, 0)
   assert.equal(store.following.length, 0)
   assert.equal(store.availability, 'unknown')
 })

@@ -107,8 +107,9 @@ async function load() {
       store.loadSettings(),
       // The owned tags, for "specific tags" routes (and the hardware list's previews).
       store.loadOverview().catch(() => null),
-      // Never throws: a failure stays in setup.loadError.
+      // Never throw: a failure stays in setup.loadError (the computers keep their last list).
       setup.loadConnections(),
+      setup.loadHosts(),
     ]);
     hydrate();
   } catch (e) {
@@ -275,8 +276,8 @@ watch(() => setup.tags.map((t) => t.device.id).join(','), (next, prev) => {
             <ElCard shadow="never" class="section-card">
               <div class="enable-title">Connect a companion manually</div>
               <p class="field-hint">
-                For developers who run the companion themselves instead of Cremind Connect: create a
-                content credential above and give it to the companion, which also needs a hardware
+                For developers who run the companion themselves instead of letting Cremind drive the
+                gateway: create a content credential above and give it to the companion, which also needs a hardware
                 credential{{ isAdmin ? ' from Tag hardware below' : ' from an admin' }}. Tags connected
                 this way are managed on the Tag hardware page, not in the lists above.
               </p>

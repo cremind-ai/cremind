@@ -1,6 +1,5 @@
-// The simple-setup client (cremind-tag docs/setup-api.md §1): paths, methods,
-// bodies, Bearer auth, the error shape — and the Idempotency-Key every
-// mutation carries.
+// The simple-setup client: paths, methods, bodies, Bearer auth, the error
+// shape — and the Idempotency-Key every mutation carries.
 //
 // A retry of the same action whose first outcome is unknown (the network
 // dropped the answer, or the server failed) must send the SAME key, so the
@@ -30,6 +29,10 @@ const SESSION = {
 const DISCOVERY = {
   id: 'dis-1', role: 'tag', short_id: '1A2B3C4D', state: 'scanning', started_at: 'x', expires_at: 'y',
   candidates: [], recommended: null, error: null,
+}
+const HOST_OP = {
+  id: 'hop-1', kind: 'host_scan', state: 'queued', stage: 'queued', stage_detail: null, host_id: 'h-1',
+  error: null, created_at: 'x', updated_at: 'y', expires_at: 'z', candidates: [], ports: [],
 }
 const PAIRING = {
   id: 'op-1', kind: 'pair_tag', state: 'running', stage: 'pairing', stage_detail: 'Waiting for the tag to wake',
@@ -75,9 +78,12 @@ test('every endpoint uses its path and method, and every mutation carries a UUID
     if (url.endsWith('/test')) return json({ delivery: { id: 77 } }, 201)
     return json({ device: { id: 'd1', paused: url.endsWith('/pause') } })
   })
-  env.route('/api/tags/recoveries', () => json({ recovery: { id: 'rec-1' }, session: SESSION, launch_url: 'cremind-connect://x' }, 201))
   env.route('/api/tags/recoveries/rec-1', () => json({ recovery: { id: 'rec-1', devices: [] } }))
-  env.route('/api/tags/connect', () => json({ latest_version: '0.2.0', downloads: {} }))
+  env.route('/api/tags/hosts', () => json({ hosts: [], active: [] }))
+  env.route('/api/tags/hosts/h-1/scan', () => json({ operation: HOST_OP }, 202))
+  env.route('/api/tags/hosts/h-1/prepare', () => json({ operation: { ...HOST_OP, kind: 'host_prepare' } }, 202))
+  env.route('/api/tags/hosts/h-1/access/pid-2', () => json({ host_id: 'h-1', profile_id: 'pid-2', profile: 'bob', granted: true }))
+  env.route('/api/tags/operations/hop-1', () => json({ operation: HOST_OP }))
 
   const created = await api.createSetupSession(URL_, TOKEN, { operation: 'connect_gateway', server_url: 'http://localhost:1180' })
   assert.equal(created.launch_url, 'cremind-connect://setup?v=1&session=ses-1')
@@ -94,10 +100,15 @@ test('every endpoint uses its path and method, and every mutation carries a UUID
   assert.equal((await api.setDevicePaused(URL_, TOKEN, 'd1', false)).paused, false)
   assert.equal((await api.sendTestCard(URL_, TOKEN, 'd1')).id, 77)
   await api.renameSetupDevice(URL_, TOKEN, 'd1', 'Kitchen')
-  const rec = await api.startRecovery(URL_, TOKEN, { companion_id: 'comp-1', server_url: 'http://localhost:1180' })
-  assert.equal(rec.recovery.id, 'rec-1')
   await api.getRecovery(URL_, TOKEN, 'rec-1')
-  await api.getConnectDownloads(URL_, TOKEN)
+  assert.deepEqual(await api.getHosts(URL_, TOKEN), { hosts: [], active: [] })
+  assert.equal((await api.scanHost(URL_, TOKEN, 'h-1')).id, 'hop-1')
+  assert.equal((await api.prepareHost(URL_, TOKEN, 'h-1')).kind, 'host_prepare')
+  assert.equal((await api.setHostAccess(URL_, TOKEN, 'h-1', 'pid-2', true)).granted, true)
+  env.route('/api/tags/connections', () => json({ operation: { ...HOST_OP, kind: 'host_connect' } }, 202))
+  await api.connectGateway(URL_, TOKEN, { host_id: 'h-1', candidate_id: 'hc_1', name: 'Office' })
+  await api.getHostOperation(URL_, TOKEN, 'hop-1')
+  await api.cancelHostOperation(URL_, TOKEN, 'hop-1')
 
   const seen = env.calls.map((c) => [c.init.method, c.url.replace(URL_, ''), bodyOf(c)])
   assert.deepEqual(seen, [
@@ -115,9 +126,14 @@ test('every endpoint uses its path and method, and every mutation carries a UUID
     ['POST', '/api/tags/devices/d1/resume', {}],
     ['POST', '/api/tags/devices/d1/test', {}],
     ['PATCH', '/api/tags/devices/d1', { name: 'Kitchen' }],
-    ['POST', '/api/tags/recoveries', { companion_id: 'comp-1', server_url: 'http://localhost:1180' }],
     ['GET', '/api/tags/recoveries/rec-1', undefined],
-    ['GET', '/api/tags/connect', undefined],
+    ['GET', '/api/tags/hosts', undefined],
+    ['POST', '/api/tags/hosts/h-1/scan', {}],
+    ['POST', '/api/tags/hosts/h-1/prepare', {}],
+    ['PUT', '/api/tags/hosts/h-1/access/pid-2', { granted: true }],
+    ['POST', '/api/tags/connections', { host_id: 'h-1', candidate_id: 'hc_1', name: 'Office' }],
+    ['GET', '/api/tags/operations/hop-1', undefined],
+    ['DELETE', '/api/tags/operations/hop-1', undefined],
   ])
   for (const call of env.calls) {
     assert.equal(call.init.headers.Authorization, `Bearer ${TOKEN}`)
@@ -135,7 +151,7 @@ test('ids are path-encoded', async () => {
   assert.equal(env.calls[0].url, `${URL_}/api/tags/setup-sessions/a%2Fb%20c`)
 })
 
-test('the server URL sent to Connect is the origin of the backend this page talks to', () => {
+test('the server URL a setup link carries is the origin of the backend this page talks to', () => {
   env = installBrowser({ href: 'http://192.168.1.20:1515/#/ann/settings/tags' })
   assert.equal(api.setupServerUrl(''), 'http://192.168.1.20:1515')
   assert.equal(api.setupServerUrl('https://cremind.example.com/'), 'https://cremind.example.com')
@@ -213,9 +229,12 @@ test('without crypto.randomUUID (plain HTTP on a LAN) keys are still v4 UUIDs', 
 
 test('refusals keep their status and code; an unreadable body falls back to the status line', async () => {
   env = installBrowser()
-  env.route('/api/tags/connections', () => refusal(403, 'simple_setup_disabled', 'Simple setup is off on this server.'))
+  env.route('/api/tags/connections', (_url, init) => (init.method === 'POST'
+    ? refusal(410, 'candidate_expired', 'That search result is too old.')
+    : refusal(403, 'simple_setup_disabled', 'Simple setup is off on this server.')))
   env.route('/api/tags/discovery', () => refusal(422, 'setup_code_wrong_role', 'This is a bridge label, not a tag label.'))
-  env.route('/api/tags/setup-sessions/ses-1/confirm', () => refusal(409, 'not_approved', 'Approve it in Cremind Connect first.'))
+  env.route('/api/tags/setup-sessions/ses-1/confirm', () => refusal(409, 'not_approved', 'Approve it on the other computer first.'))
+  env.route('/api/tags/hosts/h-1/scan', () => refusal(403, 'host_access_denied', 'The admin has not allowed this profile.'))
   env.route('/api/tags/setup-sessions/ses-2/confirm', () => refusal(410, 'session_expired', 'The setup session expired.'))
   env.route('/api/tags/pairings/op-9', () => new Response('<html>bad gateway</html>', { status: 502, statusText: 'Bad Gateway' }))
   const cases = [
@@ -224,6 +243,8 @@ test('refusals keep their status and code; an unreadable body falls back to the 
     [() => api.confirmSetupSession(URL_, TOKEN, 'ses-1'), 409, 'not_approved'],
     [() => api.confirmSetupSession(URL_, TOKEN, 'ses-2'), 410, 'session_expired'],
     [() => api.getPairing(URL_, TOKEN, 'op-9'), 502, null],
+    [() => api.scanHost(URL_, TOKEN, 'h-1'), 403, 'host_access_denied'],
+    [() => api.connectGateway(URL_, TOKEN, { host_id: 'h-1', candidate_id: 'hc_old' }), 410, 'candidate_expired'],
   ]
   for (const [call, status, code] of cases) {
     await assert.rejects(call(), (e) => {

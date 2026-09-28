@@ -1,10 +1,15 @@
-// Typed client for simple Cremind Tag hardware setup — the profile API of
-// cremind-tag docs/setup-api.md §1 (JWT, the caller's profile only):
+// Typed client for simple Cremind Tag hardware setup — the profile API (JWT,
+// the caller's profile only):
 //
-//   GET    /api/tags/connections             gateways (one per Connect worker), bridges, tags,
-//                                            computers, and the setups still running
-//   GET    /api/tags/connect                 Cremind Connect installers per OS
-//   POST   /api/tags/setup-sessions          connect_gateway | recover | probe → {session, launch_url}
+//   GET    /api/tags/hosts                   the gateway computers this profile may use, and the
+//                                            searches/connections still running on them
+//   POST   /api/tags/hosts/{id}/scan         search a computer's USB ports → {operation}
+//   POST   /api/tags/hosts/{id}/prepare      admin: install the server's gateway components
+//   PUT    /api/tags/hosts/{id}/access/{profile_id}   admin: let a profile use the server's USB ports
+//   POST   /api/tags/connections             connect (or recover) a gateway a search found → {operation}
+//   GET / DELETE /api/tags/operations/{id}   follow or cancel a search, connection or preparation
+//   GET    /api/tags/connections             gateways, bridges, tags, and the setups still running
+//   POST   /api/tags/setup-sessions          signed, expiring setup sessions → {session, launch_url}
 //   GET    /api/tags/setup-sessions/{id}     progress
 //   POST   /api/tags/setup-sessions/{id}/confirm   the browser's "yes, same words"
 //   DELETE /api/tags/setup-sessions/{id}     cancel before it is redeemed
@@ -13,8 +18,7 @@
 //   POST   /api/tags/pairings                pair a discovery candidate
 //   GET / DELETE /api/tags/pairings/{id}
 //   POST   /api/tags/devices/{id}/unpair | pause | resume | test
-//   POST   /api/tags/recoveries              move a gateway to this computer → {recovery, session, launch_url}
-//   GET    /api/tags/recoveries/{id}
+//   GET    /api/tags/recoveries/{id}         a recovery's progress, device by device
 //
 // Same conventions as tagsApi.ts (base URL, Bearer auth, TagsApiError with
 // the server's `error` code). Unlike the older /api/tags/* payloads,
@@ -76,8 +80,13 @@ export interface SetupDevice {
 
 export type ComputerPlatform = 'windows' | 'macos' | 'linux';
 
+/** The computer a gateway's worker runs on. */
 export interface SetupComputer {
-  installation_id: string;
+  /** The gateway computer it runs on; absent when the older Cremind Connect runs it. */
+  host_id?: string;
+  /** `server` | `desktop` (gateway computers), `connect` (the older Cremind Connect). */
+  kind?: string;
+  installation_id: string | null;
   name: string;
   platform: ComputerPlatform | string;
   version: string;
@@ -87,12 +96,15 @@ export interface SetupComputer {
 export type ConnectionStatus =
   | 'setting_up' | 'connected' | 'offline' | 'paused' | 'recovery_pending' | 'removal_pending';
 
-/** One gateway = one Cremind Connect worker (a private companion). `id` is the companion id. */
+/** One gateway = one worker (a private companion). `id` is the companion id. */
 export interface TagConnection {
   id: string;
   name: string;
   status: ConnectionStatus | string;
   paused: boolean;
+  /** Where the worker runs: `server` / `desktop` (a gateway computer), `legacy_external` (Cremind Connect). */
+  execution_kind?: string;
+  host_id?: string | null;
   computer: SetupComputer | null;
   gateway: SetupDevice;
   bridges: SetupDevice[];
@@ -197,11 +209,114 @@ export interface ConnectionsAnswer {
   active: { sessions: SetupSession[]; operations: SetupOperation[] };
 }
 
-export type ConnectDownloadKey = 'windows-x64' | 'macos-arm64' | 'macos-x64' | 'linux-x64-deb' | 'linux-x64-tar';
+// ── gateway computers (hardware hosts) ─────────────────────────────────────
 
-export interface ConnectDownloads {
-  latest_version: string;
-  downloads: Partial<Record<ConnectDownloadKey, { url: string; sha256?: string }>>;
+/** A computer Cremind drives USB gateways on: the server itself, or a Cremind desktop app set up for this
+ *  profile. */
+export type HostKind = 'server' | 'desktop';
+/** `running` | `unavailable` (components) | `busy_elsewhere` | `disabled` | `stalled` | `failed` | `stopped`. */
+export type HostState = string;
+
+export interface HostComponent {
+  key: 'platform' | 'packages' | 'fonts' | string;
+  /** `ready` | `missing` | `unsupported` | `broken`. */
+  state: string;
+  detail: string;
+}
+
+export interface HostReadiness {
+  /** `ready` | `partial` (gateways work, screens wait for fonts) | `missing` | `unsupported`. */
+  state: string;
+  components: HostComponent[];
+}
+
+export interface HostUsb {
+  available: boolean;
+  container: boolean;
+  reason: string | null;
+}
+
+export interface HostGateway {
+  device_id: string | null;
+  short_id: string | null;
+  state: string;
+  in_use: boolean;
+  companion_id: string | null;
+}
+
+export interface GatewayHost {
+  id: string;
+  kind: HostKind | string;
+  name: string;
+  platform: string | null;
+  version: string | null;
+  online: boolean;
+  last_seen_at: string | null;
+  state: HostState;
+  reason: string | null;
+  readiness: HostReadiness | null;
+  usb: HostUsb | null;
+  gateways: HostGateway[];
+  access: {
+    can_use: boolean;
+    reason: string | null;
+    /** The admin, on the server's own computer: may grant other profiles. */
+    can_manage: boolean;
+    /** With `can_manage`: every other profile, and whether it may use this computer's USB ports. */
+    profiles?: { profile: string; profile_id: string; granted: boolean; granted_at: string | null }[];
+  };
+  /** This profile's connections running there. */
+  connections: number;
+}
+
+export type HostOperationKind = 'host_scan' | 'host_connect' | 'host_prepare';
+
+/** What a found device means for this profile. */
+export type CandidateState =
+  | 'usable' | 'already_connected' | 'recovery_required' | 'owned_elsewhere' | 'unsupported_firmware'
+  | 'not_a_gateway' | 'busy' | 'access_denied' | 'no_answer' | 'device_rejected';
+
+export interface GatewayCandidate {
+  /** Opaque, expiring; bound to this profile, the computer and the device. */
+  id: string;
+  device_id: string;
+  short_id: string;
+  fw: string | null;
+  proto: number;
+  board: number | null;
+  state: CandidateState | string;
+  message: string;
+  companion_id: string | null;
+  expires_at: string;
+}
+
+export interface HostOperation {
+  id: string;
+  kind: HostOperationKind | string;
+  state: SetupOperationState | string;
+  stage: string;
+  stage_detail: string | null;
+  host_id: string | null;
+  error: SetupError | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+  /** host_scan: the gateways found; `ports`: ports that did not identify (busy, no access, no answer). */
+  candidates?: GatewayCandidate[];
+  ports?: { reason: string; detail: string }[];
+  /** host_connect; `recover`: it moves an existing connection here (`recovery_id`: its recovery). */
+  candidate_id?: string;
+  companion_id?: string | null;
+  recover?: boolean;
+  recovery_id?: string | null;
+  /** host_prepare. */
+  log?: string[];
+  readiness?: HostReadiness | null;
+}
+
+export interface HostsAnswer {
+  hosts: GatewayHost[];
+  active: HostOperation[];
 }
 
 // ── idempotency ────────────────────────────────────────────────────────────
@@ -309,7 +424,7 @@ function mutation<T>(
   });
 }
 
-/** Where Cremind Connect calls back: the origin (`scheme://host[:port]`, no
+/** Where a setup link calls back: the origin (`scheme://host[:port]`, no
  *  path — the server refuses one) of the backend this page talks to. */
 export function setupServerUrl(agentUrl: string): string {
   const base = tagsBaseUrl(agentUrl);
@@ -325,11 +440,7 @@ export function getConnections(agentUrl: string, token: string): Promise<Connect
   return tagsRequest(agentUrl, token, '/api/tags/connections');
 }
 
-export function getConnectDownloads(agentUrl: string, token: string): Promise<ConnectDownloads> {
-  return tagsRequest(agentUrl, token, '/api/tags/connect');
-}
-
-/** `launch_url` (the `cremind-connect://setup?…` link) comes in this answer only. */
+/** `launch_url` (the setup link the other computer opens) comes in this answer only. */
 export function createSetupSession(
   agentUrl: string,
   token: string,
@@ -438,16 +549,60 @@ export async function sendTestCard(
   return res.delivery;
 }
 
-export function startRecovery(
-  agentUrl: string,
-  token: string,
-  body: { companion_id: string; server_url: string },
-  key?: string,
-): Promise<{ recovery: Recovery; session: SetupSession; launch_url: string }> {
-  return mutation(agentUrl, token, '/api/tags/recoveries', 'POST', body, key);
-}
-
 export async function getRecovery(agentUrl: string, token: string, id: string): Promise<Recovery> {
   const res = await tagsRequest<{ recovery: Recovery }>(agentUrl, token, `/api/tags/recoveries/${enc(id)}`);
   return res.recovery;
+}
+
+// ── gateway computers ──────────────────────────────────────────────────────
+
+export function getHosts(agentUrl: string, token: string): Promise<HostsAnswer> {
+  return tagsRequest(agentUrl, token, '/api/tags/hosts');
+}
+
+/** 202; 409 `host_offline` / `components_unavailable` / `host_busy`; 403 `host_access_denied`. */
+export async function scanHost(agentUrl: string, token: string, hostId: string, key?: string): Promise<HostOperation> {
+  const res = await mutation<{ operation: HostOperation }>(agentUrl, token,
+    `/api/tags/hosts/${enc(hostId)}/scan`, 'POST', {}, key);
+  return res.operation;
+}
+
+/** Admin, the server's own computer: install the gateway components (202, follow the operation). */
+export async function prepareHost(agentUrl: string, token: string, hostId: string, key?: string): Promise<HostOperation> {
+  const res = await mutation<{ operation: HostOperation }>(agentUrl, token,
+    `/api/tags/hosts/${enc(hostId)}/prepare`, 'POST', {}, key);
+  return res.operation;
+}
+
+/** Admin: let a profile search for and claim unclaimed gateways on the server's USB ports. */
+export function setHostAccess(
+  agentUrl: string, token: string, hostId: string, profileId: string, granted: boolean, key?: string,
+): Promise<{ host_id: string; profile_id: string; profile: string; granted: boolean }> {
+  return mutation(agentUrl, token, `/api/tags/hosts/${enc(hostId)}/access/${enc(profileId)}`, 'PUT',
+    { granted }, key);
+}
+
+/** 202; 410 `candidate_expired`; 409 with the candidate's state (`owned_elsewhere`, …). */
+export async function connectGateway(
+  agentUrl: string,
+  token: string,
+  body: { host_id: string; candidate_id: string; name?: string; recover?: boolean },
+  key?: string,
+): Promise<HostOperation> {
+  const res = await mutation<{ operation: HostOperation }>(agentUrl, token, '/api/tags/connections', 'POST',
+    body, key);
+  return res.operation;
+}
+
+export async function getHostOperation(agentUrl: string, token: string, id: string): Promise<HostOperation> {
+  const res = await tagsRequest<{ operation: HostOperation }>(agentUrl, token, `/api/tags/operations/${enc(id)}`);
+  return res.operation;
+}
+
+export async function cancelHostOperation(
+  agentUrl: string, token: string, id: string, key?: string,
+): Promise<HostOperation> {
+  const res = await mutation<{ operation: HostOperation }>(agentUrl, token,
+    `/api/tags/operations/${enc(id)}`, 'DELETE', undefined, key);
+  return res.operation;
 }
