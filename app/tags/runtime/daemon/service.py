@@ -105,6 +105,9 @@ class DaemonOptions:
     write_status: bool = True
     gateway_hw_id: str | None = None
     """A fixed inventory id for the gateway (a protocol v2 worker: ``gw-<device_id>``)."""
+    client_factory: Callable[[Credential], ConnectorClient] | None = None
+    """How to reach Cremind with a credential; default: HTTP to ``cremind_url``. A worker the backend
+    hosts itself passes the in-process connector (``app.tags.hosting.local_connector``)."""
 
     @classmethod
     def from_config(cls, config: Config, *, gateway_url: str | None = None, fontpack: Path | None = None,
@@ -203,7 +206,7 @@ class DaemonService:
                           exc)
         # A different pack may be active now: give tags blocked on a mismatch another chance.
         await self.db.run(self.store.unblock_all, "fontpack_mismatch")
-        if (opts.hardware_credential or opts.content_credentials) and not opts.cremind_url:
+        if (opts.hardware_credential or opts.content_credentials) and not opts.cremind_url                 and opts.client_factory is None:
             raise DaemonConfigError("no Cremind URL configured (cremind tags tools connect server URL)")
         if opts.gateway_url is not None:
             # gateway_hw_id is derived per session (record_gateway): before the port enumerates, the USB
@@ -238,6 +241,10 @@ class DaemonService:
                  "yes" if self.hardware else "no")
 
     def _client(self, credential: Credential) -> ConnectorClient:
+        if self.options.client_factory is not None:
+            client = self.options.client_factory(credential)
+            self.clients.append(client)
+            return client
         assert self.options.cremind_url is not None
         client = ConnectorClient(self.options.cremind_url, credential, ca_file=self.options.ca_file,
                                  timeout=self.options.timeout_s, transport=self.options.transport)
