@@ -34,8 +34,9 @@ if TYPE_CHECKING:
 app = typer.Typer(name="firmware", help="List, verify and flash released firmware (gateways, bridges).",
                   no_args_is_help=True)
 
-# SoC key (tools/targets.yaml) -> (J-Link device, nrfjprog family, flash bytes). Mirrors
-# SOC_DEVICES in tools/release.py (tests/firmware checks both against targets.yaml).
+# SoC key (the firmware's tools/targets.yaml) -> (J-Link device, nrfjprog family, flash bytes). Mirrors
+# SOC_DEVICES of the firmware's tools/release.py; tests/tags/runtime/enroll/test_hardware_tables.py
+# checks it against the pinned contract's hardware/targets.yaml.
 SOC_DEVICES: dict[str, tuple[str, str, int]] = {
     "nrf51822_qfaa": ("nRF51822_xxAA", "NRF51", 262144),
     "nrf51822_qfab": ("nRF51822_xxAB", "NRF51", 131072),

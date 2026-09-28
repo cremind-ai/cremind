@@ -1,10 +1,9 @@
 """REST API for simple device setup — the calling profile's own hardware
-(cremind-tag ``docs/setup-api.md`` §1). Every route requires a session JWT;
+(``docs/tags/setup-api.md`` §1). Every route requires a session JWT;
 everything is scoped to ``request.user.username`` and its profile UUID, and
 another profile's ids answer 404.
 
 - ``GET    /api/tags/connections``                 gateways/workers with their bridges and tags
-- ``GET    /api/tags/connect``                     Cremind Connect installers per OS
 - ``POST   /api/tags/setup-sessions``              ``{operation, server_url, companion_id?}`` -> 201 ``{session, launch_url}``
 - ``GET    /api/tags/setup-sessions/{id}``         -> ``{session}``
 - ``POST   /api/tags/setup-sessions/{id}/confirm`` -> ``{session}`` (same sign-in that created it)
@@ -38,15 +37,6 @@ from app.tags import idempotency
 from app.tags.service import TagError
 from app.utils.logger import logger
 
-DEFAULT_CONNECT_BASE = "https://github.com/cremind-ai/cremind-tag/releases/latest/download"
-CONNECT_ASSETS = {
-    "windows-x64": "CremindConnect-windows-x64.exe",
-    "macos-arm64": "CremindConnect-macos-arm64.dmg",
-    "macos-x64": "CremindConnect-macos-x64.dmg",
-    "linux-x64-deb": "cremind-connect_amd64.deb",
-    "linux-x64-tar": "cremind-connect-linux-x64.tar.gz",
-}
-
 
 def _profile(request: Request) -> str:
     return getattr(request.user, "username", "") or ""
@@ -57,24 +47,6 @@ async def _optional_body(request: Request) -> tuple[dict[str, Any] | None, JSONR
     if not raw.strip():
         return {}, None
     return await json_body(request)
-
-
-def connect_downloads() -> dict[str, Any]:
-    """Installer links: ``server_config`` ``tags_connect_downloads`` (a JSON
-    object of the same shape) overrides the default GitHub release assets."""
-    import json
-
-    try:
-        from app.config.settings import get_dynamic
-
-        raw = get_dynamic("server_config", "tags_connect_downloads")
-        custom = json.loads(raw) if isinstance(raw, str) and raw.strip() else None
-    except Exception:  # noqa: BLE001
-        custom = None
-    if isinstance(custom, dict) and isinstance(custom.get("downloads"), dict):
-        return {"latest_version": custom.get("latest_version"), "downloads": custom["downloads"]}
-    return {"latest_version": None,
-            "downloads": {k: {"url": f"{DEFAULT_CONNECT_BASE}/{v}", "sha256": None} for k, v in CONNECT_ASSETS.items()}}
 
 
 def get_tags_setup_routes() -> list[Route]:
@@ -110,9 +82,6 @@ def get_tags_setup_routes() -> list[Route]:
 
     async def connections(request: Request) -> JSONResponse:
         return JSONResponse(await operations.connections(_profile(request)))
-
-    async def connect_info(request: Request) -> JSONResponse:
-        return JSONResponse(connect_downloads())
 
     async def create_session(request: Request, body: dict[str, Any]) -> JSONResponse:
         operations.require_simple_setup()
@@ -185,7 +154,6 @@ def get_tags_setup_routes() -> list[Route]:
 
     return [
         Route("/api/tags/connections", guarded(connections), methods=["GET"]),
-        Route("/api/tags/connect", guarded(connect_info), methods=["GET"]),
         Route("/api/tags/setup-sessions", once("create_session", create_session), methods=["POST"]),
         Route("/api/tags/setup-sessions/{session_id}", guarded(get_session), methods=["GET"]),
         Route("/api/tags/setup-sessions/{session_id}", guarded(delete_session), methods=["DELETE"]),
@@ -205,4 +173,4 @@ def get_tags_setup_routes() -> list[Route]:
     ]
 
 
-__all__ = ["connect_downloads", "get_tags_setup_routes"]
+__all__ = ["get_tags_setup_routes"]

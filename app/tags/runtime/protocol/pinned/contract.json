@@ -10,13 +10,13 @@
   },
   "source": {
     "repository": "https://github.com/cremind-ai/cremind-tag",
-    "revision": "b1b6ca4187634fd1dd4badac1324c4ac6bb609f1",
+    "revision": "827f86bd7c3ddc8a30d4968939370f00ce083a44",
     "dirty": false
   },
   "files": {
-    "docs/connect-setup.md": "74c933f332374c1dc603f596095cd4f508c8826804243bba91a14180e043d7a4",
-    "docs/fontpack.md": "30d73ec061f119e5495039aeece3d8bb210f5035c1597e0289829fcc9995c9c8",
-    "docs/protocol.md": "f94653780037fff67716ca87a8739d64a9ca0c7c764d922b14d0523c7b19e023",
+    "docs/connect-setup.md": "f71042934078321a33361d4a0afe4d43413056682d7e77e550f7a1a527338da2",
+    "docs/fontpack.md": "f2cdd4d520b748eee16d18d2fd2f8fc0001cca2dd53abf914daebe04df8a1a7e",
+    "docs/protocol.md": "b0b3efc2bb98cb1d60c11924d6bc1bd94d393922d094d8d73444c9d79844267d",
     "fixtures/cobs.json": "0831590cade624b11dcc38448c72c417410582900e3bd81690729521e894cdd9",
     "fixtures/crc32.json": "70d3a28fbe5d03572135c5e9a6ec144fc5aca3c24f073ba4a041443aa8b2c4c4",
     "fixtures/enrollment.json": "e0d233522715239327ce16e6242087500ca203bbfc7f502d4ea70c0d07f890d0",
@@ -31,7 +31,10 @@
     "fixtures/session.json": "0698e7210df4e914dfbbe78eab2a30758172d37656ee406ec7b8ce7509e62fbe",
     "fixtures/tag_txn.json": "cf38bbe0ec62e6afe979bc60ca7676a39b47e5345370eaf442d8104a48b44623",
     "fixtures/v2_secure.json": "886ecdea6fdfdcfdfa22f8046da25d092262690d1300709dc894dad19ecef6d6",
-    "spec.yaml": "729103a9c513c5cf7b1375863b9aa16dc9ab6358ecc6f294edd8c30edee628ce"
+    "hardware/matrix.yaml": "462a92be32fc75d819967d51c681c1dff873cd829ea7197996af39f0c41e5848",
+    "hardware/targets.yaml": "4f02ec46b1563e4839d73f295f9eb1cf44579917cd2b7c71550a7400d337057d",
+    "spec.yaml": "87135d4b38835af95d7780d66b342d873b921bf17b1137afdc732e3712cf159c",
+    "tests/conversation.h": "7230447d2277e7d7b94f31a4eb7c8860a5ff1a873488372449c8bc4f7f3e79db"
   },
-  "digest": "355cb098f835bcb4cd929c88013245b5fc94595cf42dd372b48156ee343aed2c"
+  "digest": "209d3afc1f9702310a434a2c4f37380e2342fdc265f97fb476e3cce87a293786"
 }

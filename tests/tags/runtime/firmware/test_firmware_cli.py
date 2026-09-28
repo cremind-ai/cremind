@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,7 +16,6 @@ from app.tags.runtime.cli import firmware as fw
 from app.tags.runtime.cli.main import app
 from app.tags.runtime.enroll.tools import CompletedResult, ToolInfo
 
-REPO = Path(__file__).resolve().parents[4]
 VERSION = "0.1.0"
 
 
@@ -127,31 +124,8 @@ def cli(*args: str, code: int = 0, input: str | None = None) -> Any:
     return result
 
 
-# -- tables --------------------------------------------------------------------------------------------
-
-
-FIRMWARE_REPO = Path(os.environ.get("CREMIND_TAG_FIRMWARE_REPO") or REPO.parent / "cremind-tag")
-
-
-@pytest.mark.skipif(not (FIRMWARE_REPO / "tools" / "targets.yaml").is_file(),
-                    reason="no cremind-tag firmware checkout (set CREMIND_TAG_FIRMWARE_REPO)")
-def test_soc_table_matches_the_build_matrix_and_the_release_tool() -> None:
-    tools = FIRMWARE_REPO / "tools"
-    socs = yaml.safe_load((tools / "targets.yaml").read_text(encoding="utf-8"))["socs"]
-    assert set(fw.SOC_DEVICES) == set(socs)
-    for key, (_, family, flash) in fw.SOC_DEVICES.items():
-        assert flash == socs[key]["flash"] and family == socs[key]["series"].upper()
-    sys.path.insert(0, str(tools))
-    try:
-        spec = importlib.util.spec_from_file_location("_ctag_release_tool", tools / "release.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module  # dataclasses resolve the module by name
-        spec.loader.exec_module(module)
-    finally:
-        sys.path.remove(str(tools))
-        sys.modules.pop("_ctag_release_tool", None)
-    assert {k: v[:2] for k, v in fw.SOC_DEVICES.items()} == module.SOC_DEVICES
+# The SoC table against the firmware's build matrix: tests/tags/runtime/enroll/test_hardware_tables.py
+# (the pinned contract's hardware/targets.yaml).
 
 
 # -- list / verify ---------------------------------------------------------------------------------------

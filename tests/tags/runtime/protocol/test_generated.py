@@ -24,6 +24,16 @@ def test_generator_is_deterministic(gen_fixtures: ModuleType) -> None:
     assert gen_fixtures.build_all() == gen_fixtures.build_all()
 
 
+def test_tag_core_conversations_are_current(gen_conversation: ModuleType) -> None:
+    """The conversations the firmware's tag core test replays are exactly what the reference scripts."""
+    from app.tags.runtime.protocol import contract
+
+    frames = gen_conversation.load_frames()
+    pinned = contract.pinned().conversation_path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    assert gen_conversation.emit(gen_conversation.scenarios(frames), frames) == pinned, \
+        "the Python reference no longer produces the pinned tests/conversation.h"
+
+
 def test_spec_hash_matches_generated_modules(codegen: ModuleType) -> None:
     import hashlib
 

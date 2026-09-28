@@ -19,7 +19,12 @@ transcript covers it (docs/protocol.md 5.4).
 Usage (Cremind's environment; ``cryptography`` is a core dependency)::
 
     .venv/Scripts/python.exe scripts/tags/gen_conversation.py --out ../cremind-tag/tests/ztest/tag_core/src/conversation.h
+    .venv/Scripts/python.exe scripts/tags/gen_conversation.py --check   # the pinned contract's copy
     .venv/Scripts/python.exe scripts/tags/gen_conversation.py --check ../cremind-tag/tests/ztest/tag_core/src/conversation.h
+
+The header belongs to the firmware repository (committed there, replayed by its
+tag core test) and travels in the protocol contract as ``tests/conversation.h``;
+tests/tags/runtime/protocol checks this generator against the pinned copy.
 """
 
 from __future__ import annotations
@@ -66,6 +71,8 @@ from app.tags.runtime.protocol.msgs import (  # noqa: E402
 )
 
 DEFAULT_OUT = ROOT.parent / "cremind-tag" / "tests" / "ztest" / "tag_core" / "src" / "conversation.h"
+# The copy in the pinned contract (the firmware's, as of the pinned revision).
+PINNED = ROOT / "app" / "tags" / "runtime" / "protocol" / "pinned" / "tests" / "conversation.h"
 
 TAG_ID = 0x1A2B3C4D
 SECRET = bytes(range(0x60, 0x80))
@@ -607,7 +614,8 @@ def emit(convs: list[Conv], frames: dict[str, Frame]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--check", type=Path, metavar="HEADER", help="fail when this conversation.h is stale")
+    ap.add_argument("--check", type=Path, metavar="HEADER", nargs="?", const=PINNED,
+                    help="fail when this conversation.h is stale (default: the pinned contract's copy)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT,
                     help="where to write conversation.h (default: a cremind-tag checkout next to this one)")
     args = ap.parse_args()

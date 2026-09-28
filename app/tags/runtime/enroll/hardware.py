@@ -13,9 +13,10 @@ from dataclasses import dataclass
 
 from ..protocol.ids import Board, Panel
 
-# Short ids from hardware/matrix.yaml.
+# Short ids from hardware/matrix.yaml (the pinned contract's copy; tests/tags/runtime/enroll/test_hardware_tables.py).
 BOARD_ALIASES: dict[str, Board] = {
     "nrf52840_gateway": Board.NRF52840DK_GATEWAY,
+    "nrf52840dongle_gateway": Board.NRF52840DK_GATEWAY,  # the same gateway firmware and board id on the Dongle
     "nrf52832_gateway": Board.NRF52832_GATEWAY,
     "nrf52840_bridge": Board.NRF52840_BRIDGE,
     "nrf52832_bridge": Board.NRF52832_BRIDGE,

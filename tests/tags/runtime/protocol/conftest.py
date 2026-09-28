@@ -35,6 +35,11 @@ def codegen() -> ModuleType:
 
 
 @pytest.fixture(scope="session")
+def gen_conversation() -> ModuleType:
+    return _load_tool("gen_conversation")
+
+
+@pytest.fixture(scope="session")
 def fixture() -> Any:
     """Loader for a committed JSON fixture by file name."""
 

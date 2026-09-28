@@ -4,10 +4,14 @@ The wire protocol belongs to the cremind-tag firmware repository. It publishes
 an immutable contract artifact (its ``tools/contract.py``): ``contract.json``
 (schema ``cremind-tag/contract@1``) with the contract version, the protocol
 capabilities, the source revision, the SHA-256 of every file and one
-``digest`` over them, plus ``spec.yaml``, the golden ``fixtures/`` and the
-normative ``docs/``. Cremind keeps one such snapshot in ``pinned/`` (replace
-it with ``scripts/tags/pin_contract.py``, never by hand) and generates
-:mod:`.ids` and :mod:`.msgs` from its spec (``scripts/tags/codegen.py``).
+``digest`` over them, plus ``spec.yaml``, the golden ``fixtures/``, the tag
+core conversations the firmware replays (``tests/conversation.h``), the
+hardware tables (``hardware/matrix.yaml``: boards and panels;
+``hardware/targets.yaml``: firmware targets and SoCs) and the normative
+``docs/``. Cremind keeps one such snapshot in ``pinned/`` (replace it with
+``scripts/tags/pin_contract.py``, never by hand), generates :mod:`.ids` and
+:mod:`.msgs` from its spec (``scripts/tags/codegen.py``), and its tests check
+the Python reference and its own copies of the hardware tables against it.
 
 Compatibility with devices follows the protocol capabilities recorded here,
 not the application versions of Cremind or of the firmware.
@@ -25,7 +29,7 @@ from typing import Any
 SCHEMA = "cremind-tag/contract@1"
 PINNED_DIR = Path(__file__).resolve().parent / "pinned"
 META_FILE = "contract.json"
-_TEXT_SUFFIXES = (".yaml", ".json", ".md")
+_TEXT_SUFFIXES = (".yaml", ".json", ".md", ".h")
 
 
 class ContractError(ValueError):
@@ -63,6 +67,17 @@ class Contract:
 
     def fixture(self, name: str) -> Path:
         return self.fixtures_dir / name
+
+    @property
+    def conversation_path(self) -> Path:
+        """The tag core conversations the firmware replays (scripts/tags/gen_conversation.py makes them)."""
+        return self.root / "tests" / "conversation.h"
+
+    def hardware_table(self, name: str) -> dict[str, Any]:
+        """``matrix`` (boards, panels) or ``targets`` (firmware targets, SoCs), parsed."""
+        import yaml
+
+        return yaml.safe_load((self.root / "hardware" / f"{name}.yaml").read_text(encoding="utf-8")) or {}
 
     def summary(self) -> dict[str, Any]:
         return {"version": self.version, "revision": self.revision, "digest": self.digest,
