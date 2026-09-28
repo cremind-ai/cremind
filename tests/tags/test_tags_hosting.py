@@ -271,9 +271,11 @@ def test_the_host_runs_its_own_thread_and_one_process_holds_the_gateways(tmp_pat
         finally:
             await asyncio.to_thread(host.stop, "test over")
         assert host.state == "stopped"
+        assert json.loads(paths.host_file.read_text(encoding="utf-8")).keys() == {"host_id", "created_at"}
         third = HardwareHost(paths, options=options, check_components=False)
         third._build_worker = workers.factory  # type: ignore[method-assign]
         assert await asyncio.to_thread(third.start, asyncio.get_running_loop())  # the lock was released
+        assert third.host_id == host.host_id, "the same computer after a restart (its grants, its connections)"
         await asyncio.to_thread(third.stop, "test over")
 
     asyncio.run(go())

@@ -5,6 +5,7 @@
     <SYS>/.tag-runtime/
         host.json           this installation's hardware host id (never reused)
         host.lock           held by the one process that runs the hardware runtime
+        host-lock.json      which process holds it (pid, host id)
         workers/<companion_id>/   one gateway worker each (worker.json, controller.key,
                             secrets.json, companion.sqlite3, agent.json, daemon-status.json)
         assets/fonts/<pack_id>/   verified font asset bundles (read-only), shared by every worker
@@ -38,6 +39,7 @@ from typing import Any
 DIR_NAME = ".tag-runtime"
 HOST_FILE = "host.json"
 HOST_LOCK = "host.lock"
+HOST_LOCK_INFO = "host-lock.json"
 _DEVICE_ID = re.compile(r"^[0-9a-f]{32}$")
 _WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -59,6 +61,13 @@ class RuntimePaths:
     @property
     def host_lock(self) -> Path:
         return self.base / HOST_LOCK
+
+    @property
+    def host_lock_info(self) -> Path:
+        """Who holds :attr:`host_lock` (pid, host id). Named explicitly: the lock's default,
+        ``host.lock`` → ``host.json``, is :attr:`host_file`, which the lock would overwrite and then
+        delete on release (a new host id at every start)."""
+        return self.base / HOST_LOCK_INFO
 
     @property
     def workers_dir(self) -> Path:

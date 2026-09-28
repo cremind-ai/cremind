@@ -103,7 +103,7 @@ class HardwareHost:
                 return False
             from app.tags.runtime.connect.instance import InstanceLock
 
-            lock = InstanceLock(self.paths.host_lock)
+            lock = InstanceLock(self.paths.host_lock, self.paths.host_lock_info)
             if not lock.acquire():
                 self.state = "busy_elsewhere"
                 self.reason = "Another Cremind process on this computer runs the gateways."
