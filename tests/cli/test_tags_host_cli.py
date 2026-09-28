@@ -103,5 +103,18 @@ def test_run_and_status_on_a_computer_that_was_never_set_up(fake):
     assert result.exit_code == 0, result.output
     doc = json.loads(result.output)
     assert doc["enrolled"] is False and doc["running"] is False and "components" in doc["readiness"]
+    assert doc["migration"] == {"moved": 0, "failed": 0, "rolled_back": 0}
+    assert "Cremind Connect" not in _run("tags", "host", "status").output
     result = _run("tags", "host", "forget", "--yes")
     assert result.exit_code == 0 and "not set up as a gateway computer" in result.output
+
+
+def test_status_tells_what_moved_in_from_cremind_connect(fake):
+    journals = fake["paths"].migration_dir
+    journals.mkdir(parents=True)
+    for worker_id, state in (("w-1", "complete"), ("w-2", "complete"), ("w-3", "in_progress")):
+        (journals / f"{worker_id}.json").write_text(json.dumps({"state": state}), encoding="utf-8")
+    result = _run("tags", "host", "status")
+    assert result.exit_code == 0, result.output
+    assert "Moved in: 2 gateway(s) from Cremind Connect, 1 to retry at the next start" in \
+        " ".join(result.output.split())

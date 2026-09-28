@@ -194,12 +194,16 @@ class HardwareHost:
         self.state, self.reason = "running", None
         self._ready.set()
         agent = asyncio.create_task(self._agent.run(self._stop), name="host agent")
+        # Gateways the older Cremind Connect ran on this computer move in (app/tags/hosting/migration.py).
+        migrating = asyncio.create_task(self._migrate_from_connect(client), name="connect migration")
         try:
             await self._supervisor.run(self._stop)
         finally:
             self._stop.set()
-            with contextlib.suppress(BaseException):
-                await agent
+            migrating.cancel()
+            for task in (agent, migrating):
+                with contextlib.suppress(BaseException):
+                    await task
 
     def facts(self) -> Any:
         """How this host describes itself to Cremind (:class:`~app.tags.runtime.host.agent.HostFacts`)."""
@@ -218,7 +222,46 @@ class HardwareHost:
                          server_origin=remote.server if remote is not None else server_origin(),
                          capabilities=capabilities, state=lambda: (self.state, self.reason), version=__version__,
                          fonts_pack=lambda: self.fonts_pack, host_id=self.host_id,
-                         ca_pem=remote.ca_pem if remote is not None else None)
+                         ca_pem=remote.ca_pem if remote is not None else None,
+                         migration=lambda: _migration_summary(self.paths))
+
+    async def _authority_id(self) -> str | None:
+        """This server's authority key id: the Cremind Connect workers recording it are this server's."""
+        if self.remote is not None:
+            return self.remote.server_authority_id or None
+        from app.tags.authority import AuthorityUnavailable, get_authority
+
+        from .local_connector import on_server
+
+        async def read() -> str | None:
+            try:
+                return (await get_authority()).authority_id.hex()
+            except AuthorityUnavailable:  # no gateway can be this server's yet: nothing to move
+                return None
+
+        return await on_server(read(), self._server_loop, 30.0)
+
+    async def _migrate_from_connect(self, client: Any) -> None:
+        from . import migration
+
+        try:
+            connect = await asyncio.to_thread(migration.connect_paths)
+            if connect is None:
+                return
+            authority_id = await self._authority_id()
+            if not authority_id or self._supervisor is None:
+                return
+            outcomes = await migration.migrate(self.paths, connect, authority_id=authority_id,
+                                               host_id=self.host_id or "", adopt=client.adopt_worker,
+                                               start=self._supervisor.add_worker)
+            if outcomes:
+                logger.info("[tags] from Cremind Connect: " + ", ".join(f"{o.worker_id} {o.state}" for o in outcomes))
+                if self._agent is not None:
+                    self._agent.poke()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - Connect keeps its workers; the next start tries again
+            logger.exception("[tags] moving gateways from Cremind Connect failed")
 
     def _revoked(self, exc: Exception) -> None:
         """A remote host's credential stopped working (it was removed, or re-enrolled elsewhere): stop driving
@@ -349,6 +392,12 @@ def server_origin() -> str:
     if parts.scheme in ("http", "https") and parts.hostname:
         return f"{parts.scheme}://{parts.netloc}"
     return "http://localhost:1515"
+
+
+def _migration_summary(paths: RuntimePaths) -> dict[str, int]:
+    from .migration import summary
+
+    return summary(paths)
 
 
 def _components_reason(readiness: dict[str, Any]) -> str:

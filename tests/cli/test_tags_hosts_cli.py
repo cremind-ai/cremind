@@ -104,6 +104,15 @@ def test_list_shows_each_computer_and_why_one_cannot_search(api):
     assert "Laptop: Computer offline: Laptop is not reachable right now." in " ".join(result.output.split())
 
 
+def test_show_tells_what_moved_in_from_cremind_connect(api):
+    api["hosts"] = [_host(migration={"moved": 2, "failed": 1, "rolled_back": 0})]
+    result = _run("tags", "hosts", "show", "Office PC")
+    assert result.exit_code == 0, result.output
+    assert "Moved in: 2 gateway(s) from Cremind Connect, 1 to retry at the next start" in " ".join(result.output.split())
+    api["hosts"] = [_host(migration={})]
+    assert "Cremind Connect" not in _run("tags", "hosts", "show", "Office PC").output
+
+
 def test_connect_searches_the_only_computer_and_connects_what_it_found(api):
     api["ops"] = {
         "scan-1": [_op("host_scan", "succeeded", candidates=[_candidate()], ports=[])],

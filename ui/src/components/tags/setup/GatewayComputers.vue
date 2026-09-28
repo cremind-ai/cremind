@@ -36,6 +36,16 @@ const hosts = computed(() => setup.hosts);
 
 const PLATFORM: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 
+/** Gateways taken over from the older Cremind Connect on this computer, in words. */
+function moved(h: GatewayHost): string {
+  const m = h.migration ?? {};
+  const parts: string[] = [];
+  if (m.moved) parts.push(`${m.moved === 1 ? '1 gateway' : `${m.moved} gateways`} moved in from Cremind Connect`);
+  if (m.failed) parts.push(`${m.failed} still moving (at the next start)`);
+  if (m.rolled_back) parts.push(`${m.rolled_back} left with Cremind Connect (see the log)`);
+  return parts.join('; ');
+}
+
 function facts(h: GatewayHost): string {
   const parts = [hostKindLabel(h.kind), PLATFORM[h.platform ?? ''] ?? '', h.version ? `Cremind ${h.version}` : ''];
   if (h.connections) parts.push(h.connections === 1 ? '1 of your gateways' : `${h.connections} of your gateways`);
@@ -166,6 +176,7 @@ const grantedCount = (h: GatewayHost) => (h.access.profiles ?? []).filter((p) =>
             <ElTag :type="hostStatePill(h).type" size="small" effect="plain">{{ hostStatePill(h).label }}</ElTag>
           </div>
           <div class="host-meta">{{ facts(h) }}</div>
+          <div v-if="moved(h)" class="host-meta">{{ moved(h) }}.</div>
 
           <p v-if="!h.access.can_use" class="host-note info">
             <Icon icon="mdi:lock-outline" aria-hidden="true" /><span>{{ h.access.reason }}</span>

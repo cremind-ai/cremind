@@ -72,6 +72,7 @@ class HostClient(Protocol):
     async def work(self, wait: int) -> list[dict[str, Any]]: ...
     async def progress(self, op_id: str, body: dict[str, Any]) -> dict[str, Any]: ...
     async def register_worker(self, op_id: str, body: dict[str, Any]) -> dict[str, Any]: ...
+    async def adopt_worker(self, companion_id: str) -> dict[str, Any]: ...
     async def aclose(self) -> None: ...
 
 
@@ -109,6 +110,8 @@ class HostFacts:
     ca_pem: str | None = None
     """The server's own certificate authority (a desktop host enrolled with a Cremind that has one): copied into
     each worker directory, so its connector client trusts exactly that CA."""
+    migration: Callable[[], dict[str, int]] = lambda: {}
+    """Workers taken over from the older Cremind Connect (``{moved, failed, rolled_back}``)."""
 
 
 def computer_name() -> str:
@@ -186,7 +189,8 @@ class HostAgent:
                                  "companion_id": worker.get("companion_id")})
         return {"state": "paused" if sup.get("paused") and state == "running" else state,
                 "reason": sup.get("paused") or reason, "fonts_pack": self.facts.fonts_pack(),
-                "paused": sup.get("paused"), "gateways": gateways, "workers": sup.get("workers") or []}
+                "paused": sup.get("paused"), "gateways": gateways, "workers": sup.get("workers") or [],
+                "migration": self.facts.migration()}
 
     async def hello(self) -> dict[str, Any]:
         body = {"name": self.facts.name, "platform": platform_name(), "version": self.facts.version,

@@ -73,6 +73,9 @@ class HttpHostClient:
     async def register_worker(self, op_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return await self._call("POST", f"/operations/{op_id}/worker", body=body)
 
+    async def adopt_worker(self, companion_id: str) -> dict[str, Any]:
+        return await self._call("POST", f"/workers/{companion_id}/adopt", body={})
+
     async def leave(self) -> dict[str, Any]:
         return await self._call("POST", "/leave", body={})
 

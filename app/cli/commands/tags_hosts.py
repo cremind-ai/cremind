@@ -276,6 +276,12 @@ def hosts_show(
     if access.get("profiles") is not None:
         allowed = [p.get("profile") for p in _rows(access.get("profiles")) if p.get("granted")]
         lines.append("Allowed:    " + (", ".join(str(p) for p in allowed) if allowed else "no other profile"))
+    moved = host.get("migration") or {}
+    if moved.get("moved") or moved.get("failed") or moved.get("rolled_back"):
+        lines.append(f"Moved in:   {moved.get('moved') or 0} gateway(s) from Cremind Connect"
+                     + (f", {moved['failed']} to retry at the next start" if moved.get("failed") else "")
+                     + (f", {moved['rolled_back']} left with Cremind Connect (see the log)"
+                        if moved.get("rolled_back") else ""))
     blocked = host_block(host)
     if blocked and access.get("can_use"):
         lines.append(blocked)

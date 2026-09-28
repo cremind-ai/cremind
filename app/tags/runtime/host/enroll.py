@@ -78,6 +78,8 @@ class Enrollment:
     server_installation_id: str
     enrolled_at: str
     ca_pem: str | None = None
+    server_authority_id: str = ""
+    """The server's authority key id: a Cremind Connect worker recording it is this server's (migration)."""
 
     def __repr__(self) -> str:
         return f"Enrollment(server={self.server!r}, host_id={self.host_id!r}, profile={self.profile!r})"
@@ -90,7 +92,8 @@ class Enrollment:
         return {"schema": ENROLLMENT_SCHEMA, "server": self.server, "host_id": self.host_id,
                 "credential_id": self.credential_id, "profile": self.profile, "profile_id": self.profile_id,
                 "host_name": self.host_name, "server_installation_id": self.server_installation_id,
-                "enrolled_at": self.enrolled_at, "ca_pinned": self.ca_pem is not None}
+                "enrolled_at": self.enrolled_at, "ca_pinned": self.ca_pem is not None,
+                "server_authority_id": self.server_authority_id}
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +201,8 @@ def load_enrollment(paths: Any) -> Enrollment | None:
                       profile=str(public.get("profile") or ""), profile_id=str(public.get("profile_id") or ""),
                       host_name=str(public.get("host_name") or ""),
                       server_installation_id=str(public.get("server_installation_id") or ""),
-                      enrolled_at=str(public.get("enrolled_at") or ""), ca_pem=ca_pem)
+                      enrolled_at=str(public.get("enrolled_at") or ""), ca_pem=ca_pem,
+                      server_authority_id=str(public.get("server_authority_id") or ""))
 
 
 def forget_enrollment(paths: Any) -> None:
@@ -288,7 +292,8 @@ def enroll(link_url: str, paths: Any, *, approve: Callable[[Any], bool],
             profile_id=str(profile.get("id") or bound.profile_id),
             host_name=str((result.get("host") or {}).get("name") or name),
             server_installation_id=str(server.get("installation_id") or bound.installation_id),
-            enrolled_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), ca_pem=ca_pem)
+            enrolled_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), ca_pem=ca_pem,
+            server_authority_id=str(server.get("authority_id") or bound.authority_id.hex()))
     except (KeyError, TypeError) as exc:
         raise EnrollError("bad_answer", f"Cremind's answer to redeem was not understood ({exc}).") from None
     save_enrollment(paths, enrollment)

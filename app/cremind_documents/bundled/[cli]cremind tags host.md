@@ -64,7 +64,11 @@ computer (it was removed): enroll it again. `4` means it was never set up.
 ### `cremind tags host status`
 
 The enrollment (server, profile, host id), whether the host runs, and the
-gateway components (`platform`, `packages`, `fonts`).
+gateway components (`platform`, `packages`, `fonts`). On a computer that ran
+the older Cremind Connect, a `Moved in` line tells how many of its gateways
+this computer took over (`migration` in `--json`): the host does that by
+itself when it starts, keeping their keys and pairings; one that could not
+move yet is retried at the next start.
 
 ### `cremind tags host prepare`
 

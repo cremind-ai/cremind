@@ -261,6 +261,8 @@ export interface GatewayHost {
   readiness: HostReadiness | null;
   usb: HostUsb | null;
   gateways: HostGateway[];
+  /** Gateways this computer took over from the older Cremind Connect. */
+  migration?: { moved?: number; failed?: number; rolled_back?: number };
   access: {
     can_use: boolean;
     reason: string | null;

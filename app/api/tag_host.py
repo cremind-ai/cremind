@@ -16,6 +16,8 @@ It only ever connects out (no port opens on the gateway computer):
 - ``POST operations/{id}/worker``       ``{controller_pub, credentials: {hardware_sha256, content_sha256}, gateway}``
   -> ``{companion_id, credentials, operation_id, profile, generation, server}``: a connection's worker records
 - ``POST leave``                        -> ``{host}``: the computer forgets its enrollment (its credential stops working)
+- ``POST workers/{companion_id}/adopt`` -> ``{companion_id, generation, host_id, profile}``: take over a worker the
+  older Cremind Connect ran on this computer (moved in as it was)
 
 The backend's own hardware host calls the same functions in process
 (:mod:`app.tags.hosting.local_host`). The gateway workers themselves use the
@@ -79,12 +81,16 @@ def get_tag_host_routes() -> list[Route]:
     async def leave(request: Request, p: hosts.HostPrincipal) -> dict[str, Any]:
         return await hosts.host_leave(p)
 
+    async def adopt(request: Request, p: hosts.HostPrincipal) -> dict[str, Any]:
+        return await hosts.adopt_legacy_worker(p, request.path_params["companion_id"])
+
     return [
         Route(f"{PREFIX}/hello", route(hello), methods=["POST"]),
         Route(f"{PREFIX}/work", route(work), methods=["GET"]),
         Route(f"{PREFIX}/operations/{{op_id}}/progress", route(progress), methods=["POST"]),
         Route(f"{PREFIX}/operations/{{op_id}}/worker", route(worker), methods=["POST"]),
         Route(f"{PREFIX}/leave", route(leave), methods=["POST"]),
+        Route(f"{PREFIX}/workers/{{companion_id}}/adopt", route(adopt), methods=["POST"]),
     ]
 
 

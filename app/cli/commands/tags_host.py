@@ -189,6 +189,7 @@ def host_run() -> None:
 def host_status(ctx: typer.Context) -> None:
     """This computer's enrollment, its gateway components, and whether it is running."""
     from app.tags.hosting.components import readiness
+    from app.tags.hosting.migration import summary
     from app.tags.runtime.connect.instance import is_locked
     from app.tags.runtime.host.enroll import EnrollError, load_enrollment
 
@@ -204,6 +205,8 @@ def host_status(ctx: typer.Context) -> None:
         "problem": problem,
         "running": is_locked(paths.host_lock),
         "readiness": readiness(paths.assets_dir),
+        # Gateways taken over from the older Cremind Connect on this computer.
+        "migration": summary(paths),
     }
     if ctx.obj["mode"].json:
         sys.stdout.write(json.dumps(doc, indent=2) + "\n")
@@ -220,6 +223,12 @@ def host_status(ctx: typer.Context) -> None:
     for component in ready.get("components") or []:
         detail = f" — {component.get('detail')}" if component.get("detail") else ""
         sys.stdout.write(f"  {component.get('key')}: {component.get('state')}{detail}\n")
+    moved = doc["migration"]
+    if any(moved.values()):
+        sys.stdout.write(f"Moved in:   {moved['moved']} gateway(s) from Cremind Connect"
+                         + (f", {moved['failed']} to retry at the next start" if moved["failed"] else "")
+                         + (f", {moved['rolled_back']} left with Cremind Connect (see the log)"
+                            if moved["rolled_back"] else "") + "\n")
 
 
 @host_app.command("prepare")

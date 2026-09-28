@@ -144,6 +144,8 @@ def host_json(row: Any, *, now: float, may_use: bool, why_not: str | None, can_m
         "state": state, "reason": reason,
         "readiness": caps.get("readiness"), "usb": caps.get("usb"),
         "gateways": [g for g in status.get("gateways") or [] if isinstance(g, dict)],
+        # Gateways this computer took over from the older Cremind Connect (moved / not yet).
+        "migration": status.get("migration") or {},
         "access": {"can_use": may_use, "reason": why_not, "can_manage": can_manage,
                    **({"profiles": grants} if grants is not None else {})},
         "connections": connections,
@@ -538,6 +540,33 @@ async def remove_host(profile: str, host_id: Any) -> dict[str, Any]:
     return {"host": {"id": host.id, "name": host.name, "state": "revoked"}, "connections": count}
 
 
+LEGACY_EXTERNAL = "legacy_external"
+
+
+async def adopt_legacy_worker(principal: HostPrincipal, companion_id: Any) -> dict[str, Any]:
+    """A host takes over a worker the older Cremind Connect ran on the same computer (its directory moved in as
+    it was, :mod:`app.tags.hosting.migration`): Cremind records the worker on this host. Only a connection of
+    the profile the host serves (a desktop host) that still runs outside any host; a repeat answers the same."""
+    if not isinstance(companion_id, str) or not companion_id:
+        raise TagError(422, "invalid_worker", "Name the connection to take over.")
+    now = now_ms()
+    async with get_tag_storage().engine.begin() as conn:
+        await begin_write(conn)
+        comp = (await conn.execute(select(COMPANIONS).where(COMPANIONS.c.id == companion_id))).first()
+        if comp is None or comp.mode != PRIVATE or comp.state in ("removed", "removing") \
+                or (principal.profile_id is not None and comp.owner_profile_id != principal.profile_id):
+            raise TagError(404, "connection_not_found", "No connection with that id.")
+        if comp.host_id == principal.host_id and comp.execution_kind == principal.kind:
+            pass  # taken over already (a retried request)
+        elif comp.execution_kind != LEGACY_EXTERNAL:
+            raise TagError(409, "not_legacy", "That connection already runs on a gateway computer.")
+        else:
+            await conn.execute(update(COMPANIONS).where(COMPANIONS.c.id == comp.id).values(
+                execution_kind=principal.kind, host_id=principal.host_id, updated_at=now))
+    return {"companion_id": comp.id, "generation": int(comp.generation or 0), "host_id": principal.host_id,
+            "profile": {"name": comp.owner_profile, "id": comp.owner_profile_id}}
+
+
 async def host_leave(principal: HostPrincipal) -> dict[str, Any]:
     """A desktop host forgets its enrollment (``cremind tags host forget``): the same as its owner removing it."""
     now = now_ms()
@@ -594,9 +623,12 @@ def _clean_status(body: dict[str, Any]) -> dict[str, Any]:
                             "gateway_connected": bool(w.get("gateway_connected")),
                             "gate_open": bool((w.get("gate") or {}).get("open")) if isinstance(w.get("gate"), dict)
                             else None, "last_error": str(w.get("last_error") or "")[:300] or None})
+    moved = status.get("migration") if isinstance(status.get("migration"), dict) else {}
+    migration = {key: int(moved.get(key) or 0) for key in ("moved", "failed", "rolled_back")
+                 if isinstance(moved.get(key), int) and not isinstance(moved.get(key), bool)}
     return {"state": str(status.get("state") or "unknown")[:24], "reason": str(status.get("reason") or "")[:400] or None,
             "fonts_pack": _hex(status.get("fonts_pack"), 8), "paused": str(status.get("paused") or "")[:120] or None,
-            "gateways": gateways, "workers": workers}
+            "gateways": gateways, "workers": workers, "migration": migration}
 
 
 async def host_hello(principal: HostPrincipal, body: dict[str, Any]) -> dict[str, Any]:
@@ -994,7 +1026,7 @@ async def expire(now: float | None = None) -> int:
 
 __all__ = [
     "ADMIN", "CANDIDATE_STATES", "DESKTOP", "HOST_OPS", "HOST_SCHEME", "HostPrincipal", "SERVER", "USABLE",
-    "authenticate_host", "cancel_operation", "enroll_redeem", "expire", "get_operation", "host_hello",
+    "adopt_legacy_worker", "authenticate_host", "cancel_operation", "enroll_redeem", "expire", "get_operation", "host_hello",
     "host_leave", "host_progress", "host_register_worker", "host_work", "list_hosts", "may_use",
     "new_host_credential", "new_host_credential_id", "notify_host", "on_claim_outcome", "on_gateway_ready",
     "operation_json", "parse_host_authorization", "remove_host", "set_access", "start_connect", "start_prepare",

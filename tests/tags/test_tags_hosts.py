@@ -521,6 +521,75 @@ def test_the_host_api_takes_only_a_host_credential(tagenv) -> None:
     assert status == 200 and out == {"work": []}
 
 
+# ---------------------------------------------------------------- workers moving in from Cremind Connect
+
+
+def legacy_worker(env, companion_id: str, profile: str | None, profile_id: str | None, *, mode: str = "private",
+                  execution_kind: str = "legacy_external", generation: int = 2) -> None:
+    """A connection Cremind Connect set up and runs (what every one made before gateway computers is)."""
+    with env.engine.begin() as c:
+        c.execute(text("INSERT INTO tag_companions (id, name, created_at, updated_at, mode, owner_profile, "
+                       "owner_profile_id, generation, state, execution_kind) VALUES (:i, 'Connect PC', 0, 0, :m, "
+                       ":p, :pid, :g, 'active', :k)"),
+                  {"i": companion_id, "m": mode, "p": profile, "pid": profile_id, "g": generation,
+                   "k": execution_kind})
+
+
+def test_a_computer_takes_over_the_workers_cremind_connect_ran_there(tagenv) -> None:
+    from app.tags import hosts
+    from app.tags.service import TagError
+
+    principal, _, _ = desktop(tagenv, "p1", "pid1")
+    legacy_worker(tagenv, "c-mine", "p1", "pid1")
+    legacy_worker(tagenv, "c-theirs", "p2", "pid2")
+    legacy_worker(tagenv, "c-shared", None, None, mode="legacy_shared")
+    legacy_worker(tagenv, "c-hosted", "p1", "pid1", execution_kind="server")
+
+    out = run(hosts.adopt_legacy_worker(principal, "c-mine"))
+    assert out == {"companion_id": "c-mine", "generation": 2, "host_id": "host-dsk",
+                   "profile": {"name": "p1", "id": "pid1"}}
+    row = dict(tagenv.engine.connect().execute(text(
+        "SELECT host_id, execution_kind, generation FROM tag_companions WHERE id = 'c-mine'")).mappings().one())
+    assert row == {"host_id": "host-dsk", "execution_kind": "desktop", "generation": 2}, "moved in as it was"
+    assert run(hosts.adopt_legacy_worker(principal, "c-mine")) == out, "a retried request answers the same"
+
+    for companion_id, code in (("c-theirs", "connection_not_found"), ("c-shared", "connection_not_found"),
+                               ("c-missing", "connection_not_found"), ("c-hosted", "not_legacy"), ("", "invalid_worker")):
+        with pytest.raises(TagError) as info:
+            run(hosts.adopt_legacy_worker(principal, companion_id))
+        assert info.value.code == code, companion_id
+    assert scalar(tagenv, "SELECT execution_kind FROM tag_companions WHERE id = 'c-theirs'") == "legacy_external"
+
+    # The server's own computer serves every profile: any profile's worker moves onto it.
+    assert run(hosts.adopt_legacy_worker(server(), "c-theirs"))["host_id"] == SRV_ID
+    with pytest.raises(TagError) as info:
+        run(hosts.adopt_legacy_worker(server(), "c-mine"))
+    assert info.value.code == "not_legacy", "a worker another computer took over stays there"
+
+
+def test_the_host_api_adopts_and_reports_the_move(tagenv) -> None:
+    from app.api.tag_host import get_tag_host_routes
+
+    _, cred_id, secret = desktop(tagenv, "p1", "pid1")
+    legacy_worker(tagenv, "c-mine", "p1", "pid1")
+    auth = {"authorization": f"CremindHost {cred_id}.{secret}"}
+    path = "/api/tag-host/v1/workers/{companion_id}/adopt"
+    status, out = call(get_tag_host_routes(), "POST", path,
+                       req(None, path={"companion_id": "c-mine"}, body={}, headers=auth))
+    assert status == 200 and out["companion_id"] == "c-mine" and out["host_id"] == "host-dsk", out
+    status, out = call(get_tag_host_routes(), "POST", path, req(None, path={"companion_id": "c-mine"}, body={}))
+    assert status == 401
+
+    from app.tags import hosts
+
+    principal = run(hosts.authenticate_host(cred_id, secret))
+    run(hosts.host_hello(principal, {
+        "name": "Laptop", "platform": "windows", "version": "0.0.19", "capabilities": {},
+        "status": {"state": "running", "gateways": [], "workers": [],
+                   "migration": {"moved": 1, "failed": 0, "rolled_back": 1, "junk": 5, "failed_x": "2"}}}))
+    assert host_view("p1", "host-dsk")["migration"] == {"moved": 1, "failed": 0, "rolled_back": 1}
+
+
 def test_the_guard_keeps_host_credentials_on_the_host_api() -> None:
     from app.middleware.tag_connector_guard import TagConnectorGuard
 

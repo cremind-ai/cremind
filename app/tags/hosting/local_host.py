@@ -54,6 +54,9 @@ class LocalHostClient:
     async def register_worker(self, op_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return await self._call(hosts.host_register_worker(self.principal, op_id, _json_round_trip(body)))
 
+    async def adopt_worker(self, companion_id: str) -> dict[str, Any]:
+        return await self._call(hosts.adopt_legacy_worker(self.principal, companion_id))
+
     async def aclose(self) -> None:
         return None
 
