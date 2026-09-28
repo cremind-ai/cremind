@@ -1,8 +1,8 @@
 {
   "schema": "cremind/tag-font-bundle@1",
-  "pack_id": "3367a767d30c5b49",
+  "pack_id": "b6009b469294a509",
   "profile": "full",
-  "url": "https://github.com/cremind-ai/cremind/releases/download/fonts-3367a767d30c5b49/cremind-tag-fonts-3367a767d30c5b49.tar.gz",
-  "sha256": "98d63801262560c77d3cf1f09296a403174a843d149e010ca1e635b8c899a2f0",
-  "size": 51050376
+  "url": "https://github.com/cremind-ai/cremind/releases/download/fonts-b6009b469294a509/cremind-tag-fonts-b6009b469294a509.tar.gz",
+  "sha256": "39f34e457246b141e1da642ff4cea73719d3d1b0496fbe237a0d556e644c48a1",
+  "size": 51050367
 }

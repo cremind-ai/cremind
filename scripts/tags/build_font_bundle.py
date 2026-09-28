@@ -14,8 +14,24 @@ which ``app/tags/hosting/fonts.py`` checks before installing anything.
 The pack must be built first (``cremind tags tools fonts fetch`` and
 ``cremind tags tools fonts build --profile full``). The archive is
 reproducible — entries sorted, times and owners zeroed, modes normalised,
-gzip without a timestamp — so the same fonts always give the same SHA-256.
-That is what lets CI prove a pin and a gateway computer verify a download.
+text with LF line ends, gzip without a timestamp — so the same pack always
+gives the same SHA-256. That is what lets CI prove a pin and a gateway
+computer verify a download.
+
+The canonical pack is the **Linux** build (what the release workflows run):
+the FreeType/HarfBuzz builds inside the Windows and macOS wheels round a
+handful of glyph pixels differently, so a pack built there has another pack
+id. Pin from Linux, e.g. in a container mirroring CI::
+
+    docker run --rm -v "$PWD:/src" -w /src python:3.13-slim bash -c \\
+      "pip install uv && UV_PROJECT_ENVIRONMENT=/venv uv sync --all-groups && \\
+       uv run --no-sync cremind tags tools fonts fetch && \\
+       uv run --no-sync cremind tags tools fonts build --profile full && \\
+       uv run --no-sync python scripts/tags/build_font_bundle.py --write-lock"
+
+A checkout whose own pack has another id installs the pinned bundle instead
+of its own (app/tags/hosting/fonts.py), so every gateway computer and bridge
+shares one pack.
 
 The bundle is published once per pack, as the asset of the GitHub release
 ``fonts-<pack_id>`` (the release workflows create it when it is missing), so
@@ -48,8 +64,16 @@ def release_tag(pack_id: str) -> str:
     return f"fonts-{pack_id}"
 
 
+TEXT_SUFFIXES = (".json", ".txt", ".md", ".yaml")
+
+
+def _is_text(path: Path) -> bool:
+    return path.suffix.lower() in TEXT_SUFFIXES or path.name.upper().startswith(("NOTICE", "LICENSE", "README"))
+
+
 def _tar_bytes(root: Path) -> bytes:
-    """A reproducible tar.gz of everything under ``root`` (paths relative to it)."""
+    """A reproducible tar.gz of everything under ``root`` (paths relative to it). Text files (the sidecar, the
+    notices and licences) go in with LF line ends, so a checkout on Windows builds the same bytes as CI."""
     raw = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as gz:
         with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
@@ -65,6 +89,8 @@ def _tar_bytes(root: Path) -> bytes:
                     tar.addfile(info)
                 else:
                     data = path.read_bytes()
+                    if _is_text(path):
+                        data = data.replace(b"\r\n", b"\n")
                     info.size = len(data)
                     info.mode = 0o644
                     tar.addfile(info, io.BytesIO(data))
