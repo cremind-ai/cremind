@@ -1,0 +1,37 @@
+{
+  "schema": "cremind-tag/contract@1",
+  "name": "cremind-tag-contract",
+  "version": "0.1.0",
+  "protocol": {
+    "spec_version": 2,
+    "proto_version": 1,
+    "secure_proto_version": 2,
+    "fontpack_version": 1
+  },
+  "source": {
+    "repository": "https://github.com/cremind-ai/cremind-tag",
+    "revision": "b1b6ca4187634fd1dd4badac1324c4ac6bb609f1",
+    "dirty": false
+  },
+  "files": {
+    "docs/connect-setup.md": "74c933f332374c1dc603f596095cd4f508c8826804243bba91a14180e043d7a4",
+    "docs/fontpack.md": "30d73ec061f119e5495039aeece3d8bb210f5035c1597e0289829fcc9995c9c8",
+    "docs/protocol.md": "f94653780037fff67716ca87a8739d64a9ca0c7c764d922b14d0523c7b19e023",
+    "fixtures/cobs.json": "0831590cade624b11dcc38448c72c417410582900e3bd81690729521e894cdd9",
+    "fixtures/crc32.json": "70d3a28fbe5d03572135c5e9a6ec144fc5aca3c24f073ba4a041443aa8b2c4c4",
+    "fixtures/enrollment.json": "e0d233522715239327ce16e6242087500ca203bbfc7f502d4ea70c0d07f890d0",
+    "fixtures/fontpack.json": "43d9171e1a057620d74355c5d38553f146f4a69c3d4f69704afe00921e6965cc",
+    "fixtures/fontpack_test.ctfp": "55ea0c6363cffd394b54856ce77946dc459042c2069ca5931ba02cf4b32d194b",
+    "fixtures/fragments.json": "c1265735adb4da13feeaac3c43e8bd917b179076ebaa086ad2d4e92831abb7b6",
+    "fixtures/layouts.json": "35f07c971eb88de28f058eb3a4894fa7b21ec2691c6632e664af050eb8e0aff3",
+    "fixtures/mesh_msgs.json": "d83857adcc2750fcfc512b4731f98742f8c9bee749ff3af05cdb23c65184c0e9",
+    "fixtures/qr.json": "135bb002262cb0fa45199328a0550cfdf0b8f9af575c5ea1fca8461750f64320",
+    "fixtures/render.json": "9636938061b063b39485b36c4c0610674ae3828590ee523f3a1e4a6967f3ee92",
+    "fixtures/serial_frames.json": "d286381cf007f4618c45ccb32f6d9ac06a43b8d3ba5284085bff3cf6db05b145",
+    "fixtures/session.json": "0698e7210df4e914dfbbe78eab2a30758172d37656ee406ec7b8ce7509e62fbe",
+    "fixtures/tag_txn.json": "cf38bbe0ec62e6afe979bc60ca7676a39b47e5345370eaf442d8104a48b44623",
+    "fixtures/v2_secure.json": "886ecdea6fdfdcfdfa22f8046da25d092262690d1300709dc894dad19ecef6d6",
+    "spec.yaml": "729103a9c513c5cf7b1375863b9aa16dc9ab6358ecc6f294edd8c30edee628ce"
+  },
+  "digest": "355cb098f835bcb4cd929c88013245b5fc94595cf42dd372b48156ee343aed2c"
+}

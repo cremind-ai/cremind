@@ -147,6 +147,24 @@ llm-groq = ["groq>=0.33.0", "tiktoken>=0.12.0"]
 # Google APIs (Places, Calendar, OAuth flow for Vertex AI).
 google = ["google-api-python-client>=2.0.0", "google-auth>=2.0.0"]
 
+# Cremind Tag hardware runtime (app/tags/runtime): the USB serial link to a
+# gateway, the protocol's CBOR messages, multilingual text layout (ICU line
+# breaking/bidi/graphemes, HarfBuzz shaping, FreeType rasterising) and screen
+# previews. Installed by app/features/installer.py when a gateway computer is
+# prepared; every import is lazy, so Cremind starts without it. pyicu-wheels
+# publishes macOS wheels for macOS 15 and newer only: the feature manifest
+# refuses older macOS for this extra alone (Cremind itself keeps its minimum).
+tags = [
+    "pyserial>=3.5",
+    "cbor2>=5.6",
+    "pyicu-wheels>=2.15",
+    "uharfbuzz>=0.40",
+    "freetype-py>=2.5",
+    "pillow>=10",
+    "keyring>=25",
+    "platformdirs>=4",
+]
+
 # External chat-channel adapters.
 channel-telegram-bot = ["python-telegram-bot>=21.0"]
 channel-telegram-userbot = ["telethon>=1.36.0"]
@@ -182,6 +200,14 @@ all = [
     "telethon>=1.36.0",
     "discord.py>=2.4.0",
     "slack-bolt>=1.18.0",
+    "pyserial>=3.5",
+    "cbor2>=5.6",
+    "pyicu-wheels>=2.15",
+    "uharfbuzz>=0.40",
+    "freetype-py>=2.5",
+    "pillow>=10",
+    "keyring>=25",
+    "platformdirs>=4",
 ]
 
 [project.scripts]
@@ -273,6 +299,18 @@ dev = [
     "pandas>=3.0.1",
     "pillow>=10.0",
     "pillow-heif>=0.18",
+    # The Cremind Tag hardware runtime (the `tags` extra, installed on demand
+    # when a gateway computer is prepared). Same rationale: tests/tags/runtime
+    # drives the real serial framing, CBOR, ICU/HarfBuzz layout and FreeType
+    # font builds, so a clean runner needs them.
+    "pyserial>=3.5",
+    "cbor2>=5.6",
+    "pyicu-wheels>=2.15",
+    "uharfbuzz>=0.40",
+    "freetype-py>=2.5",
+    "keyring>=25",
+    "platformdirs>=4",
+    "pytest-timeout>=2.3",
 ]
 
 # ── Ruff (lint + format) ─────────────────────────────────────────────────
@@ -310,9 +348,16 @@ ignore = ["E501"]
 "__init__.py" = ["F401"]
 # Tests sometimes shadow builtins or do other idiomatic test things.
 "tests/**" = ["F401", "F811"]
+# Vendored verbatim from upstream (Project Nayuki's QR Code generator).
+"app/tags/runtime/third_party/**" = ["E"]
 
 # ── pytest ───────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "network: needs network access (the Cremind Tag runtime tests that download pinned fonts)",
+    "fonts: needs the pinned Cremind Tag font cache (python -m app.tags.runtime.cli fonts fetch)",
+    "slow: long simulated Cremind Tag scale/fault runs (CREMIND_TAG_SCALE_FULL=1 for the full run)",
+]

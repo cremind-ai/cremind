@@ -35,6 +35,14 @@ REQUIRED_LOCKFILES = (
     "app/channels/sidecars/zalo/package-lock.json",
 )
 
+# Data files the Cremind Tag runtime reads: the pinned protocol contract
+# (verified against its manifest, and the source of the generated bindings).
+REQUIRED_DATA = (
+    "app/tags/runtime/protocol/pinned/contract.json",
+    "app/tags/runtime/protocol/pinned/spec.yaml",
+    "app/tags/runtime/protocol/pinned/fixtures/fontpack_test.ctfp",
+)
+
 
 def _resolve_wheel(argv: list[str]) -> Path:
     if len(argv) > 1:
@@ -67,6 +75,14 @@ def main(argv: list[str]) -> int:
             "(see the lockfile block in .gitignore).",
         )
 
+    missing_data = [name for name in REQUIRED_DATA if name not in names]
+    if missing_data:
+        problems.append(
+            "wheel is missing runtime data file(s):\n  "
+            + "\n  ".join(missing_data)
+            + "\nThey must stay tracked (check .gitignore rules for *.ctfp, *.yaml, *.json).",
+        )
+
     leaked = sorted(name for name in names if "/node_modules/" in name)
     if leaked:
         problems.append(
@@ -81,7 +97,7 @@ def main(argv: list[str]) -> int:
             print(f"\n{problem}", file=sys.stderr)
         return 1
 
-    print(f"OK: {wheel.name} — sidecar lockfiles present, no node_modules leakage")
+    print(f"OK: {wheel.name} — sidecar lockfiles and runtime data present, no node_modules leakage")
     return 0
 
 

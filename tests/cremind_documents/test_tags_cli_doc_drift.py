@@ -27,9 +27,11 @@ BUNDLED = Path(__file__).resolve().parents[2] / "app" / "cremind_documents" / "b
 DOC = BUNDLED / "[cli]cremind tags.md"
 HARDWARE_DOC = BUNDLED / "[cli]cremind tags hardware.md"
 DEVICES_DOC = BUNDLED / "[cli]cremind tags devices.md"
-ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC]
+TOOLS_DOC = BUNDLED / "[cli]cremind tags tools.md"
+ALL_DOCS = [DOC, HARDWARE_DOC, DEVICES_DOC, TOOLS_DOC]
 HARDWARE_GROUP = "hardware"
 DEVICES_GROUP = "devices"
+TOOLS_GROUP = "tools"
 
 
 def _doc_text(doc: Path = DOC) -> str:
@@ -52,7 +54,7 @@ def _walk(app, prefix: str):
 
 def _doc_for(path: str) -> Path:
     group = path.split(" ")[2]
-    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC}.get(group, DOC)
+    return {HARDWARE_GROUP: HARDWARE_DOC, DEVICES_GROUP: DEVICES_DOC, TOOLS_GROUP: TOOLS_DOC}.get(group, DOC)
 
 
 @pytest.mark.parametrize("doc", ALL_DOCS, ids=lambda d: d.name)

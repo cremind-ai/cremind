@@ -1551,3 +1551,9 @@ def hardware_set_defaults(
 from app.cli.commands.tags_devices import devices_app  # noqa: E402
 
 tags_app.add_typer(devices_app, name="devices")
+
+# Host-side hardware tools (firmware, enrollment, bridge fonts, simulator):
+# `cremind tags tools …` hands everything after `tools` to app.tags.runtime.cli.
+from app.cli.commands import tags_tools  # noqa: E402
+
+tags_tools.register(tags_app)

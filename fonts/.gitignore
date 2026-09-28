@@ -1,0 +1,5 @@
+# Downloaded font sources and built packs: never committed
+# (python -m app.tags.runtime.cli fonts fetch / build; see fonts/README.md).
+/cache/
+/out/
+*.ctfp
