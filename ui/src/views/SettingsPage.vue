@@ -67,7 +67,7 @@ const allCards: SettingsCard[] = [
   },
   {
     title: 'Tags',
-    description: 'Which of your Cremind Tag screens get which cards, how they look, and the credentials a companion uses',
+    description: 'Connect your Cremind Tag gateway, bridges and tags, and choose which cards their screens show and how they look',
     icon: 'mdi:tablet-dashboard',
     route: 'tags',
   },

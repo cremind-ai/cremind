@@ -333,16 +333,20 @@ async function request<T>(
   agentUrl: string,
   token: string,
   path: string,
-  init: { method?: string; body?: unknown } = {},
+  init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
 ): Promise<T> {
   const res = await fetch(`${resolveBaseUrl(agentUrl)}${path}`, {
     method: init.method ?? 'GET',
-    headers: authHeaders(token),
+    headers: { ...authHeaders(token), ...(init.headers ?? {}) },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
   });
   if (!res.ok) throw await failure(res);
   return res.json() as Promise<T>;
 }
+
+/** The request helper every `/api/tags/*` client shares (tagsSetupApi.ts):
+ *  base URL, Bearer auth, JSON, and non-2xx answers as TagsApiError. */
+export { request as tagsRequest, resolveBaseUrl as tagsBaseUrl };
 
 const enc = encodeURIComponent;
 

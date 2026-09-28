@@ -20,6 +20,8 @@ const props = defineProps<{
   label: string;
   width?: number | null;
   height?: number | null;
+  /** A small preview in a list (Settings → Tags): no revision number. */
+  hideRevision?: boolean;
 }>();
 
 const store = useTagsStore();
@@ -82,10 +84,10 @@ const aspect = computed(() =>
   <figure class="tag-preview">
     <figcaption class="tag-preview-caption">
       <span class="tag-preview-label">{{ label }}</span>
-      <span v-if="(shownRevision ?? revision) != null" class="tag-preview-rev">rev {{ shownRevision ?? revision }}</span>
+      <span v-if="!hideRevision && (shownRevision ?? revision) != null" class="tag-preview-rev">rev {{ shownRevision ?? revision }}</span>
     </figcaption>
     <div class="tag-preview-frame" :style="{ aspectRatio: aspect }">
-      <img v-if="src" :src="src" :alt="`${label} (revision ${shownRevision ?? revision})`" class="tag-preview-img" />
+      <img v-if="src" :src="src" :alt="hideRevision ? label : `${label} (revision ${shownRevision ?? revision})`" class="tag-preview-img" />
       <div v-else class="tag-preview-empty">
         <Icon
           :icon="state === 'failed' ? 'mdi:image-broken-variant' : state === 'loading' ? 'mdi:loading' : 'mdi:image-off-outline'"

@@ -34,3 +34,30 @@ export function safeRedirectTarget(raw: unknown, profile: string): string | null
 
   return raw;
 }
+
+/** Profile-less pages the router sends to the current profile's copy. */
+const PROFILE_NEUTRAL_PATHS = new Set(['/settings/tags']);
+
+/**
+ * Where a profile-less link (``/settings/tags``) goes: that page of the
+ * profile this tab uses, else of the first signed-in profile, else the
+ * profile selector with ``?redirect=`` (see profileNeutralTarget).
+ */
+export function currentProfilePath(
+  path: string,
+  current: { profileId: string; loggedIn: string[] },
+): { path: string; query?: Record<string, string> } {
+  const profile = current.profileId || current.loggedIn[0] || '';
+  if (!profile) return { path: '/', query: { redirect: path } };
+  return { path: `/${encodeURIComponent(profile)}${path}` };
+}
+
+/**
+ * A profile-less ``?redirect=`` (``/settings/tags``, opened while nobody was
+ * signed in) as that page of the profile just chosen; ``null`` for anything
+ * else. Only exact known paths map, so this opens no new redirect.
+ */
+export function profileNeutralTarget(raw: unknown, profile: string): string | null {
+  if (typeof raw !== 'string' || !profile || !PROFILE_NEUTRAL_PATHS.has(raw)) return null;
+  return `/${encodeURIComponent(profile)}${raw}`;
+}

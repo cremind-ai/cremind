@@ -159,6 +159,42 @@ type CremindBackendUpgradeBridge = {
   offDone: (cb: (result: CremindBackendUpgradeDone) => void) => void
 }
 
+// Cremind Connect (the Cremind Tag gateway service) as the desktop app bundles
+// it. ``status`` reports this OS user's installation; ``install`` installs or
+// updates the bundled copy and (re)registers its startup; ``launch`` hands a
+// ``cremind-connect://setup?…`` link to it over IPC.
+type CremindConnectStatus = {
+  installed: boolean
+  running: boolean
+  version?: string
+  /** The copy this desktop app bundles (newer than ``version`` → offer an update). */
+  bundledVersion?: string
+  installationId?: string
+  /** The computer's name as Connect reports it. */
+  computer?: string
+}
+
+type CremindConnectBridge = {
+  status(): Promise<CremindConnectStatus>
+  install(): Promise<{ ok: boolean; error?: string }>
+  launch(url: string): Promise<{ ok: boolean; error?: string }>
+}
+
+// Keeping Cremind (the local backend) running after the window closes, so tags
+// keep updating. ``applicable`` is false when the backend is not this app's to
+// keep (remote server, Docker, a system service it does not own).
+type CremindBackgroundStatus = {
+  applicable: boolean
+  enabled: boolean
+  owner: 'electron' | 'service' | 'external'
+  detail?: string
+}
+
+type CremindBackgroundBridge = {
+  status(): Promise<CremindBackgroundStatus>
+  enable(): Promise<{ ok: boolean; error?: string }>
+}
+
 type CremindBridge = {
   config: {
     agentUrl: string
@@ -177,6 +213,11 @@ type CremindBridge = {
   // have no such bridge, so callers must feature-detect and fall back to
   // ``window.open``.
   openVncDesktop?: (url: string) => Promise<{ ok: boolean; error?: string }>
+  // Cremind Tag simple setup. Optional like ``openVncDesktop``: older desktop
+  // shells have neither, so Settings → Tags feature-detects them
+  // (services/connectBridge.ts) and falls back to the browser flow.
+  connect?: CremindConnectBridge
+  background?: CremindBackgroundBridge
   installer: CremindInstallerBridge
   server: CremindServerBridge
   updater: CremindUpdaterBridge

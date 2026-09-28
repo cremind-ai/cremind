@@ -8,6 +8,7 @@ import { useSettingsStore } from '../stores/settings';
 import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
 import { myDocumentsClosedMessage, myDocumentsRouteDecision } from '../utils/myDocumentsAccess';
 import { PROFILE_ROUTES } from './profileRoutes';
+import { currentProfilePath } from '../utils/loginRedirect';
 import { redeemTlsHandoff, TlsHandoffSessionError } from '../services/configApi';
 import { restoreTransitionState } from '../services/httpsTransition';
 
@@ -67,6 +68,20 @@ async function consumeSetupHandoff(to: RouteLocationNormalized) {
     }
     return { path: '/', query: { https_handoff: 'expired' }, replace: true };
   }
+}
+
+/**
+ * Where a profile-less link (``/settings/tags``) goes: that page of the
+ * profile this tab uses, else of the first signed-in profile, else the
+ * profile selector — which sends the person there once they sign in.
+ */
+function currentProfileTarget(path: string, to: RouteLocationGeneric) {
+  const settingsStore = useSettingsStore();
+  const target = currentProfilePath(path, {
+    profileId: settingsStore.profileId,
+    loggedIn: settingsStore.getLoggedInProfiles(),
+  });
+  return target.query ? target : { ...target, query: to.query, hash: to.hash };
 }
 
 const routes = [
@@ -316,7 +331,17 @@ const routes = [
     props: true,
     meta: { title: 'Channels' },
   },
-  // Cremind Tag — the profile's routing/look settings and content credentials.
+  // A link without a profile (Cremind Connect, docs: "open Settings → Tags")
+  // lands on the current profile's page. A static path outranks
+  // ``/:profile/tags``, which would otherwise read "settings" as a profile.
+  // Not in PROFILE_ROUTES: it only redirects, and the guard below then runs
+  // for the profile-scoped target (activating its token, or asking to log in).
+  {
+    path: '/settings/tags',
+    name: 'tags-settings-current',
+    redirect: (to: RouteLocationGeneric) => currentProfileTarget('/settings/tags', to),
+  },
+  // Cremind Tag — hardware setup, the profile's routing/look settings and content credentials.
   {
     path: '/:profile/settings/tags',
     name: 'tags-settings',
