@@ -21,7 +21,7 @@ as ``host`` in the result).
 A *trial* is one content card Cremind issues (a notification, a needs-input
 question, a progress run's first card or its outcome); the traffic around the
 trials — progress updates at cadence, answers (``resolved``), cancellations — is
-measured too but reported separately. See docs/scale-test.md for the method,
+measured too but reported separately. See docs/tags/scale-test.md for the method,
 what is and is not modelled, and the results.
 
 Exit status 0 when every invariant holds in every scenario and the baseline meets
@@ -542,7 +542,7 @@ class World:
                                time_scale=cfg.time_scale)
         self.sim = self.rig.sim
         self.fake = self.rig.fake
-        for bridge in self.sim.bridges:  # the scheduling policy (docs/scale-test.md §6.2)
+        for bridge in self.sim.bridges:  # the scheduling policy (docs/tags/scale-test.md §6.2)
             if cfg.sessions is not None:
                 bridge.max_sessions = cfg.sessions
             if cfg.quick_retry is not None:
@@ -1193,7 +1193,7 @@ def analyze(world: World, acts: list[Act], live: dict[str, Any], db: dict[str, A
     overall_p95 = acceptance["initiation"]["p95"] or 0.0
     starved = [i for i, v in per_tag.items() if v["trials"] and (v["p95"] or 0) > max(target, 2 * overall_p95)]
 
-    # -- the bridges' scheduling (the policy of docs/scale-test.md §6.2) and the relay hop ------------
+    # -- the bridges' scheduling (the policy of docs/tags/scale-test.md §6.2) and the relay hop ------------
     live_bridges = live.get("bridges", {})
     traffic_min = max(1e-9, (world.traffic_end - world.traffic_start) / 60.0)
     in_traffic = {name: sum(1 for t in times if world.traffic_start * 1000.0 <= t <= world.traffic_end * 1000.0)

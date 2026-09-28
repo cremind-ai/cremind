@@ -1,6 +1,6 @@
 """Multilingual text layout for tags: plain text -> positioned glyphs -> GLYPHS commands.
 
-See docs/layout.md. Entry points:
+See docs/tags/layout.md. Entry points:
 
 - `plain_text` — card text (Markdown / HTML-ish) -> plain NFC text;
 - `layout_text` — paragraph layout in a box (ICU graphemes, bidi, line breaks;

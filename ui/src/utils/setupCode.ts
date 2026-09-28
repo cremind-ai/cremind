@@ -1,6 +1,6 @@
 // Setup codes: the QR / typed label of a Cremind Tag bridge or tag
-// (cremind-tag docs/connect-setup.md §2.2, reference implementation
-// companion/src/cremind_tag/secure/codes.py — keep the two in step).
+// (the contract's docs/connect-setup.md §2.2, reference implementation
+// app/tags/runtime/secure/codes.py — keep the two in step).
 //
 //   payload (15 B) = (0x20 | role) u8 ‖ short_id u32le ‖ setup_secret[10]
 //   code           = Crockford base32 of the payload (24 symbols, big-endian

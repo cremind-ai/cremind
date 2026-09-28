@@ -17,7 +17,7 @@ macOS the ``~/Applications/Cremind Connect.app`` symlink, so the app keeps one
 path in Finder and in its LaunchAgent). Copies placed by an OS package — the
 ``.deb`` in ``/opt/cremind-connect``, the ``.dmg`` dragged to
 ``/Applications/Cremind Connect.app`` — are *external*: registered where they
-are (docs/connect-packaging.md).
+are (docs/tags/cremind-connect.md).
 
 Inside ``data_dir``: ``installation.json``/``installation.key`` (owner-only),
 ``ipc.key``, ``install.json`` (which copy is active), ``logs/``, ``assets/``

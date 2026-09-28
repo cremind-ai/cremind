@@ -1,4 +1,4 @@
-"""Idempotency keys for the setup API (cremind-tag ``docs/setup-api.md``).
+"""Idempotency keys for the setup API (``docs/tags/setup-api.md``).
 
 A mutation may carry ``Idempotency-Key: <key>`` (or ``"idempotency_key"`` in
 its body). The first answer is stored under ``scope | route | key``; a retry

@@ -1,4 +1,4 @@
-"""ICU for the Unicode algorithms HarfBuzz does not do (docs/layout.md "Pipeline").
+"""ICU for the Unicode algorithms HarfBuzz does not do (docs/tags/layout.md "Pipeline").
 
 Everything here works on code-point indices of a Python ``str``. ICU works in
 UTF-16 code units, so each helper converts through `Utf16Map`.

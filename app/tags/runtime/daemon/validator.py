@@ -2,7 +2,7 @@
 
 Cremind already redacts what it journals (``app/tags/sanitize.py``: one-time
 codes, bearer/API tokens, ``key=…`` pairs, long base64/hex runs) and never
-journals tool or terminal output (docs/cremind-integration.md §3). This
+journals tool or terminal output (docs/tags/server-design.md §3). This
 validator mirrors those rules and **refuses** — never rewrites — a card that
 still carries such text, because it means something upstream went wrong. A
 refused job is receipted ``failed`` with detail ``refused_by_companion``

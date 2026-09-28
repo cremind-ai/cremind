@@ -1,4 +1,4 @@
-"""The simulator: one gateway, its mesh, bridges and tags (docs/simulator.md).
+"""The simulator: one gateway, its mesh, bridges and tags (docs/tags/simulator.md).
 
 Programmatic use (tests, the daemon's integration tests)::
 
@@ -12,7 +12,7 @@ Programmatic use (tests, the daemon's integration tests)::
 :class:`SimulatorThread` runs the same thing on its own event loop in a
 background thread, for callers whose loop must stay free of simulator work.
 
-Protocol v2 (docs/simulator.md "Protocol v2"): ``SimConfig.protocol = 2`` makes
+Protocol v2 (docs/tags/simulator.md "Protocol v2"): ``SimConfig.protocol = 2`` makes
 the gateway a v2 gateway and every bridge whose ``BridgeSpec.protocol`` is left
 ``None`` a v2 bridge; a tag is v2 when its ``TagSpec`` is
 (``TagSpec.generate(seed, i, protocol=2)``). v2 devices start as they leave the
@@ -112,7 +112,7 @@ class FaultSpecError(ValueError):
 
 
 def parse_fault(spec: str, faults: SimFaults) -> None:
-    """Apply one ``--fault`` spec (see docs/simulator.md for the list)."""
+    """Apply one ``--fault`` spec (see docs/tags/simulator.md for the list)."""
     name, _, arg = spec.partition("=")
     name = name.strip().lower().replace("_", "-")
 

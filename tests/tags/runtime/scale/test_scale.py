@@ -1,18 +1,18 @@
 """Simulated scale and fault test: 1 gateway, 5 bridges (one behind a relay), 20 tags, the real daemon.
 
-Both variants gate on the INVARIANTS of docs/scale-test.md §3.5 (no job lost, one outcome per delivery,
+Both variants gate on the INVARIANTS of docs/tags/scale-test.md §3.5 (no job lost, one outcome per delivery,
 displayed frames equal to the reference render, ...): a violation is a bug whatever the timing.
 
 - The fast variant (20 trials per scenario, time scale 20, ~40 s) runs by default. Latency is asserted only
   for the baseline, with a bound that ~20 trials can carry: at least ``FAST_FLOOR`` of them initiated within
-  60 s. The full runs measure about 99 % (docs/scale-test.md §5); if the true share were even 95 %, 15 to
+  60 s. The full runs measure about 99 % (docs/tags/scale-test.md §5); if the true share were even 95 %, 15 to
   30 trials would fall below 70 % with probability < 0.001, so a failure is a regression, not noise. The faults
   scenario asserts no latency: its ~20 trials are dominated by the two injected 45 s Cremind outages.
 - ``CREMIND_TAG_SCALE_FULL=1`` runs the full 200-trial measurement at time scale 10 (~5 min per scenario)
   and reports its latency without failing on it (a warning when the baseline misses the acceptance
   target, delivery initiation within 60 s for at least 95 % of trials).
 
-tools/sim_scale.py does the work; docs/scale-test.md describes the method and the results.
+scripts/tags/sim_scale.py does the work; docs/tags/scale-test.md describes the method and the results.
 """
 
 from __future__ import annotations

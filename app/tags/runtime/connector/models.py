@@ -1,4 +1,4 @@
-"""Typed views of the connector API's JSON (docs/connector-api.md).
+"""Typed views of the connector API's JSON (docs/tags/connector-api.md).
 
 Parsing is strict about what the companion relies on (ids, sequence numbers,
 epochs, timestamps) and lenient about everything else, so a newer Cremind that

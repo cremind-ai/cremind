@@ -1,4 +1,4 @@
-"""Fixtures for the simulated scale and fault test: the tool (tools/sim_scale.py) and the dev font pack."""
+"""Fixtures for the simulated scale and fault test: the tool (scripts/tags/sim_scale.py) and the dev font pack."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Screen composition: a tag's active cards -> one logical screen (docs/layout.md "Screen model").
+"""Screen composition: a tag's active cards -> one logical screen (docs/tags/layout.md "Screen model").
 
 ``compose_screen`` implements the `Composer` protocol of `compose.api`::
 

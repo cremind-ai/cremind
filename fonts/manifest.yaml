@@ -1,4 +1,4 @@
-# Cremind Tag font-pack sources, pinned (docs/fonts.md).
+# Cremind Tag font-pack sources, pinned (docs/tags/fonts.md).
 #
 # Edit this file, then run `cremind-tag fonts lock`: it downloads every pinned
 # file once into fonts/cache/, checks its size and git blob SHA-1, and records

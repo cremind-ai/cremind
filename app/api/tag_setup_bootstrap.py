@@ -1,5 +1,5 @@
 """The bootstrap API Cremind Connect uses during a setup session:
-``/api/tag-setup/v1/*`` (cremind-tag ``docs/setup-api.md`` §2).
+``/api/tag-setup/v1/*`` (``docs/tags/setup-api.md`` §2).
 
 ``Authorization: CremindSetup <session_id>.<token>`` — the token from the
 launch link, whose SHA-256 is all Cremind stores — plus, from ``bind`` on, an

@@ -1,6 +1,6 @@
-"""Active cards -> what a screen shows (docs/layout.md "Screen model").
+"""Active cards -> what a screen shows (docs/tags/layout.md "Screen model").
 
-The card JSON is the connector's (docs/connector-api.md "Job shape"). This
+The card JSON is the connector's (docs/tags/connector-api.md "Job shape"). This
 module decides, per card, the icon, the plain-text title and body, the
 language, the time stamp, a progress fraction and a QR link, and the display
 order. Nothing here draws.

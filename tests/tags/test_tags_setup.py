@@ -1,4 +1,4 @@
-"""Simple device setup (cremind-tag docs/connect-setup.md, docs/setup-api.md):
+"""Simple device setup (cremind-tag docs/connect-setup.md, docs/tags/setup-api.md):
 setup sessions and the bootstrap API, private workers, grants, operations,
 the recovery vault, isolation between profiles, and the admin fence.
 
@@ -136,7 +136,7 @@ class Device:
 
 
 def setup_code(role: str, short_id: int, secret: bytes = bytes(range(10))) -> str:
-    """Mirror of cremind_tag.secure.codes (payload -> base32 + GF(32) check)."""
+    """Mirror of app.tags.runtime.secure.codes (payload -> base32 + GF(32) check)."""
     from app.tags import protocol_v2 as v2
 
     payload = bytes([0x20 | v2.ROLES[role]]) + short_id.to_bytes(4, "little") + secret

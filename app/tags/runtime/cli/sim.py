@@ -2,7 +2,7 @@
 
 The simulator speaks the real serial protocol on TCP: point any client at
 ``socket://127.0.0.1:<port>`` (for example ``CREMIND_TAG_GATEWAY_URL``). See
-docs/simulator.md for what it models and the ``--fault`` syntax.
+docs/tags/simulator.md for what it models and the ``--fault`` syntax.
 
 ``--protocol 2`` runs factory-fresh v2 hardware (docs/connect-setup.md): an
 unowned gateway, unprovisioned unowned bridges and unowned tags whose setup
@@ -38,7 +38,7 @@ def run_sim(
     time_scale: float = typer.Option(10.0, "--time-scale", min=0.1,
                                      help="Simulated seconds per real second (30 s wakes take 3 s at 10)."),
     seed: int = typer.Option(1, "--seed", help="Seed of every random choice (ids, secrets, jitter, faults)."),
-    fault: list[str] = typer.Option([], "--fault", help="Fault injection, repeatable (docs/simulator.md)."),
+    fault: list[str] = typer.Option([], "--fault", help="Fault injection, repeatable (docs/tags/simulator.md)."),
     maint_port_base: int = typer.Option(0, "--maint-port-base",
                                         help="First bridge maintenance port (default: --port + 1)."),
     state: Path | None = typer.Option(None, "--state", help="JSON file keeping the CDB, assignments and tag NVS."),

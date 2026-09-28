@@ -1,4 +1,4 @@
-"""Simulator of the gateway, mesh, bridges and tags speaking the real serial protocol (docs/simulator.md)."""
+"""Simulator of the gateway, mesh, bridges and tags speaking the real serial protocol (docs/tags/simulator.md)."""
 
 from .bridge import BridgeFaults, SimBridge
 from .core import SimClock, rng_stream

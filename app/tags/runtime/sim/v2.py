@@ -1,4 +1,4 @@
-"""Protocol v2 on the simulated devices (docs/connect-setup.md; docs/simulator.md "Protocol v2").
+"""Protocol v2 on the simulated devices (docs/connect-setup.md; docs/tags/simulator.md "Protocol v2").
 
 The simulated v2 gateway, bridges and tags run the reference secure endpoint,
 :class:`app.tags.runtime.secure.device.SecureDevice` (ownership record, single-use
@@ -75,7 +75,7 @@ def generate_keys(seed: int, role: NodeRole, label: object, *, board: int, label
 
 def new_secure_device(keys: DeviceKeys, seed: int, label: object, record: OwnerRecord | None = None) -> SecureDevice:
     """A ``SecureDevice`` whose challenges, fresh setup secrets and Noise ephemerals come from a seeded stream
-    (docs/simulator.md: a simulated session is predictable by design)."""
+    (docs/tags/simulator.md: a simulated session is predictable by design)."""
     stream = rng_stream(seed, "v2-device", keys.role.name, label)
     return SecureDevice(keys, record, rng=stream.randbytes, ephemeral=lambda: stream.randbytes(32))
 

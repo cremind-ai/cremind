@@ -1,6 +1,6 @@
 """`cremind tags tools fonts` — pin, fetch, build and size font packs (all Noto scripts).
 
-docs/fonts.md describes the pipeline; docs/fontpack.md the pack format and the
+docs/tags/fonts.md describes the pipeline; docs/fontpack.md the pack format and the
 flash rule. Every command exits non-zero when a verification fails.
 """
 

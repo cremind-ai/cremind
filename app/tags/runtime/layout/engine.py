@@ -1,6 +1,6 @@
 """Multilingual paragraph layout: text -> positioned glyphs and line boxes.
 
-Pipeline per paragraph (docs/layout.md "Pipeline"):
+Pipeline per paragraph (docs/tags/layout.md "Pipeline"):
 
 1. NFC; grapheme clusters (ICU) — nothing below ever splits a cluster;
 2. paragraph direction (explicit, else language hint / first strong character)

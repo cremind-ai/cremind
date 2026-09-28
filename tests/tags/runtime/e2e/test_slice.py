@@ -1,4 +1,4 @@
-"""The first vertical slice against a real, throwaway Cremind (``tools/e2e_slice.py``).
+"""The first vertical slice against a real, throwaway Cremind (``scripts/tags/e2e_slice.py``).
 
 Skipped unless ``CREMIND_E2E=1``. Needs the Cremind repository with its
 ``.venv`` (``CREMIND_REPO``, default ``C:\\Users\\lyntc\\DATA\\Personal\\Cremind\\cremind``),

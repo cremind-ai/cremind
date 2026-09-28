@@ -19,7 +19,7 @@ the scheduler's comparisons):
   epoch, rotation, ``clear_required``, desired/displayed revisions) plus the
   scheduler's flags (dirty, force, blank, identify override, block reason);
   v4: ``epoch_floor``, the epoch a tag's ``STALE_EPOCH`` reported as stored
-  (bounded, docs/companion.md "Epoch floor"), reported as the inventory epoch.
+  (bounded, docs/tags/runtime.md "Epoch floor"), reported as the inventory epoch.
 - ``revisions`` — every composed screen: layout, digests, the deliveries it
   shows, the ``op_id`` persisted BEFORE the ``DELIVER_LAYOUT`` that uses it,
   attempts and the retry time (v3: ``not_found_count``, consecutive

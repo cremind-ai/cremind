@@ -1,4 +1,4 @@
-"""Install, upgrade, roll back and uninstall Cremind Connect for this OS user (docs/connect-packaging.md).
+"""Install, upgrade, roll back and uninstall Cremind Connect for this OS user (docs/tags/cremind-connect.md).
 
 **Managed copies** live in ``<app_root>/versions/<version>/`` and run through the
 ``current`` link (a directory junction on Windows, a symlink elsewhere; on macOS

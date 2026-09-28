@@ -2,7 +2,7 @@
 
 Implemented by `app.tags.runtime.compose.screen.compose_screen`; called by the daemon
 (`app.tags.runtime.daemon`) every time a tag's active card set or clock line changes.
-See docs/connector-api.md "Screen model" and docs/layout.md. Also in
+See docs/tags/connector-api.md "Screen model" and docs/tags/layout.md. Also in
 `compose.screen`: ``compose_identify(panel, fonts, tag_id=None)`` and
 ``compose_blank(panel)``; previews in `compose.preview` (``preview_png``).
 """
@@ -34,7 +34,7 @@ class TagPanel:
 
 @dataclass(frozen=True)
 class ActiveCard:
-    """One card the tag should currently show (a delivery job's `card`, see docs/connector-api.md)."""
+    """One card the tag should currently show (a delivery job's `card`, see docs/tags/connector-api.md)."""
 
     delivery_id: int
     kind: str
@@ -45,7 +45,7 @@ class ActiveCard:
 
 @dataclass(frozen=True)
 class ScreenSettings:
-    """Profile display settings delivered by `sync` (docs/connector-api.md)."""
+    """Profile display settings delivered by `sync` (docs/tags/connector-api.md)."""
 
     show_excerpts: bool = False
     qr_links: bool = False
@@ -59,7 +59,7 @@ class ComposedScreen:
     """Encoded logical screen (docs/protocol.md §4), already validated."""
     delivery_ids: tuple[int, ...]
     """Deliveries whose cards this screen shows (all become `displayed` together), in display order
-    (headline first). Cards only counted in the footer are NOT included (docs/layout.md "Delivery ids")."""
+    (headline first). Cards only counted in the footer are NOT included (docs/tags/layout.md "Delivery ids")."""
     pending_count: int
     """Active cards not shown for lack of space ("N more updates waiting for this tag")."""
     unsupported_chars: tuple[str, ...] = field(default=())

@@ -1,4 +1,4 @@
-"""The setup window's controller and the bootstrap client (docs/connect-setup.md §8.1, docs/setup-api.md §2),
+"""The setup window's controller and the bootstrap client (docs/connect-setup.md §8.1, docs/tags/setup-api.md §2),
 against a fake Cremind that checks every proof the way Cremind does, a fake window and a fake service."""
 
 from __future__ import annotations

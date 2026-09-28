@@ -1,4 +1,4 @@
-"""One content credential's feed: ``sync``, then the ``events`` loop (docs/connector-api.md).
+"""One content credential's feed: ``sync``, then the ``events`` loop (docs/tags/connector-api.md).
 
 Start-up (and every ``resync_s``, after a ``410 cursor_expired``, a changed
 ``stream_id``, or when the scheduler meets a tag it has no view of) calls

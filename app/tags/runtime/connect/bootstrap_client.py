@@ -1,4 +1,4 @@
-"""Cremind's bootstrap API, as the setup window uses it (docs/setup-api.md §2, docs/connect-setup.md §9.2).
+"""Cremind's bootstrap API, as the setup window uses it (docs/tags/setup-api.md §2, docs/connect-setup.md §9.2).
 
 ::
 
@@ -85,7 +85,7 @@ class Bound:
 
 
 def canonical_body(body: dict[str, Any]) -> bytes:
-    """Keys sorted, no spaces, UTF-8, ``proof`` left out (docs/setup-api.md §2)."""
+    """Keys sorted, no spaces, UTF-8, ``proof`` left out (docs/tags/setup-api.md §2)."""
     clean = {k: v for k, v in body.items() if k != "proof"}
     return json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 

@@ -1,5 +1,5 @@
 """Hardware operations of private workers (cremind-tag ``docs/connect-setup.md``
-§8-§10, ``docs/setup-api.md``).
+§8-§10, ``docs/tags/setup-api.md``).
 
 Profile side: the Connection view, discovery, pairing, unpair (Remove),
 pause/resume, moving a tag to another bridge, test cards, recovery.

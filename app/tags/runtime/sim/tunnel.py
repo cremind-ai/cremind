@@ -1,4 +1,4 @@
-"""A v2 bridge's end of a mesh tunnel (docs/connect-setup.md 6, 7.2; docs/simulator.md "Protocol v2").
+"""A v2 bridge's end of a mesh tunnel (docs/connect-setup.md 6, 7.2; docs/tags/simulator.md "Protocol v2").
 
 A tunnel with ``tag_id = 0`` ends at the bridge's own secure endpoint (a
 :class:`~app.tags.runtime.sim.v2.PairEndpoint` over the bridge's ``SecureDevice``); any

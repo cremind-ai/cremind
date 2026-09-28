@@ -3,7 +3,7 @@
 ``cremind-connect`` is one program with several roles (``service``, ``worker``,
 ``open``, ``window``, ``status``, ``install``, ``uninstall``, ``version``; see
 :mod:`app.tags.runtime.connect.main`). It ships as a PyInstaller bundle, so end users
-never need Git, Python or ``uv`` (docs/connect-packaging.md).
+never need Git, Python or ``uv`` (docs/tags/cremind-connect.md).
 
 Modules: :mod:`.paths` (directories), :mod:`.runtime` (version, frozen bundle,
 starting itself), :mod:`.installation` (the installation key),

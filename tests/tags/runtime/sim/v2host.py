@@ -1,4 +1,4 @@
-"""A minimal host-side protocol v2 driver for the simulator tests (docs/connect-setup.md 5-7, docs/simulator.md).
+"""A minimal host-side protocol v2 driver for the simulator tests (docs/connect-setup.md 5-7, docs/tags/simulator.md).
 
 What a Connect worker does on the wire, without its durability: ``HELLO`` and
 serial credits; plaintext ``IDENTIFY`` and ``SECURE_OPEN``; sealed requests in

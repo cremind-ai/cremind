@@ -1,5 +1,5 @@
 """The fake Cremind of the daemon tests plus the connector v2 additions a private worker uses
-(docs/setup-api.md §3): ``lease``, ``state``, ``operations`` (+ ``progress``), ``grants`` signed by an
+(docs/tags/setup-api.md §3): ``lease``, ``state``, ``operations`` (+ ``progress``), ``grants`` signed by an
 in-memory authority, and a compare-and-set ``vault``. It follows Cremind's ``app/tags/operations.py``
 closely enough for the worker's contract: grants only for an open operation of the worker that needs that
 op, for the binding's current (or pending) generation; a ``pair`` grant creates the binding; a finished

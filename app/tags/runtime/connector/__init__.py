@@ -1,4 +1,4 @@
-"""The Cremind connector: typed async client, models and the ``[cremind]`` config section (docs/connector-api.md)."""
+"""The Cremind connector: typed async client, models and the ``[cremind]`` config section (docs/tags/connector-api.md)."""
 
 from .client import (
     API_PREFIX,

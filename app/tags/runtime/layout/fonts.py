@@ -10,7 +10,7 @@ daemon's first composition pays for loading and every later one reuses:
 - cmap coverage (`app.tags.runtime.fonts.coverage.CmapIndex`);
 - the font pack itself (`FontPack`) for ink extents and to skip ink-less glyphs.
 
-Face choice for one grapheme cluster (docs/layout.md "Font selection"):
+Face choice for one grapheme cluster (docs/tags/layout.md "Font selection"):
 
 1. emoji presentation -> the emoji face when it maps the cluster;
 2. the faces declaring the cluster's resolved script, best first by language

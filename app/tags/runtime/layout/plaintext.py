@@ -1,4 +1,4 @@
-"""Plain-text extraction for card text (docs/layout.md "Plain text").
+"""Plain-text extraction for card text (docs/tags/layout.md "Plain text").
 
 Cards arrive with whatever text Cremind produced: mostly plain, sometimes with
 Markdown or HTML-ish markup from chat replies. A tag has one font style, so

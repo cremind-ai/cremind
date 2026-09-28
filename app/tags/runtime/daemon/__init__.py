@@ -1,4 +1,4 @@
-"""The delivery daemon (docs/companion.md): Cremind feed -> durable SQLite queue -> screens -> gateway -> receipts.
+"""The delivery daemon (docs/tags/runtime.md): Cremind feed -> durable SQLite queue -> screens -> gateway -> receipts.
 
 - :mod:`.service` — :class:`DaemonService` / :class:`DaemonOptions`, the composition root;
 - :mod:`.store` — :class:`QueueStore`, every state change as one transaction;

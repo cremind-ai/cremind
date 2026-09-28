@@ -1,7 +1,7 @@
 """`cremind tags tools preview` — render cards, screens or text to PNG exactly as a bridge would draw them.
 
 Every image goes through the companion's layout engine and the normative
-renderer with a built font pack (docs/layout.md). ``--pack`` defaults to
+renderer with a built font pack (docs/tags/layout.md). ``--pack`` defaults to
 ``<repo>/fonts/out/full/fontpack.ctfp`` (else the dev pack); the font cache to
 ``$CREMIND_TAG_FONT_CACHE`` or ``<repo>/fonts/cache``.
 """

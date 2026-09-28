@@ -1,4 +1,4 @@
-"""Async client for Cremind's connector API: ``/api/tag-connector/v1/*`` (docs/connector-api.md).
+"""Async client for Cremind's connector API: ``/api/tag-connector/v1/*`` (docs/tags/connector-api.md).
 
 One :class:`ConnectorClient` per credential; every request carries
 ``Authorization: CremindTag <credential-id>.<secret>``. The companion always
@@ -466,7 +466,7 @@ class ConnectorClient:
         body = await self._request("POST", "/previews", json=payload)
         return bool(body.get("stored")) if isinstance(body, Mapping) else False
 
-    # -- v2: private workers (docs/setup-api.md §3), hardware credential -------------
+    # -- v2: private workers (docs/tags/setup-api.md §3), hardware credential -------------
 
     async def _object(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         body = await self._request(method, path, **kwargs)

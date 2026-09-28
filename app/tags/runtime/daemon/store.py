@@ -4,7 +4,7 @@ All methods are synchronous and run in a worker thread (``await db.run(store.met
 each public method is ONE ``Database.transaction()`` (re-entrant: the inventory's
 ``allocate_revision`` and ``set_assignment`` join it). The async side never holds
 state that is not in these tables, so a crash at any await point loses nothing
-that was acknowledged (see docs/companion.md "Durability").
+that was acknowledged (see docs/tags/runtime.md "Durability").
 
 Vocabulary (schema in :mod:`app.tags.runtime.daemon.schema`):
 

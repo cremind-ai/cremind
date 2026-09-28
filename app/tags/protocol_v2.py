@@ -1,9 +1,10 @@
-"""Protocol-v2 helpers Cremind needs itself (cremind-tag ``docs/connect-setup.md``):
+"""Protocol-v2 helpers the server needs itself (the contract's ``docs/connect-setup.md``):
 setup codes (§2.2), device identity (§2.1) and canonical grants (§3.1).
 
-A deliberate copy of the reference in cremind-tag (``cremind_tag.secure``):
-Cremind does not depend on the companion package. ``tests/tags`` checks this
-module against vectors taken from ``protocol/fixtures/v2_secure.json``.
+A deliberate copy of the hardware runtime's reference (``app.tags.runtime.secure``):
+setup sessions and ownership must work on a server without the runtime's
+dependencies (the optional ``tags`` extra). ``tests/tags`` checks this module
+against vectors taken from the pinned ``fixtures/v2_secure.json``.
 """
 
 from __future__ import annotations

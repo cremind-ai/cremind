@@ -156,7 +156,7 @@ class BridgeRecord:
 
     @property
     def hw_id(self) -> str:
-        """Connector API identifier (docs/connector-api.md)."""
+        """Connector API identifier (docs/tags/connector-api.md)."""
         return f"br-{self.uuid}"
 
 
