@@ -8,15 +8,19 @@
  * 1. ``window.cremind.config`` — set by electron/preload.ts from the
  *    JSON file the installer writes. Authoritative under Electron.
  * 2. ``import.meta.env.VITE_AGENT_URL`` — build-time default for the
- *    standalone web build and the Vite dev server, where there's no
- *    Electron bridge.
+ *    standalone web build and the Vite dev servers. Never in a packaged
+ *    desktop app: builds read a developer's ``ui/.env.local`` too, and an
+ *    installer carrying that URL sent every fresh install there instead of
+ *    to the setup wizard.
  * 3. Same-origin: the cremind app is a single same-origin app — the SPA, API,
  *    A2A, and OAuth are all served from the page's own origin (the one public
  *    port, 1515, in native/Docker; the single-port proxy / Ingress origin in
  *    Kubernetes). Returning ``window.location.origin`` lets one URL serve the
- *    whole workflow with no port juggling.
- * 4. Empty string — only when there is no window at all (SSR/tests); the
- *    UI treats this as "not configured" and routes to the setup wizard.
+ *    whole workflow with no port juggling. Only for a page served over
+ *    http(s), and under Electron only for one the backend served.
+ * 4. Empty string — the UI treats this as "not configured" and routes to the
+ *    setup wizard. A fresh desktop install gets here: its window loads from
+ *    ``file://``, whose origin (``"file://"``) is no backend.
  *
  * Writes go through ``setAgentUrl`` so the persisted config stays in sync
  * across renderer restarts. Under the web build this is a no-op (the URL
@@ -25,20 +29,28 @@
  */
 
 export function getAgentUrl(): string {
-  const fromBridge = window.cremind?.config?.agentUrl
+  const bridge = window.cremind
+  const fromBridge = bridge?.config?.agentUrl
   if (fromBridge) return fromBridge
 
   const fromEnv = import.meta.env.VITE_AGENT_URL as string | undefined
-  if (fromEnv) return fromEnv
-
   // Single same-origin app: the SPA, API, A2A, and OAuth are all served from
   // the page's own origin (the one public port in native/Docker; the proxy /
   // Ingress origin in Kubernetes). No port juggling.
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    return window.location.origin
+  const pageOrigin = window.location?.protocol?.startsWith('http') ? window.location.origin : ''
+
+  if (bridge) {
+    // The desktop app has no backend until its setup wizard configures one,
+    // and '' is what sends the first-run gate there. Under the Vite dev server
+    // (``npm run dev``) the page origin is Vite, not a backend, so only a
+    // developer's VITE_AGENT_URL applies. A packaged app's window is either
+    // the asar copy on ``file://`` or a page the backend served (main loads
+    // ``/electron-renderer/`` from a backend it found running) — whose origin
+    // is that backend.
+    return import.meta.env.DEV ? fromEnv || '' : pageOrigin
   }
 
-  return ''
+  return fromEnv || pageOrigin
 }
 
 /**
@@ -52,10 +64,11 @@ export function getAgentUrl(): string {
  * or fronted by a proxy / Ingress on another host or port.
  *
  * Electron loads the wizard from ``file://``, where ``location.origin`` is
- * the unusable string ``"null"`` — hence the protocol guard and the historical
- * loopback fallback. ``getAgentUrl`` can't be reused here: it has no such
- * guard, and its higher-precedence sources are exactly the ones that are
- * still empty at this point in the wizard.
+ * the unusable string ``"file://"`` (``"null"`` in some browsers) — hence the
+ * protocol guard and the historical loopback fallback. ``getAgentUrl`` can't
+ * be reused here: until the wizard has configured a backend it returns ''
+ * on ``file://``, by design — that empty value is what routes a fresh
+ * install to the wizard.
  */
 export function defaultAgentOrigin(): string {
   if (typeof window !== 'undefined' && window.location?.protocol?.startsWith('http')) {

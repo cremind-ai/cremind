@@ -69,9 +69,10 @@ const STUBS = {
 const bundles = new Map()
 let instance = 0
 
-async function bundle(entry) {
-  if (!bundles.has(entry)) {
-    bundles.set(entry, build({
+async function bundle(entry, define = {}) {
+  const key = `${entry}\0${JSON.stringify(define)}`
+  if (!bundles.has(key)) {
+    bundles.set(key, build({
       entryPoints: [path.join(uiRoot, entry)],
       bundle: true,
       format: 'esm',
@@ -84,6 +85,7 @@ async function bundle(entry) {
         __VUE_OPTIONS_API__: 'false',
         __VUE_PROD_DEVTOOLS__: 'false',
         __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false',
+        ...define,
       },
       plugins: [{
         name: 'test-stubs',
@@ -102,12 +104,13 @@ async function bundle(entry) {
       }],
     }).then(result => result.outputFiles[0].text))
   }
-  return bundles.get(entry)
+  return bundles.get(key)
 }
 
-/** Import a fresh copy of `entry` (a path relative to ui/). */
-export async function load(entry) {
-  const code = `${await bundle(entry)}\n//# instance ${instance++}\n`
+/** Import a fresh copy of `entry` (a path relative to ui/). `define` adds
+ *  compile-time constants, such as the `import.meta.env` values Vite bakes in. */
+export async function load(entry, { define } = {}) {
+  const code = `${await bundle(entry, define)}\n//# instance ${instance++}\n`
   return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 }
 

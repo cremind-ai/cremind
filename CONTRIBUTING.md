@@ -359,7 +359,8 @@ Caveats:
 - **The dev SPA needs `VITE_AGENT_URL`**. The old `:1515`→`:1112`
   port-swap was removed (the SPA is same-origin in production), so in
   dev point it at the backend with `VITE_AGENT_URL=http://localhost:1112`
-  (or `ui/.env.local`).
+  (or `ui/.env.development.local`). Not `ui/.env.local`: builds read that
+  file too, so the dev URL ends up in every SPA and installer you build.
 - **`ui/node_modules` is large** — ~600 MB. Stay patient on first
   install.
 - **Don't edit `ui/package.json`'s `version` field** — it's regenerated

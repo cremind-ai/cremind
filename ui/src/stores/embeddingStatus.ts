@@ -124,6 +124,10 @@ export const useEmbeddingStatusStore = defineStore('embeddingStatus', () => {
   }
 
   function connect(agentUrl: string) {
+    // No backend yet: the desktop app's first-run installer, before the setup
+    // wizard configures one. The wizard then moves onto the backend's origin,
+    // where App.vue connects again.
+    if (!agentUrl) return;
     const token = settingsStore.authToken;
     // Idempotent: same URL AND same token → nothing to do. The token is
     // part of the key because it selects the source (multiplexed vs

@@ -97,8 +97,10 @@ The SPA needs the backend running. The backend now serves one merged app on the 
 # backend (separate terminal): internal API on :1112 only, no public :1515
 CREMIND_UI_PORT=0 uv run cremind serve
 # Vite on :1515, talking to the backend on :1112
-VITE_AGENT_URL=http://localhost:1112 npm run web:dev   # or put it in ui/.env.local
+VITE_AGENT_URL=http://localhost:1112 npm run web:dev   # or put it in ui/.env.development.local
 ```
+
+Use `ui/.env.development.local`, not `ui/.env.local`: Vite reads `.env.local` for builds too, so the dev URL would be baked into every SPA and installer you build.
 
 ### Building
 
