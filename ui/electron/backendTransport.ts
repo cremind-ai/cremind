@@ -63,6 +63,24 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     ? value as Record<string, unknown> : null
 }
 
+/**
+ * Whether a ``/health`` answer is a Cremind backend that is up and serving.
+ *
+ * The backend answers 200 in every state it serves in — ``ok``, and
+ * ``setup_pending`` on a fresh install whose Setup Wizard has not run yet,
+ * which is the very backend the first-run installer starts for that wizard —
+ * and 503 when a subsystem is down (``get_health`` in app/api/version.py;
+ * fixtures/health.json records its answers). So the status code decides, not
+ * a list of ``status`` words: this shell outlives the wheels it talks to, and
+ * a word it has not seen yet must not strand an install. The JSON document is
+ * still required, which keeps the HTTPS recovery listener's HTML page — or
+ * anything else holding the port — from passing for a backend.
+ */
+export function isServingHealth(statusCode: number, body: unknown): boolean {
+  const status = objectRecord(body)?.status
+  return statusCode === 200 && typeof status === 'string' && status !== ''
+}
+
 /** Installation ids are persistent 192-bit values written as lowercase hex. */
 export function tlsStatusInstanceId(value: unknown): string | null {
   const status = objectRecord(value) as TlsStatusRecord | null

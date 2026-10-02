@@ -10,6 +10,7 @@ import {
   httpsOrigin,
   isExpectedDefaultPortTlsStatus,
   isExpectedLocalCertificate,
+  isServingHealth,
   parseInstallEnv,
   resolveBackendOrigin,
   stopOwnedBackend,
@@ -535,12 +536,13 @@ async function rememberBackendIdentity(origin: string): Promise<unknown | null> 
   return status
 }
 
+// A fresh install's backend counts: it answers ``setup_pending`` until its
+// Setup Wizard has run, and that wizard is why the installer started it.
 async function isBackendHealthy(origin = backendSpaUrl()): Promise<boolean> {
   try {
     const response = await backendFetch(backendHealthUrl(origin))
     if (response.status !== 200) return false
-    const body = await response.json() as { status?: string }
-    return body.status === 'ok' || body.status === 'healthy'
+    return isServingHealth(response.status, await response.json())
   } catch { return false }
 }
 
@@ -1370,10 +1372,15 @@ async function startBackend(): Promise<BackendResult> {
   if (await discoverBackend()) {
     return backendReady()
   }
+  // The wizard shows a failure above the INSTALL log, which knows nothing
+  // about the server: once a server has run, point at its own log.
+  const sys = systemDirPath()
+  const serverLog = path.join(sys, 'server.log')
+  const serverErr = path.join(sys, 'server.err.log')
   // Already spawned but not healthy yet? Just wait.
   if (backendProcess && backendProcess.exitCode === null) {
     const ok = await waitForBackendHealthy()
-    return ok ? backendReady() : { ok: false, error: 'backend did not become healthy' }
+    return ok ? backendReady() : { ok: false, error: `backend did not become healthy — see ${serverErr}` }
   }
 
   // Spawn via the venv interpreter rather than cremind.exe so that
@@ -1383,10 +1390,6 @@ async function startBackend(): Promise<BackendResult> {
   if (!fs.existsSync(py)) {
     return { ok: false, error: `venv python missing at ${py} — installer didn't finish?` }
   }
-
-  const sys = systemDirPath()
-  const serverLog = path.join(sys, 'server.log')
-  const serverErr = path.join(sys, 'server.err.log')
 
   let stdoutFd: number | undefined
   let stderrFd: number | undefined
@@ -1422,9 +1425,16 @@ async function startBackend(): Promise<BackendResult> {
     try { if (stderrFd) fs.closeSync(stderrFd) } catch { /* ignore */ }
   })
 
+  // Waits out the full window even once this child has exited: a backend
+  // another launcher started (the boot service) may hold the port and still
+  // be coming up — this child then exits, and that one answers.
   const ok = await waitForBackendHealthy()
   if (!ok) {
-    return { ok: false, error: `backend at ${backendHealthUrl()} did not respond after 30s` }
+    const exit = child.exitCode ?? child.signalCode
+    const what = exit === null
+      ? `backend at ${backendHealthUrl()} did not respond after 30s`
+      : `backend exited (${exit}) without answering ${backendHealthUrl()}`
+    return { ok: false, error: `${what} — see ${serverErr}` }
   }
   return backendReady()
 }

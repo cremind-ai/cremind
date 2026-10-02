@@ -4965,13 +4965,33 @@ if ($Channel -eq 'dev') {
         Write-Info "Existing install detected at $VenvDir — upgrading in place."
         Invoke-NativeLogged { & $VenvPip install --upgrade pip }
         Invoke-NativeLogged { & $VenvPip install --upgrade $InstallSpec }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err2 "pip could not upgrade cremind (exit $LASTEXITCODE) - see $LogFile."
+            exit 1
+        }
     } else {
         Write-Info "Creating venv at $VenvDir"
         New-Item -ItemType Directory -Force -Path (Split-Path $VenvDir -Parent) | Out-Null
         Invoke-NativeLogged { & $Python -m venv $VenvDir }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err2 "Could not create the venv at $VenvDir (exit $LASTEXITCODE) - see $LogFile."
+            exit 1
+        }
         Write-Info "Installing cremind from $InstallSourceLabel (this may take a few minutes)"
         Invoke-NativeLogged { & $VenvPip install --upgrade pip }
         Invoke-NativeLogged { & $VenvPip install $InstallSpec }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err2 "pip could not install cremind (exit $LASTEXITCODE) - see $LogFile."
+            exit 1
+        }
+    }
+    # The pip upgrade above is best effort: pip.exe cannot replace itself on
+    # Windows, so it fails there and the venv keeps its bundled pip. Only the
+    # cremind install decides. Without these checks a failed install still
+    # reported success, and the first sign was a backend that never started.
+    if (-not (Test-Path $VenvCremind)) {
+        Write-Err2 "The install left no $VenvCremind - see $LogFile."
+        exit 1
     }
 
     $InstalledVersion = ''

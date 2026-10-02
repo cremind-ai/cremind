@@ -63,6 +63,11 @@ async def get_health(_request: Request) -> JSONResponse:
     ``"deferred"`` and the response is still 200 with ``status =
     "setup_pending"`` so Electron's healthcheck succeeds and the wizard
     can render.
+
+    The desktop app adopts a backend on any 200 here (``isServingHealth``
+    in ui/electron/backendTransport.ts). Every answer is recorded in
+    ui/electron/fixtures/health.json, which tests/api/test_health_answers.py
+    keeps true to this function — update both together.
     """
     db_status = await _probe_db()
     vs_status = _probe_vectorstore()
