@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -1459,6 +1461,39 @@ def test_main_exits_2_on_an_unwritable_answer(tmp_path, monkeypatch) -> None:
     rc = installer_main.main(["--output", str(out), "--catalog", str(CATALOG_PATH)])
     assert rc == 2
     assert not out.exists()
+
+
+def test_main_exits_3_when_the_tui_fails(tmp_path, monkeypatch, capsys) -> None:
+    """A TUI that cannot run is not a cancel: exit 3 sends the shell to its
+    text prompts. Uncaught, macOS's /dev/tty EOFError exited 1 and the shell
+    stopped with "Installer cancelled."."""
+    out = tmp_path / "tui.out"
+
+    def _raise(**kwargs):
+        raise EOFError
+
+    monkeypatch.setattr(installer_main.tui, "run", _raise)
+    rc = installer_main.main(["--output", str(out), "--catalog", str(CATALOG_PATH)])
+    assert rc == 3
+    assert not out.exists()  # no cancel marker
+    assert "EOFError" in capsys.readouterr().err
+
+
+def test_the_bundle_exits_with_mains_code(tmp_path) -> None:
+    """The shells act on the bundle's exit code (1 cancelled, anything else
+    non-zero → text prompts). zipapp's generated entry point dropped what
+    main() returned, so a failed catalog load exited 0 — read as success."""
+    proc = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "install" / "installer_tui.pyz"),
+            "--output", str(tmp_path / "tui.out"),
+            "--catalog", str(tmp_path / "missing.json"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 2, proc.stderr
 
 
 def test_the_kubeconfig_path_round_trips_quoted(tmp_path) -> None:
