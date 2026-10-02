@@ -1,0 +1,14 @@
+{
+  "$comment": "Every answer GET /health gives (get_health in app/api/version.py), boot_id left out. tests/api/test_health_answers.py keeps this true to the backend; ui/electron/https.test.mjs requires the desktop app to adopt exactly the 200s.",
+  "answers": [
+    { "code": 200, "body": { "status": "setup_pending", "db": "deferred", "vectorstore": "disabled" } },
+    { "code": 200, "body": { "status": "setup_pending", "db": "deferred", "vectorstore": "ok" } },
+    { "code": 503, "body": { "status": "setup_pending", "db": "deferred", "vectorstore": "error" } },
+    { "code": 200, "body": { "status": "ok", "db": "ok", "vectorstore": "disabled" } },
+    { "code": 200, "body": { "status": "ok", "db": "ok", "vectorstore": "ok" } },
+    { "code": 503, "body": { "status": "degraded", "db": "ok", "vectorstore": "error" } },
+    { "code": 503, "body": { "status": "degraded", "db": "error", "vectorstore": "disabled" } },
+    { "code": 503, "body": { "status": "degraded", "db": "error", "vectorstore": "ok" } },
+    { "code": 503, "body": { "status": "degraded", "db": "error", "vectorstore": "error" } }
+  ]
+}

@@ -1,8 +1,11 @@
 # Pull-request CI for the merged cremind repo.
 #
-# Three parallel jobs:
+# Four parallel jobs, plus the path-gated ``helm`` job at the end:
 #   - ``backend``: lint + pytest against the Python package.
 #   - ``ui``: type-check + smoke-build the web SPA bundle.
+#   - ``ui-regressions``: the UI's node:test suite — renderer stores and
+#     the Electron main process (first-run install, backend discovery,
+#     the HTTPS move) against fakes.
 #   - ``smoke-build``: build the wheel and the Linux Electron .AppImage,
 #     and upload both as PR artifacts so reviewers can download and
 #     try the build locally without waiting for an RC tag.
@@ -123,6 +126,33 @@ jobs:
       # lives in the separate ``smoke-build`` job below.
       - name: Smoke build (web)
         run: npm run web:build
+
+  ui-regressions:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22, as in development: modules under test read the global
+      # ``navigator``, which Node 20 does not have.
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      # The tests bundle with esbuild and never start Electron, so skip its
+      # binary download (the step a CDN 504 has failed before).
+      - name: Install dependencies
+        run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+      - name: Run regression tests
+        run: npm run test:regressions
 
   # End-to-end smoke build: wheel + Linux Electron installer + Docker
   # desktop image. Catches packaging breakage (missing data files,

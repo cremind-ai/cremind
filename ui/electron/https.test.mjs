@@ -18,6 +18,10 @@ async function loadHelper(name) {
 const transport = await loadHelper('backendTransport.ts')
 const stateHelpers = await loadHelper('transitionState.ts')
 const vnc = await loadHelper('vncDesktop.ts')
+// Every answer the backend's /health gives, kept true to it by
+// tests/api/test_health_answers.py.
+const { answers: healthAnswers } = JSON.parse(await readFile(path.join(here, 'fixtures', 'health.json'), 'utf8'))
+const freshInstallHealth = healthAnswers.find(({ body }) => body.db === 'deferred' && body.vectorstore === 'disabled')
 
 test('installer dotenv values are parsed without executing or expanding them', () => {
   assert.deepEqual(transport.parseInstallEnv(`﻿# comment
@@ -46,6 +50,24 @@ test('origin resolution follows setup state, explicit TLS and custom ports', () 
   assert.equal(resolve('', { CREMIND_SSL_CERTFILE: 'cert.pem', CREMIND_SSL_KEYFILE: 'key.pem' }, false), 'https://127.0.0.1:1515')
   assert.equal(transport.httpsOrigin('http://localhost'), 'https://localhost:80')
   assert.equal(transport.httpOrigin('https://user:secret@example.com'), null)
+})
+
+test('a backend counts as up exactly when its /health says it is serving', () => {
+  for (const { code, body } of healthAnswers) {
+    assert.equal(transport.isServingHealth(code, body), code === 200, JSON.stringify({ code, body }))
+  }
+  // A fresh install, waiting for its Setup Wizard, is the backend the
+  // first-run installer starts and waits for.
+  assert.equal(freshInstallHealth.body.status, 'setup_pending')
+  assert.equal(transport.isServingHealth(freshInstallHealth.code, freshInstallHealth.body), true)
+  // This shell outlives the wheels it talks to: a newer status word is fine.
+  assert.equal(transport.isServingHealth(200, { status: 'migrating' }), true)
+  // Anything else on the port: the HTTPS recovery listener's 426, a
+  // redirect, or a 200 that is not a health document.
+  for (const [code, body] of [
+    [426, { error: 'HTTPS is required.' }], [308, null], [200, null], [200, {}],
+    [200, { status: '' }], [200, { status: 1 }], [200, ['ok']], [200, 'ok'],
+  ]) assert.equal(transport.isServingHealth(code, body), false, JSON.stringify({ code, body }))
 })
 
 test('native trust accepts the installed valid leaf and rejects unrelated, wrong-name and expired certificates', async () => {
@@ -555,6 +577,23 @@ test('preflight waits for another window’s upload before activation and coales
     assert.deepEqual(loaded, [])
     phase = 'cancelled'
     await new Promise(resolve => setTimeout(resolve, 300))
+  })
+})
+
+test('Continue to Setup Wizard adopts the backend of the install it just made, in any install mode', async () => {
+  await mainHarness(async ({ invokeFromApp }) => {
+    const probed = []
+    globalThis.__cremindElectronTest.session.defaultSession.fetch = async url => {
+      probed.push(url)
+      return url.endsWith('/health')
+        ? new Response(JSON.stringify({ ...freshInstallHealth.body, boot_id: 'f'.repeat(32) }), { status: freshInstallHealth.code })
+        : new Response(JSON.stringify({ install_mode: 'native', ui_features: [] }))
+    }
+    // This system dir has no venv, and neither does a Docker install's:
+    // anything but adopting the running backend fails.
+    assert.deepEqual(await invokeFromApp('cremind:server:start'), { ok: true, agentUrl: 'http://127.0.0.1:1515' })
+    assert.equal(probed[0], 'http://127.0.0.1:1515/health')
+    assert.equal((await invokeFromApp('cremind:get-config')).agentUrl, 'http://127.0.0.1:1515')
   })
 })
 
