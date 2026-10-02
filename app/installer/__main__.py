@@ -10,12 +10,15 @@ Exit codes:
   0 — TUI exited cleanly; output file written.
   1 — user cancelled (Ctrl-C / q); shell falls back / exits.
   2 — bad arguments / catalog load failure.
+  3 — the TUI itself failed (e.g. it could not read the terminal); the
+      shell falls back to its text prompts.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 from app.installer import catalog, tui
@@ -226,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
         _write_cancel_marker(args.output)
         print("installer: cancelled.", file=sys.stderr)
         return 1
+    except Exception:
+        # A TUI that cannot run is not a cancel. Left uncaught, the error
+        # exits 1 — the cancel code — and the shell stopped with "Installer
+        # cancelled." (macOS's /dev/tty failure did exactly that). Exit 3
+        # sends it to the text prompts instead; no marker is written.
+        traceback.print_exc()
+        return 3
 
     if result is None:
         _write_cancel_marker(args.output)

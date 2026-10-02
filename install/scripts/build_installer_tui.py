@@ -62,15 +62,28 @@ def _stage(staging: Path) -> None:
         shutil.copyfile(src, dst)
 
 
+# The archive's own ``__main__.py``. zipapp's generated one (``main=
+# "pkg.mod:fn"``) calls ``fn()`` and drops what it returns, so the bundle
+# exited 0 whatever ``main()`` chose — a failed catalog load read as success
+# to the shells, and only an uncaught exception (exit 1) got through, as a
+# "cancel". Exit with main()'s code instead, as ``python -m app.installer``
+# does. Written as bytes so a Windows build matches CI's ``--check``.
+_ENTRY_POINT = b"""\
+# -*- coding: utf-8 -*-
+import app.installer.__main__
+raise SystemExit(app.installer.__main__.main())
+"""
+
+
 def _build_pyz(target: Path) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp) / "src"
         staging.mkdir()
         _stage(staging)
+        (staging / "__main__.py").write_bytes(_ENTRY_POINT)
         zipapp.create_archive(
             source=staging,
             target=target,
-            main="app.installer.__main__:main",
             interpreter=None,
             compressed=True,
         )

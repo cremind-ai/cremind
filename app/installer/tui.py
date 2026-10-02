@@ -25,7 +25,10 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
+import selectors
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple
@@ -125,6 +128,24 @@ def _make_app(title, body, buttons, kb, *, focused=None) -> Application:
     )
 
 
+def _run(app: Application) -> object:
+    """Run a dialog and return its result: ``app.run()``, except on macOS.
+
+    install.sh starts the TUI with stdin and stdout reopened from
+    ``/dev/tty`` — under ``curl | bash`` the script itself is on stdin. On
+    macOS asyncio's default event loop polls with kqueue, which refuses a
+    ``/dev/tty`` descriptor (EINVAL); prompt_toolkit reports that as
+    EOFError before the first screen draws. ``select()`` reads it fine, so
+    on macOS every dialog runs on a select()-based loop instead.
+    """
+    if sys.platform == "darwin":
+        return asyncio.run(
+            app.run_async(),
+            loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
+        )
+    return app.run()
+
+
 class _AdvanceRadioList(RadioList):
     """A RadioList whose mouse click picks a row *and* advances the dialog.
 
@@ -206,7 +227,7 @@ def _radio(
             padding=1,
         )
         app = _make_app(title, body, buttons, _base_bindings(radio=radio), focused=radio)
-        outcome = _handle_common(app.run())
+        outcome = _handle_common(_run(app))
         if outcome is not None:
             return outcome
         # Esc declined → re-show this screen.
@@ -245,7 +266,7 @@ def _text(
             padding=1,
         )
         app = _make_app(title, body, buttons, _base_bindings(), focused=textfield)
-        outcome = _handle_common(app.run())
+        outcome = _handle_common(_run(app))
         if outcome is None:
             continue  # Esc declined → re-show with the same default
         value, action = outcome
@@ -286,7 +307,7 @@ def _choice(
                 focused = btn
         body = Label(text=text, dont_extend_height=True)
         app = _make_app(title, body, buttons, _base_bindings(), focused=focused)
-        outcome = _handle_common(app.run())
+        outcome = _handle_common(_run(app))
         if outcome is not None:
             return outcome
 
@@ -295,7 +316,7 @@ def _message(title: str, text: str) -> None:
     """Informational popup with a single OK button (Ctrl-C still force-quits)."""
     ok = Button(text="OK", handler=lambda: get_app().exit(result=None))
     body = Label(text=text, dont_extend_height=True)
-    result = _make_app(title, body, [ok], _base_bindings(), focused=ok).run()
+    result = _run(_make_app(title, body, [ok], _base_bindings(), focused=ok))
     if result is _FORCE_QUIT:
         raise KeyboardInterrupt
     # OK (None) and Esc (_ESCAPE) both just dismiss the popup.
@@ -317,7 +338,7 @@ def _confirm_cancel() -> bool:
         dont_extend_height=True,
     )
     kb = _base_bindings(escape_action="keep")
-    result = _make_app("Cancel install?", body, [keep, quit_], kb, focused=keep).run()
+    result = _run(_make_app("Cancel install?", body, [keep, quit_], kb, focused=keep))
     if result is _FORCE_QUIT:
         raise KeyboardInterrupt
     return result is True
