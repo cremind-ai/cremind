@@ -4708,7 +4708,7 @@ EOF
 # --no-auto-install-python / --unattended; otherwise prompts (default Yes).
 prompt_for_python_install() {
     if [ "$AUTO_INSTALL_PYTHON" = "0" ]; then
-        err "Python 3.13 or newer is required for native mode but was not found."
+        err "Native mode needs Python 3.13.9 or newer (on macOS, 3.13) and none was found."
         print_python_manual_hint
         exit 1
     fi
@@ -4771,21 +4771,77 @@ EOF
 # and return its absolute path via $PYTHON. The cache and install dir are
 # scoped to CREMIND_INSTALL_DIR so an Install Dir wipe removes everything
 # (the interpreter is install-time scratch, not part of the user's data).
+# Asked as a range, not "3.13": cremind needs 3.13.9+, and a bare "3.13"
+# would settle for an older 3.13 already installed or on PATH.
 install_python_via_uv() {
     export UV_PYTHON_INSTALL_DIR="$CREMIND_INSTALL_DIR/python"
     export UV_CACHE_DIR="$CREMIND_INSTALL_DIR/uv-cache"
     info "Downloading isolated Python 3.13 (this may take a minute)"
-    if ! "$UV_BIN" python install 3.13 >>"$LOG_FILE" 2>&1; then
+    if ! "$UV_BIN" python install '>=3.13.9,<3.14' >>"$LOG_FILE" 2>&1; then
         err "uv failed to install Python 3.13 — see $LOG_FILE."
         exit 1
     fi
-    PYTHON="$("$UV_BIN" python find 3.13 2>/dev/null | tr -d '[:space:]')"
+    PYTHON="$("$UV_BIN" python find '>=3.13.9,<3.14' 2>/dev/null | tr -d '[:space:]')"
     if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
         err "Python install completed but the interpreter could not be located."
         exit 1
     fi
     ok "Python: $("$PYTHON" --version) at $PYTHON (isolated)"
 }
+
+# venv_python_problem X.Y.Z — why Cremind's venv can't be built on this
+# Python, or nothing when it can. find_system_python takes any 3.13+, which
+# is enough for the installer's own helper scripts but not for the venv:
+#   - cremind requires 3.13.9+, and pip refuses an older 3.13 (Debian 13
+#     ships 3.13.5);
+#   - on macOS, watchdog publishes no wheels for 3.14, so pip compiles it,
+#     which needs Xcode's command-line tools.
+venv_python_problem() {
+    local major="${1%%.*}" rest="${1#*.}" minor patch
+    minor="${rest%%.*}"
+    patch="${rest#*.}"
+    case "$major.$minor" in
+        3.13)
+            [ "$patch" -ge 9 ] 2>/dev/null || echo "cremind needs Python 3.13.9 or newer"
+            ;;
+        3.1[4-9])
+            if [ "$OS" = "macos" ]; then
+                echo "on macOS cremind needs Python 3.13 (watchdog has no macOS wheels for $major.$minor, and compiling it needs Xcode's command-line tools)"
+            fi
+            ;;
+        *)
+            echo "cremind needs Python 3.13.9 or newer"
+            ;;
+    esac
+}
+
+# run_logged <what> <command...> — run a command with its output in the log
+# only, and stop the installer if it fails: say what failed and show the end
+# of its output. Unchecked, set -e ended the installer at the failing command
+# without a word on screen, its output being in the log alone.
+run_logged() {
+    local what="$1" mark=0 rc=0
+    shift
+    if [ -f "$LOG_FILE" ]; then
+        mark="$(wc -l <"$LOG_FILE" | tr -d ' ')"
+    fi
+    "$@" >>"$LOG_FILE" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    err "$what failed (exit $rc). The end of its output:"
+    tail -n +"$((mark + 1))" "$LOG_FILE" | tail -n 25 >&2
+    err "Full log: $LOG_FILE"
+    exit 1
+}
+
+# A Python that runs the installer can still be wrong for the venv; native
+# mode then installs on an isolated 3.13 instead (asked, as below).
+if [ -n "$PYTHON" ] && [ "$CHANNEL" != "dev" ]; then
+    py_problem="$(venv_python_problem "$("$PYTHON" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')")"
+    if [ -n "$py_problem" ]; then
+        warn "Not building Cremind's venv on $("$PYTHON" --version) at $PYTHON: $py_problem."
+        PYTHON=""
+    fi
+fi
 
 # Dev channel reuses the developer's local .venv (managed by uv) for the
 # install, so we don't need a separate Python here. Skip the prompt and
@@ -4937,19 +4993,35 @@ sys.exit(0 if V(sys.argv[1]) >= V(sys.argv[2]) else 1)" "$have" "$want" 2>/dev/n
             fi
         fi
     fi
+    # A venv without cremind is what a failed install leaves behind: there is
+    # nothing in it to upgrade, and it keeps the Python that install chose.
+    if [ "$RUNTIME_KEPT" -eq 0 ] && [ -d "$VENV_DIR" ] && [ ! -x "$VENV_DIR/bin/cremind" ]; then
+        info "Removing an incomplete venv from an earlier failed install: $VENV_DIR"
+        rm -rf "$VENV_DIR"
+    fi
+
+    # --prefer-binary: the newest release with a wheel for this machine beats
+    # a newer one pip would have to compile. cryptography ships no Intel-Mac
+    # wheels since 49.0.0 and compiling it needs Rust and OpenSSL, so pip
+    # failed here on every Intel Mac; with the flag it takes 48.0.1. Where the
+    # newest release has a wheel, the flag changes nothing.
     if [ "$RUNTIME_KEPT" -eq 1 ]; then
         :
     elif [ -d "$VENV_DIR" ]; then
         info "Existing install detected at $VENV_DIR — upgrading in place."
-        "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG_FILE" 2>&1
-        "$VENV_DIR/bin/pip" install --upgrade "$INSTALL_SPEC" >>"$LOG_FILE" 2>&1
+        "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG_FILE" 2>&1 \
+            || warn "Could not upgrade pip; continuing with the venv's own (see $LOG_FILE)."
+        run_logged "Upgrading cremind with pip" \
+            "$VENV_DIR/bin/pip" install --upgrade --prefer-binary "$INSTALL_SPEC"
     else
         info "Creating venv at $VENV_DIR"
         mkdir -p "$(dirname "$VENV_DIR")"
-        "$PYTHON" -m venv "$VENV_DIR" >>"$LOG_FILE" 2>&1
+        run_logged "Creating the venv with $PYTHON" "$PYTHON" -m venv "$VENV_DIR"
         info "Installing cremind from $INSTALL_SOURCE_LABEL (this may take a few minutes)"
-        "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG_FILE" 2>&1
-        "$VENV_DIR/bin/pip" install "$INSTALL_SPEC" >>"$LOG_FILE" 2>&1
+        "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG_FILE" 2>&1 \
+            || warn "Could not upgrade pip; continuing with the venv's own (see $LOG_FILE)."
+        run_logged "Installing cremind with pip" \
+            "$VENV_DIR/bin/pip" install --prefer-binary "$INSTALL_SPEC"
     fi
 
     INSTALLED_VERSION="$("$VENV_DIR/bin/cremind" version 2>/dev/null | awk '{print $2}' || echo "?")"
