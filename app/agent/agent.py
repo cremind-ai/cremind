@@ -200,9 +200,10 @@ class CremindAgent:
                     "ready in a moment — please retry."
                 )
             elif status == "failed":
+                # rstrip: the error often ends a sentence of its own.
                 msg = (
                     "Vector embedding initialization failed: "
-                    f"{err or 'unknown error'}. Disable Vector Embedding in "
+                    f"{(err or 'unknown error').rstrip('.')}. Disable Vector Embedding in "
                     "Settings or check the server logs."
                 )
             else:

@@ -141,3 +141,13 @@ Watch `cremind embedding status --follow` and retry once it's `ready`.
 
 **`get`/`set` return 403 but `status` works** — `get`/`set` are admin-only;
 `status` and `initialize` are not. Use an admin `CREMIND_TOKEN`.
+
+**Windows: `error` says PyTorch needs the Microsoft Visual C++ runtime (older
+builds said `[WinError 1114] … torch\lib\c10.dll`)** — PyTorch needs the
+Microsoft Visual C++ runtime 14.40 or newer. When the PC's runtime is older,
+Cremind installs a private copy into its own venv (no admin needed) and loads
+it before PyTorch, so this error means that wasn't possible (offline, for
+example). Install the latest Microsoft Visual C++ Redistributable from
+https://aka.ms/vc14/vc_redist.x64.exe, then `cremind server restart`.
+`cremind embedding initialize` alone won't help: the running server keeps the
+old runtime loaded.
