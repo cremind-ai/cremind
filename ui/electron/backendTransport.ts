@@ -174,6 +174,52 @@ export function isExpectedLocalCertificate(
   } catch { return false }
 }
 
+/** How long a spawned backend may boot before the wait reports it hung. */
+export const BACKEND_BOOT_CEILING_MS = 10 * 60_000
+/** How long to keep listening on the port once the spawned backend has exited. */
+export const BACKEND_EXIT_GRACE_MS = 30_000
+
+export type BackendWait = 'healthy' | 'exited' | 'timeout'
+
+/**
+ * Wait for the backend this shell spawned to answer ``/health``.
+ *
+ * The server binds its port only once boot is done, and boot time depends on
+ * what the install has turned on: with Vector Embedding it loads PyTorch and
+ * the model first, ~40 s on a small Windows VM. A fixed 30 s budget gave up on
+ * that backend while it was still coming up — Restart Server failed, and a
+ * relaunched window stayed on the bundled UI against a dead port. So while
+ * the child runs it gets ``ceilingMs``, which is there only so a hung boot is
+ * still reported. Once it has exited, the wait goes on until ``exitGraceMs``
+ * after the spawn: a backend another launcher started (the boot service) may
+ * hold the port and still be coming up, and that one answers instead.
+ */
+export async function waitForSpawnedBackend(
+  healthy: () => Promise<boolean>,
+  running: () => boolean,
+  {
+    exitGraceMs = BACKEND_EXIT_GRACE_MS,
+    ceilingMs = BACKEND_BOOT_CEILING_MS,
+    intervalMs = 500,
+    now = Date.now,
+    sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  }: {
+    exitGraceMs?: number
+    ceilingMs?: number
+    intervalMs?: number
+    now?: () => number
+    sleep?: (ms: number) => Promise<void>
+  } = {},
+): Promise<BackendWait> {
+  const start = now()
+  for (;;) {
+    if (await healthy()) return 'healthy'
+    const alive = running()
+    if (now() - start >= (alive ? ceilingMs : exitGraceMs)) return alive ? 'timeout' : 'exited'
+    await sleep(intervalMs)
+  }
+}
+
 /** Never respawn while the previous child is still releasing its listeners. */
 export function stopOwnedBackend(
   child: ChildProcess, terminateTree: (pid: number) => void,

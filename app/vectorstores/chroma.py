@@ -341,7 +341,12 @@ class ChromaClient(VectorStoreBase):
         ids = res.get("ids") or []
         metadatas = res.get("metadatas") or []
         documents = res.get("documents") or []
-        embeddings = res.get("embeddings") or [] if with_vectors else []
+        # An ndarray: never test it for truthiness. ``or []`` here raised, so
+        # no cached embedding table ever loaded and each boot re-embedded the
+        # Google Places types.
+        embeddings = res.get("embeddings") if with_vectors else None
+        if embeddings is None:
+            embeddings = []
 
         out: List[StoredPoint] = []
         for i, raw_id in enumerate(ids):
@@ -350,7 +355,7 @@ class ChromaClient(VectorStoreBase):
                 payload[self._text_key] = documents[i]
             vec: Optional[List[float]] = None
             if with_vectors and i < len(embeddings) and embeddings[i] is not None:
-                vec = list(embeddings[i])
+                vec = [float(x) for x in embeddings[i]]
             out.append(StoredPoint(id=_coerce_id(raw_id), vector=vec, payload=payload))
         return out
 

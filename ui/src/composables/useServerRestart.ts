@@ -23,7 +23,10 @@ export type InstallMode = 'docker' | 'electron' | 'native' | null
 
 const HEALTH_POLL_INITIAL_MS = 500
 const HEALTH_POLL_MAX_MS = 3000
-const HEALTH_POLL_BUDGET_MS = 60_000
+// The old process's shutdown, the supervisor's restart delay, then a boot
+// that opens the port only at its end — with Vector Embedding, after PyTorch
+// and the model have loaded (~40 s on a small VM).
+const HEALTH_POLL_BUDGET_MS = 180_000
 // Time the "Reconnected" badge stays visible before fading back to Idle.
 const RECONNECTED_DISPLAY_MS = 3000
 
@@ -196,8 +199,8 @@ export function useServerRestart() {
     }
     // The request landed (or the IPC respawn returned). Now wait for a NEW
     // listener to come back. Under Docker / Electron this finishes in
-    // ~5–15s; under bare pip it never will, and we give up at the
-    // budget.
+    // ~5–15s (longer with Vector Embedding); under bare pip it never will,
+    // and we give up at the budget.
     const ok = await pollHealth(baselineBootId)
     if (!ok) {
       phase.value = 'failed'

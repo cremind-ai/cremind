@@ -91,11 +91,12 @@ def rebuilding_state(monkeypatch):
 
 @pytest.fixture
 def gg_places_calls(monkeypatch):
-    """Stub the Places rebuild ``_rebuild_caches`` runs first; record its store."""
-    calls: list[object] = []
+    """Stub the Places rebuild ``_rebuild_caches`` runs first; record its
+    store and embedding model."""
+    calls: list[tuple[object, object]] = []
     monkeypatch.setattr(
         "app.tools.builtin.gg_places._build_embedding_table",
-        lambda vector_store=None: calls.append(vector_store),
+        lambda vector_store=None, embedding=None: calls.append((vector_store, embedding)),
     )
     return calls
 
@@ -137,7 +138,8 @@ def test_rebuild_indexes_documents_while_the_state_is_rebuilding(
         agent=None, embedding=emb, vector_store=store, profiles=[],
     )
 
-    assert gg_places_calls == [store]
+    # The apply's own model, not a second load of it.
+    assert gg_places_calls == [(store, emb)]
     assert store.created == [(COLLECTION_NAME, 3)]
     assert len(store.added) == 1, "the doc must be indexed although the state is not READY"
     point = store.added[0]

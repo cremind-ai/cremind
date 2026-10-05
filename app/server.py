@@ -1532,6 +1532,7 @@ async def main(
                     setup_profile="admin",
                     config_storage=config_storage,
                     vector_store=vector_store,
+                    embedding=embedding,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Built-in tool registration failed: {e}")

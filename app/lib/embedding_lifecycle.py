@@ -264,7 +264,9 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
     embedding_state.set_phase("rebuilding_places")
     try:
         from app.tools.builtin import gg_places  # noqa: WPS433 — lazy by design
-        gg_places._build_embedding_table(vector_store=vector_store)
+        # This apply's own instance: the shared one is still the previous model
+        # until mark_ready, and a new LocalEmbeddings would load the model again.
+        gg_places._build_embedding_table(vector_store=vector_store, embedding=embedding)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[embedding] gg_places rebuild failed; continuing: {e}")
 

@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import https from 'node:https'
 import path from 'node:path'
 import {
+  BACKEND_BOOT_CEILING_MS,
   defaultPortHttpsOrigin,
   httpOrigin,
   httpsOrigin,
@@ -16,6 +17,7 @@ import {
   stopOwnedBackend,
   tlsStatusInstanceId,
   waitForActivationResponseGrace,
+  waitForSpawnedBackend,
 } from './backendTransport'
 import { filterTransitionState, transitionProfile, type TransitionState } from './transitionState'
 import { validVncUrl, vncUrlFor, type VncDescriptor } from './vncDesktop'
@@ -1379,8 +1381,9 @@ async function startBackend(): Promise<BackendResult> {
   const serverErr = path.join(sys, 'server.err.log')
   // Already spawned but not healthy yet? Just wait.
   if (backendProcess && backendProcess.exitCode === null) {
-    const ok = await waitForBackendHealthy()
-    return ok ? backendReady() : { ok: false, error: `backend did not become healthy — see ${serverErr}` }
+    const owned = backendProcess
+    const outcome = await waitForSpawnedBackend(() => isBackendHealthy(), () => stillRunning(owned))
+    return outcome === 'healthy' ? backendReady() : { ok: false, error: `backend did not become healthy — see ${serverErr}` }
   }
 
   // Spawn via the venv interpreter rather than cremind.exe so that
@@ -1425,18 +1428,20 @@ async function startBackend(): Promise<BackendResult> {
     try { if (stderrFd) fs.closeSync(stderrFd) } catch { /* ignore */ }
   })
 
-  // Waits out the full window even once this child has exited: a backend
-  // another launcher started (the boot service) may hold the port and still
-  // be coming up — this child then exits, and that one answers.
-  const ok = await waitForBackendHealthy()
-  if (!ok) {
-    const exit = child.exitCode ?? child.signalCode
-    const what = exit === null
-      ? `backend at ${backendHealthUrl()} did not respond after 30s`
-      : `backend exited (${exit}) without answering ${backendHealthUrl()}`
+  // No deadline while this child is still booting; once it exits, a short
+  // grace for another launcher's backend (see waitForSpawnedBackend).
+  const outcome = await waitForSpawnedBackend(() => isBackendHealthy(), () => stillRunning(child))
+  if (outcome !== 'healthy') {
+    const what = outcome === 'timeout'
+      ? `backend at ${backendHealthUrl()} did not respond within ${BACKEND_BOOT_CEILING_MS / 60_000} minutes`
+      : `backend exited (${child.exitCode ?? child.signalCode}) without answering ${backendHealthUrl()}`
     return { ok: false, error: `${what} — see ${serverErr}` }
   }
   return backendReady()
+}
+
+function stillRunning(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null
 }
 
 ipcMain.handle('cremind:server:start', async (event): Promise<BackendResult> => {
@@ -2323,9 +2328,9 @@ async function runBackendUpgrade(
       // users on the login screen post-upgrade. Health-polling instead
       // means the renderer reloads against a fully-ready backend, and
       // ``getTokenForProfile`` finds the original token still in
-      // localStorage. The 30 s ceiling matches startBackend's own
-      // readiness budget — if we don't see /health by then, surface a
-      // failure rather than reload onto a broken backend.
+      // localStorage. startBackend has already seen /health answer, so this
+      // 30 s re-check only catches a backend that fell over again — surface
+      // a failure rather than reload onto a broken backend.
       void (async () => {
         const healthy = await waitForBackendHealthy(30000)
         if (!healthy) {
@@ -3250,6 +3255,8 @@ if (!gotSingleInstanceLock) {
           // without this, every quit/relaunch leaves the renderer stuck
           // on whatever SPA was built into the installer's asar.
           void pivotFileWindowsToBackend()
+        } else {
+          console.warn(`[cremind] backend did not start: ${r.error}`)
         }
       })()
     }

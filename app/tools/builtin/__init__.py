@@ -348,6 +348,7 @@ async def register_builtin_tools(
     setup_profile: str = "admin",
     config_storage=None,
     vector_store=None,
+    embedding=None,
 ) -> None:
     """Register all built-in tool groups from ``_BUILTIN_MODULE_NAMES``.
 
@@ -360,6 +361,10 @@ async def register_builtin_tools(
     setup_profile   : profile from which to read OAuth client_id/secret at
                       registration time. Per-profile overrides remain effective
                       at execution time (handled by the adapter).
+    vector_store,
+    embedding       : the boot's vector store and loaded embedding model, handed
+                      to a ``get_prepare_tools`` that takes them, so a tool
+                      reuses the model instead of loading its own copy.
     """
     for module_name in _BUILTIN_MODULE_NAMES:
         try:
@@ -446,8 +451,11 @@ async def register_builtin_tools(
         if hasattr(module, "get_prepare_tools"):
             fn = module.get_prepare_tools
             kwargs = {}
-            if "vector_store" in inspect.signature(fn).parameters:
+            params = inspect.signature(fn).parameters
+            if "vector_store" in params:
                 kwargs["vector_store"] = vector_store
+            if "embedding" in params:
+                kwargs["embedding"] = embedding
             prepare_tools_fn = fn(**kwargs)
 
         # OAuth provider: read GOOGLE_CLIENT_ID/SECRET from the variable scope

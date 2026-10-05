@@ -414,12 +414,17 @@ COMMON_INCLUDED_TYPES: list[str] = [
 ]
 
 
-def _build_embedding_table(vector_store=None):
+def _build_embedding_table(vector_store=None, embedding=None):
     """Build the embedding table for INCLUDED_TYPES_TABLE at startup.
 
     When ``vector_store`` is provided and embedding is enabled, cached
     embeddings are loaded from the vector store on subsequent startups —
     skipping the 336 encode calls entirely.
+
+    ``embedding`` is the process's loaded ``LocalEmbeddings``, which is built
+    to be shared. Only a caller without one gets a new instance, which loads
+    the whole model a second time (~7 s of every boot on a small Windows VM)
+    and keeps a second copy of it in memory.
 
     Returns ``(embedding_vendor, embedding_table)``, or ``(None, None)`` when
     embedding is disabled or unavailable. Callers handle the ``None`` case
@@ -434,7 +439,7 @@ def _build_embedding_table(vector_store=None):
         from app.lib.embedding import LocalEmbeddings
         from app.vectorstores import get_or_build_embedding_table
 
-        embedding_vendor = LocalEmbeddings()
+        embedding_vendor = embedding if embedding is not None else LocalEmbeddings()
         table = get_or_build_embedding_table(
             vector_store=vector_store,
             embedding=embedding_vendor,
@@ -732,14 +737,17 @@ def get_tools(config: dict) -> list[BuiltInTool]:
     return [SearchPlacesTool(api_key=api_key), MapDirectionLinkTool()]
 
 
-def get_prepare_tools(vector_store=None) -> Optional[Callable]:
+def get_prepare_tools(vector_store=None, embedding=None) -> Optional[Callable]:
     """Build embedding table and return the prepare_tools callback.
 
-    Called once at startup by register_builtin_tools(). When `vector_store`
-    is provided, cached place-type embeddings are loaded from Qdrant instead
+    Called once at startup by register_builtin_tools(), with the boot's
+    shared embedding instance. When `vector_store` is provided, cached
+    place-type embeddings are loaded from Qdrant instead
     of being re-generated via gRPC. Returns None if the embedding service
     is unavailable (graceful degradation -- the tool still works, just
     without type filtering).
     """
-    embedding_vendor, embedding_table = _build_embedding_table(vector_store=vector_store)
+    embedding_vendor, embedding_table = _build_embedding_table(
+        vector_store=vector_store, embedding=embedding,
+    )
     return create_prepare_tools(embedding_vendor, embedding_table)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -124,6 +124,39 @@ test('restart waits for actual child exit and forces a stuck owned process befor
   }, 5, 5), true)
   assert.equal(killedPid, 456)
   assert.equal(await transport.stopOwnedBackend(stuck, () => {}, 5, 5), false)
+})
+
+test('a spawned backend may boot for as long as it runs, and gets a short grace once it exits', async () => {
+  // A fake clock: the backend answers from ``answersAt`` and its process
+  // exits at ``exitsAt``; every sleep moves time forward.
+  const boot = (answersAt, exitsAt = Infinity) => {
+    let now = 0
+    return {
+      wait: () => transport.waitForSpawnedBackend(async () => now >= answersAt, () => now < exitsAt, {
+        now: () => now, sleep: async (ms) => { now += ms },
+      }),
+      elapsed: () => now,
+    }
+  }
+  // Vector Embedding on a small Windows VM: alive and silent for ~40 s.
+  let b = boot(40_000)
+  assert.equal(await b.wait(), 'healthy')
+  assert.equal(b.elapsed(), 40_000)
+  // The child lost the port to a boot-service backend still coming up.
+  b = boot(20_000, 2_000)
+  assert.equal(await b.wait(), 'healthy')
+  // Nothing answers after the child dies: reported after the grace...
+  b = boot(Infinity, 2_000)
+  assert.equal(await b.wait(), 'exited')
+  assert.equal(b.elapsed(), transport.BACKEND_EXIT_GRACE_MS)
+  // ...or at once, when it dies late in its boot.
+  b = boot(Infinity, 45_000)
+  assert.equal(await b.wait(), 'exited')
+  assert.equal(b.elapsed(), 45_000)
+  // A boot that hangs is still reported, at the ceiling.
+  b = boot(Infinity)
+  assert.equal(await b.wait(), 'timeout')
+  assert.equal(b.elapsed(), transport.BACKEND_BOOT_CEILING_MS)
 })
 
 test('owned HTTPS activation leaves enough time for the committed 202 response', async () => {
@@ -319,7 +352,16 @@ async function mainHarness(run) {
       external: ['electron-updater'], define: { __CREMIND_INSTALL_CHANNEL__: '"production"' },
       plugins: [{ name: 'electron-test', setup(builder) {
         builder.onResolve({ filter: /^electron$/ }, () => ({ path: 'electron', namespace: 'mock' }))
-        builder.onLoad({ filter: /.*/, namespace: 'mock' }, () => ({ contents: 'export const {app,ipcMain,BrowserWindow,session,Tray,Menu,nativeImage,shell,dialog,Notification} = globalThis.__cremindElectronTest' }))
+        builder.onLoad({ filter: /^electron$/, namespace: 'mock' }, () => ({ contents: 'export const {app,ipcMain,BrowserWindow,session,Tray,Menu,nativeImage,shell,dialog,Notification} = globalThis.__cremindElectronTest' }))
+        // The real module unless a test supplies ``childProcess`` (a fake spawn).
+        builder.onResolve({ filter: /^node:child_process$/ }, () => ({ path: 'child_process', namespace: 'mock' }))
+        builder.onLoad({ filter: /^child_process$/, namespace: 'mock' }, () => ({ contents: `
+          import { createRequire } from 'node:module'
+          const real = createRequire(import.meta.url)('child_process')
+          const impl = () => globalThis.__cremindElectronTest?.childProcess || real
+          export const spawn = (...args) => impl().spawn(...args)
+          export const spawnSync = (...args) => impl().spawnSync(...args)
+        ` }))
       } }],
     })
     await writeFile(outfile, result.outputFiles[0].text)
@@ -594,6 +636,69 @@ test('Continue to Setup Wizard adopts the backend of the install it just made, i
     assert.deepEqual(await invokeFromApp('cremind:server:start'), { ok: true, agentUrl: 'http://127.0.0.1:1515' })
     assert.equal(probed[0], 'http://127.0.0.1:1515/health')
     assert.equal((await invokeFromApp('cremind:get-config')).agentUrl, 'http://127.0.0.1:1515')
+  })
+})
+
+test('Restart Server waits for a backend that boots for longer than 30 s', async (t) => {
+  await mainHarness(async ({ invokeFromApp, tmp }) => {
+    // The venv interpreter only has to exist; the spawn itself is faked.
+    const venv = path.join(tmp, 'system', 'venv')
+    const python = process.platform === 'win32'
+      ? path.join(venv, 'Scripts', 'python.exe') : path.join(venv, 'bin', 'python')
+    await mkdir(path.dirname(python), { recursive: true })
+    await writeFile(python, '')
+    const children = []
+    let booted = 1 // how many of the spawned children have finished booting
+    globalThis.__cremindElectronTest.childProcess = {
+      spawn() {
+        const child = Object.assign(new EventEmitter(), {
+          pid: 4000 + children.length, exitCode: null, signalCode: null,
+          kill(signal) {
+            this.signalCode = signal
+            queueMicrotask(() => this.emit('exit', null, signal))
+          },
+        })
+        children.push(child)
+        return child
+      },
+      spawnSync: () => ({ status: 0 }),
+    }
+    globalThis.__cremindElectronTest.session.defaultSession.fetch = async (url) => {
+      // The port opens once the newest child has finished booting.
+      const newest = children.at(-1)
+      if (!newest || children.length > booted || newest.signalCode !== null) {
+        throw new TypeError('fetch failed')
+      }
+      return new Response(JSON.stringify(url.endsWith('/health')
+        ? { status: 'ok' } : { install_mode: 'native', ui_features: [] }))
+    }
+    const flush = () => new Promise(resolve => setImmediate(resolve))
+
+    assert.deepEqual(await invokeFromApp('cremind:server:start'), { ok: true, agentUrl: 'http://127.0.0.1:1515' })
+    assert.equal(children.length, 1)
+
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() })
+    try {
+      const restarting = invokeFromApp('cremind:server:restart')
+      // Vector Embedding: PyTorch and the model load before the port opens.
+      for (let waited = 0; waited < 40_000; waited += 500) {
+        await flush()
+        t.mock.timers.tick(500)
+      }
+      assert.equal(children.length, 2)
+      booted = 2
+      for (let i = 0; i < 4; i++) {
+        await flush()
+        t.mock.timers.tick(500)
+      }
+      assert.deepEqual(await restarting, { ok: true, agentUrl: 'http://127.0.0.1:1515' })
+      assert.equal(children.length, 2)
+    } finally {
+      t.mock.timers.reset()
+      // Let main close the child's log files before the harness removes them.
+      children.at(-1)?.kill('SIGTERM')
+      await flush()
+    }
   })
 })
 
