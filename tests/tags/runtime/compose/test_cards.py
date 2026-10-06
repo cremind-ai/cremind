@@ -85,6 +85,39 @@ def test_red_progress_and_link() -> None:
     assert card_view(active(link=link), ScreenSettings(qr_links=False)).link is None
 
 
+@pytest.mark.parametrize(("kind", "severity", "tone", "label"), [
+    ("needs_input", "attention", "alert", "NEEDS YOU"),
+    ("needs_input", None, "alert", "NEEDS YOU"),
+    ("task_outcome", "error", "alert", "FAILED"),
+    ("automation", "error", "alert", "FAILED"),
+    ("progress", "error", "alert", "FAILED"),
+    ("health", "error", "alert", "ERROR"),
+    ("notification", "error", "alert", "ERROR"),
+    ("health", "warning", "caution", "WARNING"),
+    ("notification", "attention", "caution", "IMPORTANT"),
+    ("task_outcome", "success", "neutral", "DONE"),
+    ("notification", "info", "neutral", "NOTICE"),
+    ("excerpt", "info", "neutral", "REPLY"),
+    ("task_outcome", "info", "neutral", "UPDATE"),
+    ("calendar", None, "neutral", "CALENDAR"),
+    ("automation", "info", "neutral", "AUTOMATION"),
+    ("usage", "info", "neutral", "USAGE"),
+    ("progress", "info", "neutral", "RUNNING"),
+    ("pinned_note", "info", "neutral", "NOTE"),
+    ("health", "info", "neutral", "HEALTH"),
+    ("indexing_problem", "info", "neutral", "FILES"),
+    ("tag_diagnostics", "info", "neutral", "TAG"),
+    ("future_kind", "info", "neutral", "UPDATE"),
+    ("notification", "catastrophic", "neutral", "NOTICE"),  # unknown severity counts as info
+])
+def test_tone_and_label(kind: str, severity: str | None, tone: str, label: str) -> None:
+    extra = {} if severity is None else {"severity": severity}
+    view = card_view(active(kind=kind, **extra), ScreenSettings())
+    assert (view.tone, view.label) == (tone, label)
+    assert view.red == (tone == "alert")
+    assert view.severity == (severity if severity in ("info", "success", "attention", "warning", "error") else "info")
+
+
 def test_order_priority_then_newest() -> None:
     cards = [active(1, prio=40, minutes=5), active(2, prio=90, minutes=60), active(3, prio=40, minutes=1),
              active(4, prio=40, minutes=1), active(5, kind="resolved", prio=100)]

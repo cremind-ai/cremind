@@ -2,8 +2,8 @@
 
 The card JSON is the connector's (docs/tags/connector-api.md "Job shape"). This
 module decides, per card, the icon, the plain-text title and body, the
-language, the time stamp, a progress fraction and a QR link, and the display
-order. Nothing here draws.
+language, the time stamp, a progress fraction, a QR link, the tone and label
+of its status chip, and the display order. Nothing here draws.
 
 Policy:
 
@@ -13,8 +13,13 @@ Policy:
 - the body is shown only when the profile enables excerpts
   (``show_excerpts``) and the kind is in `BODY_KINDS`; a ``pinned_note`` body
   is text the owner wrote for this tag and is always shown;
-- the title is red on two-plane panels for ``needs_input`` cards and
-  ``error`` severity;
+- the **tone** (`tone_of`): ``alert`` for ``needs_input`` cards and ``error``
+  severity (red chips and markers on two-plane panels, bold row titles),
+  ``caution`` for ``warning`` and ``attention`` (an outlined chip), else
+  ``neutral``; ``red`` is ``tone == "alert"``;
+- the **label** (`label_of`, English caps from `compose.strings`): what the
+  chip or eyebrow says — NEEDS YOU, FAILED / ERROR, WARNING, IMPORTANT, DONE,
+  else the kind's word (NOTICE, REPLY, …);
 - progress needs real counts: integers ``done >= 0`` and ``total > 0``;
 - a QR link must be a short, token-free ``https`` URL (`qr_link`).
 """
@@ -26,6 +31,7 @@ import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 
+from app.tags.runtime.compose import strings
 from app.tags.runtime.compose.api import ActiveCard, ScreenSettings
 from app.tags.runtime.compose.timefmt import parse_timestamp
 from app.tags.runtime.layout.plaintext import plain_text
@@ -38,6 +44,12 @@ BODY_KINDS = frozenset({"excerpt", "needs_input", "task_outcome", "notification"
 ALWAYS_BODY_KINDS = frozenset({"pinned_note"})
 RED_KINDS = frozenset({"needs_input"})
 RED_SEVERITIES = frozenset({"error"})
+SEVERITIES = frozenset({"info", "success", "attention", "warning", "error"})
+"""The connector's severities (``app.tags.cards``); anything else counts as ``info``."""
+CAUTION_SEVERITIES = frozenset({"warning", "attention"})
+FAILED_KINDS = frozenset({"task_outcome", "automation", "progress"})
+"""Kinds whose ``error`` says a run failed (label FAILED rather than ERROR)."""
+ALERT, CAUTION, NEUTRAL = "alert", "caution", "neutral"
 
 KIND_ICONS: dict[str, Icon] = {
     "notification": Icon.NOTIFICATIONS, "task_outcome": Icon.TASK, "needs_input": Icon.HELP, "excerpt": Icon.CHAT,
@@ -69,9 +81,43 @@ class CardView:
     language: str
     icon: int
     red: bool
+    """``tone == "alert"``: drawn with red accents on two-plane panels."""
     ts: datetime
     progress: tuple[int, int] | None
     link: bytes | None
+    severity: str = "info"
+    """The card's severity, normalised (`SEVERITIES`; unknown -> ``info``)."""
+    tone: str = NEUTRAL
+    """``alert`` | ``caution`` | ``neutral`` (`tone_of`)."""
+    label: str = strings.LABEL_UPDATE
+    """The chip / eyebrow word in English caps (`label_of`)."""
+
+
+def severity_of(card: dict) -> str:
+    severity = card.get("severity")
+    return severity if isinstance(severity, str) and severity in SEVERITIES else "info"
+
+
+def tone_of(kind: str, severity: str) -> str:
+    """``alert`` (needs_input, error), ``caution`` (warning, attention) or ``neutral``."""
+    if kind in RED_KINDS or severity in RED_SEVERITIES:
+        return ALERT
+    return CAUTION if severity in CAUTION_SEVERITIES else NEUTRAL
+
+
+def label_of(kind: str, severity: str) -> str:
+    """The chip word: the kind's urgency first, then the severity, then the kind (module docstring)."""
+    if kind in RED_KINDS:
+        return strings.LABEL_NEEDS_YOU
+    if severity == "error":
+        return strings.LABEL_FAILED if kind in FAILED_KINDS else strings.LABEL_ERROR
+    if severity == "warning":
+        return strings.LABEL_WARNING
+    if severity == "attention":
+        return strings.LABEL_IMPORTANT
+    if severity == "success":
+        return strings.LABEL_DONE
+    return strings.KIND_LABELS.get(kind, strings.LABEL_UPDATE)
 
 
 def icon_for(card: dict, kind: str) -> int:
@@ -141,12 +187,13 @@ def card_view(active: ActiveCard, settings: ScreenSettings) -> CardView | None:
             kind in ALWAYS_BODY_KINDS or (settings.show_excerpts and kind in BODY_KINDS)):
         body = plain_text(raw_body[:BODY_MAX], keep_newlines=True) or None
     language = normalize_language(card.get("lang")) or normalize_language(settings.language)
-    severity = card.get("severity")
-    red = kind in RED_KINDS or (isinstance(severity, str) and severity in RED_SEVERITIES)
+    severity = severity_of(card)
+    tone = tone_of(kind, severity)
     ts = parse_timestamp(card.get("ts")) or parse_timestamp(active.created_at) or active.created_at
     link = qr_link(card.get("link")) if settings.qr_links else None
     return CardView(active.delivery_id, kind, int(active.priority), active.created_at, title, body, language,
-                    icon_for(card, kind), red, ts, progress_of(card) if kind == "progress" else None, link)
+                    icon_for(card, kind), tone == ALERT, ts, progress_of(card) if kind == "progress" else None, link,
+                    severity, tone, label_of(kind, severity))
 
 
 def _sort_key(view: CardView) -> tuple[int, float, int]:

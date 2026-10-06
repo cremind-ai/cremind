@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from app.tags.runtime.compose.tokens import tokens_for
 from app.tags.runtime.daemon.store import STALE_REVISION_JUMP
 from app.tags.runtime.protocol.ids import Status
 from app.tags.runtime.sim.harness import run_scenario
@@ -58,12 +59,14 @@ def test_job_is_composed_delivered_and_receipted(make_rig: Any) -> None:
 
 
 def test_footer_cards_stay_pending_until_shown(make_rig: Any) -> None:
+    most = tokens_for(400, 300).rows[0]  # list rows a 400x300 screen shows at most, under the hero card
+
     async def scenario() -> None:
         async with make_rig() as rig:
             rig.sim_tag().out_of_range = True
             await rig.start()
             ids = [rig.fake.add_job("alice", rig.hw(), title=f"Update number {i}", priority=40 + i)
-                   for i in range(7)]
+                   for i in range(most + 4)]
             await rig.wait(lambda: any(r["state"] == "sent" and len(eval(r["delivery_ids"])) >= 2
                                        for r in revisions(rig)), what="a screen with several cards sent")
             rig.sim_tag().out_of_range = False
@@ -71,8 +74,8 @@ def test_footer_cards_stay_pending_until_shown(make_rig: Any) -> None:
             await asyncio.sleep(0.5)
             shown = [d for d in ids if rig.stage(d) == "displayed"]
             waiting = [d for d in ids if d not in shown]
-            assert 2 <= len(shown) <= 4 and waiting, (shown, waiting)
-            for d in waiting:  # counted in the footer only: not displayed, and never superseded either
+            assert 2 <= len(shown) <= 1 + most and waiting, (shown, waiting)
+            for d in waiting:  # counted under "+N MORE" only: not displayed, and never superseded either
                 assert rig.stage(d) in ("companion_accepted", "gateway_received"), rig.fake.delivery(d)
                 assert rig.job_state(d) == ("active", None)
             # the highest priorities are the ones on the screen
