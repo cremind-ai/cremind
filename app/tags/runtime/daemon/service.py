@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from .. import __version__
+from ..compose import api as compose_api
 from ..connector.client import Backoff, ConnectorClient, Credential, parse_credential
 from ..connector.models import iso_now
 from ..connector.settings import CremindSettings
@@ -216,6 +217,13 @@ class DaemonService:
                           exc)
         # A different pack may be active now: give tags blocked on a mismatch another chance.
         await self.db.run(self.store.unblock_all, "fontpack_mismatch")
+        if self.fonts is not None:
+            # Screens drawn by another composer design or font pack: every tag redraws once (docs/tags/runtime.md).
+            pack_hex = self.fonts.pack_id.hex()
+            redrawn = await self.db.run(self.store.redraw_if_changed, f"{compose_api.COMPOSER_VERSION}:{pack_hex}",
+                                        pack_hex)
+            if redrawn:
+                log.info("daemon: redrawing %d tag(s) once (screen design or font pack changed)", redrawn)
         if (opts.hardware_credential or opts.content_credentials) and not opts.cremind_url                 and opts.client_factory is None:
             raise DaemonConfigError("no Cremind URL configured (cremind tags tools connect server URL)")
         if opts.gateway_url is not None:

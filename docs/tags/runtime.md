@@ -206,11 +206,31 @@ up to three more cards, footer "N more updates waiting…", [layout.md](layout.m
 Times are shown in the profile's `timezone` (an IANA name; a Windows zone id
 or a bare UTC offset is mapped defensively, anything else shows UTC). It is
 composed again only when its inputs change (cards, panel, rotation, profile
-settings, font pack — not the clock) and, even then, sent only when the
-layout digest differs from the current revision's. A change that only moves a
-progress bar waits until `progress_cadence_s` (profile setting, 300 s) after
-the previous revision. A tag nothing was shown on yet, with no cards, is left
-alone (a fresh database never paints "No updates" over a screen).
+settings, font pack, the composer's design version — not the clock) and, even
+then, sent only when the layout digest differs from the current revision's. A
+change that only moves a progress bar waits until `progress_cadence_s` (profile
+setting, 300 s) after the previous revision. A tag nothing was shown on yet,
+with no cards, is left alone (a fresh database never paints "No updates" over a
+screen).
+
+**Redraw once after a design or font-pack change.** A new screen design or
+another font pack changes no tag's cards, so on its own it would reach a tag
+only with its next card. At every start with a font pack loaded the runtime
+compares what screens are drawn with — `COMPOSER_VERSION`
+(`app/tags/runtime/compose/api.py`) and the pack id — with what its database
+recorded (`daemon_state`); when they differ, or nothing is recorded yet (a
+database from before this rule), every tag that shows this runtime's screens
+is composed again, once: owned here, enrolled, not blocked, not waiting for
+its `clear_tag`, and not on an identify or setup-code screen (one whose hold
+has ended counts as none). The log says `redrawing N tag(s) once`. The tags
+are marked changed, not forced, so the rules above apply: a screen whose
+layout comes out the same is not sent; any other tag refreshes once (a tag
+behind a bridge that lacks the new pack gets `FONTPACK_MISMATCH`, table below,
+until the bridge has it). The next start finds the same version and pack and
+redraws nothing; a fresh database only records them. **Rule:** bump
+`COMPOSER_VERSION` in the same commit as any change to how screens look
+(layout, type, spacing, colour, wording) — without it every tag keeps the old
+look until its next card.
 
 **Revisions.** Every new screen gets the next number from the inventory's
 per-tag allocator (`Database.allocate_revision`, never decreasing, continued
@@ -220,7 +240,9 @@ counted in its footer (`pending_delivery_ids`). A newer revision supersedes an
 undelivered older one; the shown cards move with it. When revision R is
 displayed, exactly its `delivery_ids` are receipted `displayed` (with revision,
 frame digest and timing); footer-only cards stay active until a later screen
-shows them, they expire, are resolved or cancelled.
+shows them, they expire, are resolved or cancelled. A redraw after a design or
+font-pack change is an ordinary new revision of the same card set: cards
+already receipted `displayed` are not receipted again.
 
 **Delivery.** `DELIVER_LAYOUT {bridge, tag, epoch, revision, update_id, fontpack_id,
 layout}` with the tag's current assignment and the active pack id; the `op_id`
@@ -441,8 +463,9 @@ durability boundary with a restart, resynchronisation (expired cursor, restored
 Cremind, lost database), duplicates, `STALE_REVISION`, the epoch floor healing
 a `STALE_EPOCH` end to end (the fake Cremind re-queues `assign_tag` above a
 reported epoch as Cremind does), `bridge_full`, power loss during a refresh,
-expiry, progress cadence, the claim's `clear_required` hold, epoch changes,
-refused cards and revoked credentials.
+expiry, progress cadence, the one redraw after a design or font-pack change,
+the claim's `clear_required` hold, epoch changes, refused cards and revoked
+credentials.
 
 The first vertical slice runs the real Cremind: `CREMIND_E2E=1 uv run pytest
 tests/e2e -q` or `python scripts/tags/e2e_slice.py` (from the

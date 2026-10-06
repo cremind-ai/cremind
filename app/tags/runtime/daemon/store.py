@@ -36,7 +36,7 @@ from typing import Any
 
 from ..connector.models import EventsPage, Job, ProfileSettings, SyncResult, iso, tag_hw_id
 from ..gateway.opid import OpIdGenerator
-from ..protocol.ids import RESULT_FLAG_DUPLICATE, Status
+from ..protocol.ids import GATEWAY_ADDR, RESULT_FLAG_DUPLICATE, Status
 from ..store.db import Database, TagRecord
 from .validator import REFUSED_DETAIL, card_problem
 
@@ -708,6 +708,36 @@ class QueueStore:
                          (override, until, tag_id))
             if force:
                 self._mark_dirty(conn, tag_id, now_iso, force=True)
+
+    def redraw_if_changed(self, marker: str, pack_id: str | None = None) -> int:
+        """Screens are drawn with ``marker`` from now on (``"<COMPOSER_VERSION>:<font pack id>"``). When the last
+        start recorded another one, or none (a database from before this rule), every tag showing this
+        companion's screens is marked dirty once: owned, enrolled here, not blocked, not waiting for its
+        ``clear_tag`` and without a live override (an identify or setup-code screen; an expired one counts as
+        none, as in :meth:`compose_input`). Dirty, not forced: a screen whose layout comes out the same is not
+        sent again. Tags behind a bridge whose active font pack is known and is not ``pack_id`` are left alone:
+        that bridge would refuse a screen drawn with this pack (``FONTPACK_MISMATCH``) and block the tag; they
+        redraw with their next card once it has the pack (the gateway's own radio draws with this host's
+        pack). Returns how many tags were marked."""
+        now_ts, now_iso = self._now()
+        held, params = "", [now_ts]
+        if pack_id:
+            held = (" AND tag_id NOT IN (SELECT t.tag_id FROM tags t JOIN bridges b ON b.addr = t.bridge_addr"
+                    " WHERE t.bridge_addr != ? AND b.fontpack_id IS NOT NULL AND b.fontpack_id != ?)")
+            params += [GATEWAY_ADDR, pack_id]
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT value FROM daemon_state WHERE key = 'screens_drawn_with'").fetchone()
+            if row is not None and row["value"] == marker:
+                return 0
+            tags = [r["tag_id"] for r in conn.execute(
+                "SELECT tag_id FROM tag_views WHERE credential_id IS NOT NULL AND blocked_reason IS NULL"
+                " AND clear_required = 0 AND (override IS NULL OR COALESCE(override_until, 0) <= ?)"
+                " AND tag_id IN (SELECT tag_id FROM tags)" + held + " ORDER BY tag_id", params)]
+            for tag_id in tags:
+                self._mark_dirty(conn, tag_id, now_iso)
+            conn.execute("INSERT INTO daemon_state (key, value) VALUES ('screens_drawn_with', ?)"
+                         " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (marker,))
+        return len(tags)
 
     def tags_needing_work(self) -> tuple[list[int], set[str]]:
         """Tags to (re)compose, and credentials whose tags lack a view (they need a ``sync``)."""

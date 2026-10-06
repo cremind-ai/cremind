@@ -101,7 +101,8 @@ cremind tags identify <tag>   # make the physical tag identify itself
 ```
 
 `refresh` and `identify` queue a hardware command; the tag acts at its next
-wake-up.
+wake-up. After a Cremind upgrade that changes how screens look, each tag
+redraws once by itself (one refresh) — no `refresh` needed.
 
 ### `cremind tags preview`
 

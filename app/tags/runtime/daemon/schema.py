@@ -32,7 +32,8 @@ the scheduler's comparisons):
 - ``gateway_ops`` — op ids of side-effecting gateway requests made by
   commands, with the retained result once it arrived.
 - ``device_status`` — telemetry for the heartbeat (battery, RSSI, last contact).
-- ``daemon_state`` — small key/value facts (the last gateway ``boot_id``).
+- ``daemon_state`` — small key/value facts (the last gateway ``boot_id``; the
+  design version and font pack the screens are drawn with, ``screens_drawn_with``).
 """
 
 from __future__ import annotations

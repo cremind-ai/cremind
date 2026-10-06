@@ -15,6 +15,11 @@ from typing import Any, Protocol
 
 from app.tags.runtime.fonts.fontset import FontSet
 
+COMPOSER_VERSION = 2
+"""The look of the screens the composer draws. Bump it in the same commit as any change to how screens look
+(layout, type, spacing, colour, wording): after the upgrade every tag then redraws once, by itself
+(``QueueStore.redraw_if_changed`` in ``app.tags.runtime.daemon.store``; docs/tags/runtime.md §5 "Redraw once")."""
+
 
 @dataclass(frozen=True)
 class TagPanel:

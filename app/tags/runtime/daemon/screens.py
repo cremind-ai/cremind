@@ -5,7 +5,9 @@ processes made):
 
 1. **Expiry** — cards past ``expires_at`` leave their card set; unreported ones
    are receipted ``expired`` (``uncertain`` after ``DISPLAY_STATE_UNKNOWN``).
-2. **Composition** — for every tag whose card set changed: skip it while the
+2. **Composition** — for every tag whose card set changed (or that a start
+   marked to redraw once after a new screen design or font pack,
+   ``QueueStore.redraw_if_changed``): skip it while the
    tag is blocked, waits for its ``clear_tag`` or has no owner; hold a
    progress-only change until ``progress_cadence_s`` after the previous
    revision; skip when the inputs (``content_key``) or the layout digest equal
@@ -36,6 +38,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from ..compose import api as compose_api
 from ..compose.api import ActiveCard, ComposedScreen, ScreenSettings, TagPanel
 from ..gateway.errors import FrameTooLargeError, GatewayError
 from ..protocol.ids import GATEWAY_ADDR, LAYOUT_SERIAL_MAX, Status
@@ -100,10 +103,10 @@ def _grouped_code(qr_text: str) -> str:
 
 def content_key(purpose: str, panel: TagPanel, settings: ScreenSettings, cards: list[ActiveCard],
                 pack_id: str) -> str:
-    """Digest of everything a screen is composed from, except the clock (a screen is not re-sent only
-    because a minute passed)."""
+    """Digest of everything a screen is composed from, the composer's design version included, except the
+    clock (a screen is not re-sent only because a minute passed)."""
     doc = {
-        "purpose": purpose, "pack": pack_id,
+        "purpose": purpose, "pack": pack_id, "design": compose_api.COMPOSER_VERSION,
         "panel": [panel.tag_id, panel.width, panel.height, panel.planes, panel.plane_flags, panel.rotation,
                   panel.name],
         "settings": [settings.show_excerpts, settings.qr_links, settings.timezone, settings.language],
