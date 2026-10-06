@@ -8,7 +8,7 @@ and ``app/tags/runtime/fonts/bundle.json`` pins it by pack id and SHA-256,
 which ``app/tags/hosting/fonts.py`` checks before installing anything.
 
     uv run python scripts/tags/build_font_bundle.py                # dist/fonts/cremind-tag-fonts-<pack>.tar.gz
-    uv run python scripts/tags/build_font_bundle.py --write-lock   # ... and pin it in bundle.json
+    uv run python scripts/tags/build_font_bundle.py --write-lock   # ... and pin it in bundle.json (Linux only)
     uv run python scripts/tags/build_font_bundle.py --check        # rebuild: it must match the pin exactly
 
 The pack must be built first (``cremind tags tools fonts fetch`` and
@@ -21,7 +21,8 @@ computer verify a download.
 The canonical pack is the **Linux** build (what the release workflows run):
 the FreeType/HarfBuzz builds inside the Windows and macOS wheels round a
 handful of glyph pixels differently, so a pack built there has another pack
-id. Pin from Linux, e.g. in a container mirroring CI::
+id. ``--write-lock`` therefore refuses to run anywhere but Linux; pin from a
+container mirroring CI (from Git Bash on Windows, prefix ``MSYS_NO_PATHCONV=1``)::
 
     docker run --rm -v "$PWD:/src" -w /src python:3.13-slim bash -c \\
       "pip install uv && UV_PROJECT_ENVIRONMENT=/venv uv sync --all-groups && \\
@@ -125,6 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--write-lock", action="store_true", help=f"pin the archive in {LOCK.relative_to(REPO)}")
     group.add_argument("--check", action="store_true", help="the rebuilt archive must match the pin exactly")
     args = parser.parse_args(argv)
+    if args.write_lock and not sys.platform.startswith("linux"):
+        print(f"--write-lock runs on Linux only: the release pins the Linux build of the pack, and a {sys.platform} "
+              "build has another pack id. Pin from a Linux container (the docker command in this script's "
+              "docstring); --check and a plain build work here.", file=sys.stderr)
+        return 1
     pin = build(args.profile, args.out)
     print(json.dumps(pin, indent=2))
     if args.write_lock:

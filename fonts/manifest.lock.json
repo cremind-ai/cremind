@@ -171,6 +171,15 @@
       "source": "notofonts",
       "url": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/76fff9eee60dcef8381bfcae8d0b4311e2186e67/fonts/NotoSansBhaiksuki/hinted/ttf/NotoSansBhaiksuki-Regular.ttf"
     },
+    "noto-sans-bold": {
+      "cache": "notofonts/NotoSans-Bold.ttf",
+      "git_blob_sha1": "aae7546dc1905b228aff70cde8c818b82f3a2bc4",
+      "path": "fonts/NotoSans/hinted/ttf/NotoSans-Bold.ttf",
+      "sha256": "1df075a380fc7cb898acf64c1f7b3b4dd780de3caa860178bf929de35817a913",
+      "size": 631484,
+      "source": "notofonts",
+      "url": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/76fff9eee60dcef8381bfcae8d0b4311e2186e67/fonts/NotoSans/hinted/ttf/NotoSans-Bold.ttf"
+    },
     "noto-sans-brahmi": {
       "cache": "notofonts/NotoSansBrahmi-Regular.ttf",
       "git_blob_sha1": "051bfd2f52506f535e89c8f9c1266a6288720e30",

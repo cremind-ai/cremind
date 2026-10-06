@@ -1,12 +1,15 @@
 # Cremind Tag font-pack sources, pinned (docs/tags/fonts.md).
 #
-# Edit this file, then run `cremind-tag fonts lock`: it downloads every pinned
+# Edit this file, then run `cremind tags tools fonts lock`: it downloads every pinned
 # file once into fonts/cache/, checks its size and git blob SHA-1, and records
 # its SHA-256 in fonts/manifest.lock.json. Builds use only locked, verified
 # files. A pack's manifest id is SHA-256(manifest.lock.json)[0:8].
 #
 # Face ids are stable: 0 is the icon face, the others keep the id they were
 # given here. New faces take the next free id; a removed face retires its id.
+# A face with role `weight` is a weight variant of the text face named by
+# `regular` (Noto Sans Bold of Noto Sans): layouts use it only for emphasis,
+# never as a fallback, and a profile that has it has its regular face too.
 schema: cremind-tag/fonts-manifest@1
 pack_name: Cremind Tag Glyph Pack   # neutral name; the NOTICE says "derived from Noto"
 
@@ -47,7 +50,7 @@ licenses:
     size: 11357
     git_blob_sha1: 7a4a3ea2424c09fbe48d455aed1eaa94d9124835
 
-# Unicode Character Database files for `cremind-tag fonts coverage`.
+# Unicode Character Database files for `cremind tags tools fonts coverage`.
 unicode:
   version: "17.0.0"
   url_template: https://www.unicode.org/Public/{version}/ucd/{path}
@@ -74,7 +77,7 @@ render:
 profiles:
   full:
     faces: all
-    text_sizes: [16, 24, 32]
+    text_sizes: [12, 14, 16, 24, 32]
     icon_sizes: [16, 24, 32, 48]
   dev:
     # Development only: fits the nRF52840 DK's 8 MiB MX25R6435F with a reduced working space.
@@ -3070,3 +3073,23 @@ faces:
     trademark: "Noto is a trademark of Google Inc."
     license: OFL-1.1
     note: "monochrome emoji (colour emoji excluded); variable font rendered at wght 400"
+  - face_id: 172
+    key: noto-sans-bold
+    family: "Noto Sans Bold"   # pack names are family + version; "Noto Sans" would repeat face 1's
+    role: weight
+    weight: 700
+    regular: noto-sans
+    scripts: [Latn, Grek, Cyrl]
+    source: notofonts
+    path: "fonts/NotoSans/hinted/ttf/NotoSans-Bold.ttf"
+    size: 631484
+    git_blob_sha1: aae7546dc1905b228aff70cde8c818b82f3a2bc4
+    version: "2.015"
+    name_version: "Version 2.015; ttfautohint (v1.8.4.7-5d5b)"
+    release: {tag: NotoSans-v2.015, published: "2024-11-20"}
+    num_glyphs: 3884
+    hinting: truetype-bytecode
+    copyright: "Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)"
+    trademark: "Noto is a trademark of Google LLC."
+    license: OFL-1.1
+    note: "emphasis only (bold titles and labels); never a fallback face"

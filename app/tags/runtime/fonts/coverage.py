@@ -127,7 +127,8 @@ def face_cmap(path: Path) -> frozenset[int]:
 
 
 class CmapIndex:
-    """Code point -> text faces that map it, for the faces of one pack."""
+    """Code point -> text faces that map it, for the faces of one pack (weight siblings included: layout
+    checks that a bold face maps a cluster before drawing it bold)."""
 
     def __init__(self, faces: Iterable[tuple[int, Path]]) -> None:
         self.cmaps: dict[int, frozenset[int]] = {face_id: face_cmap(path) for face_id, path in faces}
@@ -204,11 +205,13 @@ def candidate_faces(fonts: FontSet, script: str, language: str = "") -> tuple[Fa
     Faces whose ``languages`` match ``language`` by the longest BCP-47 prefix
     win (``zh-Hant-HK`` picks HK over TC); then primary, CJK-region,
     supplement and optional faces in face-id order. Han with no matching
-    language prefers the ``zh-Hans`` face (Noto Sans SC). Callers still check
-    the chosen face's cmap and fall back to `CmapIndex.faces_for`.
+    language prefers the ``zh-Hans`` face (Noto Sans SC). Weight siblings
+    (``regular_face_id`` set, e.g. Noto Sans Bold) never take part: they are
+    for emphasis only. Callers still check the chosen face's cmap and fall back
+    to `CmapIndex.faces_for`.
     """
     rank = {"primary": 0, "emoji": 0, "cjk-region": 1, "supplement": 2, "optional": 3}
-    faces = [f for f in fonts.faces if f.path is not None and script in f.scripts]
+    faces = [f for f in fonts.faces if f.path is not None and f.regular_face_id is None and script in f.scripts]
     if not any(_lang_match(language, f.languages) for f in faces) and script == "Hani":
         language = _HAN_DEFAULT_LANGUAGE
     return tuple(sorted(faces, key=lambda f: (-_lang_match(language, f.languages), rank.get(f.role, 4),

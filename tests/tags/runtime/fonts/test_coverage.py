@@ -35,12 +35,13 @@ def test_coverage_report(repo: Any, built: Any) -> None:
     report = coverage_report(u, [(f.face_id, f.key, f.scripts, f.path) for f in fs.faces if f.path])
     s = report["scripts"]
     assert (s["Latn"]["covered"], s["Latn"]["total"], s["Latn"]["status"]) == (2, 3, "partial")
-    assert s["Latn"]["missing"] == ["U+0043"] and s["Latn"]["faces"] == [1]
+    assert s["Latn"]["missing"] == ["U+0043"] and s["Latn"]["faces"] == [1, 4]
     assert (s["Hani"]["covered"], s["Hani"]["status"], s["Hani"]["faces"]) == (4, "full", [2, 3])
     assert s["Thai"]["status"] == "none" and s["Hani"]["extensions_total"] == 1
     assert report["summary"] == {"scripts": 3, "full": 1, "partial": 1, "none": 1, "partial_scripts": ["Latn"],
                                  "missing_scripts": ["Thai"], "code_points_covered": 8}
     assert report["faces"]["test-han-jp"]["declared"]["Hani"] == [2, 4]
+    assert report["faces"]["test-sans-bold"] == {"face_id": 4, "cmap": 3, "declared": {"Latn": [2, 3]}}
 
 
 def test_check_text(repo: Any, built: Any) -> None:
@@ -49,6 +50,7 @@ def test_check_text(repo: Any, built: Any) -> None:
     assert check_text("ACAก七C", fs) == ("C", "ก", "七")
     index = CmapIndex.for_fontset(fs)
     assert index.faces_for(0x4E00) == (2, 3) and index.faces_for(0x4E02) == (2,) and index.covers(0x2014)
+    assert index.faces_for(0x41) == (1, 4) and index.faces_for(0x2014) == (1,)  # the bold face's cmap is indexed
     assert check_text("", fs) == ("",)  # icon codepoints are not text
 
 
@@ -60,6 +62,7 @@ def test_candidate_faces(repo: Any, built: Any) -> None:
     assert keys("Hani") == ["test-han-sc", "test-han-jp"]  # no language: zh-Hans face
     assert keys("Hani", "en") == ["test-han-sc", "test-han-jp"]
     assert keys("Latn", "ja") == ["test-sans"] and keys("Thai") == []
+    assert keys("Latn") == ["test-sans"]  # the bold sibling declares Latn too but never takes part in face choice
 
 
 def test_format_ranges() -> None:

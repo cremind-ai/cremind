@@ -20,7 +20,7 @@ def test_cli_pipeline(repo: Any, tmp_path: Path) -> None:
     common = ["--manifest", str(repo.manifest)]
     cache = ["--cache", str(repo.cache)]
     r = _run("list", *common)
-    assert r.exit_code == 0 and "test-han-jp" in r.output and "4 faces" in r.output
+    assert r.exit_code == 0 and "test-han-jp" in r.output and "5 faces" in r.output and "weight" in r.output
 
     r = _run("lock", *common, *cache)
     assert r.exit_code == 0, r.output

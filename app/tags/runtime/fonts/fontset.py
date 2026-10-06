@@ -7,7 +7,7 @@ glyph for glyph:
   HarfBuzz shapes with and FreeType rasterised,
 - the font pack built from exactly those files (face ids, strikes, metrics),
 - the face metadata layout needs to choose a face (scripts, language hints,
-  direction, role).
+  direction, role, weight).
 
 Contract between `app.tags.runtime.fonts` (builds packs, owns `FontSet.load`) and
 `app.tags.runtime.layout` / `app.tags.runtime.compose` (consume it).
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-FaceRole = Literal["primary", "supplement", "cjk-region", "optional", "emoji", "icons"]
+FaceRole = Literal["primary", "supplement", "cjk-region", "optional", "emoji", "icons", "weight"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,11 @@ class FaceInfo:
     variations: tuple[tuple[str, float], ...] = ()
     """Variation-axis coordinates the pack was rasterised at (Noto Emoji: ``(("wght", 400.0),)``);
     shape with the same (HarfBuzz ``font.set_variations``)."""
+    weight: int = 400
+    """Design weight on the CSS scale (400 regular, 700 bold)."""
+    regular_face_id: int | None = None
+    """Set on a weight sibling of that face (role ``weight``, e.g. Noto Sans Bold -> 1): used only for
+    emphasis, never chosen by fallback."""
 
 
 @dataclass(frozen=True)

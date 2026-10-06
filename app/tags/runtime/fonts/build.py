@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.tags.runtime import __version__
 from app.tags.runtime.fontpack.format import (
     FACE_FLAG_CJK,
     FACE_FLAG_ICON,
@@ -85,8 +84,9 @@ def plan_build(manifest: Manifest, profile: str = "full", faces: Sequence[str] |
                sizes: Sequence[int] | None = None) -> BuildPlan:
     """Resolve a profile plus optional face (keys or ids) and size filters.
 
-    ``faces`` replaces the profile's face list (the icon face is always kept);
-    ``sizes`` intersects both the text and the icon sizes.
+    ``faces`` replaces the profile's face list (the icon face is always kept, and
+    a weight face brings its regular face); ``sizes`` intersects both the text
+    and the icon sizes.
     """
     if profile not in manifest.profiles:
         raise BuildError(f"unknown profile {profile!r}; choose from {sorted(manifest.profiles)}")
@@ -95,6 +95,8 @@ def plan_build(manifest: Manifest, profile: str = "full", faces: Sequence[str] |
         chosen: list[FaceEntry] = [manifest.icon_face]
         for item in faces:
             face = manifest.face_by_id(int(item)) if str(item).isdigit() else manifest.face(str(item))
+            if face.regular is not None and manifest.face(face.regular) not in chosen:
+                chosen.append(manifest.face(face.regular))  # a weight face never ships without its regular face
             if face not in chosen:
                 chosen.append(face)
     elif prof.faces is None:
@@ -134,7 +136,8 @@ def _faces_doc(manifest: Manifest, lock: Lock, faces: Sequence[FaceEntry],
         doc: dict[str, Any] = {
             "face_id": face.face_id, "key": face.key, "family": face.family, "version": face.version,
             "pack_name": face.pack_name, "role": face.role, "scripts": list(face.scripts),
-            "languages": list(face.languages), "rtl": face.rtl, "flags": face_flags(face),
+            "languages": list(face.languages), "rtl": face.rtl, "flags": face_flags(face), "weight": face.weight,
+            "regular_face_id": manifest.face(face.regular).face_id if face.regular else None,
             "variations": {axis: value for axis, value in face.variations},
             "hinting": face.hinting, "render_mode": manifest.hint_mode(face),
             "glyph_count": len(icons) + 1 if face.is_icons else face.num_glyphs,
@@ -263,8 +266,9 @@ def build(manifest: Manifest, plan: BuildPlan, *, cache_dir: Path | None = None,
         "schema": SIDECAR_SCHEMA, "pack_name": manifest.pack_name, "profile": plan.name,
         "pack_id": pack.pack_id.hex(), "content_hash": pack.content_hash.hex(),
         "manifest_id": lock.manifest_id.hex(), "total_size": pack.total_size,
-        "generator": {"cremind_tag": __version__, "generator_version": GENERATOR_VERSION,
-                      "freetype": freetype_version(), "freetype_py": freetype_py_version()},
+        # No Cremind version here: the sidecar ships in the font asset bundle, whose SHA-256 is pinned.
+        "generator": {"generator_version": GENERATOR_VERSION, "freetype": freetype_version(),
+                      "freetype_py": freetype_py_version()},
         "text_sizes": list(plan.text_sizes), "icon_sizes": list(plan.icon_sizes),
         "faces": _faces_doc(manifest, lock, plan.faces, icons),
     }
@@ -352,7 +356,9 @@ def load_fontset(pack_path: Path, cache_dir: Path | None = None, *, verify_files
         faces.append(FaceInfo(face_id=record.face_id, key=meta["key"], family=meta["family"], path=path,
                               scripts=tuple(meta["scripts"]), role=meta["role"], languages=tuple(meta["languages"]),
                               rtl=bool(meta["rtl"]),
-                              variations=tuple((a, float(v)) for a, v in sorted(meta["variations"].items()))))
+                              variations=tuple((a, float(v)) for a, v in sorted(meta["variations"].items())),
+                              # Sidecars written before weight faces existed have neither key.
+                              weight=int(meta.get("weight", 400)), regular_face_id=meta.get("regular_face_id")))
     strikes = {(s.face_id, s.size_px): StrikeMetrics(s.face_id, s.size_px, s.ascent, s.descent, s.line_height,
                                                      s.glyph_count) for s in pack.strikes}
     return FontSet(pack_path, pack.pack_id, tuple(faces), strikes)

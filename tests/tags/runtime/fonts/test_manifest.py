@@ -28,8 +28,8 @@ def test_repository_manifest_is_valid() -> None:
     m = load_manifest(REPO / "fonts" / "manifest.yaml")
     assert m.icon_face.face_id == 0 and m.icon_face.key == "material-icons"
     assert [f.face_id for f in m.faces] == sorted({f.face_id for f in m.faces})
-    assert len(m.faces) == 172
-    assert {f.role for f in m.faces} == {"icons", "primary", "supplement", "cjk-region", "optional", "emoji"}
+    assert len(m.faces) == 173
+    assert {f.role for f in m.faces} == {"icons", "primary", "supplement", "cjk-region", "optional", "emoji", "weight"}
     cjk = {f.key: f.languages for f in m.faces if f.role == "cjk-region"}
     assert set(cjk) == {"noto-sans-sc", "noto-sans-tc", "noto-sans-hk", "noto-sans-jp", "noto-sans-kr"}
     assert all("Hani" in m.face(k).scripts for k in cjk)
@@ -37,7 +37,16 @@ def test_repository_manifest_is_valid() -> None:
     assert m.face("noto-sans-arabic").rtl and m.face("noto-sans-hebrew").rtl and not m.face("noto-sans").rtl
     assert m.face("noto-nastaliq-urdu").role == "optional"
     assert {f.license for f in m.faces} == {"OFL-1.1", "Apache-2.0"}
+    bold, sans = m.face("noto-sans-bold"), m.face("noto-sans")
+    assert (bold.face_id, bold.role, bold.weight, bold.regular, bold.scripts) == (172, "weight", 700, "noto-sans",
+                                                                                  sans.scripts)
+    assert bold.pack_name == "Noto Sans Bold 2.015" != sans.pack_name
+    assert (bold.copyright, bold.trademark, bold.license) == (sans.copyright, sans.trademark, sans.license)
+    assert [f.key for f in m.faces if f.role == "weight"] == ["noto-sans-bold"]
+    assert m.profiles["full"].faces is None and m.profiles["full"].text_sizes == (12, 14, 16, 24, 32)
+    # dev stays 16/24 px regular: the old-pack path keeps its coverage.
     assert m.profiles["dev"].faces is not None and "noto-sans-thai" in m.profiles["dev"].faces
+    assert "noto-sans-bold" not in m.profiles["dev"].faces and m.profiles["dev"].text_sizes == (16, 24)
 
 
 def test_repository_icon_map_matches_the_spec() -> None:
@@ -80,11 +89,37 @@ def _doc(repo: Any) -> dict[str, Any]:
     (lambda d: d["profiles"]["dev"].update(faces=["test-icons", "nope"]), "unknown faces"),
     (lambda d: d["sources"]["test"].update(commit="main"), "commit"),
     (lambda d: d["render"]["hinting"].update(cff="light"), "render.hinting"),
+    # Weight faces (faces[4] is test-sans-bold, the bold of test-sans).
+    (lambda d: d["faces"][4].pop("regular"), "missing 'regular'"),
+    (lambda d: d["faces"][4].update(regular="nope"), "not in the manifest"),
+    (lambda d: d["faces"][4].update(regular="test-icons"), "only a text face"),
+    (lambda d: d["faces"][4].update(weight=400), "other than 400"),
+    (lambda d: d["faces"][4].update(weight=750), "steps of 100"),
+    (lambda d: d["faces"][4].update(weight=1000), "steps of 100"),
+    (lambda d: d["faces"][4].update(scripts=["Latn", "Hani"]), r"\['Hani'\] are not scripts of its regular"),
+    (lambda d: d["faces"][1].update(weight=700), "only role 'weight'"),
+    (lambda d: d["faces"][2].update(regular="test-sans"), "only role 'weight'"),
+    (lambda d: d["faces"].append(dict(d["faces"][4], face_id=5, key="test-sans-bold-2", path="sans/Bold2.ttf")),
+     "already has a weight 700 face"),
+    (lambda d: d["faces"].append(dict(d["faces"][4], face_id=5, key="test-sans-black", path="sans/Black.ttf",
+                                      weight=900, regular="test-sans-bold")), "only a text face"),
+    (lambda d: d["profiles"]["dev"].update(faces=["test-icons", "test-sans-bold"]), "regular face in the profile"),
+    (lambda d: d["faces"][1].update(role="optional"), "regular face in the profile"),  # `all` leaves it out
 ])
 def test_invalid_manifests(repo: Any, mutate: Any, message: str) -> None:
     doc = copy.deepcopy(_doc(repo))
     mutate(doc)
     with pytest.raises(ManifestError, match=message):
+        parse_manifest(doc, repo.manifest)
+
+
+def test_text_sizes_follow_the_contract(repo: Any) -> None:
+    """FONT_SIZES (protocol/spec.yaml) allows 12 and 14 px text strikes since contract 0.3.0; 20 is still no size."""
+    doc = _doc(repo)
+    doc["profiles"]["dev"]["text_sizes"] = [16, 12, 14]
+    assert parse_manifest(doc, repo.manifest).profiles["dev"].text_sizes == (12, 14, 16)
+    doc["profiles"]["dev"]["text_sizes"] = [12, 20]
+    with pytest.raises(ManifestError, match=r"sizes \[20\]"):
         parse_manifest(doc, repo.manifest)
 
 

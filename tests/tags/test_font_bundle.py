@@ -12,9 +12,12 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tarfile
 import time
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -55,3 +58,24 @@ def test_the_pin_names_a_published_release_asset() -> None:
     pin = json.loads((REPO / "app" / "tags" / "runtime" / "fonts" / "bundle.json").read_text(encoding="utf-8"))
     assert pin["schema"] == m.SCHEMA and len(pin["sha256"]) == 64 and pin["size"] > 0
     assert pin["url"] == f"{m.URL_BASE}/{m.release_tag(pin['pack_id'])}/{m.archive_name(pin['pack_id'])}"
+
+
+def test_only_a_linux_build_is_pinned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                      capsys: pytest.CaptureFixture[str]) -> None:
+    """Windows and macOS builds have another pack id, so --write-lock refuses to run there (before building
+    anything); --check and a plain build still run everywhere."""
+    m = _module()
+    pin = {"schema": m.SCHEMA, "pack_id": "abc123", "profile": "full", "url": "https://example.invalid/a.tar.gz",
+           "sha256": "0" * 64, "size": 1}
+    built: list[str] = []
+    monkeypatch.setattr(m, "build", lambda profile, out_dir: built.append(profile) or dict(pin))
+    monkeypatch.setattr(m, "REPO", tmp_path)
+    monkeypatch.setattr(m, "LOCK", tmp_path / "bundle.json")
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert m.main(["--write-lock"]) == 1 and built == [] and not m.LOCK.exists()
+    assert "Linux only" in capsys.readouterr().err
+    m.LOCK.write_text(json.dumps(pin), encoding="utf-8")
+    assert m.main(["--check"]) == 0 and m.main([]) == 0 and built == ["full", "full"]
+    monkeypatch.setattr(sys, "platform", "linux")
+    m.LOCK.unlink()
+    assert m.main(["--write-lock"]) == 0 and json.loads(m.LOCK.read_text(encoding="utf-8")) == pin

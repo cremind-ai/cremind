@@ -159,6 +159,11 @@ class FaceEntry:
     copyright: str
     trademark: str | None
     license: str
+    weight: int = 400
+    """Design weight on the CSS scale (400 regular, 700 bold)."""
+    regular: str | None = None
+    """Role ``weight``: the key of the regular face this face is a weight variant of (emphasis only,
+    never a fallback face)."""
     release_tag: str | None = None
     release_published: str | None = None
     note: str | None = None
@@ -325,6 +330,8 @@ def parse_manifest(data: dict[str, Any], path: Path) -> Manifest:
         num_glyphs = _req(f, "num_glyphs", where)
         lic = str(_req(f, "license", where))
         variations = f.get("variations") or {}
+        weight = f.get("weight", 400)
+        regular = f.get("regular")
         if not _KEY.fullmatch(key):
             raise ManifestError(f"{where}: key must be a lowercase slug")
         if not isinstance(face_id, int) or not 0 <= face_id <= 0xFFFF:
@@ -343,6 +350,15 @@ def parse_manifest(data: dict[str, Any], path: Path) -> Manifest:
             raise ManifestError(f"{where}: license {lic!r} is not in licenses")
         if not isinstance(variations, dict) or any(not _AXIS.fullmatch(str(a)) for a in variations):
             raise ManifestError(f"{where}: variations must map 4-character axis tags to values")
+        if isinstance(weight, bool) or not isinstance(weight, int) or not 100 <= weight <= 900 or weight % 100:
+            raise ManifestError(f"{where}: weight must be 100..900 in steps of 100")
+        if role == "weight":
+            if weight == 400:
+                raise ManifestError(f"{where}: a weight face needs a weight other than 400 (the regular weight)")
+            if not regular:
+                raise ManifestError(f"{where}: missing 'regular' (the key of the face it is a weight of)")
+        elif weight != 400 or regular is not None:
+            raise ManifestError(f"{where}: only role 'weight' faces take a weight other than 400 or a 'regular'")
         release = f.get("release") or {}
         icon_map = icon_codepoints = None
         if role == "icons":
@@ -358,6 +374,7 @@ def parse_manifest(data: dict[str, Any], path: Path) -> Manifest:
             name_version=str(_req(f, "name_version", where)), num_glyphs=num_glyphs, hinting=hint,
             variations=tuple((str(a), float(v)) for a, v in sorted(variations.items())),
             copyright=str(_req(f, "copyright", where)), trademark=f.get("trademark"), license=lic,
+            weight=weight, regular=str(regular) if regular is not None else None,
             release_tag=release.get("tag"), release_published=release.get("published"), note=f.get("note"),
             icon_map=icon_map, icon_codepoints=icon_codepoints))
 
@@ -373,6 +390,25 @@ def parse_manifest(data: dict[str, Any], path: Path) -> Manifest:
     cache_names = [f.file.cache_name for f in faces]
     if len(set(cache_names)) != len(cache_names):
         raise ManifestError("two faces share a cache file name (<source>/<basename>)")
+    # A weight face (e.g. Noto Sans Bold) is a sibling of one regular text face: same scripts or fewer,
+    # one face per (regular, weight).
+    by_key = {f.key: f for f in faces}
+    variants: set[tuple[str, int]] = set()
+    for face in faces:
+        if face.role != "weight":
+            continue
+        where = f"face {face.key!r}"
+        base = by_key.get(str(face.regular))
+        if base is None:
+            raise ManifestError(f"{where}: regular face {face.regular!r} is not in the manifest")
+        if base.role in ("icons", "emoji", "weight"):
+            raise ManifestError(f"{where}: regular face {base.key!r} has role {base.role!r}; "
+                                "only a text face can have weights")
+        if extra := sorted(set(face.scripts) - set(base.scripts)):
+            raise ManifestError(f"{where}: scripts {extra} are not scripts of its regular face {base.key!r}")
+        if (base.key, face.weight) in variants:
+            raise ManifestError(f"{where}: {base.key!r} already has a weight {face.weight} face")
+        variants.add((base.key, face.weight))
 
     profiles: dict[str, Profile] = {}
     for name, p in (_req(data, "profiles", "manifest") or {}).items():
@@ -386,6 +422,10 @@ def parse_manifest(data: dict[str, Any], path: Path) -> Manifest:
                 raise ManifestError(f"{where}: unknown faces {unknown}")
             if icon_faces[0].key not in profile_faces:
                 raise ManifestError(f"{where}: must include the icon face")
+        members = set(profile_faces) if profile_faces is not None else {f.key for f in faces if f.role != "optional"}
+        if orphans := sorted(k for k in members if by_key[k].regular and by_key[k].regular not in members):
+            raise ManifestError(f"{where}: a weight face needs its regular face in the profile too: "
+                                + ", ".join(f"{k} -> {by_key[k].regular}" for k in orphans))
         profiles[name] = Profile(name, profile_faces, _sizes(_req(p, "text_sizes", where), FONT_SIZES, where),
                                  _sizes(_req(p, "icon_sizes", where), ICON_SIZES, where),
                                  p.get("flash_size"), p.get("working_space"))

@@ -13,7 +13,7 @@ repository's `docs/fontpack.md`, pinned in `app/tags/runtime/protocol/pinned/doc
 | `cache/`, `out/` | Downloaded sources and built packs | no |
 
 ```sh
-cremind tags tools fonts fetch                  # fill fonts/cache from the lock (≈ 56 MB, verified)
+cremind tags tools fonts fetch                  # fill fonts/cache from the lock (≈ 57 MB, verified)
 cremind tags tools fonts build --profile full   # fonts/out/full/fontpack.ctfp
 cremind tags tools fonts build --profile dev    # fonts/out/dev/fontpack.ctfp (development only)
 ```

@@ -131,6 +131,7 @@ def git_blob_sha1(data: bytes) -> str:
 
 BOX = Glyph(300, [(30, 0, 270, 30), (30, 360, 270, 390), (30, 30, 60, 360), (240, 30, 270, 360)])  # .notdef frame
 BAR = Glyph(300, [(60, 0, 240, 300)])  # solid 180x300-unit block: 6x10 px at 16 px
+BOLD_BAR = Glyph(330, [(60, 0, 270, 300)])  # 7x10 px at 16 px, advance 11: tells bold from regular
 SPACE = Glyph(150)
 HAN_A = Glyph(480, [(30, -30, 450, 0), (30, 390, 450, 420), (225, -30, 255, 420)])
 HAN_B = Glyph(480, [(30, 180, 450, 210), (225, -30, 255, 420)])
@@ -141,6 +142,12 @@ def latin_font(names: dict[int, str]) -> bytes:
     """Glyphs: 0 .notdef, 1 space, 2 'A' (bar), 3 'B' (same bar), 4 wide bar."""
     wide = Glyph(9000, [(0, 0, 8400, 60)])  # 280 px at 16 px: wider than a glyph entry allows
     return make_ttf([BOX, SPACE, BAR, BAR, wide], {0x20: 1, 0x41: 2, 0x42: 3, 0x2014: 4}, names=names)
+
+
+def bold_font(names: dict[int, str]) -> bytes:
+    """The Latin face's bold weight: glyphs 0 .notdef, 1 space, 2 'A', 3 'B' (wider bars). It has no U+2014,
+    so a run can need a character the regular face maps and the bold one does not."""
+    return make_ttf([BOX, SPACE, BOLD_BAR, BOLD_BAR], {0x20: 1, 0x41: 2, 0x42: 3}, names=names)
 
 
 def han_font(names: dict[int, str], extra: bool) -> bytes:
@@ -200,7 +207,8 @@ def _names(family: str, version: str, copyright_: str, trademark: str | None) ->
 
 
 def make_repo(root: Path) -> Repo:
-    """Manifest + icon map + cache for 1 icon face, 1 Latin face, 2 Han regional faces."""
+    """Manifest + icon map + cache for 1 icon face, 1 Latin face, 2 Han regional faces and the Latin face's
+    bold weight (face 4, role ``weight``; in ``full``, not in ``dev``)."""
     from app.tags.runtime.fonts.rasterize import font_facts
 
     fonts_dir = root / "fonts"
@@ -215,6 +223,8 @@ def make_repo(root: Path) -> Repo:
          "Copyright Test Han", None, lambda names: han_font(names, extra=True)),
         ("test-han-jp", "Test Han JP", "cjk-region", ["Jpan", "Hani"], ["ja"], "han/TestHanJP-Regular.ttf",
          "Copyright Test Han", None, lambda names: han_font(names, extra=False)),
+        ("test-sans-bold", "Test Sans Bold", "weight", ["Latn"], [], "sans/TestSans-Bold.ttf", "Copyright Test Sans",
+         "Test is a trademark", bold_font),
     ]
     faces = []
     for face_id, (key, family, role, scripts, languages, path, copyright_, trademark, maker) in enumerate(specs):
@@ -231,6 +241,8 @@ def make_repo(root: Path) -> Repo:
         }
         if languages:
             entry["languages"] = languages
+        if role == "weight":
+            entry |= {"weight": 700, "regular": "test-sans"}
         faces.append(entry)
     codepoints = "".join(f"{icon.name.lower()}_m {ICON_BASE + i:x}\n" for i, icon in enumerate(Icon))
     (cache / "test" / "TestIcons.codepoints").write_text(codepoints, encoding="utf-8", newline="\n")

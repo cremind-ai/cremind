@@ -26,13 +26,15 @@ from app.tags.runtime.protocol.ids import Icon
 def test_plan_profiles_and_filters(repo: Any) -> None:
     m = load_manifest(repo.manifest)
     full = plan_build(m, "full")
-    assert [f.key for f in full.faces] == ["test-icons", "test-sans", "test-han-sc", "test-han-jp"]
+    assert [f.key for f in full.faces] == ["test-icons", "test-sans", "test-han-sc", "test-han-jp", "test-sans-bold"]
     assert (full.name, full.text_sizes, full.icon_sizes) == ("full", (16, 24, 32), (16, 24, 32, 48))
     dev = plan_build(m, "dev")
     assert [f.key for f in dev.faces] == ["test-icons", "test-sans"] and dev.text_sizes == (16,)
     custom = plan_build(m, "full", faces=["3"], sizes=[16, 48])
     assert [f.key for f in custom.faces] == ["test-icons", "test-han-jp"]
     assert (custom.name, custom.text_sizes, custom.icon_sizes) == ("full-custom", (16,), (16, 48))
+    bold = plan_build(m, "full", faces=["test-sans-bold"])  # a weight face brings its regular face
+    assert [f.key for f in bold.faces] == ["test-icons", "test-sans", "test-sans-bold"]
     with pytest.raises(BuildError, match="neither"):
         plan_build(m, "full", sizes=[20])
     with pytest.raises(BuildError, match="unknown profile"):
@@ -49,10 +51,13 @@ def test_pack_round_trips_through_the_format(built: Any) -> None:
     assert faces[0].flags & FACE_FLAG_ICON and faces[0].glyph_count == len(Icon) + 1
     assert faces[0].name == "Test Icons 1.000" and faces[1].scripts == "Latn"
     assert faces[2].flags & FACE_FLAG_CJK and faces[2].scripts == "Hans,Hani"
+    assert (faces[4].name, faces[4].flags, faces[4].scripts) == ("Test Sans Bold 1.000", 0, "Latn")  # no new flag
     assert [(s.face_id, s.size_px) for s in pack.strikes] == (
-        [(0, s) for s in (16, 24, 32, 48)] + [(f, s) for f in (1, 2, 3) for s in (16, 24, 32)])
+        [(0, s) for s in (16, 24, 32, 48)] + [(f, s) for f in (1, 2, 3, 4) for s in (16, 24, 32)])
     bar = pack.glyph(1, 16, 2)
     assert bar is not None and (bar.width, bar.height, bar.bearing_x, bar.bearing_y, bar.advance) == (6, 10, 2, 10, 10)
+    bold = pack.glyph(4, 16, 2)  # the bold face's wider bar
+    assert bold is not None and (bold.width, bold.height, bold.bearing_x, bold.advance) == (7, 10, 2, 11)
     assert pack.glyph(1, 16, 1) is not None and pack.glyph(1, 16, 1).width == 0  # type: ignore[union-attr]
     icon = pack.glyph(0, 48, int(Icon.PERSON))
     assert icon is not None and (icon.width, icon.height, icon.bearing_x, icon.bearing_y) == (48, 48, 0, 0)
@@ -91,7 +96,9 @@ def test_identical_bitmaps_are_stored_once(built: Any) -> None:
 def test_sidecar_and_notice(built: Any) -> None:
     doc = json.loads(built.sidecar_path.read_text(encoding="utf-8"))
     assert doc["pack_id"] == built.pack_id.hex() and doc["manifest_id"] == built.manifest_id.hex()
-    assert [f["face_id"] for f in doc["faces"]] == [0, 1, 2, 3]
+    assert set(doc["generator"]) == {"generator_version", "freetype", "freetype_py"}  # no Cremind version
+    assert [f["face_id"] for f in doc["faces"]] == [0, 1, 2, 3, 4]
+    assert [(f["weight"], f["regular_face_id"]) for f in doc["faces"]] == [(400, None)] * 4 + [(700, 1)]
     sc = doc["faces"][2]
     assert sc["languages"] == ["zh-Hans", "zh"] and sc["file"]["cache"] == "test/TestHanSC-Regular.ttf"
     assert len(sc["file"]["sha256"]) == 64 and sc["render_mode"] == "none"
@@ -103,13 +110,30 @@ def test_sidecar_and_notice(built: Any) -> None:
 
 def test_fontset_load(repo: Any, built: Any) -> None:
     fs = FontSet.load(built.pack_path, repo.cache)
-    assert fs.pack_id == built.pack_id and [f.face_id for f in fs.faces] == [0, 1, 2, 3]
-    icons, sans, sc, jp = fs.faces
+    assert fs.pack_id == built.pack_id and [f.face_id for f in fs.faces] == [0, 1, 2, 3, 4]
+    icons, sans, sc, jp, bold = fs.faces
     assert icons.path is None and icons.role == "icons"
     assert sans.path == repo.cache / "test" / "TestSans-Regular.ttf" and sans.scripts == ("Latn",)
+    assert (sans.weight, sans.regular_face_id) == (400, None)
     assert (sc.role, sc.languages, jp.languages) == ("cjk-region", ("zh-Hans", "zh"), ("ja",))
+    assert (bold.role, bold.weight, bold.regular_face_id, bold.scripts) == ("weight", 700, 1, ("Latn",))
+    assert bold.path == repo.cache / "test" / "TestSans-Bold.ttf"
     assert fs.strike(1, 16).ascent == 14 and fs.strike(1, 16).glyph_count == 5
+    assert fs.strike(4, 16).ascent == 14 and fs.strike(4, 16).glyph_count == 4
     assert fs.has_strike(0, 48) and not fs.has_strike(1, 48)
+
+
+def test_fontset_load_reads_an_older_sidecar(repo: Any, built: Any, tmp_path: Path) -> None:
+    """Sidecars written before weight faces existed name no weight: every face loads as a regular one."""
+    doc = json.loads(built.sidecar_path.read_text(encoding="utf-8"))
+    for face in doc["faces"]:
+        del face["weight"], face["regular_face_id"]
+    pack = tmp_path / "fontpack.ctfp"
+    shutil.copyfile(built.pack_path, pack)
+    (tmp_path / "fontpack.json").write_text(json.dumps(doc), encoding="utf-8")
+    fs = load_fontset(pack, repo.cache)
+    assert [f.face_id for f in fs.faces] == [0, 1, 2, 3, 4]
+    assert {(f.weight, f.regular_face_id) for f in fs.faces} == {(400, None)}
 
 
 def test_fontset_load_verifies_font_files(repo: Any, built: Any, tmp_path: Path) -> None:
@@ -130,7 +154,8 @@ def test_fontset_load_without_sidecar_uses_the_manifest(repo: Any, built: Any, t
     shutil.copyfile(built.pack_path, pack)
     monkeypatch.setenv("CREMIND_TAG_REPO", str(repo.root))
     fs = load_fontset(pack, repo.cache)
-    assert [f.key for f in fs.faces] == ["test-icons", "test-sans", "test-han-sc", "test-han-jp"]
+    assert [f.key for f in fs.faces] == ["test-icons", "test-sans", "test-han-sc", "test-han-jp", "test-sans-bold"]
+    assert (fs.face(4).weight, fs.face(4).regular_face_id) == (700, 1)
 
 
 def test_build_refuses_an_unpinned_freetype(repo: Any) -> None:
