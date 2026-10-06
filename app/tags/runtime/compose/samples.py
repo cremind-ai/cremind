@@ -1,4 +1,4 @@
-"""Sample texts and sample pages: the multilingual set and one automatic sample per face.
+"""Sample texts, sample pages and the screen gallery: the multilingual set, one sample per face, example screens.
 
 `MULTILINGUAL` is a hand-written set covering the scripts people write cards
 in (plus mixed directions, combining marks and emoji). `face_sample` builds a
@@ -11,8 +11,13 @@ numerals, symbols, emoji) use their numbers and symbols. A weight sibling
 (Noto Sans Bold) is sampled at its weight (``FaceSample.weight``), the only way
 the engine draws it.
 
-`write_samples` renders both through the reference renderer into PNG pages
-(the ``cremind tags tools preview samples`` command).
+The gallery: `example_screens` (the card sets `example_cards` — also the
+composer tests' fixture — and `gallery_cards`, on every panel class from the
+2.13" Hema to 800x480) and `special_screens` (identify, the setup code).
+
+`write_samples` renders all of it through the reference renderer into PNG
+pages and screens at the scale asked for (the ``cremind tags tools preview
+samples`` command).
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from app.tags.runtime.fonts.coverage import UnicodeScripts, load_unicode, needs_glyph
 from app.tags.runtime.fonts.fontset import FaceInfo, FontSet
@@ -30,7 +36,7 @@ from app.tags.runtime.layout.engine import TextBlock, layout_text
 from app.tags.runtime.layout.fonts import WEIGHTS, FontContext
 from app.tags.runtime.layout.unicode import emoji_presentation, general_category, script_of
 from app.tags.runtime.protocol.ids import Color
-from app.tags.runtime.protocol.layout import Command, Layout, Line
+from app.tags.runtime.protocol.layout import Command, Glyphs, Layout, Line, decode_layout
 
 MULTILINGUAL: tuple[tuple[str, str, str], ...] = (
     ("English", "en", "The quick brown fox jumps over the lazy dog. Approve deployment?"),
@@ -189,7 +195,7 @@ def _pages(entries: Sequence[tuple[str, TextBlock]], fonts: FontSet, width: int,
 
 def write_samples(fonts: FontSet, out: Path, *, scale: int = 1, width: int = 800, now: datetime | None = None,
                   progress: Callable[[str], None] = lambda _m: None) -> dict:
-    """Render the sample set, every face's sample and example screens into ``out``; returns a summary."""
+    """Render the sample set, every face's sample and the screen gallery into ``out``; returns a summary."""
     from app.tags.runtime.compose.preview import render_image
 
     out.mkdir(parents=True, exist_ok=True)
@@ -230,23 +236,45 @@ def write_samples(fonts: FontSet, out: Path, *, scale: int = 1, width: int = 800
             render_image(page, fonts, scale=scale).save(path, optimize=True)
             progress(f"wrote {path}")
 
-    # Example screens (landscape/portrait, black-white and black-white-red).
-    from app.tags.runtime.compose.api import TagPanel
-    from app.tags.runtime.compose.preview import preview_png
-    from app.tags.runtime.compose.screen import compose_identify, compose_screen
+    # The screen gallery: example screens, then identify and the setup code. render_png keeps the scale asked
+    # for (the connector's preview_png would drop a large one to scale 1 above 64 KiB).
+    from app.tags.runtime.compose.preview import render_png
+    from app.tags.runtime.compose.screen import compose_identify, compose_screen, compose_setup_code
+    from app.tags.runtime.protocol.ids import NodeRole
+    from app.tags.runtime.secure.codes import SetupPayload
 
     now = now or datetime(2026, 9, 27, 7, 5, tzinfo=UTC)
-    for name, panel, settings, cards in example_screens(now):
-        screen = compose_screen(panel, cards, fonts, settings, now)
+    gallery = [(name, panel, compose_screen(panel, cards, fonts, settings, now))
+               for name, panel, settings, cards in example_screens(now)]
+    setup = SetupPayload(NodeRole.TAG, HEMA_ID, bytes(range(10)))
+    for name, panel, what in special_screens():
+        gallery.append((name, panel, compose_identify(panel, fonts) if what == "identify"
+                        else compose_setup_code(panel, fonts, setup.code(), setup.qr_text())))
+    for name, panel, screen in gallery:
         path = out / f"screen-{name}.png"
-        path.write_bytes(preview_png(screen, panel, fonts, scale=scale))
-        summary["screens"].append({"name": name, "bytes": len(screen.layout), "delivery_ids": list(screen.delivery_ids),
-                                   "pending": screen.pending_count, "png": path.stat().st_size})
+        path.write_bytes(render_png(screen.layout, fonts, panel=panel, scale=scale))
+        summary["screens"].append(_screen_summary(name, panel, screen, path.stat().st_size))
         progress(f"wrote {path}")
-    panel = TagPanel(0x1A2B3C4D, 400, 300, 2, 3, 0, "Desk")
-    (out / "screen-identify.png").write_bytes(preview_png(compose_identify(panel, fonts), panel, fonts, scale=scale))
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return summary
+
+
+def _screen_summary(name: str, panel: Any, screen: Any, png: int) -> dict:
+    """``summary.json``'s entry for one gallery screen: the panel, the layout's cost, the type it uses, red."""
+    from app.tags.runtime.compose.screen import logical_size
+    from app.tags.runtime.compose.tokens import panel_class
+
+    layout = decode_layout(screen.layout)
+    runs = [c for c in layout.commands if isinstance(c, Glyphs)]
+    width, height = logical_size(panel)
+    return {"name": name,
+            "panel": {"width": panel.width, "height": panel.height, "rotation": panel.rotation,
+                      "planes": panel.planes, "logical": f"{width}x{height}", "class": panel_class(width, height)},
+            "bytes": len(screen.layout), "commands": len(layout.commands), "glyphs": sum(len(c.glyphs) for c in runs),
+            "sizes": sorted({c.size_px for c in runs}), "faces": sorted({c.face for c in runs}),
+            "uses_red": any(getattr(c, "color", None) == Color.RED for c in layout.commands),
+            "delivery_ids": list(screen.delivery_ids), "pending": screen.pending_count,
+            "unsupported": list(screen.unsupported_chars), "png": png}
 
 
 def example_cards(now: datetime) -> list:
@@ -277,10 +305,62 @@ def example_cards(now: datetime) -> list:
     ]
 
 
+def _card(now: datetime, did: int, kind: str, title: str, prio: int, minutes: int, **extra: object) -> Any:
+    """An active card ``minutes`` old in the connector's card shape (``lang`` defaults to English)."""
+    from app.tags.runtime.compose.api import ActiveCard
+
+    ts = now - timedelta(minutes=minutes)
+    body = {"v": 1, "kind": kind, "title": title, "lang": extra.pop("lang", "en"),
+            "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"), **extra}
+    return ActiveCard(did, kind, prio, ts, body)
+
+
+def gallery_cards(now: datetime) -> dict[str, list]:
+    """The gallery's other card sets: a pinned test note, a dense list, a failure on top, Vietnamese titles."""
+    dense = ["Build #482 passed", "New comment on Q4 roadmap", "Invoice INV-2291 paid", "Backup verified: 14 GB",
+             "Lan shared 3 files with you", "Deploy window opens at 16:00", "Disk usage at 81% on lab-02",
+             "Weekly report is ready"]
+    return {
+        "test-card": [_card(now, 601, "pinned_note", "Hello from Cremind", 55, 0, icon="check_circle",
+                            body="This tag is set up and receiving updates.")],
+        "dense": example_cards(now) + [_card(now, 801 + i, "notification", title, 40, 2 + 7 * i)
+                                       for i, title in enumerate(dense)],
+        "error": [
+            _card(now, 701, "automation", "Morning briefing automation failed", 70, 4, severity="error",
+                  icon="error", body="The model provider returned an error: rate limit reached."),
+            _card(now, 702, "indexing_problem", "Document indexing: paused", 45, 25, severity="warning",
+                  icon="folder", body="The Documents folder is not reachable."),
+            _card(now, 703, "task_outcome", "Reply ready: Budget review", 50, 12, severity="success", icon="chat"),
+            _card(now, 704, "calendar", "Next: 14:00 Product sync", 35, 1, icon="event"),
+            _card(now, 705, "tag_diagnostics", "Battery low", 20, 60, severity="warning", icon="battery_low",
+                  body="2410 mV"),
+        ],
+        "vietnamese": [
+            _card(now, 901, "needs_input", "Duyệt triển khai bản 2.4 lên môi trường production?", 90, 3,
+                  severity="attention", icon="approval", lang="vi", body="Trò chuyện: Kế hoạch phát hành"),
+            _card(now, 902, "health", "Kênh Zalo bị ngắt kết nối", 75, 40, severity="warning", icon="link_off",
+                  lang="vi"),
+            _card(now, 903, "task_outcome", "Đã có trả lời: Tóm tắt cuộc họp sáng nay", 50, 20, severity="success",
+                  icon="chat", lang="vi"),
+            _card(now, 904, "notification", "Lan đã chia sẻ 3 tệp với bạn", 40, 55, lang="vi"),
+            _card(now, 905, "calendar", "Tiếp theo: 14:00 Họp nhóm sản phẩm", 35, 2, icon="event", lang="vi"),
+        ],
+    }
+
+
+HEMA_ID = 0xD1F06B9A
+"""The 2.13" Hema tag of the gallery: native 128x250 black/white/red, rotation 3 (logical 250x128)."""
+
+
 def example_screens(now: datetime) -> list:
+    """(name, panel, settings, cards) of every example screen (``screen-<name>.png``)."""
     from app.tags.runtime.compose.api import ScreenSettings, TagPanel
 
     cards = example_cards(now)
+    sets = gallery_cards(now)
+    en = ScreenSettings(False, False, "Asia/Ho_Chi_Minh", "en")
+    hema = TagPanel(HEMA_ID, 128, 250, 2, 3, 3, "Hema")
+    desk_bwr = TagPanel(0x1A2B3C4D, 400, 300, 2, 3, 0, "Desk")
     return [
         ("landscape-bw", TagPanel(0x1A2B3C4D, 400, 300, 1, 1, 0, "Desk"),
          ScreenSettings(False, False, "Asia/Ho_Chi_Minh", "en"), cards),
@@ -293,4 +373,26 @@ def example_screens(now: datetime) -> list:
         ("portrait-progress", TagPanel(0x1A2B3C4D, 400, 300, 1, 1, 3, "Lab"),
          ScreenSettings(False, False, "Europe/Berlin", "de"), [c for c in cards if c.kind == "progress"]),
         ("empty", TagPanel(0x1A2B3C4D, 400, 300, 1, 1, 0, "Desk"), ScreenSettings(), []),
+        ("hema-bwr", hema, en, cards),
+        ("hema-bw", TagPanel(HEMA_ID, 128, 250, 1, 1, 3, "Hema"), en, cards),
+        ("hema-portrait-bwr", TagPanel(HEMA_ID, 128, 250, 2, 3, 0, "Hema"), en, cards),
+        ("hema-test-card", hema, en, sets["test-card"]),
+        ("hema-error", hema, en, sets["error"]),
+        ("hema-dense", hema, en, sets["dense"]),
+        ("hema-vietnamese", hema, ScreenSettings(False, False, "Asia/Ho_Chi_Minh", "vi"), sets["vietnamese"]),
+        ("s-264x176-bwr", TagPanel(0x3C4D5E6F, 264, 176, 2, 3, 0, "Door"), en, cards),
+        ("landscape-bwr-dense", desk_bwr, en, sets["dense"]),
+        ("small-296x128-bw", TagPanel(0x2B3C4D5E, 296, 128, 1, 1, 0, "Shelf"), en, cards),
+        ("large-800x480-bwr", TagPanel(0x4D5E6F70, 800, 480, 2, 3, 0, "Wall"),
+         ScreenSettings(True, True, "Asia/Ho_Chi_Minh", "en"), cards),
     ]
+
+
+def special_screens() -> list:
+    """(name, panel, ``identify`` | ``setup-code``) of the gallery's screens that show no cards."""
+    from app.tags.runtime.compose.api import TagPanel
+
+    hema = TagPanel(HEMA_ID, 128, 250, 2, 3, 3, "Hema")
+    desk = TagPanel(0x1A2B3C4D, 400, 300, 2, 3, 0, "Desk")
+    return [("identify", desk, "identify"), ("identify-hema", hema, "identify"),
+            ("setup-code-hema", hema, "setup-code"), ("setup-code-landscape", desk, "setup-code")]

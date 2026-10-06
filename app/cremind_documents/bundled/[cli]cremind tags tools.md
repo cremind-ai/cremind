@@ -1,5 +1,5 @@
 ---
-description: "Cremind Tag hardware tools on this computer, for developers and factory stations: flash gateway/bridge/tag firmware, enroll a tag over SWD, install a font pack on a bridge by USB, provision a mesh by hand, build fonts, render previews, run the simulator, run a manual runtime daemon, collect diagnostics. Setting up your own hardware is `cremind tags devices` instead."
+description: "Cremind Tag hardware tools on this computer, for developers and factory stations: flash gateway/bridge/tag firmware, enroll a tag over SWD, install a font pack on a bridge by USB, provision a mesh by hand, build fonts, render screen previews for any panel (the 2.13-inch Hema too), run the simulator, run a manual runtime daemon, collect diagnostics. Setting up your own hardware is `cremind tags devices` instead."
 ---
 
 # `cremind tags tools` — Cremind Tag hardware tools
@@ -67,7 +67,18 @@ Cremind checkout.
 
 ### `cremind tags tools preview`
 
-Render cards, screens or text to PNG exactly as a bridge draws them.
+Render cards, screens or text to PNG exactly as a bridge draws them. `card`,
+`screen` and `identify` draw for `--panel bw` or `bwr` (400×300 unless
+`--width`, `--height` or `--rotation` say otherwise) or for any hardware panel
+by name, with its native size, colours and rotation: `--panel hema213` is the
+Hema 2.13" tag (black/white/red, read landscape: a 250×128 image). `samples`
+renders the multilingual set, every font face and a gallery of example
+screens on every panel size.
+
+```bash
+cremind tags tools preview screen cards.json --panel hema213 --scale 2 --out hema.png
+cremind tags tools preview identify --panel hema213 --tag-id D1F06B9A --name Hema
+```
 
 ### `cremind tags tools sim`
 

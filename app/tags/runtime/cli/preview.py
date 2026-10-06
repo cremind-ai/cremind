@@ -3,7 +3,10 @@
 Every image goes through the companion's layout engine and the normative
 renderer with a built font pack (docs/tags/layout.md). ``--pack`` defaults to
 ``<repo>/fonts/out/full/fontpack.ctfp`` (else the dev pack); the font cache to
-``$CREMIND_TAG_FONT_CACHE`` or ``<repo>/fonts/cache``.
+``$CREMIND_TAG_FONT_CACHE`` or ``<repo>/fonts/cache``. ``--panel`` is ``bw`` or
+``bwr`` (400x300 unless ``--width``/``--height`` say otherwise) or a hardware
+panel by name (``hema213``, ...), which brings its native size, colours and
+rotation.
 """
 
 from __future__ import annotations
@@ -25,6 +28,16 @@ app = typer.Typer(name="preview", help="Render cards, screens or text to PNG exa
 PackOpt = typer.Option(None, "--pack", help="Font pack (.ctfp; default: <repo>/fonts/out/full, else dev).")
 CacheOpt = typer.Option(None, "--cache", help="Font cache (default: $CREMIND_TAG_FONT_CACHE or <repo>/fonts/cache).")
 ScaleOpt = typer.Option(1, "--scale", min=1, max=8, help="Enlarge pixels in the PNG (nearest neighbour).")
+PanelOpt = typer.Option("bw", "--panel",
+                        help="bw (black/white) or bwr (black/white/red), 400x300 unless --width/--height; or a "
+                             "hardware panel by name, e.g. hema213 or uc8176_bwr (its native size, colours and "
+                             "rotation).")
+RotationOpt = typer.Option(None, "--rotation", min=0, max=3,
+                           help="Quarter turns clockwise, logical -> native (default: the hardware panel's, else 0; "
+                                "1 = portrait on 400x300).")
+WidthOpt = typer.Option(None, "--width", min=1, max=2048, help="Native panel width (default: the panel's, else 400).")
+HeightOpt = typer.Option(None, "--height", min=1, max=2048,
+                         help="Native panel height (default: the panel's, else 300).")
 
 
 @app.callback()
@@ -58,12 +71,28 @@ def _fonts(pack: Path | None, cache: Path | None) -> Any:
         raise _fail(str(exc)) from None
 
 
-def _panel(kind: str, rotation: int, name: str, tag_id: int, width: int, height: int) -> Any:
+def _panel(kind: str, rotation: int | None, name: str, tag_id: int, width: int | None, height: int | None) -> Any:
+    """``bw``/``bwr``: a black/white(/red) panel, 400x300 rotation 0 unless the options say otherwise. Any other
+    name or number is a hardware panel (``enroll/hardware.py``: ``hema213``, ``uc8176_bwr``, ...): its profile
+    gives the native size, the colour planes and the rotation a new tag gets; the options override them."""
     from app.tags.runtime.compose.api import TagPanel
 
-    if kind not in ("bw", "bwr"):
-        raise _fail("--panel must be bw or bwr")
-    return TagPanel(tag_id, width, height, 2 if kind == "bwr" else 1, 0x03 if kind == "bwr" else 0x01, rotation, name)
+    if kind in ("bw", "bwr"):
+        (planes, flags), w, h, turns = (2, 0x03) if kind == "bwr" else (1, 0x01), 400, 300, 0
+    else:
+        from app.tags.runtime.enroll.hardware import PANEL_PROFILES, parse_panel
+
+        try:
+            hardware = parse_panel(kind)
+        except ValueError as exc:
+            raise _fail(f"--panel: {exc}") from None
+        profile = PANEL_PROFILES.get(hardware)
+        if profile is None:
+            raise _fail(f"--panel {kind}: panel {hardware.name.lower()} has no verified profile; "
+                        "use --panel bw or bwr with --width and --height")
+        planes, flags, w, h, turns = profile.planes, profile.plane_flags, profile.width, profile.height, profile.rotation
+    return TagPanel(tag_id, w if width is None else width, h if height is None else height, planes, flags,
+                    turns if rotation is None else rotation, name)
 
 
 def _now(value: str | None) -> datetime:
@@ -217,10 +246,10 @@ def text(
 @app.command()
 def card(
     path: Path = typer.Argument(..., help="JSON file: a delivery job (with 'card') or a bare card."),
-    panel: str = typer.Option("bw", "--panel", help="bw (black/white) or bwr (black/white/red)."),
-    rotation: int = typer.Option(0, "--rotation", min=0, max=3, help="Quarter turns (1 = portrait on 400x300)."),
-    width: int = typer.Option(400, "--width", help="Native panel width."),
-    height: int = typer.Option(300, "--height", help="Native panel height."),
+    panel: str = PanelOpt,
+    rotation: int | None = RotationOpt,
+    width: int | None = WidthOpt,
+    height: int | None = HeightOpt,
     name: str = typer.Option("Tag", "--name", help="Tag name for the header."),
     lang: str | None = typer.Option(None, "--lang", help="Profile language (default: settings or en)."),
     tz: str | None = typer.Option(None, "--tz", help="Profile time zone (default: settings or UTC)."),
@@ -240,10 +269,10 @@ def card(
 @app.command()
 def screen(
     path: Path = typer.Argument(..., help="JSON: a list of jobs/cards, or {cards|jobs: [...], settings: {...}}."),
-    panel: str = typer.Option("bw", "--panel", help="bw (black/white) or bwr (black/white/red)."),
-    rotation: int = typer.Option(0, "--rotation", min=0, max=3, help="Quarter turns (1 = portrait on 400x300)."),
-    width: int = typer.Option(400, "--width", help="Native panel width."),
-    height: int = typer.Option(300, "--height", help="Native panel height."),
+    panel: str = PanelOpt,
+    rotation: int | None = RotationOpt,
+    width: int | None = WidthOpt,
+    height: int | None = HeightOpt,
     name: str = typer.Option("Tag", "--name", help="Tag name for the header."),
     lang: str | None = typer.Option(None, "--lang", help="Profile language (default: settings or en)."),
     tz: str | None = typer.Option(None, "--tz", help="Profile time zone (default: settings or UTC)."),
@@ -260,9 +289,10 @@ def screen(
                     single=False)
 
 
-def _screen_command(path: Path, panel_kind: str, rotation: int, width: int, height: int, name: str,
-                    lang: str | None, tz: str | None, excerpts: bool | None, qr: bool | None, now_s: str | None,
-                    out: Path, scale: int, pack: Path | None, cache: Path | None, *, single: bool) -> None:
+def _screen_command(path: Path, panel_kind: str, rotation: int | None, width: int | None, height: int | None,
+                    name: str, lang: str | None, tz: str | None, excerpts: bool | None, qr: bool | None,
+                    now_s: str | None, out: Path, scale: int, pack: Path | None, cache: Path | None, *,
+                    single: bool) -> None:
     from app.tags.runtime.compose.preview import preview_png
     from app.tags.runtime.compose.screen import compose_screen
 
@@ -281,16 +311,18 @@ def _screen_command(path: Path, panel_kind: str, rotation: int, width: int, heig
 
 @app.command()
 def identify(
-    panel: str = typer.Option("bw", "--panel", help="bw or bwr."),
-    rotation: int = typer.Option(0, "--rotation", min=0, max=3),
-    name: str = typer.Option("Desk", "--name"),
+    panel: str = PanelOpt,
+    rotation: int | None = RotationOpt,
+    width: int | None = WidthOpt,
+    height: int | None = HeightOpt,
+    name: str = typer.Option("Desk", "--name", help="Tag name under the id."),
     tag_id: str = typer.Option("1A2B3C4D", "--tag-id", help="Tag id (hex)."),
     out: Path = typer.Option(Path("preview-identify.png"), "--out", "-o"),
     scale: int = ScaleOpt,
     pack: Path | None = PackOpt,
     cache: Path | None = CacheOpt,
 ) -> None:
-    """Render the identify screen (large tag id and name)."""
+    """Render the identify screen (a frame, the tag id large and the name)."""
     from app.tags.runtime.compose.preview import preview_png
     from app.tags.runtime.compose.screen import compose_identify
 
@@ -298,7 +330,7 @@ def identify(
         tid = int(tag_id, 16)
     except ValueError:
         raise _fail("--tag-id must be hexadecimal") from None
-    tp = _panel(panel, rotation, name, tid, 400, 300)
+    tp = _panel(panel, rotation, name, tid, width, height)
     fonts = _fonts(pack, cache)
     composed = compose_identify(tp, fonts)
     png = preview_png(composed, tp, fonts, scale=scale)
@@ -314,7 +346,8 @@ def samples(
     pack: Path | None = PackOpt,
     cache: Path | None = CacheOpt,
 ) -> None:
-    """Render the multilingual sample set, one automatic sample per face and example screens."""
+    """Render the multilingual sample set, one automatic sample per face and the screen gallery (every panel
+    class, identify, the setup code)."""
     from app.tags.runtime.compose.samples import write_samples
 
     fonts = _fonts(pack, cache)

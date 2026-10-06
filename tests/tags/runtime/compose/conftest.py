@@ -1,6 +1,7 @@
-"""Fixtures: the locally built font packs and a realistic card set (see tests/layout/conftest.py).
+"""Fixtures: the locally built font packs and the screen time (see tests/tags/runtime/layout/conftest.py).
 
-``fonts`` is the full pack (``fonts/out/full``) unless ``CREMIND_TAG_TEST_PACK`` names another pack's asset
+``fonts`` is the full pack (``fonts/out/full``: 172 faces — icons, 170 regular text faces with emoji, Noto Sans
+Bold — at 12/14/16/24/32 px) unless ``CREMIND_TAG_TEST_PACK`` names another pack's asset
 directory (``fontpack.ctfp`` and ``cache/`` inside, e.g. a host's
 ``~/.cremind/.tag-runtime/assets/fonts/<pack id>``): then the whole suite runs on that pack — an older one
 without 12/14 px or bold text included, which is how the composer's fallbacks are checked against the pack a
