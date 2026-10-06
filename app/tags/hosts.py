@@ -631,6 +631,22 @@ def _clean_status(body: dict[str, Any]) -> dict[str, Any]:
             "gateways": gateways, "workers": workers, "migration": migration}
 
 
+async def bridge_font_packs(host_id: str) -> list[str]:
+    """The font packs the bridges behind this host's gateways have active, the most common first: the host
+    keeps them installed when it prunes older packs, and falls back to them while the pinned pack is missing
+    (their tags keep drawing)."""
+    async with get_tag_storage().engine.connect() as conn:
+        rows = (await conn.execute(select(DEVICES.c.info).select_from(
+            DEVICES.join(COMPANIONS, COMPANIONS.c.id == DEVICES.c.companion_id)).where(
+            COMPANIONS.c.host_id == host_id, COMPANIONS.c.state != "removed", DEVICES.c.kind == "bridge"))).all()
+    counts: dict[str, int] = {}
+    for (info,) in rows:
+        pack = _hex(info.get("fontpack_id") if isinstance(info, dict) else None, 8)
+        if pack:
+            counts[pack] = counts.get(pack, 0) + 1
+    return sorted(counts, key=lambda pack: (-counts[pack], pack))
+
+
 async def host_hello(principal: HostPrincipal, body: dict[str, Any]) -> dict[str, Any]:
     """A host's status report (every ~20 s): who it is, its components and USB access, its gateways."""
     now = now_ms()
@@ -1026,9 +1042,9 @@ async def expire(now: float | None = None) -> int:
 
 __all__ = [
     "ADMIN", "CANDIDATE_STATES", "DESKTOP", "HOST_OPS", "HOST_SCHEME", "HostPrincipal", "SERVER", "USABLE",
-    "adopt_legacy_worker", "authenticate_host", "cancel_operation", "enroll_redeem", "expire", "get_operation", "host_hello",
-    "host_leave", "host_progress", "host_register_worker", "host_work", "list_hosts", "may_use",
-    "new_host_credential", "new_host_credential_id", "notify_host", "on_claim_outcome", "on_gateway_ready",
+    "adopt_legacy_worker", "authenticate_host", "bridge_font_packs", "cancel_operation", "enroll_redeem", "expire",
+    "get_operation", "host_hello", "host_leave", "host_progress", "host_register_worker", "host_work", "list_hosts",
+    "may_use", "new_host_credential", "new_host_credential_id", "notify_host", "on_claim_outcome", "on_gateway_ready",
     "operation_json", "parse_host_authorization", "remove_host", "set_access", "start_connect", "start_prepare",
     "start_scan",
 ]

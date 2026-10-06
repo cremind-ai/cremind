@@ -75,7 +75,7 @@ def build(directory: Path, port: str, paths: ConnectPaths | None, *, transport: 
     loaded ``fonts`` are given (default: the standard asset roots)."""
     from ..daemon.service import DaemonOptions, DaemonService
     from ..gateway.link import SecureOptions
-    from ..resources import find_font_assets
+    from ..resources import find_font_assets, pinned_pack_id
     from ..secrets import FileBackend, SecretStore
     from .agent import ConnectAgent
     from .setup_flow import read_controller_key
@@ -98,9 +98,15 @@ def build(directory: Path, port: str, paths: ConnectPaths | None, *, transport: 
     ca_file = directory / str(ca) if ca else None
     pack = cache = None
     if fonts is None:
-        assets = find_font_assets(roots=font_roots)
+        # The pack this Cremind pins; an older one only until it is installed (the bridges' packs are not
+        # known before the daemon opens its database: the fallback is the first pack).
+        pinned = pinned_pack_id()
+        assets = find_font_assets(roots=font_roots, prefer=pinned)
         if assets is not None:
             pack, cache = assets.pack_path, assets.cache_dir
+            if pinned and assets.pack_id != pinned:
+                log.warning("worker: font pack %s is loaded; this Cremind pins %s — prepare the gateway computer to "
+                            "update", assets.pack_id, pinned)
         else:
             log.warning("worker: no verified font pack is installed; screens are held until one is")
     secure = SecureOptions(controller, expect_device_id=ident.gateway_device_id, expect_ik=ident.gateway_ik,

@@ -132,6 +132,20 @@ def scan_problem(op: dict[str, Any]) -> Optional[str]:
     return "no_gateway"
 
 
+def fonts_hint(host: dict[str, Any]) -> Optional[str]:
+    """A newer font pack is available for the computer (its tag screens keep working with the older one): how
+    to install it (``None``: no update)."""
+    if not (host.get("readiness") or {}).get("fonts_update"):
+        return None
+    if host.get("kind") == "server":
+        ref = str(host.get("name") or host.get("id") or "")
+        ref = f'"{ref}"' if " " in ref else ref
+        return ("a font update is available (tag screens keep working meanwhile): cremind -p admin tags hosts prepare"
+                + (f" {ref}" if ref else ""))
+    return (f"a font update is available (tag screens keep working meanwhile): run cremind tags host prepare on "
+            f"{host_name(host)}, then restart Cremind there")
+
+
 def host_block(host: dict[str, Any]) -> Optional[str]:
     """Why a computer cannot search right now, in words (``None``: it can)."""
     if not (host.get("access") or {}).get("can_use"):
@@ -235,9 +249,11 @@ def hosts_list(ctx: typer.Context) -> None:
                       str(h.get("connections") or 0))
     table.render()
     for h in items:
-        blocked = host_block(h)
-        if blocked and (h.get("access") or {}).get("can_use"):
-            sys.stdout.write(f"{h.get('name')}: {blocked}\n")
+        if not (h.get("access") or {}).get("can_use"):
+            continue
+        note = host_block(h) or fonts_hint(h)
+        if note:
+            sys.stdout.write(f"{h.get('name')}: {note}\n")
 
 
 @hosts_app.command("show")
@@ -282,9 +298,9 @@ def hosts_show(
                      + (f", {moved['failed']} to retry at the next start" if moved.get("failed") else "")
                      + (f", {moved['rolled_back']} left with Cremind Connect (see the log)"
                         if moved.get("rolled_back") else ""))
-    blocked = host_block(host)
-    if blocked and access.get("can_use"):
-        lines.append(blocked)
+    note = host_block(host) or fonts_hint(host)
+    if note and access.get("can_use"):
+        lines.append(note[0].upper() + note[1:])
     sys.stdout.write("\n".join(lines) + "\n")
 
 

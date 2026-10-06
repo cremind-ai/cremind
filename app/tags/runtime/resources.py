@@ -26,6 +26,12 @@ its id matches; every source font has the recorded SHA-256), and
 :func:`install_font_assets` copies a verified pack read-only into
 ``<data>/assets/fonts/<pack_id>/``, where every worker shares it. A consumer
 loads fonts with ``app.tags.runtime.fonts.build.load_fontset(a.pack_path, a.cache_dir)``.
+
+Several packs can be installed side by side (an upgrade pins a new one,
+``fonts/bundle.json``): a consumer draws with the pinned pack
+(:func:`pinned_pack_id`) when it is there, and otherwise falls back in a fixed
+order (:func:`find_font_assets`) — never in the order packs were installed,
+whose directories keep their archive's timestamps.
 """
 
 from __future__ import annotations
@@ -49,6 +55,8 @@ SIDECAR_FILE = "fontpack.json"
 CACHE_DIR = "cache"
 NOTICE_FILE = "NOTICE"
 LICENSES_DIR = "LICENSES"
+PIN_FILE = Path(__file__).resolve().parent / "fonts" / "bundle.json"
+"""The font bundle this Cremind's release pins (``pack_id``, where to download it, its SHA-256)."""
 
 
 class FontAssetsError(ValueError):
@@ -159,13 +167,35 @@ def font_assets_in(root: Path) -> list[FontAssets]:
     return out
 
 
-def find_font_assets(pack_id: str | None = None, *, roots: Sequence[Path] | None = None) -> FontAssets | None:
-    """The pack ``pack_id`` (or, without one, the first pack) from the first root that has it."""
-    for root in asset_roots() if roots is None else roots:
-        for assets in font_assets_in(root):
-            if pack_id is None or assets.pack_id == pack_id:
-                return assets
-    return None
+def pinned_pack_id(pin_file: Path | None = None) -> str | None:
+    """The pack this Cremind draws with: the one its release pins (``None`` without a pin, e.g. a frozen
+    program that does not carry ``bundle.json``)."""
+    try:
+        doc = json.loads(Path(pin_file or PIN_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pack_id = doc.get("pack_id") if isinstance(doc, dict) else None
+    return pack_id if isinstance(pack_id, str) and pack_id else None
+
+
+def find_font_assets(pack_id: str | None = None, *, roots: Sequence[Path] | None = None, prefer: str | None = None,
+                     also_prefer: Sequence[str] = ()) -> FontAssets | None:
+    """The pack ``pack_id`` from the first root that has it. Without one, the pack to draw with: ``prefer`` (the
+    pinned pack) when it is installed, else the first of ``also_prefer`` that is (the packs the bridges show),
+    else the first pack of the first root that has any (in directory-name order)."""
+    roots = asset_roots() if roots is None else roots
+    if pack_id is not None:
+        for root in roots:
+            for assets in font_assets_in(root):
+                if assets.pack_id == pack_id:
+                    return assets
+        return None
+    found = [assets for root in roots for assets in font_assets_in(root)]
+    for wanted in (prefer, *also_prefer):
+        hit = next((a for a in found if wanted and a.pack_id == wanted), None)
+        if hit is not None:
+            return hit
+    return found[0] if found else None
 
 
 def _sha256(path: Path) -> str:
@@ -253,6 +283,6 @@ def _rmtree(path: Path) -> None:
         shutil.rmtree(path, onexc=onexc)
 
 
-__all__ = ["ASSETS_ENV", "FontAssets", "FontAssetsError", "asset_roots", "bundled_asset_dirs", "find_font_assets",
-           "font_assets_in", "install_font_assets", "is_frozen", "load_font_assets", "make_font_assets",
-           "verify_font_assets"]
+__all__ = ["ASSETS_ENV", "FontAssets", "FontAssetsError", "PIN_FILE", "asset_roots", "bundled_asset_dirs",
+           "find_font_assets", "font_assets_in", "install_font_assets", "is_frozen", "load_font_assets",
+           "make_font_assets", "pinned_pack_id", "verify_font_assets"]

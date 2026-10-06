@@ -1,5 +1,5 @@
 ---
-description: "Gateway computers for Cremind Tag: the computers whose USB ports Cremind drives your gateways from. List them and see if each is ready, search one's USB ports for a gateway, prepare the gateway components on the server (admin), and let other profiles use the server's USB ports (admin)."
+description: "Gateway computers for Cremind Tag: the computers whose USB ports Cremind drives your gateways from. List them and see if each is ready (or has a font update available), search one's USB ports for a gateway, prepare the gateway components on the server — again after an update brings new fonts (admin) — and let other profiles use the server's USB ports (admin)."
 ---
 
 # `cremind tags hosts` — the computers Cremind drives gateways from
@@ -43,12 +43,19 @@ state (`running`, `offline`, `unavailable` — components missing,
 `busy_elsewhere`, `stalled`, `failed`), components (`ready`, `partial` —
 gateways work, tag screens wait for fonts), USB access, whether you may use it
 (`manage` for the admin on the server), and how many of your gateways it
-drives. A computer that cannot search says why below the table.
+drives. Below the table, a computer that cannot search says why, and one with
+a **font update available** says how to install it.
 
 ### `cremind tags hosts show <computer>`
 
 One computer in detail: each component, USB access, the gateways it sees on
-its ports, and who may use it.
+its ports, and who may use it. A component is `ready`, `missing`,
+`unsupported` or `broken`; the fonts can also be `outdated` — an update of
+Cremind pinned a newer font pack than the one the computer draws with. Tag
+screens keep working with the older pack, so the computer stays `ready` (in
+`--json`, `readiness.fonts_update` is `true`) until its components are
+prepared again: `cremind -p admin tags hosts prepare` for the server's own
+computer, `cremind tags host prepare` on a desktop gateway computer.
 
 ### `cremind tags hosts scan [computer]`
 
@@ -76,6 +83,15 @@ Python packages through the feature installer, and the verified font bundle
 tag screens need — then start gateway support. Progress is printed line by
 line; it keeps going on the server if you stop waiting. Run it again to retry
 after a failure.
+
+Run it again after an update that brings new fonts (`hosts list` says *a font
+update is available*): it installs the font pack this Cremind pins, restarts
+gateway support on it, then removes the older packs nothing uses any more —
+never one a bridge behind this computer's gateways still shows. A pack that
+cannot be removed yet (Windows keeps a file in use) stays until the next
+preparation; that never fails it. Tags behind a bridge draw with the new
+fonts once the bridge has the same pack (`cremind tags tools bridge
+fonts-install`, over the bridge's USB port).
 
 ```bash
 cremind -p admin tags hosts prepare

@@ -1,5 +1,5 @@
 ---
-description: "Make this computer a gateway computer for a Cremind server running elsewhere (a container, a NAS, another machine) so it drives Cremind Tag USB gateways plugged in here: enroll it from the Cremind page's setup link, run it, check its status and components, or forget it. The Cremind desktop app does this by itself."
+description: "Make this computer a gateway computer for a Cremind server running elsewhere (a container, a NAS, another machine) so it drives Cremind Tag USB gateways plugged in here: enroll it from the Cremind page's setup link, run it, check its status and components, prepare them (again after an update brings new fonts), or forget it. The Cremind desktop app does this by itself."
 ---
 
 # `cremind tags host` — this computer as a gateway computer
@@ -64,17 +64,25 @@ computer (it was removed): enroll it again. `4` means it was never set up.
 ### `cremind tags host status`
 
 The enrollment (server, profile, host id), whether the host runs, and the
-gateway components (`platform`, `packages`, `fonts`). On a computer that ran
-the older Cremind Connect, a `Moved in` line tells how many of its gateways
-this computer took over (`migration` in `--json`): the host does that by
-itself when it starts, keeping their keys and pairings; one that could not
-move yet is retried at the next start.
+gateway components (`platform`, `packages`, `fonts`). The fonts are
+`outdated` while this computer draws tag screens with an older font pack than
+the one this Cremind pins (after an update): the screens keep working, and
+`cremind tags host prepare` installs the new one (`fonts_pack` in `--json`:
+the pack the running host draws with). On a computer that ran the older
+Cremind Connect, a `Moved in` line tells how many of its gateways this
+computer took over (`migration` in `--json`): the host does that by itself
+when it starts, keeping their keys and pairings; one that could not move yet
+is retried at the next start.
 
 ### `cremind tags host prepare`
 
 Install the gateway components here: checks the gateway packages (install
 them with `pip install "cremind[tags]"` if they are missing) and installs the
-verified font bundle tag screens are drawn with.
+verified font bundle tag screens are drawn with — the pack this Cremind pins,
+so run it again after an update that brings new fonts. Gateway support that
+is already running keeps the fonts it started with: the command then says
+**restart Cremind here to use pack …** (restart the Cremind app, or
+`cremind tags host run`). Older packs stay installed here.
 
 ### `cremind tags host forget`
 

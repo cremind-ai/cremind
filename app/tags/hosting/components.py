@@ -7,15 +7,18 @@ A gateway worker needs three things beyond Cremind itself:
 - **fonts** — a verified font asset bundle (the pack the bridges draw from,
   and the source fonts the worker shapes text with) under
   ``<SYS>/.tag-runtime/assets``; without it a worker still connects and
-  pairs, but holds screens;
+  pairs, but holds screens. With only an older pack than the one this
+  Cremind pins (an upgrade brought new fonts), screens keep working with it:
+  the component is ``outdated``, the host stays ``ready`` and says a font
+  update is available (``fonts_update``);
 - **the platform** — Windows x64, Linux x64/arm64, macOS 15 or newer (the
   ICU wheels exist for macOS 15+ only: an older macOS keeps every other
   Cremind feature, just not gateways).
 
 :func:`readiness` reports each (``ready`` / ``missing`` / ``unsupported`` /
-``broken``) plus what the host can reach (``usb``): whether the backend runs
-in a container, where USB only exists when it was mapped in. It never
-installs anything; :mod:`.prepare` does.
+``broken``, and ``outdated`` for the fonts) plus what the host can reach
+(``usb``): whether the backend runs in a container, where USB only exists
+when it was mapped in. It never installs anything; :mod:`.prepare` does.
 """
 
 from __future__ import annotations
@@ -31,13 +34,14 @@ from typing import Any
 PACKAGE_PROBES = ("serial", "cbor2", "icu", "uharfbuzz", "freetype", "PIL")
 FEATURE_KEY = "tags"
 MIN_MACOS = (15, 0)
+OUTDATED = "outdated"
 
 
 @dataclass(frozen=True)
 class Component:
     key: str
     state: str
-    """``ready`` | ``missing`` | ``unsupported`` | ``broken``."""
+    """``ready`` | ``missing`` | ``unsupported`` | ``broken`` | ``outdated`` (fonts: an older pack still draws)."""
     detail: str = ""
 
     def as_json(self) -> dict[str, Any]:
@@ -88,8 +92,10 @@ def packages() -> Component:
     return Component("packages", "ready")
 
 
-def fonts(assets_root: Path, expected_pack: str | None = None) -> Component:
-    """A verified pack in ``assets_root`` (the expected one, when the release names it)."""
+def fonts(assets_root: Path, expected_pack: str | None = None, loaded_pack: str | None = None) -> Component:
+    """A verified pack in ``assets_root``: ``ready`` with the expected one (the pack the release pins, when it
+    names one), ``outdated`` while only another one is there — or while the running host still draws with
+    another one (``loaded_pack``, when known)."""
     fonts_dir = assets_root / "fonts"
     if not fonts_dir.is_dir():
         return Component("fonts", "missing", "No font pack is installed yet.")
@@ -100,10 +106,14 @@ def fonts(assets_root: Path, expected_pack: str | None = None) -> Component:
     found = font_assets_in(assets_root)
     if not found:
         return Component("fonts", "missing", "No font pack is installed yet.")
-    if expected_pack and not any(a.pack_id == expected_pack for a in found):
-        return Component("fonts", "missing", f"Font pack {expected_pack} is not installed yet "
-                                             f"(installed: {', '.join(a.pack_id for a in found)}).")
-    return Component("fonts", "ready", ", ".join(a.pack_id for a in found))
+    installed = [a.pack_id for a in found]
+    if expected_pack and (expected_pack not in installed or (loaded_pack and loaded_pack != expected_pack)):
+        # What the host draws with meanwhile (when that is not known: find_font_assets' fallback).
+        current = loaded_pack if loaded_pack and loaded_pack != expected_pack else installed[0]
+        return Component("fonts", OUTDATED, f"Tag screens use font pack {current}; this Cremind draws with "
+                                            f"{expected_pack}. Prepare the components to update (screens keep "
+                                            "working).")
+    return Component("fonts", "ready", ", ".join(installed))
 
 
 def usb_access() -> dict[str, Any]:
@@ -123,10 +133,12 @@ def usb_access() -> dict[str, Any]:
     return {"available": True, "container": container, "reason": None}
 
 
-def readiness(assets_root: Path, expected_pack: str | None = None) -> dict[str, Any]:
-    """Everything the gateway page shows about this host's components."""
-    items = [platform_support(), packages(), fonts(assets_root, expected_pack)]
-    states = {c.key: c.state for c in items}
+def readiness(assets_root: Path, expected_pack: str | None = None, loaded_pack: str | None = None) -> dict[str, Any]:
+    """Everything the gateway page shows about this host's components (``expected_pack``: the pack this
+    Cremind pins; ``loaded_pack``: the one the running host draws with, when known)."""
+    items = [platform_support(), packages(), fonts(assets_root, expected_pack, loaded_pack)]
+    # An outdated font pack still draws every screen: the host is ready, with a font update available.
+    states = {c.key: "ready" if c.state == OUTDATED else c.state for c in items}
     if states["platform"] == "unsupported":
         overall = "unsupported"
     elif all(s == "ready" for s in states.values()):
@@ -135,7 +147,8 @@ def readiness(assets_root: Path, expected_pack: str | None = None) -> dict[str, 
         overall = "partial"  # gateways connect and pair; screens wait for the fonts
     else:
         overall = "missing"
-    return {"state": overall, "components": [c.as_json() for c in items], "usb": usb_access()}
+    return {"state": overall, "components": [c.as_json() for c in items], "usb": usb_access(),
+            "fonts_update": items[2].state == OUTDATED}
 
 
 def can_host(readiness_doc: dict[str, Any]) -> bool:
@@ -143,5 +156,5 @@ def can_host(readiness_doc: dict[str, Any]) -> bool:
     return readiness_doc.get("state") in ("ready", "partial")
 
 
-__all__ = ["Component", "FEATURE_KEY", "PACKAGE_PROBES", "can_host", "fonts", "packages", "platform_support",
-           "readiness", "usb_access"]
+__all__ = ["Component", "FEATURE_KEY", "OUTDATED", "PACKAGE_PROBES", "can_host", "fonts", "packages",
+           "platform_support", "readiness", "usb_access"]

@@ -6,11 +6,13 @@
  * (as the computer itself reports it: its components, its USB access), what
  * stands in the way and what to do about it, and "Connect a gateway here".
  *
- * The admin also prepares the server's gateway components (progress, retry)
- * and decides which other profiles may use the server's USB ports. A
- * profile allowed there claims only unclaimed gateways; everything it
- * connects stays its own. "Set up a gateway computer" adds one of the
- * profile's own computers (the Cremind app on it); "Remove" takes one away.
+ * The admin also prepares the server's gateway components (progress, retry;
+ * again when an update brings new fonts — the screens keep working with the
+ * older ones meanwhile) and decides which other profiles may use the server's
+ * USB ports. A profile allowed there claims only unclaimed gateways;
+ * everything it connects stays its own. "Set up a gateway computer" adds one
+ * of the profile's own computers (the Cremind app on it); "Remove" takes one
+ * away.
  */
 import { computed, ref } from 'vue';
 import { ElButton, ElMessage, ElMessageBox, ElSwitch, ElTag } from 'element-plus';
@@ -19,8 +21,8 @@ import { useTagsSetupStore } from '../../../stores/tagsSetup';
 import { TagsApiError } from '../../../services/tagsApi';
 import type { GatewayHost, HostOperation } from '../../../services/tagsSetupApi';
 import {
-  hostBlock, hostKindLabel, hostName, hostOpProgressLabel, hostStatePill, isOperationTerminal, isoToMs,
-  setupErrorMessage,
+  fontsUpdateNote, hostBlock, hostKindLabel, hostName, hostOpProgressLabel, hostStatePill, isOperationTerminal,
+  isoToMs, setupErrorMessage,
 } from '../../../utils/tagsSetupFormat';
 import { formatRelativeTime } from '../../../utils/relativeTime';
 
@@ -74,7 +76,7 @@ function partial(h: GatewayHost): boolean {
 }
 
 function canPrepare(h: GatewayHost): boolean {
-  return h.kind === 'server' && h.access.can_manage && (h.state === 'unavailable' || partial(h));
+  return h.kind === 'server' && h.access.can_manage && (h.state === 'unavailable' || partial(h) || !!fontsUpdateNote(h));
 }
 
 function canConnect(h: GatewayHost): boolean {
@@ -192,6 +194,10 @@ const grantedCount = (h: GatewayHost) => (h.access.profiles ?? []).filter((p) =>
                 Gateways work here, but tag screens wait for their fonts.
                 {{ h.access.can_manage ? 'Prepare the components to finish.' : 'The admin can prepare them in Settings → Tags.' }}
               </span>
+            </div>
+            <div v-else-if="fontsUpdateNote(h)" class="host-note info" role="status">
+              <Icon icon="mdi:information-outline" aria-hidden="true" />
+              <span>{{ fontsUpdateNote(h) }}</span>
             </div>
           </template>
 

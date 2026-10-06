@@ -104,6 +104,32 @@ def test_list_shows_each_computer_and_why_one_cannot_search(api):
     assert "Laptop: Computer offline: Laptop is not reachable right now." in " ".join(result.output.split())
 
 
+def test_a_font_update_is_a_hint_never_a_problem(api):
+    outdated = {"state": "ready", "fonts_update": True, "components": [
+        {"key": "fonts", "state": "outdated", "detail": "Tag screens use font pack a1a1a1a1a1a1a1a1; this Cremind "
+                                                        "draws with b2b2b2b2b2b2b2b2."}]}
+    api["hosts"] = [_host(readiness=outdated),
+                    _host(id="h-lap", kind="desktop", name="Laptop", readiness=outdated,
+                          access={"can_use": True, "reason": None, "can_manage": False})]
+    result = _run("tags", "hosts", "list")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert ('Office PC: a font update is available (tag screens keep working meanwhile): '
+            'cremind -p admin tags hosts prepare "Office PC"') in text
+    assert ("Laptop: a font update is available (tag screens keep working meanwhile): run cremind tags host "
+            "prepare on Laptop, then restart Cremind there") in text
+    result = _run("tags", "hosts", "show", "Office PC")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "fonts: outdated — Tag screens use font pack a1a1a1a1a1a1a1a1" in text
+    assert "A font update is available" in text and "cremind -p admin tags hosts prepare" in text
+    # The computer still searches.
+    api["ops"] = {"scan-1": [_op("host_scan", "succeeded", candidates=[_candidate()], ports=[])]}
+    assert _run("tags", "hosts", "scan", "Office PC").exit_code == 0
+    api["hosts"] = [_host()]
+    assert "font update" not in _run("tags", "hosts", "list").output
+
+
 def test_show_tells_what_moved_in_from_cremind_connect(api):
     api["hosts"] = [_host(migration={"moved": 2, "failed": 1, "rolled_back": 0})]
     result = _run("tags", "hosts", "show", "Office PC")

@@ -289,6 +289,30 @@ test('what a search means, and the words for each problem a gateway computer can
   assert.equal(M.hostBlock(host({ usb: { available: false, container: true, reason: null } })).title, 'USB access denied')
 })
 
+test('an update that brings new fonts: the computer stays ready, and says how to install them', async () => {
+  const { M } = await setup()
+  const outdated = {
+    state: 'ready', fonts_update: true,
+    components: [{ key: 'fonts', state: 'outdated', detail: 'Tag screens use font pack b6009b469294a509; …' }],
+  }
+  const member = { can_use: true, reason: null, can_manage: false }
+  assert.deepEqual(M.hostStatePill(host()), { label: 'Ready', type: 'success' })
+  assert.deepEqual(M.hostStatePill(host({ readiness: outdated })), { label: 'Ready, font update available', type: 'success' })
+  assert.deepEqual(M.hostStatePill(host({ readiness: { state: 'partial', components: [] } })),
+    { label: 'Ready, screens waiting', type: 'warning' })
+  // Not a problem: the computer still searches and connects; a note says what to do.
+  assert.equal(M.hostBlock(host({ readiness: outdated })), null)
+  assert.equal(M.fontsUpdateNote(host()), null)
+  assert.match(M.fontsUpdateNote(host({ readiness: outdated })), /screens keep working.*Prepare the components to install it/)
+  assert.match(M.fontsUpdateNote(host({ readiness: outdated, access: member })), /admin can install it in Settings → Tags/)
+  // A desktop computer prepares its own components: the page cannot do it from here.
+  assert.match(M.fontsUpdateNote(host({ readiness: outdated, kind: 'desktop', name: 'Laptop', access: member })),
+    /Run "cremind tags host prepare" on Laptop, then restart Cremind there/)
+  // Offline, or not running: nothing to say about fonts.
+  assert.equal(M.fontsUpdateNote(host({ readiness: outdated, online: false })), null)
+  assert.equal(M.fontsUpdateNote(host({ readiness: outdated, state: 'unavailable' })), null)
+})
+
 test('a connection still running shows as a setup to continue, also after a refresh', async () => {
   const { env, store } = await setup()
   env.route('/api/tags/connections', () => json(listAnswer()))

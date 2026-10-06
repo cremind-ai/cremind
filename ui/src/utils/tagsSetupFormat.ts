@@ -296,8 +296,9 @@ export function hostStatePill(h: Pick<GatewayHost, 'online' | 'state' | 'readine
   if (!h.online) return { label: 'Offline', type: 'info' };
   switch (h.state) {
     case 'running':
-      return h.readiness?.state === 'partial'
-        ? { label: 'Ready, screens waiting', type: 'warning' }
+      if (h.readiness?.state === 'partial') return { label: 'Ready, screens waiting', type: 'warning' };
+      return h.readiness?.fonts_update
+        ? { label: 'Ready, font update available', type: 'success' }
         : { label: 'Ready', type: 'success' };
     case 'paused': return { label: 'Paused for an update', type: 'info' };
     case 'unavailable': return { label: 'Components needed', type: 'warning' };
@@ -308,6 +309,24 @@ export function hostStatePill(h: Pick<GatewayHost, 'online' | 'state' | 'readine
     case 'stopped': return { label: 'Stopped', type: 'info' };
     default: return { label: 'Starting', type: 'info' };
   }
+}
+
+/**
+ * A newer font pack is available on computer `h` (an update brought new fonts): the screens keep working with
+ * the older one, so this is a note, not a problem. What to do, in words — the admin prepares the server's
+ * components here; a desktop computer prepares its own — or null when there is no update to install.
+ */
+export function fontsUpdateNote(
+  h: Pick<GatewayHost, 'online' | 'state' | 'readiness' | 'kind' | 'name' | 'access'>,
+): string | null {
+  if (!h.online || h.state !== 'running' || !h.readiness?.fonts_update || h.readiness.state === 'partial') return null;
+  const lead = 'A font update is available. Tag screens keep working with the current fonts until it is installed.';
+  if (h.kind === 'server') {
+    return h.access?.can_manage
+      ? `${lead} Prepare the components to install it.`
+      : `${lead} The admin can install it in Settings → Tags.`;
+  }
+  return `${lead} Run "cremind tags host prepare" on ${hostName(h)}, then restart Cremind there.`;
 }
 
 /** The things that can stand between a person and a connected gateway, each with its own words. */

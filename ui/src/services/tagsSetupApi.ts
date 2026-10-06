@@ -231,7 +231,7 @@ export type HostState = string;
 
 export interface HostComponent {
   key: 'platform' | 'packages' | 'fonts' | string;
-  /** `ready` | `missing` | `unsupported` | `broken`. */
+  /** `ready` | `missing` | `unsupported` | `broken` | `outdated` (fonts: an older pack still draws the screens). */
   state: string;
   detail: string;
 }
@@ -240,6 +240,8 @@ export interface HostReadiness {
   /** `ready` | `partial` (gateways work, screens wait for fonts) | `missing` | `unsupported`. */
   state: string;
   components: HostComponent[];
+  /** A newer font pack is available: screens keep working with the older one until it is installed. */
+  fonts_update?: boolean;
 }
 
 export interface HostUsb {

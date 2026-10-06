@@ -15,6 +15,12 @@ from, in order:
 Whatever the source, it is verified (the archive's SHA-256 when pinned, then
 the pack and every source font against the sidecar) and copied read-only to
 ``<SYS>/.tag-runtime/assets/fonts/<pack_id>`` (:func:`install_font_assets`).
+
+An upgrade that pins a new pack leaves the older one installed: the host
+keeps drawing with it (its fonts component is ``outdated``) until the
+components are prepared again, which installs the pinned pack, restarts the
+host on it and then removes the packs nothing uses any more
+(:func:`remove_other_packs`).
 """
 
 from __future__ import annotations
@@ -22,10 +28,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
+import secrets
 import tarfile
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +57,13 @@ def bundle_lock() -> dict[str, Any] | None:
     if not isinstance(doc, dict) or not doc.get("pack_id"):
         return None
     return doc
+
+
+def pinned_pack() -> str | None:
+    """The pack this release pins, the one gateway computers draw with (``None`` in a checkout without a pin)."""
+    from app.tags.runtime.resources import pinned_pack_id
+
+    return pinned_pack_id(LOCK_FILE)
 
 
 def installed_packs(assets_dir: Path) -> list[Any]:
@@ -172,14 +185,31 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def remove_other_packs(assets_dir: Path, keep: str) -> None:
-    """Drop superseded packs (read-only copies) once workers use ``keep``."""
+def remove_other_packs(assets_dir: Path, keep: str | Collection[str],
+                       say: Callable[[str], None] = lambda _m: None) -> list[str]:
+    """Drop superseded packs (read-only copies) once workers use ``keep`` (a pack id, or several); returns the
+    ids removed. Best effort: each pack is first moved out of ``fonts/`` in one rename, which fails as a whole
+    while a process still has one of its files open (Windows) — that pack stays, complete and usable, until
+    the next time — and only then deleted."""
     from app.tags.runtime.resources import _rmtree
 
+    keep_ids = {keep} if isinstance(keep, str) else set(keep)
+    trash = assets_dir / "fonts" / ".tmp"
+    removed = []
     for pack in installed_packs(assets_dir):
-        if pack.pack_id != keep:
-            _rmtree(pack.root)
-    shutil.rmtree(assets_dir / "fonts" / ".tmp", ignore_errors=True)
+        if pack.pack_id in keep_ids:
+            continue
+        try:
+            trash.mkdir(parents=True, exist_ok=True)
+            os.rename(pack.root, trash / f"{pack.pack_id}-{secrets.token_hex(4)}")
+        except OSError as exc:
+            say(f"Font pack {pack.pack_id} is still in use ({exc.strerror or exc}); it is removed next time.")
+            continue
+        removed.append(pack.pack_id)
+        say(f"Removed font pack {pack.pack_id}, which nothing uses any more.")
+    _rmtree(trash)  # what is left of earlier attempts too (a file still open stays until the next time)
+    return removed
 
 
-__all__ = ["BUNDLE_ENV", "Installed", "bundle_lock", "ensure_installed", "installed_packs", "remove_other_packs"]
+__all__ = ["BUNDLE_ENV", "Installed", "bundle_lock", "ensure_installed", "installed_packs", "pinned_pack",
+           "remove_other_packs"]

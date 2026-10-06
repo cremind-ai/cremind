@@ -109,6 +109,44 @@ def test_run_and_status_on_a_computer_that_was_never_set_up(fake):
     assert result.exit_code == 0 and "not set up as a gateway computer" in result.output
 
 
+def test_prepare_says_when_the_running_host_needs_a_restart_for_new_fonts(fake, monkeypatch, tmp_path):
+    from app.tags.hosting import components, fonts
+    from app.tags.runtime.connect.instance import InstanceLock
+
+    old, pinned = "a1" * 8, "b2" * 8
+    lock_file = tmp_path / "bundle.json"
+    lock_file.write_text(json.dumps({"pack_id": pinned}), encoding="utf-8")
+    monkeypatch.setattr(fonts, "LOCK_FILE", lock_file)
+    monkeypatch.setattr(components, "packages", lambda: components.Component("packages", "ready"))
+    paths = fake["paths"]
+    for pack in (old, pinned):  # the pinned pack is what ensure_installed (faked) installs
+        directory = paths.assets_dir / "fonts" / pack
+        directory.mkdir(parents=True)
+        (directory / "fontpack.ctfp").write_bytes(b"pack")
+        (directory / "fontpack.json").write_text(json.dumps({"pack_id": pack}), encoding="utf-8")
+    monkeypatch.setattr(fonts, "ensure_installed",
+                        lambda assets_dir, say: fonts.Installed(pinned, True, f"Font pack {pinned} installed."))
+    result = _run("tags", "host", "prepare")
+    assert result.exit_code == 0, result.output
+    assert "This computer is ready to drive gateways." in result.output
+
+    # Gateway support runs here, still with the older pack it loaded when it started.
+    host_lock = InstanceLock(paths.host_lock, paths.host_lock_info)
+    assert host_lock.acquire()
+    try:
+        host_lock.write_info(host_id="h-1", fonts_pack=old)
+        result = _run("tags", "host", "prepare")
+        assert result.exit_code == 0, result.output
+        assert (f"Gateway support is running here with font pack {old}: restart Cremind here to use pack "
+                f"{pinned}.") in " ".join(result.output.split())
+        doc = json.loads(_run("--json", "tags", "host", "status").output)
+        assert doc["running"] is True and doc["fonts_pack"] == old and doc["readiness"]["fonts_update"] is True
+        fonts_doc = next(c for c in doc["readiness"]["components"] if c["key"] == "fonts")
+        assert fonts_doc["state"] == "outdated" and doc["readiness"]["state"] == "ready"
+    finally:
+        host_lock.release()
+
+
 def test_status_tells_what_moved_in_from_cremind_connect(fake):
     journals = fake["paths"].migration_dir
     journals.mkdir(parents=True)

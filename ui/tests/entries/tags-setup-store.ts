@@ -6,6 +6,6 @@ export { FAST_POLL_MS, SLOW_POLL_MS, useTagsSetupStore } from '../../src/stores/
 export { useSettingsStore } from '../../src/stores/settings';
 export {
   CONNECT_STAGES, candidateTitle, candidateView, connectStageIndex, discoveryDecision, enrollFailure, enrollStep,
-  hostBlock, hostOpProgressLabel, isWaitingForWake, operationProgressLabel, pendingSetups, plugInstruction,
-  problemText, scanDecision, setupErrorMessage, tagParent, tagReach,
+  fontsUpdateNote, hostBlock, hostOpProgressLabel, hostStatePill, isWaitingForWake, operationProgressLabel,
+  pendingSetups, plugInstruction, problemText, scanDecision, setupErrorMessage, tagParent, tagReach,
 } from '../../src/utils/tagsSetupFormat';

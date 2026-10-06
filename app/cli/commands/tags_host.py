@@ -51,6 +51,16 @@ def _paths() -> Any:
     return default_paths()
 
 
+def _running(paths: Any) -> tuple[bool, Optional[str]]:
+    """Whether gateway support runs on this computer now, and the font pack it draws with (when it says)."""
+    from app.tags.runtime.connect.instance import is_locked, read_info
+
+    if not is_locked(paths.host_lock):
+        return False, None
+    pack = read_info(paths.host_lock_info).get("fonts_pack")
+    return True, pack if isinstance(pack, str) and pack else None
+
+
 def _emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -188,9 +198,9 @@ def host_run() -> None:
 @graceful_errors
 def host_status(ctx: typer.Context) -> None:
     """This computer's enrollment, its gateway components, and whether it is running."""
+    from app.tags.hosting import fonts
     from app.tags.hosting.components import readiness
     from app.tags.hosting.migration import summary
-    from app.tags.runtime.connect.instance import is_locked
     from app.tags.runtime.host.enroll import EnrollError, load_enrollment
 
     paths = _paths()
@@ -199,12 +209,15 @@ def host_status(ctx: typer.Context) -> None:
         problem = None
     except EnrollError as exc:
         enrollment, problem = None, str(exc)
+    running, loaded = _running(paths)
     doc = {
         "enrolled": enrollment is not None,
         "enrollment": enrollment.public_json() if enrollment is not None else None,
         "problem": problem,
-        "running": is_locked(paths.host_lock),
-        "readiness": readiness(paths.assets_dir),
+        "running": running,
+        # The font pack the running host draws with (when it says), and the components against this release's pin.
+        "fonts_pack": loaded,
+        "readiness": readiness(paths.assets_dir, fonts.pinned_pack(), loaded),
         # Gateways taken over from the older Cremind Connect on this computer.
         "migration": summary(paths),
     }
@@ -246,9 +259,15 @@ def host_prepare() -> None:
               "pip install \"cremind[tags]\"")
     installed = fonts.ensure_installed(paths.assets_dir, lambda line: sys.stdout.write(line + "\n"))
     sys.stdout.write(installed.message + "\n")
-    doc = readiness(paths.assets_dir)
+    running, loaded = _running(paths)
+    doc = readiness(paths.assets_dir, fonts.pinned_pack(), loaded)
     if doc.get("state") not in ("ready",):
         _fail(f"Components: {doc.get('state')}. See: cremind tags host status")
+    if running and installed.pack_id and (installed.changed or loaded != installed.pack_id):
+        # The running host loaded its fonts when it started: it keeps the older pack (or none) until then.
+        sys.stdout.write(f"Gateway support is running here{f' with font pack {loaded}' if loaded else ''}: "
+                         f"restart Cremind here to use pack {installed.pack_id}.\n")
+        return
     sys.stdout.write("This computer is ready to drive gateways.\n")
 
 

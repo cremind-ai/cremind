@@ -33,7 +33,7 @@ import asyncio
 import contextlib
 import os
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar
 
 from app.utils.logger import logger
@@ -94,10 +94,11 @@ class HardwareHost:
             if self.running:
                 return True
             from .components import can_host, readiness
+            from .fonts import pinned_pack
 
             self.paths.ensure()
             self.host_id = self.remote.host_id if self.remote is not None else host_identity(self.paths)["host_id"]
-            self.readiness = readiness(self.paths.assets_dir)
+            self.readiness = readiness(self.paths.assets_dir, pinned_pack())
             if self.check_components and not can_host(self.readiness):
                 self.state, self.reason = "unavailable", _components_reason(self.readiness)
                 return False
@@ -121,6 +122,10 @@ class HardwareHost:
                 self._shutdown_locked()
                 return False
             self.state, self.reason = "running", None
+            # The pack it draws with, beside who holds the lock: `cremind tags host prepare` tells whether a
+            # restart is due.
+            with contextlib.suppress(OSError, RuntimeError):
+                lock.write_info(host_id=self.host_id, fonts_pack=self.fonts_pack)
             logger.info(f"[tags] hardware host {self.host_id} running (font pack {self.fonts_pack or 'none'})")
             return True
 
@@ -172,7 +177,7 @@ class HardwareHost:
         from .local_host import LocalHostClient
 
         self._stop = asyncio.Event()
-        self._fonts, self.fonts_pack = await asyncio.to_thread(self._load_fonts)
+        self._fonts, self.fonts_pack = await asyncio.to_thread(self._load_fonts, await self._bridge_packs())
         options = self.options or SupervisorOptions()
         if options.pause_reason is None:
             options.pause_reason = update_in_progress
@@ -211,9 +216,12 @@ class HardwareHost:
         from app.tags.runtime.host.agent import HostFacts, computer_name
 
         from .components import readiness
+        from .fonts import pinned_pack
 
         def capabilities() -> dict[str, Any]:
-            self.readiness = readiness(self.paths.assets_dir)
+            # Running, the host draws with the pack it loaded: still another one than the pin is a font update.
+            loaded = self.fonts_pack if self.state == "running" else None
+            self.readiness = readiness(self.paths.assets_dir, pinned_pack(), loaded)
             return {"readiness": {k: v for k, v in self.readiness.items() if k != "usb"},
                     "usb": self.readiness.get("usb")}
 
@@ -290,16 +298,48 @@ class HardwareHost:
                 "status": {"state": self.state, "reason": self.reason, "gateways": [], "workers": []}}
         await hosts.host_hello(hosts.HostPrincipal(self.host_id, hosts.SERVER), body)
 
-    def _load_fonts(self) -> tuple[Any, str | None]:
-        """The verified font pack the workers share (loaded once: about 90 MB of fonts)."""
+    async def _bridge_packs(self) -> list[str]:
+        """The packs this host's bridges show (the server's own host, from Cremind's records; best effort): what
+        it falls back to while the pinned pack is not installed, so their tags keep drawing. Asked only when
+        that choice matters: several packs installed, none of them the pinned one."""
+        if self.remote is not None:
+            return []  # a desktop gateway computer has no records to ask: the fallback is the first pack
+        try:
+            from app.tags.runtime.resources import font_assets_in
+
+            from .fonts import pinned_pack
+
+            installed = [a.pack_id for a in font_assets_in(self.paths.assets_dir)]
+            if len(installed) < 2 or pinned_pack() in installed:
+                return []
+            from app.tags.hosts import bridge_font_packs
+
+            from .local_connector import on_server
+
+            return await asyncio.wait_for(on_server(bridge_font_packs(self.host_id or ""), self._server_loop, 10.0),
+                                          10.0)
+        except Exception:  # noqa: BLE001 - the fallback stays the first pack
+            logger.debug("[tags] could not read the font packs the bridges show", exc_info=True)
+            return []
+
+    def _load_fonts(self, also_prefer: Sequence[str] = ()) -> tuple[Any, str | None]:
+        """The verified font pack the workers share (loaded once: about 90 MB of fonts): the pack this Cremind
+        pins, else — until the components are prepared — one the bridges show (``also_prefer``), else the first
+        installed."""
         try:
             from app.tags.runtime.fonts.fontset import FontSet
             from app.tags.runtime.resources import find_font_assets
 
-            assets = find_font_assets(roots=[self.paths.assets_dir])
+            from .fonts import pinned_pack
+
+            pinned = pinned_pack()
+            assets = find_font_assets(roots=[self.paths.assets_dir], prefer=pinned, also_prefer=also_prefer)
             if assets is None:
                 logger.warning("[tags] no font pack is installed: workers connect and pair, screens wait")
                 return None, None
+            if pinned and assets.pack_id != pinned:
+                logger.warning(f"[tags] font pack {assets.pack_id} is loaded; this Cremind pins {pinned} — prepare "
+                               "the gateway computer to update")
             return FontSet.load(assets.pack_path, assets.cache_dir), assets.pack_id
         except Exception:  # noqa: BLE001
             logger.exception("[tags] the installed font pack could not be loaded; screens wait for a good one")
@@ -403,7 +443,10 @@ def _migration_summary(paths: RuntimePaths) -> dict[str, int]:
 
 
 def _components_reason(readiness: dict[str, Any]) -> str:
-    blocked = [c for c in readiness.get("components") or [] if c.get("state") != "ready"]
+    from .components import OUTDATED
+
+    # An outdated font pack stands in nobody's way: screens keep working with it.
+    blocked = [c for c in readiness.get("components") or [] if c.get("state") not in ("ready", OUTDATED)]
     if not blocked:
         return "The gateway components are not ready."
     return " ".join(c.get("detail") or f"{c['key']}: {c['state']}" for c in blocked)

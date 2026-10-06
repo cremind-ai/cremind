@@ -9,7 +9,11 @@ a bounded ``log``), so the page shows progress and offers a retry:
 2. **fonts** — a verified font asset bundle into ``<SYS>/.tag-runtime/assets``
    (:mod:`.fonts`); never built on the user's computer, except from a
    developer checkout that already has the built pack;
-3. **start** — the hardware host starts (or restarts, to load new fonts).
+3. **start** — the hardware host starts (or restarts, to load new fonts: also
+   when it still draws with another pack than the pinned one, installed
+   meanwhile). Once it draws with the pinned pack, the packs nothing uses any
+   more are removed — best effort, and never a pack a bridge behind this
+   computer's gateways still shows.
 
 The operation succeeds when the host runs; otherwise it fails with what is
 still missing.
@@ -18,6 +22,7 @@ still missing.
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import Callable
 from typing import Any
 
@@ -76,25 +81,56 @@ async def prepare(op_id: str) -> None:
         installed = await asyncio.to_thread(fonts.ensure_installed, host.paths.assets_dir, say)
         await _update(op_id, log_line=installed.message)
         await _update(op_id, stage="starting", stage_detail="Starting gateway support")
+        pinned = fonts.pinned_pack()
         if host.running and installed.changed:
             await stop_hosting("new fonts were installed")
+        elif host.running and pinned and installed.pack_id == pinned and host.fonts_pack != pinned:
+            await _update(op_id, log_line=f"Switching to font pack {pinned}…")
+            await stop_hosting(f"switching to font pack {pinned}")
         result = await start_hosting()
-        doc = readiness(host.paths.assets_dir)
         if result["state"] != "running":
             raise PrepareFailed("components_unavailable", result.get("reason") or "Gateway support did not start.",
-                                readiness=doc)
+                                readiness=readiness(host.paths.assets_dir, pinned))
+        if pinned and host.fonts_pack == pinned:
+            await _remove_old_packs(op_id, host, pinned)
+        doc = readiness(host.paths.assets_dir, pinned, host.fonts_pack)
         await _update(op_id, state="succeeded", stage="done", stage_detail=None, finished_at=now_ms(),
                       result_extra={"readiness": doc}, log_line="Gateway support is running.")
     except PrepareFailed as exc:
         await _update(op_id, state="failed", stage="done", finished_at=now_ms(),
                       error={"code": exc.code, "message": str(exc)},
-                      result_extra={"readiness": exc.readiness or readiness(host.paths.assets_dir)},
+                      result_extra={"readiness": exc.readiness or readiness(host.paths.assets_dir,
+                                                                            fonts.pinned_pack())},
                       log_line=str(exc))
     except Exception as exc:  # noqa: BLE001 - reported on the operation, the server goes on
         logger.exception("[tags] preparing the gateway components failed")
         await _update(op_id, state="failed", stage="done", finished_at=now_ms(),
                       error={"code": "prepare_failed", "message": f"Preparing the components failed: {exc}"},
                       log_line=f"Failed: {exc}")
+
+
+async def _remove_old_packs(op_id: str, host: Any, pinned: str) -> None:
+    """The host draws with the pinned pack: remove the packs nothing uses any more — but never one a bridge
+    behind this computer's gateways still shows (unknown: nothing is removed). Best effort: a pack that cannot
+    go now (a file still open, on Windows) stays until the next preparation, and the preparation goes on."""
+    from app.tags.hosts import bridge_font_packs
+
+    from . import fonts
+
+    lines: list[str] = []
+    try:
+        keep = {pinned, *await bridge_font_packs(host.host_id or "")}
+
+        def remove() -> list[str]:
+            gc.collect()  # the fonts the stopped host had open (Windows keeps open files from being moved)
+            return fonts.remove_other_packs(host.paths.assets_dir, keep, lines.append)
+
+        await asyncio.to_thread(remove)
+    except Exception:  # noqa: BLE001 - older packs only take room
+        logger.warning("[tags] removing the font packs nothing uses any more failed", exc_info=True)
+    for line in lines:
+        logger.info(f"[tags] {line}")
+        await _update(op_id, log_line=line)
 
 
 class PrepareFailed(Exception):

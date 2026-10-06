@@ -137,6 +137,24 @@ version share it. `app.tags.runtime.resources` resolves asset roots in this orde
 (`fonts.manifest.repo_root` refuses to guess one; only `$CREMIND_TAG_REPO`
 counts).
 
+Several packs can sit side by side (an update pins a new one in
+`app/tags/runtime/fonts/bundle.json`). A worker, and a gateway computer's
+host, draws with the **pinned** pack when it is installed
+(`resources.pinned_pack_id`, `find_font_assets(prefer=…)`); until then it
+falls back in a fixed order — on the server's own computer a pack the bridges
+behind its gateways show (Cremind's records), else the first pack by
+directory name, never the install order (installed pack directories keep the
+archive's timestamps) — and logs that the computer should be prepared. Its
+fonts component is then `outdated` and the host reports `fonts_update`, while
+the screens keep working. Preparing the components (`cremind -p admin tags
+hosts prepare`) installs the pinned pack, restarts the host on it, and then
+removes the packs nothing uses (`app.tags.hosting.fonts.remove_other_packs`):
+best effort — a pack whose files are still open (Windows) stays whole until the
+next preparation — and never a pack a bridge behind that computer's gateways
+still shows. `cremind tags host prepare` on a desktop gateway computer
+installs the pinned pack but removes nothing (it has no record of the
+bridges), and asks for a restart when the host already runs.
+
 ## 3. What each installer does
 
 **Windows** (`packaging/windows/cremind-connect.iss`, Inno Setup 6): per user
