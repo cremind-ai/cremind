@@ -1,7 +1,7 @@
 {
   "schema": "cremind-tag/contract@1",
   "name": "cremind-tag-contract",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "protocol": {
     "spec_version": 2,
     "proto_version": 1,
@@ -10,11 +10,11 @@
   },
   "source": {
     "repository": "https://github.com/cremind-ai/cremind-tag",
-    "revision": "39bd23d475c6a92ab403a8cb3f056b05b8bb80ee",
+    "revision": "46c5e48e59237acdbde9c183bca317ca208841cb",
     "dirty": false
   },
   "files": {
-    "docs/connect-setup.md": "566d9a4cb1a8e13e98762f018fb4656b199c05df11de07c66e8eaed1262b8f22",
+    "docs/connect-setup.md": "9fbfecf424a22138b5b3f0b321778f6c5368516bb41f7ad9d4f1d2ef0afe5b1b",
     "docs/fontpack.md": "f2cdd4d520b748eee16d18d2fd2f8fc0001cca2dd53abf914daebe04df8a1a7e",
     "docs/protocol.md": "2b577f2b0aebda58304b11f43227d9e25cd87b8492536a9e3f6f94eb525fb201",
     "fixtures/cobs.json": "0831590cade624b11dcc38448c72c417410582900e3bd81690729521e894cdd9",
@@ -31,10 +31,10 @@
     "fixtures/session.json": "0698e7210df4e914dfbbe78eab2a30758172d37656ee406ec7b8ce7509e62fbe",
     "fixtures/tag_txn.json": "cf38bbe0ec62e6afe979bc60ca7676a39b47e5345370eaf442d8104a48b44623",
     "fixtures/v2_secure.json": "886ecdea6fdfdcfdfa22f8046da25d092262690d1300709dc894dad19ecef6d6",
-    "hardware/matrix.yaml": "462a92be32fc75d819967d51c681c1dff873cd829ea7197996af39f0c41e5848",
-    "hardware/targets.yaml": "4f02ec46b1563e4839d73f295f9eb1cf44579917cd2b7c71550a7400d337057d",
-    "spec.yaml": "8fb34ff9f0db29c444d99acba3f567a99af959e61896f3c0ebef2de5b31d135a",
+    "hardware/matrix.yaml": "38d0da4133a65830cd53a210559d282ba37fbba79635d315c8c6c01f231a2a13",
+    "hardware/targets.yaml": "88449efbd7c6c7f8743406c14b0555e48c15e671e621e309835b9c0984f50407",
+    "spec.yaml": "346b8e78203425336997e96235becac507064c54d8460b77f38262ff4879d855",
     "tests/conversation.h": "7230447d2277e7d7b94f31a4eb7c8860a5ff1a873488372449c8bc4f7f3e79db"
   },
-  "digest": "afbc0ac7e7edfd4fbbac2e5055020d353ec6bbb1949aaefd0eeb66a6e129f7a3"
+  "digest": "16b033e3863cee1720cbfdb1e2ad894e78ccd4f1e24edeef08df7243b951b7e2"
 }

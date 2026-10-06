@@ -31,6 +31,7 @@ PANEL_ALIASES: dict[str, Panel] = {
     "bwr": Panel.UC8176_420_BWR,
     "uc8176_bw": Panel.UC8176_420_BW,
     "uc8176_bwr": Panel.UC8176_420_BWR,
+    "hema213": Panel.SSD1619_213_BWR,
 }
 
 TAG_BOARDS = frozenset(b for b in Board if b >= Board.LAOWU_BW_NRF51822)
@@ -38,12 +39,14 @@ TAG_BOARDS = frozenset(b for b in Board if b >= Board.LAOWU_BW_NRF51822)
 
 @dataclass(frozen=True, slots=True)
 class PanelProfile:
-    """Native geometry and plane encoding (docs/protocol.md §4.4 "Planes")."""
+    """Native geometry and plane encoding (docs/protocol.md §4.4 "Planes"); ``rotation`` is how the panel
+    sits in its tag (quarter turns, as ``tag_devices.rotation``): the default a new tag of this panel gets."""
 
     width: int
     height: int
     planes: int
     plane_flags: int  # bit0: plane 0 bit 1 = white; bit1: plane 1 bit 1 = red
+    rotation: int = 0
 
     @property
     def plane_len(self) -> int:
@@ -54,6 +57,8 @@ PANEL_PROFILES: dict[Panel, PanelProfile] = {
     Panel.UC8176_420_BW: PanelProfile(400, 300, 1, 0x01),
     Panel.UC8176_420_BWR: PanelProfile(400, 300, 2, 0x03),
     Panel.NONE: PanelProfile(400, 300, 1, 0x01),  # dev tag without a display: a virtual 4.2" BW panel
+    # Hema 2.13": native 128 x 250 portrait; the tag reads landscape with the native origin top-right.
+    Panel.SSD1619_213_BWR: PanelProfile(128, 250, 2, 0x03, rotation=3),
 }
 
 # Panel the board ships with (hardware/matrix.yaml); UNVERIFIED needs explicit geometry.
@@ -61,7 +66,7 @@ BOARD_PANEL: dict[Board, Panel] = {
     Board.LAOWU_BW_NRF51822: Panel.UC8176_420_BW,
     Board.LAOWU_BWR_NRF51802: Panel.UC8176_420_BWR,
     Board.SIFEI_NRF52810: Panel.UNVERIFIED,
-    Board.HEMA_NRF52811: Panel.UNVERIFIED,
+    Board.HEMA_NRF52811: Panel.SSD1619_213_BWR,
     Board.NRF52DK_TAG: Panel.NONE,
 }
 
