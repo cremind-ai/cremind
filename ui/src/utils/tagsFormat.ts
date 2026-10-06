@@ -1,6 +1,7 @@
-// Pure helpers for the Cremind Tag pages: labels, pill colours, icon names and
-// the settings form's inherit/override model. No Vue, no fetch — so they are
-// cheap to reuse from every tags component and to test under node:test.
+// Pure helpers for the Cremind Tag pages: labels, pill colours, icon names,
+// screen preview sizes and the settings form's inherit/override model. No Vue,
+// no fetch — so they are cheap to reuse from every tags component and to test
+// under node:test.
 import type {
   TagDelivery, TagEffectiveOptions, TagOptions, TagOptionsPatch, TagRoute,
 } from '../services/tagsApi';
@@ -84,6 +85,72 @@ export function panelLabel(d: { width: number | null; height: number | null; pla
 
 export function deviceTitle(d: { name?: string | null; hw_id: string }): string {
   return (d.name || '').trim() || d.hw_id;
+}
+
+// ── screen previews ────────────────────────────────────────────────────────
+
+/** The screen as the tag is read: the panel's native ``width``×``height``
+ *  turned by ``rotation`` quarter turns, so an odd turn swaps them (the
+ *  2.13-inch Hema is native 128×250 with rotation 3: it reads 250×128). The
+ *  stored preview PNGs are in this orientation. Null while the size is unknown. */
+export function logicalSize(d: { width?: number | null; height?: number | null; rotation?: number | null }):
+  { width: number; height: number } | null {
+  if (!d.width || !d.height) return null;
+  return Math.abs(d.rotation ?? 0) % 2 === 1
+    ? { width: d.height, height: d.width }
+    : { width: d.width, height: d.height };
+}
+
+export interface PreviewZoom {
+  /** The size to draw the image at, in CSS pixels. */
+  cssWidth: number;
+  cssHeight: number;
+  /** Screen (device) pixels per panel pixel: a whole number when ``pixelated``. */
+  zoom: number;
+  /** Draw it nearest-neighbour (``image-rendering: pixelated``). */
+  pixelated: boolean;
+}
+
+/** How to draw a preview PNG whose ``natural`` size is the panel's (one PNG
+ *  pixel per panel pixel) in a ``box`` of CSS pixels, on a screen with ``dpr``
+ *  device pixels per CSS pixel. When it fits at 1× or more it is drawn at the
+ *  largest whole zoom that fits, at most ``maxZoom``, nearest-neighbour: every
+ *  panel pixel becomes the same square of screen pixels, so the 1 px stems of
+ *  12 px text all survive (a fractional scale drops or doubles some of them).
+ *  Only an image that does not fit at 1× — a thumbnail — is scaled down, and
+ *  smoothly. */
+export function previewZoom(
+  natural: { w: number; h: number },
+  box: { w: number; h: number },
+  dpr: number,
+  maxZoom = 4,
+): PreviewZoom {
+  const ratio = dpr > 0 ? dpr : 1;
+  const fit = Math.min(box.w * ratio / natural.w, box.h * ratio / natural.h);
+  const zoom = fit >= 1 ? Math.max(1, Math.min(Math.floor(fit), Math.floor(maxZoom))) : fit > 0 ? fit : 0;
+  return {
+    cssWidth: natural.w * zoom / ratio, cssHeight: natural.h * zoom / ratio, zoom, pixelated: fit >= 1,
+  };
+}
+
+/** `previewZoom` for a preview already drawn at the whole zoom ``held`` (the
+ *  same image on the same screen): it zooms out as soon as ``held`` stops
+ *  fitting, but in only once the bigger zoom fits with ``slack`` CSS pixels of
+ *  width to spare. A preview that grows can bring in a page scrollbar that
+ *  narrows its own box; without the slack it would zoom straight back out,
+ *  and in again, frame after frame. */
+export function steadyZoom(
+  held: number | null,
+  natural: { w: number; h: number },
+  box: { w: number; h: number },
+  dpr: number,
+  maxZoom = 4,
+  slack = 24,
+): PreviewZoom {
+  const next = previewZoom(natural, box, dpr, maxZoom);
+  if (!held || !next.pixelated || next.zoom <= held) return next;
+  const roomy = previewZoom(natural, { w: box.w - slack, h: box.h }, dpr, maxZoom);
+  return roomy.pixelated && roomy.zoom > held ? roomy : previewZoom(natural, box, dpr, held);
 }
 
 // ── deliveries ─────────────────────────────────────────────────────────────

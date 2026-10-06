@@ -287,6 +287,7 @@ function preview(t: SetupDevice) {
     revision: known?.previews?.displayed ?? (t.delivery?.displayed_revision || null),
     width: known?.width ?? null,
     height: known?.height ?? null,
+    rotation: known?.rotation ?? 0,
   };
 }
 
@@ -498,6 +499,9 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
                   kind="displayed"
                   label="Screen"
                   hide-revision
+                  shrink
+                  :max-height="80"
+                  :name="setupDeviceTitle(t.device)"
                   :epoch="t.device.generation"
                   v-bind="preview(t.device)"
                 />
@@ -578,7 +582,6 @@ const busyFor = (d: SetupDevice) => (d.id && busy.value.startsWith(`${d.id}:`) ?
 .hw-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .thumb { width: 96px; }
 .thumb :deep(.tag-preview-caption) { display: none; }
-.thumb :deep(.tag-preview-frame) { max-height: 80px; }
 .thumb :deep(.tag-preview-empty) { padding: 6px; font-size: 0.7rem; }
 .empty {
   display: flex; align-items: center; gap: 12px; margin-top: 16px; padding: 16px;

@@ -18,7 +18,7 @@ import TagDeliveryHistory from './TagDeliveryHistory.vue';
 import { formatRelativeTime } from '../../utils/relativeTime';
 import { formatTimestamp } from '../../utils/usageFormat';
 import {
-  BATTERY_LOW_MV, batteryIcon, deviceStatusPill, deviceTitle, formatBattery, formatRssi, panelLabel,
+  BATTERY_LOW_MV, batteryIcon, deviceStatusPill, deviceTitle, formatBattery, formatRssi, logicalSize, panelLabel,
 } from '../../utils/tagsFormat';
 
 const props = defineProps<{ device: TagDevice; pending: number; now: number; isAdmin?: boolean }>();
@@ -46,6 +46,13 @@ function openHardware() {
   router.push({ path: `/${route.params.profile}/settings/tags/hardware`, query: { tag: d.value.id } });
 }
 const lowBattery = computed(() => d.value.battery_mv != null && d.value.battery_mv < BATTERY_LOW_MV);
+/** Each preview is at least as wide as the screen at one CSS pixel per tag
+ *  pixel (+ its frame), so two that do not fit side by side wrap instead of
+ *  shrinking; never wider than the card, whose preview then scrolls. */
+const previewsStyle = computed(() => {
+  const s = logicalSize(d.value);
+  return s ? { '--preview-min': `min(${s.width + 2}px, 100%)` } : {};
+});
 const behind = computed(() => d.value.desired_revision > d.value.displayed_revision);
 // What the history should re-read on: anything the poll sees move on this tag.
 const historyKey = computed(() => `${d.value.updated_at}:${props.pending}:${d.value.desired_revision}:${d.value.displayed_revision}`);
@@ -225,14 +232,14 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
       </div>
     </div>
 
-    <div class="previews">
+    <div class="previews" :style="previewsStyle">
       <TagPreviewImage
-        :device-id="d.id" kind="displayed" label="On the tag now" :epoch="d.epoch"
-        :revision="d.previews?.displayed ?? null" :width="d.width" :height="d.height"
+        :device-id="d.id" kind="displayed" label="On the tag now" :epoch="d.epoch" :name="title"
+        :revision="d.previews?.displayed ?? null" :width="d.width" :height="d.height" :rotation="d.rotation"
       />
       <TagPreviewImage
-        :device-id="d.id" kind="desired" label="Next screen" :epoch="d.epoch"
-        :revision="d.previews?.desired ?? null" :width="d.width" :height="d.height"
+        :device-id="d.id" kind="desired" label="Next screen" :epoch="d.epoch" :name="title"
+        :revision="d.previews?.desired ?? null" :width="d.width" :height="d.height" :rotation="d.rotation"
       />
     </div>
 
@@ -304,7 +311,7 @@ defineExpose({ upsertDelivery: (x: TagDelivery) => history.value?.upsert(x) });
 .fact-icon { font-size: 1rem; }
 
 .previews { display: flex; gap: 14px; margin-top: 14px; flex-wrap: wrap; }
-.previews > * { min-width: 180px; }
+.previews > * { min-width: var(--preview-min, 180px); }
 
 .history-toggle {
   display: flex; align-items: center; gap: 4px; margin-top: 12px; padding: 4px 0;

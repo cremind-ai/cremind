@@ -147,6 +147,65 @@ test('cancel wording: a card the companion holds can still be cancelled', () => 
   assert.equal(fmt.cancelledMessage({ resolved: null }), 'Delivery cancelled')
 })
 
+test('a preview has the size the tag is read at: an odd quarter turn swaps the panel', () => {
+  // The 2.13-inch Hema: native 128x250, rotation 3 — its PNG is 250x128.
+  assert.deepEqual(fmt.logicalSize({ width: 128, height: 250, rotation: 3 }), { width: 250, height: 128 })
+  assert.deepEqual(fmt.logicalSize({ width: 128, height: 250, rotation: 1 }), { width: 250, height: 128 })
+  assert.deepEqual(fmt.logicalSize({ width: 400, height: 300, rotation: 2 }), { width: 400, height: 300 })
+  assert.deepEqual(fmt.logicalSize({ width: 400, height: 300, rotation: 0 }), { width: 400, height: 300 })
+  assert.deepEqual(fmt.logicalSize({ width: 400, height: 300 }), { width: 400, height: 300 }, 'no rotation reads as native')
+  assert.equal(fmt.logicalSize({ width: null, height: 300, rotation: 1 }), null)
+  assert.equal(fmt.logicalSize({ width: 400, height: 0 }), null)
+})
+
+test('a preview zooms by whole screen pixels, and smoothly only below 1x', () => {
+  // 400x300 in a 460x360 box: 1x, never the 1.15x (or the old 0.8x) that drops 1 px stems.
+  assert.deepEqual(fmt.previewZoom({ w: 400, h: 300 }, { w: 460, h: 360 }, 1),
+    { cssWidth: 400, cssHeight: 300, zoom: 1, pixelated: true })
+  // On a 225% screen the same box holds 2 screen pixels per tag pixel (the height allows 2.7).
+  const hidpi = fmt.previewZoom({ w: 400, h: 300 }, { w: 460, h: 360 }, 2.25)
+  assert.equal(hidpi.zoom, 2)
+  assert.equal(hidpi.pixelated, true)
+  assert.ok(Math.abs(hidpi.cssWidth * 2.25 - 800) < 1e-9, 'exactly 800 screen pixels wide')
+  // The Hema at 125%: 2x is 500 screen pixels = 400 CSS pixels.
+  assert.deepEqual(fmt.previewZoom({ w: 250, h: 128 }, { w: 460, h: 360 }, 1.25),
+    { cssWidth: 400, cssHeight: 204.8, zoom: 2, pixelated: true })
+  // The height bounds it too, and maxZoom caps it.
+  assert.equal(fmt.previewZoom({ w: 250, h: 128 }, { w: 2000, h: 300 }, 1).zoom, 2)
+  assert.equal(fmt.previewZoom({ w: 250, h: 128 }, { w: 2000, h: 2000 }, 1).zoom, 4)
+  assert.equal(fmt.previewZoom({ w: 250, h: 128 }, { w: 2000, h: 2000 }, 1, 6).zoom, 6)
+  assert.equal(fmt.previewZoom({ w: 250, h: 128 }, { w: 2000, h: 2000 }, 1, Infinity).zoom, 8)
+  // An exact fit is that zoom, not one less.
+  assert.equal(fmt.previewZoom({ w: 250, h: 128 }, { w: 750 / 1.1, h: 1000 }, 1.1).zoom, 3)
+
+  // A thumbnail (96 px wide) cannot hold 1x: scaled down to fit, smoothly.
+  const thumb = fmt.previewZoom({ w: 250, h: 128 }, { w: 94, h: 80 }, 1)
+  assert.equal(thumb.pixelated, false)
+  assert.ok(Math.abs(thumb.cssWidth - 94) < 1e-9)
+  assert.ok(thumb.cssHeight < 80)
+  assert.ok(thumb.zoom > 0 && thumb.zoom < 1)
+  // A bad screen ratio counts as 1; an unmeasured box draws nothing.
+  assert.equal(fmt.previewZoom({ w: 400, h: 300 }, { w: 460, h: 360 }, 0).cssWidth, 400)
+  assert.deepEqual(fmt.previewZoom({ w: 400, h: 300 }, { w: 0, h: 360 }, 1),
+    { cssWidth: 0, cssHeight: 0, zoom: 0, pixelated: false })
+})
+
+test('a preview zooms in only with room to spare, so a page scrollbar cannot flip it back', () => {
+  const hema = { w: 250, h: 128 }
+  // 505 px holds 2x (500), but a scrollbar that 2x brings in would take it back below 500.
+  assert.equal(fmt.steadyZoom(1, hema, { w: 505, h: 360 }, 1).zoom, 1, 'held at 1x')
+  assert.equal(fmt.steadyZoom(null, hema, { w: 505, h: 360 }, 1).zoom, 2, 'a first fit takes the largest')
+  assert.equal(fmt.steadyZoom(1, hema, { w: 530, h: 360 }, 1).zoom, 2, 'enough to spare')
+  // Out as soon as the held zoom stops fitting, and kept while it still fits.
+  assert.equal(fmt.steadyZoom(2, hema, { w: 499, h: 360 }, 1).zoom, 1)
+  assert.equal(fmt.steadyZoom(2, hema, { w: 501, h: 360 }, 1).zoom, 2)
+  // A bigger jump (760 px holds 3x) stops at the largest zoom that fits with the slack.
+  const step = fmt.steadyZoom(1, hema, { w: 760, h: 1000 }, 1)
+  assert.deepEqual(step, { cssWidth: 500, cssHeight: 256, zoom: 2, pixelated: true })
+  // Below 1x there is nothing to hold.
+  assert.equal(fmt.steadyZoom(1, hema, { w: 94, h: 80 }, 1).pixelated, false)
+})
+
 test('scan results accept the likely result shapes', () => {
   assert.deepEqual(fmt.scanResults({ devices: [{ uuid: 'u1', rssi: -50 }, { id: 'u2', name: 'B' }, {}] }), [
     { uuid: 'u1', rssi: -50, name: null },
