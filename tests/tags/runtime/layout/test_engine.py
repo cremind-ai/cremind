@@ -273,6 +273,7 @@ def test_alignment_respects_direction(fonts: Any) -> None:
 
 
 def test_positions_accumulate_in_26_6(fonts: Any) -> None:
+    """Without grid fitting (and in every run that is not grid-fitted) HarfBuzz's 26.6 advances accumulate."""
     ctx = FontContext.for_fontset(fonts)
     buf = hb.Buffer()
     buf.add_str("i")
@@ -280,8 +281,11 @@ def test_positions_accumulate_in_26_6(fonts: Any) -> None:
     hb.shape(ctx.hb_font(1, 24), buf, {})
     advance = buf.glyph_positions[0].x_advance
     assert advance % 64, "the test needs a fractional advance"
-    block = lay(fonts, "i" * 60, width=5000)
+    block = lay(fonts, "i" * 60, width=5000, grid_fit=False)
     assert [g.x for g in block.glyphs] == [(k * advance + 32) >> 6 for k in range(60)]
+    # Grid-fitted (the default): whole-pixel steps of the pack's hinted advance.
+    hinted = ctx.glyph(1, 24, block.glyphs[0].glyph_id).advance
+    assert [g.x for g in lay(fonts, "i" * 60, width=5000).glyphs] == [k * hinted for k in range(60)]
 
 
 def test_line_boxes_grow_to_the_ink(fonts: Any) -> None:
@@ -295,11 +299,14 @@ def test_line_boxes_grow_to_the_ink(fonts: Any) -> None:
         assert b.top >= a.bottom
 
 
-def test_layout_is_deterministic(fonts: Any) -> None:
-    text = "Tiếng Việt, مرحبا 123, שלום, สวัสดีครับ, नमस्ते, 你好 😀 — wrapped over lines"
-    first = lay(fonts, text, width=150, size_px=16, max_lines=4)
+@pytest.mark.parametrize("style", [{}, {"weight": "bold"}, {"leading": "tight"}, {"leading": (12, 3)},
+                                   {"tracking": 1}, {"grid_fit": False},
+                                   {"weight": "bold", "leading": "tight", "tracking": 2}], ids=repr)
+def test_layout_is_deterministic(fonts: Any, style: dict[str, Any]) -> None:
+    text = "Tiếng Việt, مرحبا 123, שלום, สวัสดีครับ, नमस्ते, 你好 😀 — NEEDS YOU, wrapped over lines"
+    first = lay(fonts, text, width=150, size_px=16, max_lines=4, **style)
     engine_module._cache.clear()
-    second = lay(fonts, text, width=150, size_px=16, max_lines=4)
+    second = lay(fonts, text, width=150, size_px=16, max_lines=4, **style)
     assert first is not second and first == second
     assert first.commands(3, 4, 1) == second.commands(3, 4, 1)
 

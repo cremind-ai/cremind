@@ -294,8 +294,10 @@ font file, checking that the file has the SHA-256 it was rasterised from
 - `StrikeMetrics` (`ascent`, `descent`, `line_height`, `glyph_count`) are
   whole pixels as stored in the pack: ceilings of FreeType's scaled
   ascender/−descender/height at that size. Glyph advances in the pack are the
-  hinted advances rounded half up; HarfBuzz positions are unhinted, so layouts
-  that want crisp spacing for simple scripts can use the pack advances.
+  hinted advances rounded half up; HarfBuzz positions are unhinted, so the
+  layout engine advances Latin, Greek and Cyrillic runs by the pack advances
+  (plus kerning rounded to whole pixels) for crisp, even spacing
+  ([`layout.md`](layout.md) "Positions").
 
 ## Licensing
 

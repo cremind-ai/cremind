@@ -30,7 +30,7 @@ def load_pack(profile: str) -> Any:
 
 @pytest.fixture(scope="session")
 def fonts() -> Any:
-    """The full pack (171 faces, 16/24/32 px)."""
+    """The full pack (172 faces: icons, 170 regular text faces with emoji, Noto Sans Bold; 12/14/16/24/32 px)."""
     return load_pack("full")
 
 

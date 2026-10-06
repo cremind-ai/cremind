@@ -16,8 +16,9 @@ what is known not to work.
 |---|---|
 | `layout/plaintext.py` | card text (Markdown / HTML-ish) → plain NFC text |
 | `layout/unicode.py` | ICU: graphemes, line breaks, bidi, scripts, emoji properties, NFC |
-| `layout/fonts.py` | `FontContext`: HarfBuzz fonts, cmap coverage, face choice, pack glyphs |
+| `layout/fonts.py` | `FontContext`: HarfBuzz fonts, cmap coverage, face choice, weights, sizes, line boxes, pack glyphs |
 | `layout/engine.py` | `layout_text` → `TextBlock` (`LineBox`es, `PositionedGlyph`s) |
+| `layout/legibility.py` | `legible_size(text)`: the per-script legibility floors |
 | `layout/commands.py` | positioned glyphs → `GLYPHS` commands |
 | `compose/api.py` | the contract: `TagPanel`, `ActiveCard`, `ScreenSettings`, `ComposedScreen`, `Composer` |
 | `compose/cards.py` | card policy: visibility, icon, body, colour, progress, QR link, order |
@@ -30,8 +31,14 @@ what is known not to work.
 ## Pipeline
 
 `layout_text(text, fonts, width=, size_px=, language=, direction=, align=,
-max_lines=, ellipsis=)` lays out plain text (`\n` separates paragraphs) in a
-box `width` pixels wide. Per paragraph:
+max_lines=, ellipsis=, line_spacing=, weight=, leading=, tracking=, grid_fit=)`
+lays out plain text (`\n` separates paragraphs) in a box `width` pixels wide;
+`measure_text` is its one-line width (it takes `weight`, `tracking` and
+`grid_fit` too). `size_px` must be a text size the pack has:
+`FontContext.text_sizes()` lists them (12, 14, 16, 24, 32 on the full pack;
+16/24 on the dev pack; 16/24/32 on packs built before contract 0.3.0) and
+`FontContext.nearest_size(want)` picks the largest available ≤ `want`, else
+the smallest. Per paragraph:
 
 1. **Normalise.** C0/C1 controls are removed (a tab becomes a space), then NFC
    with ICU's data (ICU 77 = Unicode 16; Python's `unicodedata` is older).
@@ -49,7 +56,12 @@ box `width` pixels wide. Per paragraph:
    take the preceding script (the following one at the paragraph start); an
    opening paired bracket remembers the script it was opened in and its
    closing bracket gets the same (UAX #24-style, 64-deep stack).
-5. **Font fallback per cluster** — see "Font selection" below.
+5. **Font fallback per cluster** — see "Font selection" below — then the
+   **weight**: with `weight="bold"` a cluster is drawn with its face's bold
+   sibling (Noto Sans Bold, face 172, for Noto Sans) when the pack has that
+   strike and the sibling maps every character the cluster needs; any other
+   cluster (Arabic, Han, emoji, …) and every cluster on a pack without a bold
+   face stays regular, silently.
 6. **Shaping** with uharfbuzz: every maximal run of clusters with the same
    (bidi level, face, script) is shaped with the **whole paragraph as
    context** (`add_codepoints(text, offset, length)`), direction from the
@@ -83,20 +95,44 @@ box `width` pixels wide. Per paragraph:
 10. **Visual order.** Line levels from `Bidi.setLine` (rule L1), then rule L2
     over the line's runs; HarfBuzz already returns each RTL run's glyphs left
     to right.
-11. **Positions.** The pen accumulates HarfBuzz `x_advance`s in 26.6; each
-    glyph origin is `pen + x_offset` (and `baseline − y_offset`) rounded half
-    up to whole pixels: `(v + 32) >> 6`. Nothing accumulates rounded values, so
-    there is no drift (`test_positions_accumulate_in_26_6`). Glyph advances
-    stored in the pack (hinted) are not used.
+11. **Positions.** Left-to-right runs in a face whose regular face declares
+    only Latin, Greek and Cyrillic (Noto Sans and Noto Sans Bold) are
+    **grid-fitted** (`grid_fit=True`, the default): each spacing glyph
+    advances by the **hinted advance stored in the pack** (what FreeType's
+    autohinter gave the bitmap) plus HarfBuzz's kerning — its `x_advance`
+    minus the glyph's nominal advance — rounded to whole pixels, so every
+    position is an exact pixel and the same pair of letters always gets the
+    same gap (on unhinted 26.6 positions a third to a half of the steps at
+    12–16 px were a pixel off, and the same pair could get different gaps). A
+    mark keeps HarfBuzz's offset from its base glyph's pen position, rounded
+    once, so a combining sequence looks the same wherever it sits.
+    `tracking` (0–8 px) is added between clusters of these runs, never after
+    a line's last, and turns the `liga`/`clig`/`dlig` ligatures off ("fi" stays
+    two letters); line fitting, placement and the ellipsis all use the same
+    advances, and a width from `measure_text` fits the text exactly. Every
+    other run — other scripts, right-to-left runs, and everything with
+    `grid_fit=False` — keeps HarfBuzz's positions: the pen accumulates
+    `x_advance`s in 26.6 and each glyph origin is `pen + x_offset` (and
+    `baseline − y_offset`) rounded half up to whole pixels, `(v + 32) >> 6`.
+    Nothing accumulates rounded values, so there is no drift
+    (`test_positions_accumulate_in_26_6`); tracking does not apply there.
 12. **Alignment.** `start`/`end` follow the paragraph direction (start = left
     in LTR, right in RTL), `center`, or absolute `left`/`right`; the line's
     left edge is a whole pixel.
-13. **Line boxes.** Ascent and descent start from the base face's strike
-    metrics (Noto Sans, face 1: 18/5 px at 16 px, 26/8 at 24, 35/10 at 32) and
-    grow to the ink of the line's glyphs (bitmap extents from the pack), so
-    Arabic, Thai, Tibetan or stacked Vietnamese lines are taller only when
-    their marks need it and lines never overlap. Lines stack with no gap
-    (`line_spacing` adds one).
+13. **Line boxes.** Every line starts from an ascent and descent set by
+    `leading` (`FontContext.line_box`) and grows to the ink of its glyphs
+    (bitmap extents from the pack), so Arabic, Thai, Tibetan or stacked
+    Vietnamese lines are taller only when their marks need it and lines never
+    overlap. Lines stack with no gap (`line_spacing` adds one).
+    - `"font"` (default): the base face's strike metrics (Noto Sans, face 1:
+      13/4 px at 12 px, 15/5 at 14, 18/5 at 16, 26/8 at 24, 35/10 at 32).
+    - `"tight"`: from Noto Sans's ink — one pixel above the tallest of
+      `bdfhklHT0([` and down to the deepest of `gjpqy(),;[`, each capped at
+      the strike value: 11/3 at 12 px, 12/4 at 14, 13/4 at 16, 19/6 at 24,
+      26/8 at 32. No ASCII glyph of Noto Sans or its Bold reaches outside it,
+      so an ASCII paragraph steps by exactly ascent + descent; accented
+      capitals (Vietnamese `Ở` and `Ẫ` reach 13 px at 12 px) grow their line.
+    - `(ascent, descent)`: used as given (still grown to the ink).
 
 Glyphs without ink (spaces, zero-width marks) only move the pen and are not
 emitted, which saves glyph budget. A `TextBlock` holds the normalised `text`,
@@ -138,6 +174,35 @@ size (the dev pack has no 32 px):
 Controls, format characters (except visible prepended concatenation marks),
 separators and variation selectors need no glyph and never count against a
 face (`fonts.coverage.needs_glyph`).
+
+**Weight siblings never take part in fallback.** A face with role `weight`
+(`FaceInfo.regular_face_id` set: Noto Sans Bold → Noto Sans) is not a
+candidate in any step above, ranks last if it ever were, and stands for its
+regular face when it is the previous cluster's face; the regular choice is made
+first and `FontContext.styled` swaps in the sibling only for `weight="bold"`
+(step 5 of the pipeline). `FontContext.has_weight("bold", size)` tells whether
+the pack can draw Noto Sans bold at a size; `regular_of(face)` maps a sibling
+back to its regular face.
+
+### Legibility floors
+
+`layout.legible_size(text)` is the smallest text size every script of a text
+stays readable at on a 1-bit panel: the largest floor over the scripts of its
+code points, judged from renders of the multilingual samples at 12, 14 and
+16 px with the full pack.
+
+| Floor | Scripts |
+|---|---|
+| 12 px | Latin (Vietnamese included), Greek, Cyrillic, Armenian, Georgian, Hebrew, Cherokee |
+| 14 px | Arabic, Syriac, Thaana, N'Ko, Adlam, Hanifi Rohingya, Ethiopic, Canadian syllabics, Thai, Lao, Hiragana, Katakana, Hangul (dots, vowel marks and small strokes crowd at 12 px) |
+| 16 px | Han, Bopomofo, Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Khmer, Myanmar, Tibetan, Mongolian and every other script (conjuncts, stacks and dense ideographs clot below) |
+
+Common and Inherited characters (digits, punctuation, symbols, combining
+marks, emoji) and unassigned or private-use ones have no floor of their own
+(12 px). The engine never applies the floors: the composer raises a text's
+size to `legible_size(text)` (localised dates and times included) and lets
+`nearest_size` pick the strike. Emoji are legible only from about 16 px
+(monochrome blobs at 12), which the floor deliberately ignores.
 
 ### GLYPHS commands
 
@@ -323,6 +388,7 @@ thread, formatter and cache locks).
 
 ```sh
 cremind tags tools preview text "Tiếng Việt مرحبا 123 שלום" --size 24 --width 300 --lang vi --out t.png --scale 2
+cremind tags tools preview text "NEEDS YOU" --size 12 --weight bold --tracking 1 --leading tight --out chip.png
 cremind tags tools preview card job.json --panel bwr --out card.png            # one job or bare card
 cremind tags tools preview screen cards.json --panel bwr --rotation 1 --out s.png   # [jobs] or {jobs|cards, settings}
 cremind tags tools preview identify --tag-id 1A2B3C4D --name Desk --out id.png
@@ -330,7 +396,11 @@ cremind tags tools preview samples --out ../build/layout-samples [--scale 2]
 ```
 
 `--pack` defaults to `<repo>/fonts/out/full/fontpack.ctfp` (else the dev
-pack), `--cache` to the font cache. `text` prints every line (range, x,
+pack), `--cache` to the font cache. `text` takes the engine's typography:
+`--size` (a text size the pack has), `--weight regular|bold` (it notes when
+the pack has no bold face at that size), `--leading font|tight|ASCENT,DESCENT`,
+`--tracking 0..8` and `--no-grid-fit` (HarfBuzz's unhinted positions, to
+compare). It prints every line (range, x,
 width, baseline, direction), the faces used and unsupported characters;
 `card`/`screen` print the layout size, glyph and command counts, shown and
 pending delivery ids. `screen` files take the connector job shape (or bare
@@ -375,18 +445,29 @@ packs are marked `fonts` and skip when `fonts/out/<profile>` or
   Bengali / Tamil conjuncts and reordering, emoji presentation, unsupported
   characters and clusters, ellipsis (LTR at the right, RTL at the left), max
   lines across paragraphs, alignment, 26.6 rounding without drift, line boxes
-  grown to the ink, determinism, the dev pack;
+  grown to the ink, determinism (every weight, leading and tracking), the dev
+  pack;
+- spacing (`test_spacing.py`): Latin steps = the pack's hinted advance plus
+  HarfBuzz's kerning rounded per pair at every size and weight, one gap per
+  letter pair over a long text, no overlapping ink in tight pairs, marks at
+  the same offset from their base wherever they sit, Devanagari / Arabic /
+  Thai / Hebrew positions unchanged, tight leading (exact pitch for ASCII,
+  grown and never overlapping for stacked capitals), tracking only between
+  clusters (exact `measure_text`, no ligatures), end/centre-aligned ink inside
+  the box, bold on Noto Sans Bold for Latin/Greek/Cyrillic only and regular on
+  a pack without it, cache keys; `test_legibility.py`: the floor table;
 - GLYPHS: grouping, i8 overflow splits, 255-glyph runs, serpentine order,
   real blocks encoding and validating with `protocol/layout.py`;
 - **every face** (acceptance, "cover every installed script with automated
-  samples"): for each of the **170 text faces** of the full pack a sample is
+  samples"): for each of the **170 text faces** of the full pack (and Noto
+  Sans Bold, laid out bold) a sample is
   generated from the face's cmap ∩ the pinned `Scripts.txt` — letters of the
   face's first declared script (numbers and symbols for music, numerals,
   symbols and emoji faces) that the engine draws **with that face**, evenly
   spread over the repertoire, grouped in four-letter words — laid out and
   rendered: the face is used, nothing is unsupported, HarfBuzz returns no
   `.notdef`, the rendering has ink. The 41 multilingual samples are checked
-  the same way;
+  the same way (and never use the bold face);
 - composer: every panel and rotation validates, delivery ids and pending
   counts, red only on BWR, bodies only with excerpts, QR rules, progress,
   identify and blank, the dev pack, worst cases (20 cards, 400-character
@@ -406,8 +487,16 @@ packs are marked `fonts` and skip when `fonts/out/<profile>` or
   use 32 px show them cut (24/16 px are complete).
 - **Nastaliq off**: Urdu is drawn with Noto Sans Arabic (Naskh-style); Noto
   Nastaliq Urdu is an optional face outside the `full` pack.
-- **Spacing**: glyphs are placed at HarfBuzz's unhinted positions while the
-  bitmaps are auto-hinted 1-bpp; spacing can look uneven by a pixel at 16 px.
+- **Spacing** (resolved for Latin, Greek and Cyrillic): grid-fitted runs use
+  the pack's hinted advances, so letter pairs get one fixed gap. Other scripts
+  (and right-to-left runs) are still placed at HarfBuzz's unhinted 26.6
+  positions while their bitmaps are auto-hinted 1-bpp, so their spacing can
+  look uneven by a pixel; tracking does not apply to them. Hinted widths
+  differ from HarfBuzz's: on composer-like text +1.4 % at 12 px, −0.2 % at
+  14, −2.8 % at 16 (Regular), +6.4 % / +3.7 % / 0 % (Bold).
+- **Bold Vietnamese at 12 px**: Noto Sans Bold's 12 px bitmap of `ắ` merges
+  the acute into the breve (the font's hinting); use 14 px for bold
+  Vietnamese.
 - **Unicode versions**: ICU 77 knows Unicode 16; characters new in the pinned
   Unicode 17 data are treated as Common (their face is still found by cmap).
 - **No hyphenation or justification**; no vertical text (Mongolian is shown

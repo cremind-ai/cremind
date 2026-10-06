@@ -7,7 +7,9 @@ sample for **any** face from its cmap and the pinned Unicode ``Scripts.txt``
 declared script that the layout engine would draw **with that face** (so the
 sample exercises the face, not a fallback), evenly spread over the script's
 repertoire and grouped into four-letter "words"; faces without letters (music,
-numerals, symbols, emoji) use their numbers and symbols.
+numerals, symbols, emoji) use their numbers and symbols. A weight sibling
+(Noto Sans Bold) is sampled at its weight (``FaceSample.weight``), the only way
+the engine draws it.
 
 `write_samples` renders both through the reference renderer into PNG pages
 (the ``cremind tags tools preview samples`` command).
@@ -25,7 +27,7 @@ from pathlib import Path
 from app.tags.runtime.fonts.coverage import UnicodeScripts, load_unicode, needs_glyph
 from app.tags.runtime.fonts.fontset import FaceInfo, FontSet
 from app.tags.runtime.layout.engine import TextBlock, layout_text
-from app.tags.runtime.layout.fonts import FontContext
+from app.tags.runtime.layout.fonts import WEIGHTS, FontContext
 from app.tags.runtime.layout.unicode import emoji_presentation, general_category, script_of
 from app.tags.runtime.protocol.ids import Color
 from app.tags.runtime.protocol.layout import Command, Layout, Line
@@ -88,6 +90,8 @@ class FaceSample:
     language: str
     text: str
     """Empty when no character of the face is drawn by it (every one is taken by a better face)."""
+    weight: str = "regular"
+    """The `layout_text` weight the sample is drawn at ("bold" for Noto Sans Bold)."""
 
 
 def default_unicode() -> UnicodeScripts:
@@ -117,12 +121,15 @@ def face_sample(fonts: FontSet, face: FaceInfo, unicode: UnicodeScripts, *, coun
     scripts = [s for s in face.scripts if s not in _PSEUDO_SCRIPTS and s in unicode.scripts]
     if not scripts:
         scripts = ["Zyyy"]
+    weight = next((name for name, value in WEIGHTS.items() if value == face.weight), "regular")
 
     def drawn_here(cp: int) -> bool:
         if not needs_glyph(chr(cp)):
             return False
         emoji = emoji_presentation([cp])
         fid, ok = ctx.choose([cp], _script_for_choice(cp), language, size_px, None, emoji)
+        if face.regular_face_id is not None:  # a weight sibling draws what its regular face would, at its weight
+            fid = ctx.styled(fid, face.weight, size_px, [cp])
         return ok and fid == face.face_id
 
     for script in scripts:
@@ -134,8 +141,8 @@ def face_sample(fonts: FontSet, face: FaceInfo, unicode: UnicodeScripts, *, coun
             if pool:
                 picks = [pool[i * len(pool) // min(count, len(pool))] for i in range(min(count, len(pool)))]
                 words = ["".join(chr(cp) for cp in picks[i:i + 4]) for i in range(0, len(picks), 4)]
-                return FaceSample(face.face_id, face.key, script, language, " ".join(words))
-    return FaceSample(face.face_id, face.key, scripts[0], language, "")
+                return FaceSample(face.face_id, face.key, script, language, " ".join(words), weight)
+    return FaceSample(face.face_id, face.key, scripts[0], language, "", weight)
 
 
 def face_samples(fonts: FontSet, unicode: UnicodeScripts | None = None, **kw: int) -> list[FaceSample]:
@@ -213,10 +220,10 @@ def write_samples(fonts: FontSet, out: Path, *, scale: int = 1, width: int = 800
         for sample in face_samples(fonts, unicode, size_px=size):
             info = fonts.face(sample.face_id)
             block = layout_text(sample.text or "(no characters drawn by this face)", fonts, width=width - 16,
-                                size_px=size, language=sample.language)
+                                size_px=size, language=sample.language, weight=sample.weight)  # type: ignore[arg-type]
             face_entries.append((f"{sample.face_id} {info.key} [{sample.script}]", block))
             summary["faces"].append({"face_id": sample.face_id, "key": sample.key, "script": sample.script,
-                                     "text": sample.text, "faces": list(block.faces),
+                                     "weight": sample.weight, "text": sample.text, "faces": list(block.faces),
                                      "unsupported": list(block.unsupported), "notdef": block.notdef})
         for n, page in enumerate(_pages(face_entries, fonts, width, 1600), start=1):
             path = out / f"faces-{n:02d}.png"

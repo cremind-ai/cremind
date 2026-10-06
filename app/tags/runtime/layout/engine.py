@@ -8,7 +8,9 @@ Pipeline per paragraph (docs/tags/layout.md "Pipeline"):
 3. script itemisation: each cluster takes its base character's script; Common
    and Inherited clusters take the preceding script (the following one at the
    start), paired brackets take their opener's script;
-4. font fallback per cluster (`FontContext.choose`);
+4. font fallback per cluster (`FontContext.choose`), then the weight: with
+   ``weight="bold"`` a cluster whose face has a bold sibling with the strike
+   that maps it is drawn with the sibling (`FontContext.styled`);
 5. HarfBuzz shaping of every (level, face, script) run with the whole
    paragraph as context, giving each cluster an advance;
 6. line break opportunities (ICU, locale-tailored: dictionaries for Thai, Lao,
@@ -21,10 +23,16 @@ Pipeline per paragraph (docs/tags/layout.md "Pipeline"):
 8. max lines: the last line keeps what fits before a trailing ellipsis
    (U+2026 in whichever face covers it; "..." otherwise);
 9. rule L1/L2 visual reordering of the runs of each line (ICU line levels);
-10. positions accumulated in 26.6 fixed point, each glyph origin rounded half up
-    to whole pixels (no drift); lines aligned start/end/center respecting the
-    paragraph direction; line boxes from the base face's strike metrics grown to
-    the ink of the line's glyphs.
+10. positions: left-to-right runs in Latin/Greek/Cyrillic faces are
+    **grid-fitted** (`_fit`, the default): each glyph advances by the pack's
+    hinted advance plus HarfBuzz's kerning rounded to whole pixels, plus
+    ``tracking`` between clusters, and marks keep their HarfBuzz offset from
+    their base rounded once, so the same pair always gets the same gap; every
+    other run keeps HarfBuzz's 26.6 positions. The pen accumulates in 26.6 and
+    each glyph origin is rounded half up to whole pixels (no drift); lines are
+    aligned start/end/center respecting the paragraph direction; line boxes
+    start from the base face's strike metrics (or the "tight" ink box) and grow
+    to the ink of the line's glyphs.
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ import re
 import threading
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import uharfbuzz as hb
@@ -41,7 +49,7 @@ import uharfbuzz as hb
 from app.tags.runtime.fonts.fontset import FontSet
 from app.tags.runtime.protocol.layout import Glyphs
 
-from .fonts import FontContext, han_language, is_han_family
+from .fonts import WEIGHTS, FontContext, Leading, Weight, han_language, is_han_family
 from .unicode import (
     ParagraphBidi,
     Utf16Map,
@@ -66,7 +74,15 @@ _CONTROLS = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f]")
 """C0/C1 controls except the line feed (paragraph separator): removed; a tab becomes a space."""
 _BOT = int(hb.BufferFlags.BOT)
 _EOT = int(hb.BufferFlags.EOT)
+_NO_LIGATURES = {"liga": False, "clig": False, "dlig": False}
+"""Features of tracked runs: letter-spaced text never joins letters (Arabic ``rlig`` and Indic forms untouched)."""
 MAX_WIDTH = 16000
+MAX_TRACKING = 8
+
+
+def _px(v: int) -> int:
+    """26.6 -> whole pixels, rounded half up."""
+    return (v + 32) >> 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +189,8 @@ class _Paragraph:
     space: list[bool]
     partial: list[str]
     """Clusters no single face maps completely."""
+    trail: list[int] = field(default_factory=list)
+    """trail[k] = tracking (26.6) after cluster k inside its run (in ``prefix``; none when the cluster ends a line)."""
 
     @property
     def clusters(self) -> int:
@@ -249,7 +267,7 @@ class _Shaper:
         self.size = size_px
 
     def shape(self, face: int, context: list[int], start: int, end: int, rtl: bool, script: str,
-              language: str) -> list[tuple[int, int, int, int, int]]:
+              language: str, features: dict[str, bool] | None = None) -> list[tuple[int, int, int, int, int]]:
         """Glyphs of ``context[start:end]`` in visual order: (gid, cluster, x_advance, x_offset, y_offset)."""
         buf = hb.Buffer()
         buf.add_codepoints(context, start, end - start)
@@ -260,7 +278,7 @@ class _Shaper:
         flags = (_BOT if start == 0 else 0) | (_EOT if end == len(context) else 0)
         if flags:
             buf.flags = hb.BufferFlags(flags)
-        hb.shape(self.ctx.hb_font(face, self.size), buf, {})
+        hb.shape(self.ctx.hb_font(face, self.size), buf, features or {})
         return [(i.codepoint, i.cluster, p.x_advance, p.x_offset, p.y_offset)
                 for i, p in zip(buf.glyph_infos, buf.glyph_positions, strict=True)]
 
@@ -279,13 +297,75 @@ def _runs(keys: Sequence[tuple[int, int, str]]) -> list[tuple[int, int]]:
 
 
 class _Engine:
-    def __init__(self, ctx: FontContext, size_px: int, width: int, language: str, direction: Direction) -> None:
+    def __init__(self, ctx: FontContext, size_px: int, width: int, language: str, direction: Direction,
+                 weight: int = WEIGHTS["regular"], tracking: int = 0, grid_fit: bool = True) -> None:
         self.ctx = ctx
         self.size = size_px
         self.width26 = width * 64
         self.language = language
         self.direction = direction
+        self.weight = weight
+        self.tracking = tracking
+        self.grid_fit = grid_fit
         self.shaper = _Shaper(ctx, size_px)
+
+    def _styled(self, face: int, cluster: Sequence[int]) -> int:
+        """The face drawing ``cluster`` at the engine's weight (`FontContext.styled`)."""
+        return face if self.weight == WEIGHTS["regular"] else self.ctx.styled(face, self.weight, self.size, cluster)
+
+    # ------------------------------------------------------------------ shaping and grid fitting
+
+    def _fitted(self, face: int, rtl: bool) -> bool:
+        """Whether a run is grid-fitted: left to right, in a Latin/Greek/Cyrillic face, unless turned off."""
+        return self.grid_fit and not rtl and self.ctx.grid_fit(face)
+
+    def _shape_run(self, face: int, cps: list[int], start: int, end: int, rtl: bool, script: str,
+                   language: str) -> list[tuple[int, int, int, int, int]]:
+        """Glyphs of one run (`_Shaper.shape`), grid-fitted by `_fit` when `_fitted`.
+
+        Line fitting (`_advances`), placement (`build_line`) and the ellipsis all shape through here, so
+        they agree on every advance.
+        """
+        if not self._fitted(face, rtl):
+            return self.shaper.shape(face, cps, start, end, rtl, script, language)
+        run = self.shaper.shape(face, cps, start, end, rtl, script, language,
+                                _NO_LIGATURES if self.tracking else None)
+        return self._fit(face, run)
+
+    def _fit(self, face: int, run: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, int, int, int]]:
+        """Whole-pixel advances for one left-to-right run (docs/tags/layout.md "Pipeline", positions).
+
+        A spacing glyph advances by the pack's hinted advance plus HarfBuzz's kerning (its ``x_advance``
+        minus the glyph's nominal advance) rounded to whole pixels; ``tracking`` pixels go between
+        clusters, never after the run's last. A mark (zero advance) keeps HarfBuzz's offset from its base
+        glyph's pen position, rounded once. Every advance and x offset comes out a multiple of 64, so
+        positions are exact pixels and the same pair of glyphs always gets the same gap.
+        """
+        adv = self.ctx.advances(face, self.size)
+        nominal = self.ctx.nominal_advances(face, self.size)
+        known = min(len(adv), len(nominal))
+        t64 = self.tracking * 64
+        out: list[tuple[int, int, int, int, int]] = []
+        u = h = bu = bh = 0  # unhinted / hinted pen, and both at the last spacing glyph
+        for gid, cl, xa, xo, yo in run:
+            if t64 and out and cl != out[-1][1]:  # between clusters only, never after the run's last
+                g = out[-1]
+                out[-1] = (g[0], g[1], g[2] + t64, g[3], g[4])
+                h += t64
+            if xa:  # spacing glyph: hinted advance + kerning, whole pixels
+                if gid < known:
+                    fa = (adv[gid] + _px(xa - nominal[gid])) * 64
+                else:  # not in the strike (a pack built from other files): its own advance, rounded
+                    fa = _px(xa) * 64
+                fo = _px(xo) * 64
+                bu, bh = u, h
+            else:  # mark / zero-width: keep its HarfBuzz offset from its base
+                fa = 0
+                fo = bh + _px(u + xo - bu) * 64 - h
+            out.append((gid, cl, fa, fo, yo))
+            u += xa
+            h += fa
+        return out
 
     # ------------------------------------------------------------------ paragraph analysis
 
@@ -305,10 +385,10 @@ class _Engine:
             lang = _lang_for(scripts[k], self.language, han_lang)
             face, complete = self.ctx.choose(cluster, scripts[k], lang, self.size, previous,
                                              emoji_presentation(cluster))
-            faces.append(face)
+            faces.append(self._styled(face, cluster))
             if not complete:
                 partial.append(text[bounds[k]:bounds[k + 1]])
-            previous = face
+            previous = face  # the regular face: fallback never sees a weight sibling
         at = {b: k for k, b in enumerate(bounds)}
         breaks: list[int] = []
         hard: set[int] = set()
@@ -326,11 +406,12 @@ class _Engine:
         space = [all(is_space(cp) for cp in cps[bounds[k]:bounds[k + 1]]) for k in range(len(bounds) - 1)]
         para = _Paragraph(text, cps, bounds, level, bidi, scripts, faces, self.language, han_lang, sorted(set(breaks)),
                           hard, [], space, partial)
-        para.prefix = self._advances(para)
+        para.prefix, para.trail = self._advances(para)
         return para
 
-    def _advances(self, para: _Paragraph) -> list[int]:
-        """Per-cluster advances from shaping each run with the whole paragraph as context."""
+    def _advances(self, para: _Paragraph) -> tuple[list[int], list[int]]:
+        """Per-cluster advance prefix sums from shaping each run with the whole paragraph as context, and the
+        tracking each cluster's advance includes after it (`_Paragraph.trail`)."""
         k_count = para.clusters
         cluster_of = [0] * len(para.cps)
         for k in range(k_count):
@@ -338,16 +419,21 @@ class _Engine:
                 cluster_of[i] = k
         keys = [(para.bidi.levels[para.bounds[k]], para.faces[k], para.scripts[k]) for k in range(k_count)]
         adv = [0] * k_count
+        trail = [0] * k_count
         for i, j in _runs(keys):
             level, face, script = keys[i]
             lang = _lang_for(script, para.language, para.han_language)
-            for _gid, cl, xa, _xo, _yo in self.shaper.shape(face, para.cps, para.bounds[i], para.bounds[j],
-                                                             bool(level & 1), script, lang):
+            run = self._shape_run(face, para.cps, para.bounds[i], para.bounds[j], bool(level & 1), script, lang)
+            for _gid, cl, xa, _xo, _yo in run:
                 adv[cluster_of[cl]] += xa
+            if self.tracking and self._fitted(face, bool(level & 1)):
+                for a, b in zip(run, run[1:], strict=False):
+                    if cluster_of[a[1]] != cluster_of[b[1]]:
+                        trail[cluster_of[a[1]]] = self.tracking * 64
         prefix = [0]
         for a in adv:
             prefix.append(prefix[-1] + a)
-        return prefix
+        return prefix, trail
 
     # ------------------------------------------------------------------ one line
 
@@ -380,8 +466,8 @@ class _Engine:
         for i, j in items:
             level, face, script = keys[i]
             lang = _lang_for(script, para.language, para.han_language)
-            shaped.append(self.shaper.shape(face, cps, cluster_bounds[i], cluster_bounds[j], bool(level & 1),
-                                            script, lang))
+            shaped.append(self._shape_run(face, cps, cluster_bounds[i], cluster_bounds[j], bool(level & 1),
+                                          script, lang))
         glyphs: list[tuple[int, int, int, int, int]] = []
         pen = 0
         notdef = 0
@@ -397,12 +483,13 @@ class _Engine:
 
     def _ellipsis(self, para: _Paragraph, ks: int, ke: int) -> tuple[list[int], list[int], list[str]]:
         script = para.scripts[ke - 1] if ke > ks else (para.scripts[ks] if ks < para.clusters else "Zyyy")
-        previous = para.faces[ke - 1] if ke > ks else None
+        previous = self.ctx.regular_of(para.faces[ke - 1]) if ke > ks else None
         lang = _lang_for(script, para.language, para.han_language)
         face, ok = self.ctx.choose([ELLIPSIS], script, lang, self.size, previous, None)
         if ok:
-            return [ELLIPSIS], [face], [script]
+            return [ELLIPSIS], [self._styled(face, [ELLIPSIS])], [script]
         face, ok = self.ctx.choose([0x2E], script, lang, self.size, previous, None)
+        face = self._styled(face, [0x2E])
         return ([0x2E] * 3, [face] * 3, [script] * 3) if ok else ([], [], [])
 
     # ------------------------------------------------------------------ breaking
@@ -414,7 +501,8 @@ class _Engine:
 
     def _fits(self, para: _Paragraph, ks: int, ke: int) -> bool:
         te = self._trim(para, ks, ke)
-        return para.prefix[te] - para.prefix[ks] <= self.width26
+        trail = para.trail[te - 1] if te > ks else 0  # a line's last cluster carries no tracking
+        return para.prefix[te] - para.prefix[ks] - trail <= self.width26
 
     def _greedy_end(self, para: _Paragraph, ks: int) -> int:
         best = None
@@ -489,29 +577,48 @@ _CACHE_SIZE = 1024
 
 def layout_text(text: str, fonts: FontSet, *, width: int, size_px: int = 16, language: str = "",
                 direction: Direction = "auto", align: Align = "start", max_lines: int | None = None,
-                ellipsis: bool = True, line_spacing: int = 0) -> TextBlock:
+                ellipsis: bool = True, line_spacing: int = 0, weight: Weight = "regular",
+                leading: Leading | tuple[int, int] = "font", tracking: int = 0, grid_fit: bool = True) -> TextBlock:
     """Lay out ``text`` (plain; ``\\n`` separates paragraphs) in a box ``width`` pixels wide.
 
     ``language`` is a BCP-47 hint (face choice for Han, HarfBuzz language,
     locale-tailored line breaking, paragraph direction without strong
     characters). ``max_lines`` cuts the text, ending the last line with an
-    ellipsis unless ``ellipsis`` is False. Results are cached (TextBlock is
-    immutable).
+    ellipsis unless ``ellipsis`` is False.
+
+    ``weight="bold"`` draws every cluster whose face has a bold sibling with
+    the strike (Noto Sans Bold for Latin, Greek, Cyrillic) in it; other
+    scripts, and every cluster on a pack without one, stay regular.
+    ``leading`` sets the line box each line starts from: ``"font"`` (strike
+    metrics), ``"tight"`` (the ink of ascenders and descenders,
+    `FontContext.line_box`) or an explicit ``(ascent, descent)``; lines still
+    grow to their ink, so they never overlap. ``tracking`` (0..8 px) is added
+    between clusters, never after a line's last, and turns ligatures off; it
+    applies only in grid-fitted runs. ``grid_fit`` (default) places
+    left-to-right Latin/Greek/Cyrillic runs on the pack's hinted advances;
+    False keeps HarfBuzz's 26.6 positions everywhere. Results are cached
+    (TextBlock is immutable).
     """
     if not 1 <= width <= MAX_WIDTH:
         raise ValueError(f"width {width} outside 1..{MAX_WIDTH}")
     if max_lines is not None and max_lines < 1:
         raise ValueError("max_lines must be >= 1")
+    if weight not in WEIGHTS:
+        raise ValueError(f"weight must be one of {', '.join(WEIGHTS)}, not {weight!r}")
+    if not (isinstance(tracking, int) and 0 <= tracking <= MAX_TRACKING):
+        raise ValueError(f"tracking {tracking!r} outside 0..{MAX_TRACKING}")
+    if isinstance(leading, list):
+        leading = tuple(leading)  # type: ignore[assignment]
     language = normalize_language(language)
     key = (fonts.pack_id, str(fonts.pack_path), id(fonts), text, width, size_px, language, direction, align,
-           max_lines, ellipsis, line_spacing)
+           max_lines, ellipsis, line_spacing, weight, leading, tracking, bool(grid_fit))
     with _cache_lock:
         hit = _cache.get(key)
         if hit is not None:
             _cache.move_to_end(key)
             return hit
     block = _layout(text, FontContext.for_fontset(fonts), width, size_px, language, direction, align, max_lines,
-                    ellipsis, line_spacing)
+                    ellipsis, line_spacing, WEIGHTS[weight], leading, tracking, bool(grid_fit))
     with _cache_lock:
         _cache[key] = block
         while len(_cache) > _CACHE_SIZE:
@@ -519,17 +626,20 @@ def layout_text(text: str, fonts: FontSet, *, width: int, size_px: int = 16, lan
     return block
 
 
-def measure_text(text: str, fonts: FontSet, *, size_px: int = 16, language: str = "") -> int:
+def measure_text(text: str, fonts: FontSet, *, size_px: int = 16, language: str = "", weight: Weight = "regular",
+                 tracking: int = 0, grid_fit: bool = True) -> int:
     """Advance width in pixels of ``text`` on one line (no wrapping)."""
-    return layout_text(text, fonts, width=MAX_WIDTH, size_px=size_px, language=language, max_lines=1).width
+    return layout_text(text, fonts, width=MAX_WIDTH, size_px=size_px, language=language, max_lines=1, weight=weight,
+                       tracking=tracking, grid_fit=grid_fit).width
 
 
 def _layout(text: str, ctx: FontContext, width: int, size_px: int, language: str, direction: Direction,
-            align: Align, max_lines: int | None, ellipsis: bool, line_spacing: int) -> TextBlock:
+            align: Align, max_lines: int | None, ellipsis: bool, line_spacing: int, weight: int,
+            leading: Leading | tuple[int, int], tracking: int, grid_fit: bool) -> TextBlock:
     text = nfc(_CONTROLS.sub(lambda m: " " if m.group(0) == "\t" else "",
                              text.replace("\r\n", "\n").replace("\r", "\n")))
-    engine = _Engine(ctx, size_px, width, language, direction)
-    base = ctx.fonts.strike(ctx.base_face(size_px), size_px)
+    engine = _Engine(ctx, size_px, width, language, direction, weight, tracking, grid_fit)
+    ascent, descent = ctx.line_box(size_px, leading)
     paragraphs = text.split("\n")
     offsets = []
     pos = 0
@@ -555,8 +665,7 @@ def _layout(text: str, ctx: FontContext, width: int, size_px: int, language: str
         truncated = truncated or cut
         rtl = bool(para.level & 1)
         for line in plines:
-            box, lglyphs = _place(ctx, size_px, width, align, rtl, base.ascent, base.descent, line, offset,
-                                  len(lines), y)
+            box, lglyphs = _place(ctx, size_px, width, align, rtl, ascent, descent, line, offset, len(lines), y)
             lines.append(box)
             glyphs.extend(lglyphs)
             notdef += line.notdef

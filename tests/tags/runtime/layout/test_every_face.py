@@ -2,11 +2,11 @@
 
 For every text face of the full pack, a sample is generated from the face's
 cmap and the pinned ``Scripts.txt`` (letters of its primary script that the
-layout engine draws with that face), laid out and rendered through the
-reference renderer: the face must be used, no character may be unsupported,
-HarfBuzz must return no .notdef and the rendering must have ink. The explicit
-script tests live in test_engine.py; the hand-written multilingual set is
-checked here too.
+layout engine draws with that face; Noto Sans Bold at its weight), laid out and
+rendered through the reference renderer: the face must be used, no character
+may be unsupported, HarfBuzz must return no .notdef and the rendering must have
+ink. The explicit script tests live in test_engine.py; the hand-written
+multilingual set is checked here too (and never drawn with a weight sibling).
 """
 
 from __future__ import annotations
@@ -40,15 +40,21 @@ def unicode_data() -> Any:
 
 
 def test_every_text_face_draws_its_own_sample(fonts: Any, unicode_data: Any) -> None:
-    samples = face_samples(fonts, unicode_data, size_px=24)
+    # 170 regular faces; a weight sibling (Noto Sans Bold, face 172) is never chosen at the regular weight,
+    # so its sample is drawn at its own weight.
     text_faces = [f for f in fonts.faces if f.path is not None]
-    assert len(samples) == len(text_faces) == 170
+    regular = [f for f in text_faces if f.regular_face_id is None]
+    samples = face_samples(fonts, unicode_data, size_px=24)
+    assert len(samples) == len(text_faces) and len(regular) == 170
+    assert {s.face_id for s in samples if s.weight == "bold"} == {f.face_id for f in text_faces
+                                                                  if f.regular_face_id is not None}
     problems = []
     for sample in samples:
         if not sample.text:
             problems.append((sample.face_id, sample.key, "no character drawn by this face"))
             continue
-        block = layout_text(sample.text, fonts, width=760, size_px=24, language=sample.language)
+        block = layout_text(sample.text, fonts, width=760, size_px=24, language=sample.language,
+                            weight=sample.weight)  # type: ignore[arg-type]
         if sample.face_id not in block.faces:
             problems.append((sample.face_id, sample.key, f"drawn with {block.faces}"))
         if block.unsupported or block.notdef:
@@ -64,3 +70,4 @@ def test_multilingual_samples(fonts: Any, label: str, language: str, text: str) 
     assert block.unsupported == () and block.notdef == 0, label
     assert all(line.width <= 380 for line in block.lines)
     assert _ink(fonts, block) > 0
+    assert all(fonts.face(f).regular_face_id is None for f in block.faces), "a weight sibling drew regular text"

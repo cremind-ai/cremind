@@ -17,6 +17,8 @@ from typing import Any
 
 import typer
 
+from app.tags.runtime.protocol.ids import FONT_SIZES
+
 app = typer.Typer(name="preview", help="Render cards, screens or text to PNG exactly as a bridge would draw them.",
                   no_args_is_help=True)
 
@@ -131,15 +133,41 @@ def _read_json(path: Path) -> Any:
         raise _fail(f"{path}: {exc}") from None
 
 
+def _leading(value: str) -> str | tuple[int, int]:
+    """``font``, ``tight`` or ``ASCENT,DESCENT`` (whole pixels)."""
+    if value in ("font", "tight"):
+        return value
+    try:
+        ascent, descent = (int(v) for v in value.split(","))
+    except ValueError:
+        raise _fail("--leading must be font, tight or ASCENT,DESCENT (e.g. 13,4)") from None
+    if ascent < 0 or descent < 0:
+        raise _fail("--leading ASCENT,DESCENT must be >= 0")
+    return ascent, descent
+
+
 @app.command()
 def text(
     value: str = typer.Argument(..., help="Text to lay out ('\\n' in the text separates paragraphs)."),
-    size: int = typer.Option(24, "--size", help="Strike size in px (16, 24, 32)."),
+    size: int = typer.Option(24, "--size", help=f"Strike size in px: one of {', '.join(map(str, FONT_SIZES))} "
+                                               "that the pack has."),
     width: int = typer.Option(380, "--width", min=1, max=4000, help="Box width in px."),
     lang: str = typer.Option("", "--lang", help="BCP-47 language hint (face choice, breaking, direction)."),
     direction: str = typer.Option("auto", "--dir", help="Paragraph direction: auto, ltr or rtl."),
     align: str = typer.Option("start", "--align", help="start, end, center, left or right."),
     max_lines: int | None = typer.Option(None, "--max-lines", min=1, help="Cut with an ellipsis after N lines."),
+    weight: str = typer.Option("regular", "--weight",
+                               help="regular or bold (Latin, Greek and Cyrillic; other scripts, and packs without "
+                                    "a bold face, stay regular)."),
+    leading: str = typer.Option("font", "--leading",
+                                help="Line box each line starts from: font (strike metrics), tight (ascender and "
+                                     "descender ink) or ASCENT,DESCENT in px; lines still grow to their ink."),
+    tracking: int = typer.Option(0, "--tracking", min=0, max=8,
+                                 help="Pixels added between letters of grid-fitted (Latin, Greek, Cyrillic) runs; "
+                                      "turns ligatures off."),
+    grid_fit: bool = typer.Option(True, "--grid-fit/--no-grid-fit",
+                                  help="Place Latin, Greek and Cyrillic on the pack's hinted advances (default), or "
+                                       "everything on HarfBuzz's unhinted positions."),
     red: bool = typer.Option(False, "--red", help="Draw in red (a black/white/red preview)."),
     out: Path = typer.Option(Path("preview-text.png"), "--out", "-o", help="PNG to write."),
     scale: int = ScaleOpt,
@@ -148,17 +176,26 @@ def text(
 ) -> None:
     """Lay out one text and render it; prints lines, faces and unsupported characters."""
     from app.tags.runtime.compose.preview import render_png
-    from app.tags.runtime.layout import layout_text
+    from app.tags.runtime.layout import FontContext, layout_text
     from app.tags.runtime.protocol.ids import Color
     from app.tags.runtime.protocol.layout import Layout
 
     if direction not in ("auto", "ltr", "rtl") or align not in ("start", "end", "center", "left", "right"):
         raise _fail("--dir must be auto/ltr/rtl and --align start/end/center/left/right")
+    if weight not in ("regular", "bold"):
+        raise _fail("--weight must be regular or bold")
+    line_box = _leading(leading)
     fonts = _fonts(pack, cache)
+    ctx = FontContext.for_fontset(fonts)
     if not fonts.has_strike(1 if any(f.face_id == 1 for f in fonts.faces) else fonts.faces[1].face_id, size):
-        raise _fail(f"the pack has no {size} px strikes")
+        sizes = ", ".join(map(str, ctx.text_sizes()))
+        raise _fail(f"the pack has no {size} px strikes (its text sizes: {sizes})")
+    if weight == "bold" and not ctx.has_weight("bold", size):
+        typer.secho(f"note: the pack has no bold face at {size} px; the text is drawn regular",
+                    fg=typer.colors.YELLOW)
     block = layout_text(value.replace("\\n", "\n"), fonts, width=width, size_px=size, language=lang,
-                        direction=direction, align=align, max_lines=max_lines)  # type: ignore[arg-type]
+                        direction=direction, align=align, max_lines=max_lines, weight=weight,  # type: ignore[arg-type]
+                        leading=line_box, tracking=tracking, grid_fit=grid_fit)  # type: ignore[arg-type]
     pad = 4
     layout = Layout(width + 2 * pad, max(1, block.height + 2 * pad), 0, Color.WHITE,
                     tuple(block.commands(pad, pad, Color.RED if red else Color.BLACK)))
