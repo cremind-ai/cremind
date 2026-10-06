@@ -1,0 +1,6 @@
+.env
+.monitor/
+.listener.lock
+.listener_heartbeat
+__pycache__/
+*.pyc

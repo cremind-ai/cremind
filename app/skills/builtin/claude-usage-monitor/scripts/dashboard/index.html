@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Usage Monitor</title>
+    <link rel="icon" href="/icon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="brand">
+          <img src="/icon.svg" alt="" />
+          <div>
+            <h1>Claude Usage Monitor</h1>
+            <p class="sub" id="subtitle">Starting…</p>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <button id="theme-toggle" class="ghost small" type="button" aria-label="Switch theme">◐ Theme</button>
+      </header>
+
+      <div id="link-banner" class="banner" hidden>
+        <span class="icon" aria-hidden="true">▲</span>
+        <div id="link-banner-text"></div>
+      </div>
+
+      <!-- Running account -->
+      <section class="card" id="hero-card" aria-labelledby="hero-heading">
+        <div class="card-head">
+          <h2 id="hero-heading">Running now</h2>
+          <div class="spacer"></div>
+          <span id="hero-chip"></span>
+        </div>
+        <div id="hero-body">
+          <p class="empty">Waiting for the first reply from a Claude Code session…</p>
+        </div>
+      </section>
+
+      <!-- 5-hour window chart -->
+      <section class="card" id="chart-card" hidden aria-labelledby="chart-heading">
+        <div class="card-head">
+          <div>
+            <h2 id="chart-heading">This 5-hour window</h2>
+            <figcaption id="chart-caption"></figcaption>
+          </div>
+          <div class="spacer"></div>
+          <button id="table-toggle" class="ghost small" type="button" aria-expanded="false" aria-controls="chart-table">
+            Table view
+          </button>
+        </div>
+        <figure>
+          <div class="chart-wrap" id="chart-wrap"></div>
+          <div class="table-view" id="chart-table" hidden></div>
+        </figure>
+      </section>
+
+      <!-- All accounts -->
+      <section class="card flush" aria-labelledby="accounts-heading">
+        <div class="card-head" style="padding: 18px 18px 0; margin-bottom: 8px">
+          <h2 id="accounts-heading">All accounts</h2>
+          <div class="spacer"></div>
+          <span class="sub" id="accounts-note"></span>
+        </div>
+        <div style="overflow-x: auto">
+          <table>
+            <thead>
+              <tr>
+                <th>Account</th>
+                <th>Status</th>
+                <th>5-hour session</th>
+                <th>Weekly</th>
+                <th class="hide-sm">Figures as of</th>
+                <th class="right"><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody id="accounts-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Profiles: how accounts get tracked -->
+      <section class="card" aria-labelledby="profiles-heading">
+        <div class="card-head">
+          <h2 id="profiles-heading">Tracking more accounts</h2>
+        </div>
+        <p class="sub" style="margin-bottom: 12px">
+          Claude only reveals an account's usage to a session signed in to it. Give each extra account its own
+          Claude Code profile — a separate config folder with its own login — and it is tracked alongside your main one
+          without ever changing which account your sessions use.
+        </p>
+        <ol class="steps">
+          <li>Ask Cremind to <b>add a Claude account profile</b>, e.g. “add a Claude usage profile named spare1”. A window opens with Claude Code in the new profile.</li>
+          <li>Sign in there with the account to track, type <code>/usage</code>, then <code>/exit</code>.</li>
+          <li>To refresh it later, press <b>Open</b> below and run <code>/usage</code> again. Idle accounts stay accurate on their own — usage only grows when an account is used.</li>
+        </ol>
+        <ul class="profiles" id="profiles-list"></ul>
+      </section>
+
+      <!-- Activity -->
+      <section class="card" aria-labelledby="events-heading">
+        <div class="card-head">
+          <h2 id="events-heading">Activity</h2>
+        </div>
+        <ul class="events" id="events-list"></ul>
+      </section>
+
+      <!-- Settings -->
+      <section class="card">
+        <details id="settings">
+          <summary>Alert settings</summary>
+          <p class="sub" style="margin-bottom: 14px">
+            Either limit interrupts a session when it runs out, so each has the same two alerts. An account past a
+            switch-now threshold isn't suggested as the next one until that limit resets.
+          </p>
+          <div class="settings-grid">
+            <fieldset class="limit-group">
+              <legend>5-hour limit</legend>
+              <div class="field">
+                <label for="warnPct">Heads-up at</label>
+                <div class="row"><input type="number" id="warnPct" min="1" max="100" step="1" /> <span class="sub">%</span></div>
+              </div>
+              <div class="field">
+                <label for="critPct">Switch now at</label>
+                <div class="row"><input type="number" id="critPct" min="1" max="100" step="1" /> <span class="sub">%</span></div>
+              </div>
+            </fieldset>
+            <fieldset class="limit-group">
+              <legend>Weekly limit</legend>
+              <div class="field">
+                <label for="weeklyWarnPct">Heads-up at</label>
+                <div class="row"><input type="number" id="weeklyWarnPct" min="1" max="100" step="1" /> <span class="sub">%</span></div>
+              </div>
+              <div class="field">
+                <label for="weeklyCritPct">Switch now at</label>
+                <div class="row"><input type="number" id="weeklyCritPct" min="1" max="100" step="1" /> <span class="sub">%</span></div>
+              </div>
+              <span class="hint">
+                Higher than the 5-hour ones because 1% of the weekly limit is about 5× as much usage: the last 5%
+                still lasts around half an hour of heavy use.
+              </span>
+            </fieldset>
+            <div class="field">
+              <label for="etaAlertMin">Alert when either limit is</label>
+              <div class="row"><input type="number" id="etaAlertMin" min="0" max="120" step="1" /> <span class="sub">minutes away</span></div>
+              <span class="hint">Based on the measured burn rate. 0 turns this off.</span>
+            </div>
+            <div class="field">
+              <span class="row"><input type="checkbox" id="events" /> <label for="events">Send alerts to Cremind events</label></span>
+              <span class="row"><input type="checkbox" id="sound" /> <label for="sound">Beep in this tab</label></span>
+              <button id="test-alert" class="small" type="button" style="align-self: start; margin-top: 4px">Send a test alert</button>
+              <span class="hint" id="events-hint">
+                Each alert is a Cremind skill event. Ask Cremind to notify you about Claude usage alerts and it subscribes
+                to them; with no subscription an alert only appears here.
+              </span>
+            </div>
+          </div>
+          <p class="sub" id="settings-saved" style="margin-top: 12px" hidden>Saved.</p>
+        </details>
+      </section>
+
+      <section class="card">
+        <details>
+          <summary>How the figures are measured</summary>
+          <div class="method">
+            <p>
+              <b>Official readings</b> come from Claude Code itself: its own usage cache (refreshed when you sign in or
+              run <code>/usage</code>), the terminal status line after each reply, and limit-reached notices.
+            </p>
+            <p>
+              <b>Between readings</b> — and for VS Code sessions, which never run a status line — the monitor adds up what
+              each reply cost at API list prices, from the session transcripts, and converts it with a calibration:
+              <span id="calibration-note">…</span> Figures built this way are marked <b>≈</b>. Each new official
+              reading replaces the estimate and refines the calibration.
+            </p>
+            <p>
+              Usage made outside this computer (claude.ai, the mobile apps, another machine) only shows up at the next
+              official reading.
+            </p>
+            <p id="statusline-note" class="sub"></p>
+          </div>
+        </details>
+      </section>
+
+      <p class="sub" style="text-align: center">
+        Reads only usage figures, token counts and the signed-in account from Claude Code's own files. Login tokens and
+        conversation content are never read.
+      </p>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
