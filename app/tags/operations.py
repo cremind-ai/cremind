@@ -27,6 +27,7 @@ controller key, the profile's UUID and this server's authority.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Any
 
@@ -55,6 +56,11 @@ WAITING = "waiting_for_connect"
 # A gateway binding the worker can act through (claimed; ready once it has reported in).
 GATEWAY_READY = ("paired", "ready")
 _PAIR_KINDS = {"bridge": "pair_bridge", "tag": "pair_tag"}
+# A tag enrolled over SWD with the hardware tools (protocol v1) joins without a label: an import, followed
+# through the pairing endpoints like a pairing.
+_IMPORT = "import_tag"
+_PAIRING_KINDS = (*_PAIR_KINDS.values(), _IMPORT)
+_V1_DEVICE_LABEL = b"cremind-tag/v1-tag"
 _HEX32 = set("0123456789abcdef")
 VAULT_KEEP = 3
 
@@ -583,7 +589,7 @@ async def start_pairing(profile: str, body: dict[str, Any]) -> dict[str, Any]:
 
 async def get_pairing(profile: str, op_id: str) -> dict[str, Any]:
     async with get_tag_storage().engine.connect() as conn:
-        row = await _own_operation(conn, profile, op_id, tuple(_PAIR_KINDS.values()))
+        row = await _own_operation(conn, profile, op_id, _PAIRING_KINDS)
         return await pairing_json(conn, row)
 
 
@@ -606,7 +612,7 @@ async def cancel_pairing(profile: str, op_id: str) -> dict[str, Any]:
     now = now_ms()
     async with get_tag_storage().engine.begin() as conn:
         await begin_write(conn)
-        row = await _own_operation(conn, profile, op_id, tuple(_PAIR_KINDS.values()))
+        row = await _own_operation(conn, profile, op_id, _PAIRING_KINDS)
         await cancel_operation_row(conn, row, now, reason="Cancelled.")
         if row.binding_id and row.state not in FINAL_STATES:
             binding = (await conn.execute(select(BINDINGS).where(BINDINGS.c.id == row.binding_id))).first()
@@ -619,11 +625,140 @@ async def cancel_pairing(profile: str, op_id: str) -> dict[str, Any]:
     return out
 
 
+def _protocol(binding: Any) -> int:
+    """1 for a tag imported from the hardware tools (no v2 ownership to release or rekey), else 2."""
+    return 1 if (binding.info or {}).get("proto") == 1 else 2
+
+
 async def _forget_binding(conn, binding: Any, now: float, *, reason: str, cleanup: str) -> None:
     await tombstone(conn, binding, reason=reason, cleanup=cleanup, now=now)
     await conn.execute(delete(BINDINGS).where(BINDINGS.c.id == binding.id))
     if binding.tag_device_id:
         await conn.execute(delete(DEVICES).where(DEVICES.c.id == binding.tag_device_id))
+
+
+# ── import (a tag enrolled with the hardware tools) ──
+
+
+def v1_device_id(tag_id: int) -> str:
+    """A v1 tag's stand-in device id (hex): its tag id, little-endian, so that its short id and hw id stay
+    the tag id, then a fixed hash of it. A v1 tag has no identity key; this only keys its binding, so the
+    same tag cannot be bound twice on this server."""
+    raw = tag_id.to_bytes(4, "little")
+    return (raw + hashlib.sha256(_V1_DEVICE_LABEL + raw).digest()[:12]).hex()
+
+
+def _import_tag_id(value: Any) -> int:
+    text = str(value if value is not None else "").strip()
+    text = text[2:] if text.lower().startswith("0x") else text
+    if len(text) == 8 and set(text.lower()) <= _HEX32 and 1 <= int(text, 16) <= 0xFFFFFFFE:
+        return int(text, 16)
+    raise TagError(422, "invalid_tag_id", "'tag_id' is the tag id the hardware tools printed: 8 hex digits, "
+                                          "e.g. 1A2B3C4D.")
+
+
+async def _may_import_on(conn, comp: Any, profile: str, profile_id: str) -> bool:
+    """The gateway's worker reads the tag's secret from the hardware tools on its own computer, so only the
+    owner of that computer may import: the admin on the server's computer, the enrolling profile on a
+    desktop it enrolled."""
+    from app.tags.hosts import HOSTS
+
+    host = (await conn.execute(select(HOSTS).where(HOSTS.c.id == comp.host_id))).first() if comp.host_id else None
+    if host is None or host.state != "active":
+        return False
+    if host.kind == "server":
+        return profile == "admin"
+    return host.kind == "desktop" and host.owner_profile_id == profile_id
+
+
+async def _import_parent(conn, comp: Any) -> tuple[Any, str | None]:
+    """Where an imported tag connects: the gateway's own radio while it reaches tags, else the first ready
+    bridge with room (locked, so two adds cannot both take its last slot). ``(None, reason)`` when none."""
+    gateway = await _serving_gateway(conn, comp)
+    bridges = (await conn.execute(select(BINDINGS.c.tag_device_id).where(
+        BINDINGS.c.companion_id == comp.id, BINDINGS.c.role == "bridge", BINDINGS.c.state == "ready",
+    ).order_by(BINDINGS.c.created_at))).scalars().all()
+    places = ([gateway.id] if gateway is not None else []) + [b for b in bridges if b]
+    for place in places:
+        parent = (await conn.execute(select(DEVICES).where(DEVICES.c.id == place).with_for_update())).first()
+        if not await _can_parent(conn, comp, parent):
+            continue
+        max_tags = parent_capacity(parent.kind, parent.info)
+        if max_tags is not None and await _taken(conn, parent.id) + await _reserved(conn, comp.id, parent.id) >= max_tags:
+            continue
+        return parent, None
+    return None, "bridge_full" if places else "no_ready_bridge"
+
+
+async def start_import(profile: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Add a tag enrolled over SWD with ``cremind tags tools tag enroll`` (protocol v1: no setup label, no
+    pairing). The gateway's worker takes the tag's secret and panel from the hardware tools on its computer,
+    keeps the secret (and a sealed copy in the recovery vault), assigns the tag's key and clears its screen:
+    the clear proves the secret is the tag's. The device row and binding exist from the start; a failed or
+    cancelled import removes them. Followed like a pairing (``GET /api/tags/pairings/{id}``)."""
+    require_simple_setup()
+    tag_id = _import_tag_id(body.get("tag_id"))
+    name = body.get("name")
+    if name is not None:
+        from app.tags.service import device_name
+
+        name = device_name(name)
+    gateway_id = body.get("gateway_id")
+    now = now_ms()
+    async with get_tag_storage().engine.begin() as conn:
+        await begin_write(conn)
+        profile_id = await _profile_ids(conn, profile)
+        comps = [c for c in await _usable_companions(conn, profile, profile_id) if await _ready_gateway(conn, c)]
+        if not comps:
+            raise TagError(409, "no_gateway", "Connect a gateway first.")
+        if gateway_id is None and len(comps) > 1:
+            raise TagError(409, "gateway_required", "Choose the gateway the tag should use.")
+        comp = next((c for c in comps if gateway_id is None or c.id == gateway_id), None)
+        if comp is None:
+            raise TagError(404, "connection_not_found", "No connected gateway with that id.")
+        if comp.paused:
+            raise TagError(409, "gateway_paused", "The gateway is paused; resume it first.")
+        if not await _may_import_on(conn, comp, profile, profile_id):
+            raise TagError(403, "import_not_allowed", "Only the owner of the computer this gateway is plugged into "
+                                                      "can add tags enrolled there with the hardware tools.")
+        device = v1_device_id(tag_id)
+        hw = f"{tag_id:08X}"
+        bound = (await conn.execute(select(BINDINGS.c.id).where(BINDINGS.c.device_id == device))).first()
+        known = (await conn.execute(select(DEVICES.c.id).where(
+            DEVICES.c.companion_id == comp.id, DEVICES.c.kind == "tag", DEVICES.c.hw_id == hw))).first()
+        if bound is not None or known is not None:
+            raise TagError(409, "already_paired", "This tag is already set up.")
+        parent, reason = await _import_parent(conn, comp)
+        if parent is None:
+            if reason == "bridge_full":
+                raise TagError(409, "bridge_full", "Your gateway and its bridges have no room for another tag.")
+            raise TagError(409, "no_ready_bridge", "Your gateway cannot reach tags itself: add a bridge first, and "
+                                                   "wait until it shows Ready.")
+        device_row_id, binding_id = str(uuid.uuid4()), str(uuid.uuid4())
+        await conn.execute(DEVICES.insert(), [{
+            "id": device_row_id, "companion_id": comp.id, "kind": "tag", "hw_id": hw, "name": name or "New tag",
+            "owner_profile": profile, "bridge_device_id": parent.id, "epoch": 0, "rotation": 0,
+            "info": {"device_id": device, "protocol": 1}, "status": "pairing", "desired_revision": 0,
+            "displayed_revision": 0, "clear_required": True, "claimed_at": now, "created_at": now,
+            "updated_at": now,
+        }])
+        await conn.execute(BINDINGS.insert(), [{
+            "id": binding_id, "device_id": device, "role": "tag", "identity_pub": "00" * 32, "short_id": tag_id,
+            "companion_id": comp.id, "tag_device_id": device_row_id, "owner_profile": profile,
+            "owner_profile_id": profile_id, "state": "pairing", "generation": 0, "pending_generation": None,
+            "paused": False, "fw": None, "board": None, "info": {"proto": 1}, "created_at": now, "updated_at": now,
+            "paired_at": None, "ready_at": None,
+        }])
+        op_args = {"role": "tag", "tag_id": tag_id, "device_id": device, "name": name or "",
+                   "bridge_hw_id": parent.hw_id, "bridge_id": parent.id,
+                   "first_tag": await _first_tag(conn, profile_id)}
+        row = await queue_operation(conn, kind=_IMPORT, profile=profile, profile_id=profile_id,
+                                    companion_id=comp.id, binding_id=binding_id, args=op_args, now=now,
+                                    stage="waiting_for_device")
+        out = await pairing_json(conn, (await conn.execute(
+            select(OPERATIONS).where(OPERATIONS.c.id == row["id"]))).first(), now)
+    notify_commands([comp.id])
+    return out
 
 
 # ── unpair (Remove), pause, move, test ──
@@ -680,9 +815,9 @@ async def unpair(profile: str, device_row_id: str, body: dict[str, Any]) -> dict
                     status="needs_bridge", updated_at=now))
         args = {"device_id": binding.device_id, "role": binding.role, "hw_id": dev.hw_id if dev is not None else None,
                 "generation": int(binding.generation or 0), "epoch": int(dev.epoch or 0) if dev is not None else 0,
-                "affected": affected,
-                "devices": [{"device_id": b.device_id, "role": b.role, "generation": int(b.generation or 0)}
-                            for b in targets]}
+                "affected": affected, "protocol": _protocol(binding),
+                "devices": [{"device_id": b.device_id, "role": b.role, "generation": int(b.generation or 0),
+                             "protocol": _protocol(b)} for b in targets]}
         op = await queue_operation(conn, kind=kind, profile=profile, profile_id=profile_id, companion_id=comp.id,
                                    binding_id=binding.id, args=args, now=now, stage="queued")
         wake.append(comp.id)
@@ -1002,6 +1137,9 @@ async def _device_report(conn, op: Any, comp: Any, report: dict[str, Any], now: 
             info["fontpack_id"] = report["fontpack_id"][:32]
         if isinstance(report.get("fontpack_ok"), bool):
             info["fontpack_ok"] = report["fontpack_ok"]
+    if binding.role == "tag" and op.kind in ("pair_tag", _IMPORT) and not dev.rotation and "panel" in values:
+        # A new tag reads the way its panel sits in it (the 2.13-inch Hema: landscape, rotation 3).
+        values["rotation"] = _default_rotation(values["panel"])
     epoch = _u32(report.get("epoch"))
     if binding.role == "tag" and epoch is not None and epoch > int(dev.epoch or 0):
         values["epoch"] = epoch
@@ -1009,6 +1147,18 @@ async def _device_report(conn, op: Any, comp: Any, report: dict[str, Any], now: 
             DELIVERIES.c.tag_device_id == dev.id, DELIVERIES.c.stage.in_(ACTIVE_STAGES)).values(epoch=epoch))
     values["info"] = info
     await conn.execute(update(DEVICES).where(DEVICES.c.id == dev.id).values(**values))
+
+
+def _default_rotation(panel: int) -> int:
+    """The quarter turns a new tag with ``panel`` gets (its panel profile's)."""
+    try:
+        from app.tags.runtime.enroll.hardware import PANEL_PROFILES
+        from app.tags.runtime.protocol.ids import Panel
+
+        profile = PANEL_PROFILES.get(Panel(panel))
+    except (ImportError, ValueError):
+        return 0
+    return profile.rotation if profile is not None else 0
 
 
 async def _mark_ready(conn, binding: Any, now: float, *, lift_clear: bool) -> list[str]:
@@ -1117,7 +1267,7 @@ async def _finish(conn, op: Any, comp: Any, state: str, now: float,
             if binding.tag_device_id:
                 await conn.execute(update(DEVICES).where(DEVICES.c.id == binding.tag_device_id).values(
                     status="ok", updated_at=now))
-    elif op.kind in ("pair_bridge", "pair_tag") and binding is not None:
+    elif op.kind in ("pair_bridge", "pair_tag", _IMPORT) and binding is not None:
         if state == "succeeded":
             lifted += await _mark_ready(conn, binding, now, lift_clear=True)
         elif state == "failed" and binding.state == "pairing":
@@ -1472,6 +1622,6 @@ __all__ = [
     "cancel_pairing", "cancel_waiting_recovery", "connections", "discovery_json", "expire_operations",
     "get_discovery", "get_pairing", "get_recovery", "issue_grant", "lease", "move_tag", "on_worker_heartbeat",
     "operation_json", "progress", "require_simple_setup", "send_test", "set_paused", "simple_setup_enabled",
-    "start_discovery", "start_pairing", "start_recovery", "unpair", "vault_get", "vault_put",
-    "worker_operation", "worker_state",
+    "start_discovery", "start_import", "start_pairing", "start_recovery", "unpair", "v1_device_id", "vault_get",
+    "vault_put", "worker_operation", "worker_state",
 ]

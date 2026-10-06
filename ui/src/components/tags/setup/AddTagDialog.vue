@@ -11,6 +11,10 @@
  * step offers "Show this profile's activity on this tag", on by default, and
  * turns Tags on when the dialog is finished. The preference is never touched
  * otherwise (re-pairing, a later tag, or the switch turned off).
+ *
+ * A tag enrolled over SWD with the hardware tools has no label: "Enrolled with
+ * the hardware tools?" takes its tag id instead (an import, followed like a
+ * pairing).
  */
 import { computed, nextTick, ref, watch } from 'vue';
 import { ElButton, ElDialog, ElInput, ElMessage, ElResult, ElSwitch } from 'element-plus';
@@ -30,13 +34,17 @@ const tagsStore = useTagsStore();
 const setup = useTagsSetupStore();
 const {
   codeText, parsed, name, codeError, choiceError, discovery, pairing, candidates, chosen, busy, stopping, step,
-  problem, lookingFor, near, find, pair, cancel, again, resume, reset,
+  problem, lookingFor, near, find, pair, importTag, cancel, again, resume, reset,
 } = useDevicePairing('tag');
 
 const codeInput = ref<InstanceType<typeof SetupCodeInput> | null>(null);
 const turnOn = ref(true);
 const finishing = ref(false);
 const testing = ref(false);
+/** A tag without a label (enrolled with the hardware tools): added by its tag id. */
+const byTagId = ref(false);
+const tagIdText = ref('');
+const tagIdOk = computed(() => /^(0x)?[0-9a-f]{8}$/i.test(tagIdText.value.trim()));
 
 const device = computed(() => pairing.value?.device ?? null);
 const title = computed(() => (device.value ? setupDeviceTitle(device.value) : 'Your tag'));
@@ -51,6 +59,8 @@ watch(() => props.modelValue, async (open) => {
   if (!open) return;
   reset();
   turnOn.value = true;
+  byTagId.value = false;
+  tagIdText.value = '';
   if (props.resume) resume(props.resume);
   await nextTick();
   if (step.value === 'code') codeInput.value?.focus();
@@ -73,7 +83,17 @@ async function sendTest() {
 /** Same code again; a setup resumed after a refresh has no code, so back to the label. */
 function searchAgain() {
   again();
-  if (parsed.value) void find();
+  if (byTagId.value && tagIdOk.value) void importTag(tagIdText.value);
+  else if (parsed.value) void find();
+}
+
+function addByTagId() {
+  if (tagIdOk.value) void importTag(tagIdText.value);
+}
+
+function useTagId(on: boolean) {
+  byTagId.value = on;
+  codeError.value = '';
 }
 
 function close() {
@@ -132,20 +152,49 @@ function beforeClose(_done: () => void) {
       @again="again()"
     >
       <template #code>
-        <p class="intro-text">
-          Find the label on the back of the tag. Scan its QR code, upload a photo of it, or type the
-          code. Keep the tag close to {{ near }}.
-        </p>
-        <SetupCodeInput
-          ref="codeInput"
-          v-model="codeText"
-          role="tag"
-          :server-error="codeError"
-          @parsed="(v) => (parsed = v)"
-          @submit="find()"
-        />
+        <template v-if="!byTagId">
+          <p class="intro-text">
+            Find the label on the back of the tag. Scan its QR code, upload a photo of it, or type the
+            code. Keep the tag close to {{ near }}.
+          </p>
+          <SetupCodeInput
+            ref="codeInput"
+            v-model="codeText"
+            role="tag"
+            :server-error="codeError"
+            @parsed="(v) => (parsed = v)"
+            @submit="find()"
+          />
+        </template>
+        <template v-else>
+          <p class="intro-text">
+            A tag enrolled with the hardware tools has no label. With your gateway plugged into the
+            computer where the tag was enrolled, type the tag id the enrollment printed. Keep the tag
+            close to {{ near }}.
+          </p>
+          <label class="field-label" for="add-tag-id">Tag id</label>
+          <ElInput
+            id="add-tag-id"
+            v-model="tagIdText"
+            maxlength="10"
+            placeholder="1A2B3C4D"
+            :class="{ 'is-error': !!codeError }"
+            @input="codeError = ''"
+            @keyup.enter="addByTagId()"
+          />
+          <p v-if="codeError" class="field-error" role="alert">{{ codeError }}</p>
+        </template>
         <label class="field-label" for="add-tag-name">Name <span class="optional">(optional)</span></label>
-        <ElInput id="add-tag-name" v-model="name" maxlength="128" placeholder="Kitchen" @keyup.enter="parsed && find()" />
+        <ElInput
+          id="add-tag-name"
+          v-model="name"
+          maxlength="128"
+          placeholder="Kitchen"
+          @keyup.enter="byTagId ? addByTagId() : parsed && find()"
+        />
+        <ElButton class="mode-link" link type="primary" @click="useTagId(!byTagId)">
+          {{ byTagId ? 'Use the setup code on a label instead' : 'Enrolled with the hardware tools? Add it by its tag id' }}
+        </ElButton>
       </template>
 
       <template #done>
@@ -175,7 +224,10 @@ function beforeClose(_done: () => void) {
     <template #footer>
       <template v-if="step === 'code'">
         <ElButton @click="close">Cancel</ElButton>
-        <ElButton type="primary" :disabled="!parsed" :loading="busy === 'find'" @click="find()">Find tag</ElButton>
+        <ElButton v-if="byTagId" type="primary" :disabled="!tagIdOk" :loading="busy === 'pair'" @click="addByTagId()">
+          Add tag
+        </ElButton>
+        <ElButton v-else type="primary" :disabled="!parsed" :loading="busy === 'find'" @click="find()">Find tag</ElButton>
       </template>
       <template v-else-if="step === 'searching' || step === 'choose'">
         <ElButton @click="again()">Back</ElButton>
@@ -196,6 +248,8 @@ function beforeClose(_done: () => void) {
 .intro-text { margin: 0 0 10px; font-size: 0.88rem; line-height: 1.55; color: var(--text-primary); }
 .field-label { display: block; margin: 14px 0 6px; font-size: 0.82rem; font-weight: 600; color: var(--text-secondary); }
 .optional { font-weight: 400; color: var(--text-tertiary); }
+.field-error { margin: 6px 0 0; font-size: 0.8rem; color: var(--el-color-danger); }
+.mode-link { margin-top: 12px; padding: 0; font-size: 0.82rem; }
 .done-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
 .done-actions .el-button + .el-button { margin-left: 0; }
 .btn-icon { margin-right: 6px; }

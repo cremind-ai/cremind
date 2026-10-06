@@ -72,6 +72,17 @@ async def start_pairing(client, discovery_id: str, candidate_id: str, name: Opti
     return _obj(await client.post_json("/api/tags/pairings", body))
 
 
+async def import_tag(client, tag_id: str, *, gateway_id: Optional[str] = None,
+                     name: Optional[str] = None) -> dict[str, Any]:
+    """`{pairing}` for a tag enrolled with the hardware tools (followed with :func:`get_pairing`)."""
+    body: dict[str, Any] = {"tag_id": tag_id, "idempotency_key": _key()}
+    if gateway_id:
+        body["gateway_id"] = gateway_id
+    if name:
+        body["name"] = name
+    return _obj(await client.post_json("/api/tags/imports", body))
+
+
 async def get_pairing(client, pairing_id: str) -> dict[str, Any]:
     return _obj(await client.get_json(f"/api/tags/pairings/{_seg(pairing_id)}"))
 

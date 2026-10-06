@@ -109,7 +109,8 @@ computer). Sessions expire 5 minutes after creation unless redeemed.
 | POST | `/api/tags/discovery` | `{role: bridge|tag, setup_code, gateway_id?, duration_s?}` → 201 `{discovery}` |
 | GET | `/api/tags/discovery/{id}` | → `{discovery}` |
 | POST | `/api/tags/pairings` | `{discovery_id, candidate_id, name?}` → 201 `{pairing}` |
-| GET / DELETE | `/api/tags/pairings/{id}` | → `{pairing}` |
+| GET / DELETE | `/api/tags/pairings/{id}` | → `{pairing}` (also an import's) |
+| POST | `/api/tags/imports` | `{tag_id, name?, gateway_id?}` → 201 `{pairing}`: a tag enrolled with the hardware tools (see **Import**) |
 | POST | `/api/tags/devices/{id}/unpair` | `{}` → `{operation, device}` |
 | POST | `/api/tags/devices/{id}/pause` / `resume` | `{}` → `{device}` (gateway: the whole connection) |
 | POST | `/api/tags/devices/{id}/move` | `{bridge_id}` → `{operation}`: a ready tag onto its own gateway (while that `serves_tags`) or a ready bridge of that gateway; 409 `not_movable`, `candidate_not_eligible`, `bridge_full` |
@@ -145,6 +146,25 @@ device id>}` and makes the gateway the tag's parent.
 **Pairing**: an Operation plus `"role"`, `"first_tag": bool` (the profile's
 first tag: the page offers "Send this profile's activity", on by default).
 
+**Import** (`import_tag`): a tag enrolled over SWD with the hardware tools
+(`cremind tags tools tag enroll`, protocol v1) has no setup label and cannot
+take a pairing grant. The import names it by its tag id (8 hex digits); the
+gateway's worker takes the tag's secret and panel from the hardware tools on
+its own computer, keeps the secret (and a sealed copy in the vault, entry
+`{role: tag, proto: 1, secret, tag_id, bridge, epoch, board, panel, …}`),
+assigns the tag's v1 `K_epoch` on the gateway's own radio (or the first ready
+bridge with room) and clears it — the clear proves the secret is the tag's.
+Only the owner of the gateway's computer may import (the admin on the server's
+own computer, the enrolling profile on its desktop): 403 `import_not_allowed`.
+The binding exists from the start, keyed by a stand-in device id (the tag id,
+little-endian, then 12 bytes of `SHA-256("cremind-tag/v1-tag" ‖ tag id)`;
+`identity_pub` all zeros, `info.proto` 1), so a tag binds once per server
+(409 `already_paired`); a failed or cancelled import removes it. Followed with
+`GET /api/tags/pairings/{id}` like a pairing; worker failures `not_enrolled_here`
+(the tools there have no such tag) and `panel_unsupported` (its firmware drives
+no display). Removing an imported tag has no release (the worker drops the key;
+the tag keeps its enrollment), and a recovery restores it from the vault.
+
 **Recovery**: an Operation plus `"companion_id"` and
 `"devices": [{"id", "kind", "name", "state": "pending|rekeyed|recovery_pending|failed"}]`.
 
@@ -152,7 +172,8 @@ Error codes: `simple_setup_disabled` (403), `setup_code_invalid`,
 `setup_code_wrong_role` (422), `no_gateway`, `gateway_required`,
 `gateway_offline`, `no_ready_bridge` (409), `device_owned` (409),
 `candidate_not_eligible` (409), `bridge_full` (409), `not_found` (404),
-`session_expired` (410), `not_approved`, `already_redeemed` (409).
+`session_expired` (410), `not_approved`, `already_redeemed` (409),
+`invalid_tag_id` (422), `import_not_allowed` (403), `already_paired` (409).
 
 `no_ready_bridge` (a tag's search): nothing can take a tag — no unpaused
 gateway serves tags itself and none has a ready bridge. The message says which:

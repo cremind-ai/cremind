@@ -144,6 +144,26 @@ export function useDevicePairing(role: 'bridge' | 'tag') {
     }
   }
 
+  /** A tag enrolled with the hardware tools (no label): imported by its tag id, then followed as a pairing. */
+  async function importTag(tagId: string): Promise<void> {
+    if (busy.value) return;
+    busy.value = 'pair';
+    failure.value = null;
+    codeError.value = '';
+    try {
+      const p = await store.importTag(tagId, name.value);
+      lookingFor.value = tagId.trim().toUpperCase();
+      pairingId.value = p.id;
+      store.follow('pairing', p.id);
+    } catch (e) {
+      const why = describe(e);
+      if (why.code === 'invalid_tag_id') codeError.value = why.message;
+      else failure.value = why;
+    } finally {
+      busy.value = '';
+    }
+  }
+
   async function cancel(): Promise<void> {
     const id = pairingId.value;
     if (!id) return;
@@ -228,6 +248,7 @@ export function useDevicePairing(role: 'bridge' | 'tag') {
     near,
     find,
     pair,
+    importTag,
     cancel,
     again,
     resume,

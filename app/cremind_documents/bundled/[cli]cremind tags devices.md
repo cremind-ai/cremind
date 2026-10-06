@@ -1,5 +1,5 @@
 ---
-description: "Set up your own Cremind Tag hardware: connect a USB gateway plugged into a gateway computer, add an e-paper tag (it connects through the gateway itself or a bridge) or a bridge from the setup code on its label, send a test card, pause, move a tag to the gateway or another bridge, remove, or move everything to another computer. Settings → Tags does the same; this is the CLI."
+description: "Set up your own Cremind Tag hardware: connect a USB gateway plugged into a gateway computer, add an e-paper tag (it connects through the gateway itself or a bridge) or a bridge from its label's setup code, import a tag enrolled over SWD with the hardware tools, send a test card, pause, move a tag to the gateway or another bridge, remove, or move everything to another computer. Settings → Tags does the same; this is the CLI."
 ---
 
 # `cremind tags devices` — set up your own gateways, bridges and tags
@@ -28,8 +28,9 @@ tags) by its id or name; a gateway computer by its id or name.
 ## Finding this in the web UI
 
 > **Settings → Tags** — the **Your hardware** section: *Gateway computers*,
-> *Connect gateway*, *Add bridge*, *Add tag*, and each device's *Send test*,
-> *Rename*, *Pause*, *Remove* and *Move to another computer*.
+> *Connect gateway*, *Add bridge*, *Add tag* (with *Enrolled with the hardware
+> tools?* for a tag without a label), and each device's *Send test*, *Rename*,
+> *Pause*, *Remove* and *Move to another computer*.
 
 ## Global flags
 
@@ -102,6 +103,32 @@ gateway'.`). Power the device first. A tag checks in about every 30 seconds, so
 | `--gateway` | bridges: which connection to join (needed when you have several) |
 | `--candidate` | tags: which search result to pair with when several devices (your gateway, bridges) hear it — the output lists each one by name, e.g. `c1  gateway 'Office gateway'  rssi -55` |
 | `--name` | a name for the new device |
+| `--timeout` | seconds to wait |
+
+### `cremind tags devices import <tag_id>`
+
+Add a tag that was enrolled over SWD with the hardware tools
+(`cremind tags tools tag enroll`): such a tag has no setup label. Plug your
+gateway into the computer where the tag was enrolled and import it by the tag
+id the enrollment printed. Cremind takes the tag's key from the hardware tools
+on that computer, connects the tag through your gateway itself (or a ready
+bridge) and clears its screen, which proves the key is right; then it shows
+your cards like any other tag. Only the owner of that computer may import
+there — on the server's own computer, the admin.
+
+Your gateway's worker keeps the tag's key, with a sealed copy in Cremind's
+recovery data so that `recover` can move the tag to another computer.
+Removing the tag forgets its key; the tag keeps its enrollment and can be
+imported again.
+
+```bash
+cremind tags devices import D1F06B9A --name Shelf
+```
+
+| Flag | Meaning |
+|---|---|
+| `--gateway` | the connection (gateway) to use, when you have several |
+| `--name` | a name for the tag |
 | `--timeout` | seconds to wait |
 
 ### `cremind tags devices status <id>`
@@ -185,6 +212,10 @@ pending** until each one does).
 | `gateway_required` | you have several gateways: pass `--gateway` |
 | `setup_code_invalid` / `setup_code_wrong_role` | a typo, or a bridge label used for a tag (or the reverse) |
 | `already_paired` | that device is already yours |
+| `invalid_tag_id` | `import` takes the tag id the hardware tools printed: 8 hex digits (`cremind tags tools tag list`) |
+| `import_not_allowed` | only the owner of the computer the gateway is plugged into may import there (on the server's own computer: the admin) |
+| `not_enrolled_here` | the hardware tools on the gateway's computer have no such tag: import it with the gateway plugged into the computer where it was enrolled |
+| `panel_unsupported` | the tag's firmware has no supported display yet: flash newer tag firmware and enroll it again |
 | `device_owned` | the device is set up elsewhere; reset it to set it up again |
 | `session_expired` | a setup session lasts a few minutes; start again |
 | `bridge_full` | that gateway or bridge serves all the tags it can: pick another with `--candidate`, or move a tag off it (`move <tag> --to <gateway or bridge>`) |

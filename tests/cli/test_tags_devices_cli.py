@@ -83,7 +83,7 @@ def api(monkeypatch):
                 return {"discovery": {"id": "dis-1", "role": "tag", "state": "found",
                                       "candidates": copy.deepcopy(state["candidates"]),
                                       "recommended": state["recommended"]}}
-            if name == "start_pairing":
+            if name in ("start_pairing", "import_tag"):
                 return {"pairing": {"id": "op-1", "state": "queued"}}
             if name == "get_pairing":
                 return {"pairing": {"id": "op-1", "state": "succeeded", "stage": "done", "stage_detail": None}}
@@ -100,8 +100,8 @@ def api(monkeypatch):
             raise AssertionError(f"unexpected call {name}")
         return fake
 
-    for name in ("connections", "start_discovery", "get_discovery", "start_pairing", "get_pairing", "move", "unpair",
-                 "hosts", "scan_host", "connect_gateway", "get_operation"):
+    for name in ("connections", "start_discovery", "get_discovery", "start_pairing", "import_tag", "get_pairing",
+                 "move", "unpair", "hosts", "scan_host", "connect_gateway", "get_operation"):
         monkeypatch.setattr(c, name, record(name))
     import app.cli.commands.tags  # noqa: F401 - the parent group first: it registers its sub-apps
     import app.cli.commands.tags_devices as devices_cmd
@@ -152,6 +152,14 @@ def test_add_tag_names_each_device_that_hears_it_and_where_it_connects(api):
     assert result.exit_code == 1
     assert "found it, but nothing that hears it can take it (bridge_full)." in result.output
     assert "--to <gateway or bridge>" in result.output
+
+
+def test_import_adds_a_tag_enrolled_with_the_hardware_tools(api):
+    result = _run("tags", "devices", "import", "D1F06B9A", "--name", "Shelf")
+    assert result.exit_code == 0, result.output
+    assert "Tag ready." in result.output
+    assert _calls(api, "import_tag") == [(("D1F06B9A",), {"gateway_id": None, "name": "Shelf"})]
+    assert _calls(api, "get_pairing") == [(("op-1",), {})]  # followed like a pairing
 
 
 def test_move_takes_the_tags_gateway_or_a_bridge_of_that_gateway(api):

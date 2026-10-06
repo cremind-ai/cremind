@@ -446,6 +446,41 @@ test('stopping a pairing that is still being reconciled keeps following it until
   assert.equal(store.isFollowing('pairing', 'op-8'), false)
 })
 
+test('a tag enrolled with the hardware tools: imported by its tag id, then followed like a pairing', async () => {
+  const { env, M, store } = await setup()
+  env.route('/api/tags/connections', () => json(listAnswer([connection()])))
+  await store.loadConnections()
+  const op = (state, extra = {}) => ({
+    id: 'op-9', kind: 'import_tag', state, stage: 'clearing', stage_detail: null, device: null, error: null,
+    created_at: 'x', updated_at: 'y', role: 'tag', first_tag: true, ...extra,
+  })
+  env.route('/api/tags/imports', () => json({ pairing: op('queued') }, 201))
+  env.route('/api/tags/pairings/op-9', sequence('pairing', [
+    op('running', { stage_detail: 'Waiting for the tag to wake' }),
+    op('succeeded', { device: device('tag', 'tag-9', { name: 'Shelf', short_id: 'D1F06B9A' }) }),
+  ]))
+
+  const started = await store.importTag(' d1f06b9a ', ' Shelf ')
+  const post = env.callsTo('/api/tags/imports')[0]
+  assert.equal(post.init.method, 'POST')
+  assert.deepEqual(JSON.parse(post.init.body), { tag_id: 'd1f06b9a', name: 'Shelf' })
+  assert.ok(post.init.headers['Idempotency-Key'])
+  store.follow('pairing', started.id)
+  await store.tick()
+  assert.equal(M.isWaitingForWake(store.pairings['op-9']), true)
+  await store.tick()
+  assert.equal(store.pairings['op-9'].state, 'succeeded')
+  assert.equal(store.isFollowing('pairing', 'op-9'), false)
+
+  // Still running after a refresh: it resumes in Add tag, like a pairing.
+  assert.deepEqual(M.pendingSetups([op('running')]).map((p) => [p.kind, p.id, p.title]),
+    [['pair_tag', 'op-9', 'Adding a tag']])
+  // Its refusals, in plain words.
+  assert.match(M.setupErrorMessage('not_enrolled_here', { role: 'tag' }), /computer where the tag was enrolled/)
+  assert.match(M.setupErrorMessage('import_not_allowed', { role: 'tag' }), /owner of the computer/)
+  assert.match(M.setupErrorMessage('invalid_tag_id', { role: 'tag' }), /8 characters/)
+})
+
 test('a retried mutation after a dropped answer sends the same key', async () => {
   const { env, store } = await setup()
   let fail = true

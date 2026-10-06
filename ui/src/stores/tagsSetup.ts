@@ -27,6 +27,7 @@ import {
   setupServerUrl,
   startDiscovery as apiStartDiscovery,
   startPairing as apiStartPairing,
+  importTag as apiImportTag,
   unpairDevice,
   type Discovery,
   type GatewayHost,
@@ -367,6 +368,16 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     return p;
   }
 
+  /** A tag enrolled with the hardware tools (no label), by its tag id. */
+  async function importTag(tagId: string, name?: string): Promise<Pairing> {
+    const tok = token();
+    const clean = (name ?? '').trim();
+    const body = { tag_id: tagId.trim(), ...(clean ? { name: clean } : {}) };
+    const p = await keys.run(`import:${body.tag_id.toUpperCase()}`, body, (key) => apiImportTag(url(), tok, body, key));
+    if (token() === tok) pairings.value[p.id] = p;
+    return p;
+  }
+
   /** Cancel and reconcile: the answer may still be running (a pairing that
    *  may have committed on the device is checked first), so it stays followed
    *  until it ends — kept, or cancelled. */
@@ -513,6 +524,7 @@ export const useTagsSetupStore = defineStore('tagsSetup', () => {
     cancelSession,
     startDiscovery,
     startPairing,
+    importTag,
     cancelPairing,
     scanHost,
     connectCandidate,

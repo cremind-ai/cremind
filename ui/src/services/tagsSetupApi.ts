@@ -144,7 +144,7 @@ export interface SetupSession {
 }
 
 export type SetupOperationKind =
-  | 'discovery' | 'pair_bridge' | 'pair_tag' | 'unpair'
+  | 'discovery' | 'pair_bridge' | 'pair_tag' | 'import_tag' | 'unpair'
   | 'recover_gateway' | 'release_gateway' | 'claim_gateway';
 export type SetupOperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'pending_device';
 
@@ -514,6 +514,19 @@ export async function startPairing(
   key?: string,
 ): Promise<Pairing> {
   const res = await mutation<{ pairing: Pairing }>(agentUrl, token, '/api/tags/pairings', 'POST', body, key);
+  return res.pairing;
+}
+
+/** A tag enrolled over SWD with the hardware tools (no label): imported by its
+ *  tag id from the hardware tools on the gateway's computer, then followed
+ *  like a pairing. */
+export async function importTag(
+  agentUrl: string,
+  token: string,
+  body: { tag_id: string; name?: string; gateway_id?: string },
+  key?: string,
+): Promise<Pairing> {
+  const res = await mutation<{ pairing: Pairing }>(agentUrl, token, '/api/tags/imports', 'POST', body, key);
   return res.pairing;
 }
 

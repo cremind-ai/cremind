@@ -306,7 +306,7 @@ def test_the_setup_and_host_client_calls_only_real_server_routes():
     samples = {"session_id": "s1", "operation": "connect_gateway", "server_url": "https://x", "role": "tag",
                "setup_code": "CODE", "discovery_id": "d1", "candidate_id": "c1", "pairing_id": "p1",
                "device_id": "dev1", "paused": True, "bridge_id": "b1", "recovery_id": "r1", "host_id": "h1",
-               "profile_id": "pid1", "granted": True, "operation_id": "o1"}
+               "profile_id": "pid1", "granted": True, "operation_id": "o1", "tag_id": "1A2B3C4D"}
 
     async def go():
         cl = _Client()

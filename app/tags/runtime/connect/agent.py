@@ -805,6 +805,101 @@ class ConnectAgent:
         svc.wake_scheduler()
         return epoch
 
+    # ------------------------------------------------------------------ import_tag
+
+    async def _op_import_tag(self, ctx: OpContext) -> dict[str, Any]:
+        """A tag enrolled over SWD with the hardware tools on this computer (protocol v1, no setup label): its
+        secret and panel come from the tools' inventory here, its key is assigned through the gateway's own
+        radio (or a bridge), and the first CLEAR proves the secret is the tag's. A failed or cancelled import
+        leaves nothing here; the tag keeps its enrollment and can be imported again."""
+        from ..enroll.local import local_enrollment
+        from ..protocol.ids import Panel
+
+        args, svc = ctx.args, self.svc
+        tag_id = int(args.get("tag_id") or 0)
+        device = bytes.fromhex(str(args["device_id"]))
+        bridge = await self._bridge(str(args.get("bridge_hw_id") or ""))
+        found = await asyncio.to_thread(local_enrollment, tag_id)
+        if found is None:
+            raise OperationFailed("not_enrolled_here", f"The hardware tools on this computer have no tag {tag_id:08X}. "
+                                                       "Import it on the computer where it was enrolled.")
+        tools = found.record
+        if tools.panel == int(Panel.UNVERIFIED):
+            raise OperationFailed("panel_unsupported", "This tag's display is not supported yet, so it cannot show "
+                                                       "anything. Flash newer tag firmware and enroll it again.")
+        ctx.on_cleanup(lambda: self._forget_v1_local(ctx, device, tag_id))
+        ref = await asyncio.to_thread(svc.secrets.set_tag_secret, tag_id, found.secret)
+        if await svc.db.run(svc.db.find_tag, tag_id) is None:
+            record = await svc.db.run(svc.db.insert_tag, TagRecord(
+                tag_id=tag_id, board=tools.board, panel=tools.panel, width=tools.width, height=tools.height,
+                planes=tools.planes, plane_flags=tools.plane_flags, secret_ref=ref,
+                name=str(args.get("name") or "") or tools.name, fw=tools.fw))
+        else:
+            record = await svc.db.run(lambda: svc.db.update_tag(tag_id, secret_ref=ref))
+        self.state.put(device.hex(), role="tag", hw_id=record.hw_id, gen=0, tag_id=tag_id, bridge=bridge.hw_id,
+                       proto=1)
+        await ctx.progress(stage="clearing", detail="Waiting for the tag to wake")
+        epoch = await self._assign_and_clear(ctx, record, bridge)
+        await self.vault_write(device.hex(), _v1_vault_state(record, found.secret, bridge.hw_id, epoch),
+                               stage="committed", generation=0)
+        svc.request_inventory()
+        await ctx.finish(device={"gen": 0, "epoch": epoch, "board": record.board, "panel": record.panel,
+                                 "width": record.width, "height": record.height, "planes": record.planes,
+                                 "fw": record.fw})
+        return {"hw_id": record.hw_id, "epoch": epoch}
+
+    async def _forget_v1_local(self, ctx: OpContext, device: bytes, tag_id: int) -> None:
+        """Stop serving an imported v1 tag here: unassign its key, drop its record and its secret. There is no
+        ownership to release; the tag keeps its enrollment."""
+        svc = self.svc
+        tag = await svc.db.run(svc.db.find_tag, tag_id)
+        if tag is not None and tag.bridge_addr and tag.epoch:
+            addr, epoch = tag.bridge_addr, tag.epoch
+            with contextlib.suppress(Exception):
+                await ctx.step("unassign", lambda g, op: g.unassign_tag(addr, tag_id, epoch, op_id=op), attempts=3)
+        with contextlib.suppress(Exception):
+            await svc.db.run(lambda: svc.store.set_override(tag_id, None, None, force=False))
+        if tag is not None:
+            await svc.db.run(svc.db.delete_tag, tag_id)
+        await asyncio.to_thread(svc.secrets.delete_tag_secret, tag_id)
+        self.state.forget(device.hex())
+
+    def _is_v1(self, device: bytes, protocol: Any = None) -> bool:
+        return protocol == 1 or (self.state.device(device.hex()) or {}).get("proto") == 1
+
+    def _v1_tag_id(self, device: bytes, hw_id: str) -> int:
+        entry = self.state.device(device.hex()) or {}
+        return int(entry.get("tag_id") or (int(hw_id, 16) if hw_id else identity.short_id(device)))
+
+    async def _restore_v1_tag(self, ctx: OpContext, device: bytes, entry: dict[str, Any]) -> bool:
+        """Recovery of an imported v1 tag: nothing to rekey (it has no ownership), only its secret and panel
+        from the vault and a fresh epoch through the place it used."""
+        svc = self.svc
+        tag_id = int(entry.get("tag_id") or identity.short_id(device))
+        try:
+            bridge = await self._bridge(str(entry.get("bridge") or ""))
+            secret = bytes.fromhex(str(entry["secret"]))
+            ref = await asyncio.to_thread(svc.secrets.set_tag_secret, tag_id, secret)
+            record = await svc.db.run(svc.db.find_tag, tag_id)
+            if record is None:
+                record = await svc.db.run(svc.db.insert_tag, TagRecord(
+                    tag_id=tag_id, board=int(entry["board"]), panel=int(entry["panel"]), width=int(entry["width"]),
+                    height=int(entry["height"]), planes=int(entry["planes"]), plane_flags=int(entry["plane_flags"]),
+                    secret_ref=ref, name=str(entry.get("name") or ""), fw=entry.get("fw")))
+            else:
+                record = await svc.db.run(lambda: svc.db.update_tag(tag_id, secret_ref=ref))
+            self.state.put(device.hex(), role="tag", hw_id=record.hw_id, gen=0, tag_id=tag_id,
+                           bridge=bridge.hw_id, proto=1)
+            epoch = await self._assign_and_clear(ctx, record, bridge, floor=int(entry.get("epoch") or 0))
+        except (OperationFailed, KeyError, ValueError) as exc:
+            log.info("agent: tag %08X not restored during recovery: %s", tag_id, exc)
+            await ctx.progress(devices=[{"device_id": device.hex(), "state": "pending"}])
+            return False
+        await self.vault_write(device.hex(), _v1_vault_state(record, secret, bridge.hw_id, epoch),
+                               stage="committed", generation=0)
+        await ctx.progress(devices=[{"device_id": device.hex(), "state": "rekeyed", "gen": 0, "cleared": True}])
+        return True
+
     # ------------------------------------------------------------------ move_tag
 
     async def _op_move_tag(self, ctx: OpContext) -> dict[str, Any]:
@@ -833,7 +928,9 @@ class ConnectAgent:
         args = ctx.args
         role = str(args.get("role"))
         device = bytes.fromhex(str(args["device_id"]))
-        if role == "tag":
+        if role == "tag" and self._is_v1(device, args.get("protocol")):
+            await self._forget_v1_local(ctx, device, self._v1_tag_id(device, str(args.get("hw_id") or "")))
+        elif role == "tag":
             await self._release_tag(ctx, device, str(args.get("hw_id") or ""))
         elif role == "bridge":
             await self._release_bridge(ctx, device)
@@ -959,7 +1056,10 @@ class ConnectAgent:
                 device = bytes.fromhex(str(item["device_id"]))
                 sub = ctx.child(f"{role}:{device.hex()}")
                 try:
-                    if role == "tag":
+                    if role == "tag" and self._is_v1(device, item.get("protocol")):
+                        entry = self.state.device(device.hex()) or {}
+                        await self._forget_v1_local(sub, device, self._v1_tag_id(device, str(entry.get("hw_id") or "")))
+                    elif role == "tag":
                         entry = self.state.device(device.hex()) or {}
                         await self._release_tag(sub, device, str(entry.get("hw_id") or ""))
                     else:
@@ -1016,6 +1116,8 @@ class ConnectAgent:
                     dev_hex, addr=node.addr, name=node.name, configured=node.configured,
                     gateway_hw_id=self.svc.gateway_hw_id))
                 ok = await self._rekey_bridge(ctx.child(f"bridge:{dev_hex}"), bytes.fromhex(dev_hex), node.addr)
+            elif role == "tag" and entry.get("proto") == 1:
+                ok = await self._restore_v1_tag(ctx.child(f"tag:{dev_hex}"), bytes.fromhex(dev_hex), entry)
             elif role == "tag":
                 ok = await self._rekey_tag(ctx.child(f"tag:{dev_hex}"), bytes.fromhex(dev_hex), entry)
             else:
@@ -1227,6 +1329,14 @@ class OpContext:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _v1_vault_state(tag: TagRecord, secret: bytes, bridge_hw_id: str, epoch: int) -> dict[str, Any]:
+    """What a recovery needs to serve an imported v1 tag again: its secret, panel and place (no ownership)."""
+    return {"role": "tag", "proto": 1, "gen": 0, "secret": secret.hex(), "tag_id": tag.tag_id,
+            "bridge": bridge_hw_id, "epoch": epoch, "board": tag.board, "panel": tag.panel, "width": tag.width,
+            "height": tag.height, "planes": tag.planes, "plane_flags": tag.plane_flags, "name": tag.name,
+            "fw": tag.fw}
 
 
 def _panel_for_board(board: int) -> Any:

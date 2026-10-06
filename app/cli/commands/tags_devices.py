@@ -53,6 +53,9 @@ _HINTS = {
     "setup_code_invalid": "Check the code on the label (25 characters; 0/O and 1/I/L are the same).",
     "setup_code_wrong_role": "This label belongs to another kind of device.",
     "already_paired": "It is already set up: cremind tags devices list",
+    "invalid_tag_id": "Give the tag id the hardware tools printed: 8 hex digits (cremind tags tools tag list).",
+    "import_not_allowed": "Import it from the profile that owns the computer the gateway is plugged into (the "
+                          "admin on the server's own computer).",
     "device_owned": "That device is set up elsewhere. Reset it (see its documentation) to set it up again.",
     "session_expired": "The setup expired. Start again.",
     "bridge_full": "Pick another gateway or bridge with room, or move a tag off this one: "
@@ -354,6 +357,38 @@ def devices_add(
     chosen = next((c for c in candidates if c.get("id") == pick), None)
     via = f" It connects through {_candidate_name(chosen, kind)}." if kind == "tag" and chosen else ""
     sys.stdout.write(f"{kind.capitalize()} ready.{via}\n")
+
+
+@devices_app.command("import")
+@graceful_errors
+def devices_import(
+    ctx: typer.Context,
+    tag_id: str = typer.Argument(..., help="The tag id `cremind tags tools tag enroll` printed (8 hex digits)."),
+    gateway: Optional[str] = typer.Option(None, "--gateway", help="The connection (gateway) the tag should use "
+                                                                  "(when you have several)."),
+    name: Optional[str] = typer.Option(None, "--name", help="A name for the tag."),
+    timeout: int = typer.Option(300, "--timeout", help="Seconds to wait for the tag."),
+) -> None:
+    """Add a tag enrolled over SWD with the hardware tools (it has no setup label). Run it with the gateway
+    plugged into the computer where the tag was enrolled: Cremind takes the tag's key from the hardware tools
+    there and clears the tag's screen to prove it."""
+    from app.cli.client import tags_setup as api
+    from app.cli.output import print_json
+
+    gateway_id = _call(ctx, lambda c: _connection(c, gateway)).get("id") if gateway else None
+    out = _call(ctx, lambda c: api.import_tag(c, tag_id, gateway_id=gateway_id, name=name), hints=_HINTS)
+    pairing = out.get("pairing") or {}
+    sys.stdout.write("Importing — waiting for the tag to wake (about 30 s)…\n")
+    final = _wait(ctx, lambda c: api.get_pairing(c, pairing["id"]),
+                  lambda o: (o.get("pairing") or {}).get("state") in ("succeeded", "failed", "cancelled"), timeout,
+                  lambda o: (o.get("pairing") or {}).get("stage_detail") or (o.get("pairing") or {}).get("stage"))
+    if _mode(ctx).json:
+        print_json(final)
+        return
+    p = final.get("pairing") or {}
+    if p.get("state") != "succeeded":
+        _fail(f"tag not added: {((p.get('error') or {}).get('message') or p.get('state'))}")
+    sys.stdout.write("Tag ready.\n")
 
 
 @devices_app.command("cancel")

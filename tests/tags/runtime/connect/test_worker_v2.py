@@ -278,6 +278,118 @@ def test_recovery_on_a_replacement_computer(paths: Any) -> None:
     asyncio.run(scenario())
 
 
+def v1_radio_config() -> SimConfig:
+    """A gateway with tag links, no bridge, and a v1 tag enrolled over SWD (no setup label)."""
+    return SimConfig(seed=SEED, time_scale=200, protocol=2, bridges=[], tags=[TagSpec.generate(SEED, 0, protocol=1)])
+
+
+def test_a_tag_enrolled_with_the_hardware_tools_is_imported_on_the_gateways_radio(paths: Any, monkeypatch) -> None:
+    """A v1 tag joins without a label: the worker takes its secret from the hardware tools on this computer,
+    assigns its v1 key on the gateway's radio and clears it; removing it keeps no secret here."""
+    from app.tags import operations
+    from app.tags.runtime.enroll import local
+    from app.tags.runtime.store.db import TagRecord
+
+    async def scenario() -> None:
+        async with Simulator(v1_radio_config()) as sim:
+            gw = sim.gateway.secure
+            assert gw is not None
+            spec = sim.config.tags[0]
+            tools = TagRecord(tag_id=spec.tag_id, board=spec.board, panel=spec.panel, width=spec.width,
+                              height=spec.height, planes=spec.planes, plane_flags=spec.plane_flags,
+                              secret_ref="keyring:tag:x", name="Shelf")
+            monkeypatch.setattr(local, "local_enrollment", lambda tag_id, config=None: (
+                local.LocalEnrollment(tools, spec.secret) if tag_id == spec.tag_id else None))
+            fake = FakeV2Cremind()
+            directory = paths.worker_dir("w1")
+            make_worker(directory, fake, gw.device_id, gw.keys.ik_pub)
+            async with worker(directory, sim, paths, fake) as run:
+                await run_op(fake, "claim_gateway", {"device_id": gw.device_id.hex(), "ik": gw.keys.ik_pub.hex(),
+                                                     "gen": 0, "mode": "claim"})
+                gateway_hw = f"gw-{gw.device_id.hex()}"
+                await until(lambda: any(g.get("hw_id") == gateway_hw and g.get("tag_links") == 2
+                                        for inv in fake.inventories for g in inv.get("gateways", [])), 60,
+                            "tag links reported")
+                device = operations.v1_device_id(spec.tag_id)
+                fake.add_binding(bytes.fromhex(device), "tag", bytes(32), 0)
+                op = await run_op(fake, "import_tag", {"role": "tag", "tag_id": spec.tag_id, "device_id": device,
+                                                       "name": "", "bridge_hw_id": gateway_hw, "bridge_id": "g1"})
+                local_tag = await run.svc.db.run(run.svc.db.find_tag, spec.tag_id)
+                assert local_tag is not None and local_tag.bridge_addr == GATEWAY_ADDR and local_tag.epoch >= 1
+                assert local_tag.name == "Shelf" and local_tag.secret_ref.startswith("file:")
+                assert sim.tag(spec.tag_id).nvs.stored_epoch == local_tag.epoch  # cleared under the v1 key
+                assert op["device"]["panel"] == spec.panel and op["device"]["gen"] == 0
+                vault = fake.vault_latest(device)["state"]
+                assert vault["proto"] == 1 and vault["secret"] == spec.secret.hex() and vault["bridge"] == gateway_hw
+                assert fake.bindings[device]["state"] == "ready"
+
+                # A tag the tools here never enrolled: refused, nothing kept.
+                missing = fake.queue_operation("import_tag", {"role": "tag", "tag_id": 0x12345678,
+                                                              "device_id": operations.v1_device_id(0x12345678),
+                                                              "bridge_hw_id": gateway_hw, "bridge_id": "g1"})
+                await until(lambda: fake.op(missing)["state"] in ("succeeded", "failed"), 60, "refused import")
+                assert fake.op(missing)["state"] == "failed"
+                assert fake.op(missing)["error"]["code"] == "not_enrolled_here"
+                assert await run.svc.db.run(run.svc.db.find_tag, 0x12345678) is None
+
+                # Removing it: no release (v1 has no ownership); its record and secret leave this worker.
+                await run_op(fake, "unpair", {"device_id": device, "role": "tag", "hw_id": f"{spec.tag_id:08X}",
+                                              "generation": 0, "epoch": local_tag.epoch, "protocol": 1})
+                assert await run.svc.db.run(run.svc.db.find_tag, spec.tag_id) is None
+                assert not run.svc.secrets.has_tag_secret(spec.tag_id)
+
+    asyncio.run(scenario())
+
+
+def test_an_imported_tag_comes_back_on_a_replacement_computer(paths: Any, monkeypatch) -> None:
+    """8.4 for a v1 tag: nothing to rekey; the new worker takes its secret and panel from the vault, then
+    assigns and clears it above the epoch it had."""
+    from app.tags import operations
+    from app.tags.runtime.enroll import local
+    from app.tags.runtime.store.db import TagRecord
+
+    async def scenario() -> None:
+        async with Simulator(v1_radio_config()) as sim:
+            gw = sim.gateway.secure
+            assert gw is not None
+            spec = sim.config.tags[0]
+            tools = TagRecord(tag_id=spec.tag_id, board=spec.board, panel=spec.panel, width=spec.width,
+                              height=spec.height, planes=spec.planes, plane_flags=spec.plane_flags,
+                              secret_ref="keyring:tag:x", name="Shelf")
+            monkeypatch.setattr(local, "local_enrollment", lambda tag_id, config=None: (
+                local.LocalEnrollment(tools, spec.secret) if tag_id == spec.tag_id else None))
+            fake = FakeV2Cremind()
+            old_dir = paths.worker_dir("old")
+            make_worker(old_dir, fake, gw.device_id, gw.keys.ik_pub)
+            gateway_hw = f"gw-{gw.device_id.hex()}"
+            device = operations.v1_device_id(spec.tag_id)
+            async with worker(old_dir, sim, paths, fake):
+                await run_op(fake, "claim_gateway", {"device_id": gw.device_id.hex(), "ik": gw.keys.ik_pub.hex(),
+                                                     "gen": 0, "mode": "claim"})
+                await until(lambda: any(g.get("hw_id") == gateway_hw and g.get("tag_links") == 2
+                                        for inv in fake.inventories for g in inv.get("gateways", [])), 60,
+                            "tag links reported")
+                fake.add_binding(bytes.fromhex(device), "tag", bytes(32), 0)
+                await run_op(fake, "import_tag", {"role": "tag", "tag_id": spec.tag_id, "device_id": device,
+                                                  "name": "", "bridge_hw_id": gateway_hw, "bridge_id": "g1"})
+            first_epoch = fake.vault_latest(device)["state"]["epoch"]
+            monkeypatch.setattr(local, "local_enrollment", lambda tag_id, config=None: None)  # another computer
+            for cred in fake.credentials.values():
+                cred.revoked = True
+            new_dir = paths.worker_dir("new")
+            make_worker(new_dir, fake, gw.device_id, gw.keys.ik_pub, bind_gateway=False)
+            async with worker(new_dir, sim, paths, fake) as run:
+                op = await run_op(fake, "recover_gateway", {}, timeout=180)
+                assert op["result"] == {"pending": []}
+                assert op["devices"][device]["state"] == "rekeyed" and op["devices"][device]["cleared"] is True
+                restored = await run.svc.db.run(run.svc.db.find_tag, spec.tag_id)
+                assert restored is not None and restored.epoch > first_epoch and restored.name == "Shelf"
+                assert run.svc.secrets.get_tag_secret(spec.tag_id, restored.secret_ref) == spec.secret
+                assert sim.tag(spec.tag_id).nvs.stored_epoch == restored.epoch
+
+    asyncio.run(scenario())
+
+
 def radio_config(fontpack: bytes | None = None) -> SimConfig:
     """A gateway with tag links and no bridge at all (docs/protocol.md §11)."""
     return SimConfig(seed=SEED, time_scale=200, protocol=2, fontpack=fontpack, bridges=[],

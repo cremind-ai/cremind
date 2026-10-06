@@ -1162,3 +1162,160 @@ def test_heartbeat_with_live_generations_ends_reconciling(tagenv) -> None:
     assert scalar(tagenv, "SELECT state FROM tag_bindings WHERE device_id = :d", d=ctx.bridge.device_id) == "reconciling"
     ctx.worker.call("POST", "/heartbeat", body={"devices": [{"kind": "bridge", "hw_id": hw, "gen": 1}]})
     assert scalar(tagenv, "SELECT state FROM tag_bindings WHERE device_id = :d", d=ctx.bridge.device_id) == "ready"
+
+
+# ---------------------------------------------------------------- tags enrolled with the hardware tools
+
+
+def put_on_host(env, ctx, kind: str, *, owned: bool = False) -> None:
+    """Put the worker's connection on a gateway computer: the server's own, or a desktop (enrolled by the
+    connection's owner when ``owned``)."""
+    import uuid
+
+    from sqlalchemy import text
+
+    owner_id = scalar(env, "SELECT owner_profile_id FROM tag_companions WHERE id = :i", i=ctx.worker.companion_id)
+    owner = scalar(env, "SELECT owner_profile FROM tag_companions WHERE id = :i", i=ctx.worker.companion_id)
+    host_id = str(uuid.uuid4())
+    with env.engine.begin() as c:
+        c.execute(text("INSERT INTO tag_hosts (id, kind, name, owner_profile, owner_profile_id, platform, version, "
+                       "state, created_at, updated_at) VALUES (:id, :kind, 'LEE-AI-PC', :o, :oid, 'windows', "
+                       "'0.0.20', 'active', 0, 0)"),
+                  {"id": host_id, "kind": kind, "o": owner if owned else None, "oid": owner_id if owned else None})
+        c.execute(text("UPDATE tag_companions SET host_id = :h WHERE id = :i"),
+                  {"h": host_id, "i": ctx.worker.companion_id})
+
+
+def imports(body: dict, profile: str = "p1") -> tuple[int, dict]:
+    prof, _, _ = _routes()
+    return call(prof, "POST", "/api/tags/imports", req(profile, body=body))
+
+
+def gateway_serving_tags(env, profile: str = "p1", **radio) -> SimpleNamespace:
+    ctx = connect_gateway(env, profile)
+    finish_claim(env, ctx)
+    report_gateway(ctx, **({"tag_links": 2, "max_tags": 20, "assigned": 0} | radio))
+    return ctx
+
+
+def test_import_a_tag_enrolled_with_the_hardware_tools(tagenv) -> None:
+    from app.tags import operations
+
+    prof, _, _ = _routes()
+    ctx = gateway_serving_tags(tagenv)
+    gw_row = row_of(tagenv, ctx.gateway)
+    # Only the owner of the gateway's computer imports (its worker reads the tag's secret there); on the
+    # server's own computer that is the admin.
+    status, out = imports({"tag_id": "D1F06B9A"})
+    assert status == 403 and out["error"] == "import_not_allowed"  # no gateway computer known
+    put_on_host(tagenv, ctx, "server")
+    status, out = imports({"tag_id": "D1F06B9A"})
+    assert status == 403 and out["error"] == "import_not_allowed"
+    put_on_host(tagenv, ctx, "desktop", owned=True)
+    for bad in ("", "D1F06B9", "D1F06B9AA", "XYZ12345", "00000000", "FFFFFFFF"):
+        status, out = imports({"tag_id": bad})
+        assert status == 422 and out["error"] == "invalid_tag_id", bad
+
+    status, out = imports({"tag_id": "0xd1f06b9a", "name": "Shelf"})
+    assert status == 201, out
+    pairing = out["pairing"]
+    assert pairing["role"] == "tag" and pairing["stage"] == "waiting_for_device" and pairing["first_tag"] is True
+    device = operations.v1_device_id(0xD1F06B9A)
+    assert device.startswith("9a6bf0d1")  # the tag id, little-endian: its short id and hw id stay the tag id
+    [binding] = rows(tagenv, "SELECT state, short_id, identity_pub, info, tag_device_id FROM tag_bindings "
+                             "WHERE device_id = :d", d=device)
+    assert binding["state"] == "pairing" and int(binding["short_id"]) == 0xD1F06B9A
+    assert json.loads(binding["info"]) == {"proto": 1} and binding["identity_pub"] == "00" * 32
+    tag_row = binding["tag_device_id"]
+    assert parent_of(tagenv, tag_row) == gw_row
+    assert scalar(tagenv, "SELECT hw_id FROM tag_devices WHERE id = :i", i=tag_row) == "D1F06B9A"
+    status, out = imports({"tag_id": "D1F06B9A"})
+    assert status == 409 and out["error"] == "already_paired"
+    status, out = call(prof, "GET", "/api/tags/pairings/{op_id}", req("p2", path={"op_id": pairing["id"]}))
+    assert status == 404  # another profile cannot follow it
+
+    # The worker gets an import: the tag's place, no setup secret, and no grant for it.
+    op_id = pairing["id"]
+    status, op = ctx.worker.call("GET", "/operations/{operation_id}", path_params={"operation_id": op_id})
+    assert op["operation"]["kind"] == "import_tag" and op["operation"]["setup_secret"] is None
+    args = op["operation"]["args"]
+    assert (args["tag_id"], args["device_id"], args["bridge_hw_id"], args["bridge_id"]) == \
+        (0xD1F06B9A, device, gw_hw(ctx), gw_row)
+    status, out = ctx.worker.call("POST", "/grants", body={"operation_id": op_id, "op": "pair", "device_id": device,
+                                                            "role": "tag", "gen_from": 0, "challenge": "00" * 16,
+                                                            "ik": "00" * 32})
+    assert status in (403, 422), out
+    # Its recovery entry is this worker's to keep.
+    status, out = ctx.worker.call("PUT", "/vault/{subject}", path_params={"subject": device},
+                                  body={"stage": "committed", "generation": 0, "state": {"role": "tag", "proto": 1}})
+    assert status == 200, out
+
+    # The clear went through: ready, held content flows, and the panel's rotation applies.
+    for body in ({"stage": "clearing", "device": {"gen": 0, "epoch": 1, "board": 19, "panel": 3, "width": 128,
+                                                   "height": 250, "planes": 2}},
+                 {"stage": "done", "state": "succeeded"}):
+        status, out = ctx.worker.call("POST", "/operations/{operation_id}/progress",
+                                      path_params={"operation_id": op_id}, body=body)
+        assert status == 200, out
+    [dev] = rows(tagenv, "SELECT status, rotation, panel, width, height, clear_required, name FROM tag_devices "
+                         "WHERE id = :i", i=tag_row)
+    assert dev["status"] == "ok" and dev["clear_required"] in (0, False) and dev["name"] == "Shelf"
+    assert (int(dev["panel"]), int(dev["width"]), int(dev["height"])) == (3, 128, 250)
+    assert int(dev["rotation"]) == 3  # the 2.13-inch Hema reads landscape
+    status, pairing = call(prof, "GET", "/api/tags/pairings/{op_id}", req("p1", path={"op_id": op_id}))
+    assert pairing["pairing"]["state"] == "succeeded" and pairing["pairing"]["device"]["state"] == "ready"
+    assert pairing["pairing"]["device"]["short_id"] == "D1F06B9A"
+    conn = connection_view()
+    assert [t["id"] for t in conn["tags"]] == [tag_row] and conn["gateway"]["capacity"]["assigned"] == 1
+
+    # Removing it: there is no ownership to release; the worker is told it is a v1 tag.
+    status, out = call(prof, "POST", "/api/tags/devices/{device_id}/unpair", req("p1", path={"device_id": tag_row},
+                                                                                body={}))
+    assert status == 200, out
+    status, op = ctx.worker.call("GET", "/operations/{operation_id}",
+                                 path_params={"operation_id": out["operation"]["id"]})
+    assert op["operation"]["args"]["protocol"] == 1
+    assert [d["protocol"] for d in op["operation"]["args"]["devices"]] == [1]
+
+
+def test_a_failed_or_cancelled_import_leaves_nothing_behind(tagenv) -> None:
+    prof, _, _ = _routes()
+    ctx = gateway_serving_tags(tagenv)
+    put_on_host(tagenv, ctx, "desktop", owned=True)
+    status, out = imports({"tag_id": "1A2B3C4D"})
+    assert status == 201, out
+    op_id = out["pairing"]["id"]
+    status, out = ctx.worker.call("POST", "/operations/{operation_id}/progress", path_params={"operation_id": op_id},
+                                  body={"state": "failed", "error": {"code": "not_enrolled_here",
+                                                                     "message": "No tag 1A2B3C4D here."}})
+    assert status == 200, out
+    assert scalar(tagenv, "SELECT COUNT(*) FROM tag_devices WHERE hw_id = '1A2B3C4D'") == 0
+    assert scalar(tagenv, "SELECT COUNT(*) FROM tag_bindings WHERE short_id = :s", s=0x1A2B3C4D) == 0
+    status, pairing = call(prof, "GET", "/api/tags/pairings/{op_id}", req("p1", path={"op_id": op_id}))
+    assert pairing["pairing"]["state"] == "failed" and pairing["pairing"]["error"]["code"] == "not_enrolled_here"
+    # Imported again, then cancelled from the page: gone again.
+    status, out = imports({"tag_id": "1A2B3C4D"})
+    assert status == 201, out
+    status, out = call(prof, "DELETE", "/api/tags/pairings/{op_id}", req("p1", path={"op_id": out["pairing"]["id"]}))
+    assert status == 200 and out["pairing"]["state"] == "cancelled"
+    assert scalar(tagenv, "SELECT COUNT(*) FROM tag_bindings WHERE short_id = :s", s=0x1A2B3C4D) == 0
+
+
+def test_an_import_needs_room_for_the_tag(tagenv) -> None:
+    ctx = connect_gateway(tagenv)
+    finish_claim(tagenv, ctx)
+    put_on_host(tagenv, ctx, "desktop", owned=True)
+    status, out = imports({"tag_id": "1A2B3C4D"})  # the gateway cannot reach tags itself and has no bridge
+    assert status == 409 and out["error"] == "no_ready_bridge"
+    report_gateway(ctx, tag_links=2, max_tags=1, assigned=0)
+    status, out = imports({"tag_id": "1A2B3C4D"})
+    assert status == 201, out
+    status, out = imports({"tag_id": "2A2B3C4D"})
+    assert status == 409 and out["error"] == "bridge_full"
+
+
+def test_the_admin_imports_on_the_servers_own_computer(tagenv) -> None:
+    ctx = gateway_serving_tags(tagenv, "admin")
+    put_on_host(tagenv, ctx, "server")
+    status, out = imports({"tag_id": "D1F06B9A"}, profile="admin")
+    assert status == 201, out

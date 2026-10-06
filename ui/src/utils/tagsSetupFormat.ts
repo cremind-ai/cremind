@@ -668,6 +668,11 @@ const ERROR_TEXT: Record<string, string> = {
   declined: 'Setting up the computer was declined on it.',
   not_a_gateway: 'That device is not a gateway.',
   device_rejected: 'The gateway\'s identity does not check out. Unplug it and try again; if this repeats, reset it.',
+  // Tags enrolled with the hardware tools (imported by tag id).
+  invalid_tag_id: 'A tag id is 8 characters, 0-9 and A-F, as the hardware tools printed it (for example 1A2B3C4D).',
+  import_not_allowed: 'Only the owner of the computer your gateway is plugged into can add tags enrolled there (on the server\'s own computer, the admin).',
+  not_enrolled_here: 'The hardware tools on your gateway\'s computer have no tag with that id. Plug the gateway into the computer where the tag was enrolled.',
+  panel_unsupported: 'This tag\'s display is not supported by its firmware yet. Flash newer tag firmware and enroll it again.',
 };
 
 /**
@@ -747,7 +752,8 @@ export function pendingSetups(
   for (const op of operations) {
     if (isOperationTerminal(op.state)) continue;
     const detail = operationProgressLabel(op);
-    if (op.kind === 'pair_tag') out.push({ kind: 'pair_tag', id: op.id, title: 'Adding a tag', detail });
+    // An import (a tag enrolled with the hardware tools) resumes in Add tag like a pairing.
+    if (op.kind === 'pair_tag' || op.kind === 'import_tag') out.push({ kind: 'pair_tag', id: op.id, title: 'Adding a tag', detail });
     else if (op.kind === 'pair_bridge') out.push({ kind: 'pair_bridge', id: op.id, title: 'Adding a bridge', detail });
     else if (op.kind === 'discovery') out.push({ kind: 'discovery', id: op.id, title: 'Looking for a device', detail });
     else if (op.kind === 'recover_gateway') {

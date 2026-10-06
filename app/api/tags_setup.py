@@ -115,6 +115,11 @@ def get_tags_setup_routes() -> list[Route]:
     async def pairing(request: Request, body: dict[str, Any]) -> JSONResponse:
         return JSONResponse({"pairing": await operations.start_pairing(_profile(request), body)}, status_code=201)
 
+    async def import_tag(request: Request, body: dict[str, Any]) -> JSONResponse:
+        out = await operations.start_import(_profile(request), body)
+        logger.info(f"[tags] tag import requested by {_profile(request)}")
+        return JSONResponse({"pairing": out}, status_code=201)
+
     async def get_pairing(request: Request) -> JSONResponse:
         return JSONResponse({"pairing": await operations.get_pairing(_profile(request), request.path_params["op_id"])})
 
@@ -164,6 +169,7 @@ def get_tags_setup_routes() -> list[Route]:
         Route("/api/tags/pairings", once("pairing", pairing), methods=["POST"]),
         Route("/api/tags/pairings/{op_id}", guarded(get_pairing), methods=["GET"]),
         Route("/api/tags/pairings/{op_id}", guarded(cancel_pairing), methods=["DELETE"]),
+        Route("/api/tags/imports", once("import", import_tag), methods=["POST"]),
         Route("/api/tags/devices/{device_id}/unpair", once("unpair", unpair), methods=["POST"]),
         Route("/api/tags/devices/{device_id}/pause", once("pause", pause_handler(True)), methods=["POST"]),
         Route("/api/tags/devices/{device_id}/resume", once("resume", pause_handler(False)), methods=["POST"]),

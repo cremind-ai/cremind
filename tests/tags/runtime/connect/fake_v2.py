@@ -179,7 +179,7 @@ class FakeV2Cremind(FakeCremind):  # type: ignore[misc, valid-type]
 
     def _finish(self, op: dict[str, Any], state: str) -> None:
         binding = self.bindings.get(str(op.get("binding") or op["args"].get("device_id") or ""))
-        if op["kind"] in ("claim_gateway", "pair_bridge", "pair_tag") and binding is not None:
+        if op["kind"] in ("claim_gateway", "pair_bridge", "pair_tag", "import_tag") and binding is not None:
             if state == "succeeded":
                 binding["state"] = "ready"
             elif state == "failed" and binding["state"] == "pairing":
