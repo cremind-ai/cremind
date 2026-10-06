@@ -1,10 +1,12 @@
 """Screen composition contract: a tag's active cards -> one logical screen.
 
 Implemented by `app.tags.runtime.compose.screen.compose_screen`; called by the daemon
-(`app.tags.runtime.daemon`) every time a tag's active card set or clock line changes.
+(`app.tags.runtime.daemon`) every time a tag's active card set or another input of its
+screen changes (never for the clock: the masthead's time is when the screen was composed).
 See docs/tags/connector-api.md "Screen model" and docs/tags/layout.md. Also in
-`compose.screen`: ``compose_identify(panel, fonts, tag_id=None)`` and
-``compose_blank(panel)``; previews in `compose.preview` (``preview_png``).
+`compose.screen`: ``compose_identify(panel, fonts, tag_id=None)``,
+``compose_setup_code(panel, fonts, code, qr_text)`` and ``compose_blank(panel)``;
+previews in `compose.preview` (``preview_png``).
 """
 
 from __future__ import annotations
@@ -64,13 +66,14 @@ class ComposedScreen:
     """Encoded logical screen (docs/protocol.md §4), already validated."""
     delivery_ids: tuple[int, ...]
     """Deliveries whose cards this screen shows (all become `displayed` together), in display order
-    (headline first). Cards only counted in the footer are NOT included (docs/tags/layout.md "Delivery ids")."""
+    (the hero card first, then the rows). Cards only counted under "+N MORE" are NOT included
+    (docs/tags/layout.md "Delivery ids")."""
     pending_count: int
-    """Active cards not shown for lack of space ("N more updates waiting for this tag")."""
+    """Active cards not shown for lack of space (the N of "+N MORE")."""
     unsupported_chars: tuple[str, ...] = field(default=())
     """Characters no face in the pack covers (reported in previews and diagnostics)."""
     pending_delivery_ids: tuple[int, ...] = field(default=())
-    """The deliveries counted in the footer (``len == pending_count``); they stay undisplayed."""
+    """The deliveries counted under "+N MORE" (``len == pending_count``); they stay undisplayed."""
 
 
 class Composer(Protocol):

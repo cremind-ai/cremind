@@ -109,7 +109,7 @@ random tag:
 | 10 % | broadcast | the same notification to 3–6 random tags at once |
 | 20 % | question | a `needs_input` card (priority 90), answered by a `resolved` job 1–5 minutes later |
 | 12 % | progress run | a `progress` card, 2–5 updates 30–90 s apart (the profile's 300 s cadence holds them), then a `task_outcome` card replacing it |
-| 28 % | flurry | 3–6 notifications to one tag within 4 s (coalescing, and the footer: only four cards fit on a screen); 20 % have one card cancelled 5–30 s later |
+| 28 % | flurry | 3–6 notifications to one tag within 4 s (coalescing, and the footer — the cards a screen only counts, under "+N MORE": a 400×300 screen with the dev pack shows eight or nine cards before the rest wait there); 20 % have one card cancelled 5–30 s later |
 
 A **trial** is one content card: a notification, a broadcast copy, a flurry
 card, a question, a progress run's first card or its outcome. Progress updates,
@@ -173,9 +173,9 @@ BLE connection attempts fail although the tag advertises.
   the direct ones) and the messages that waited for the relay's resume.
 - **Delivery initiation** = queued → `transferring` (the tag started receiving
   a screen that shows the card). The acceptance population is the trials minus
-  cards held in a footer by the screen model (counted in "N more updates
-  waiting" before any screen showing them was displayed: newer or
-  higher-priority cards had the four places) and minus cards that left the card
+  cards held in a footer by the screen model (counted under "+N MORE" before
+  any screen showing them was displayed: newer or higher-priority cards had
+  the places on the screen) and minus cards that left the card
   set (cancelled, answered, replaced) within 60 s without starting; a card that
   left later counts as a miss, with the time it waited (censored).
 

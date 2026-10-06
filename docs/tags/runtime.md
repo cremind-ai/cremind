@@ -200,18 +200,24 @@ runs, and raw tool or terminal output (ANSI escapes, code fences, tracebacks,
 shell prompts, log lines). Such a card is refused — never rewritten — and
 receipted `failed` with detail `refused_by_companion`; its text is never logged.
 
-**Composition.** The screen is `compose_screen` of the card set (headline,
-up to three more cards, footer "N more updates waiting…", [layout.md](layout.md)),
-`compose_identify` for an `identify` command, `compose_blank` after a `clear`.
-Times are shown in the profile's `timezone` (an IANA name; a Windows zone id
-or a bare UTC offset is mapped defensively, anything else shows UTC). It is
+**Composition.** The screen is `compose_screen` of the card set
+([layout.md](layout.md) "Screen model": a masthead with the tag's name and
+"Updated" with the time the screen was composed; the first card with its
+status label — a red chip when it needs the owner or reports an error — and
+bold title; the next cards as one-line rows, as many as the panel holds;
+"+N MORE" counting the rest), `compose_identify` for an `identify` command,
+`compose_setup_code` for a removed tag's last screen, `compose_blank` after
+a `clear`. Times are shown in the profile's `timezone` (an IANA name; a
+Windows zone id or a bare UTC offset is mapped defensively, anything else
+shows UTC). It is
 composed again only when its inputs change (cards, panel, rotation, profile
 settings, font pack, the composer's design version — not the clock) and, even
 then, sent only when the layout digest differs from the current revision's. A
 change that only moves a progress bar waits until `progress_cadence_s` (profile
 setting, 300 s) after the previous revision. A tag nothing was shown on yet,
 with no cards, is left alone (a fresh database never paints "No updates" over a
-screen).
+screen). What an upgrade to a new screen design and font pack does to tags
+already in use: [upgrade-tags-screen-design.md](../upgrade-tags-screen-design.md).
 
 **Redraw once after a design or font-pack change.** A new screen design or
 another font pack changes no tag's cards, so on its own it would reach a tag
@@ -222,11 +228,15 @@ recorded (`daemon_state`); when they differ, or nothing is recorded yet (a
 database from before this rule), every tag that shows this runtime's screens
 is composed again, once: owned here, enrolled, not blocked, not waiting for
 its `clear_tag`, and not on an identify or setup-code screen (one whose hold
-has ended counts as none). The log says `redrawing N tag(s) once`. The tags
-are marked changed, not forced, so the rules above apply: a screen whose
-layout comes out the same is not sent; any other tag refreshes once (a tag
-behind a bridge that lacks the new pack gets `FONTPACK_MISMATCH`, table below,
-until the bridge has it). The next start finds the same version and pack and
+has ended counts as none). A tag behind a bridge whose active pack is known to
+be another one is left alone: that bridge would refuse the new screen and
+block the tag, so the tag keeps its screen until its next card (a card that
+comes before the bridge has the pack fails with `FONTPACK_MISMATCH`, table
+below). The gateway's own radio draws with this computer's pack, so its tags
+always redraw. The log says
+`redrawing N tag(s) once`. The tags are marked changed, not forced, so the
+rules above apply: a screen whose layout comes out the same is not sent; any
+other tag refreshes once. The next start finds the same version and pack and
 redraws nothing; a fresh database only records them. **Rule:** bump
 `COMPOSER_VERSION` in the same commit as any change to how screens look
 (layout, type, spacing, colour, wording) — without it every tag keeps the old
@@ -235,11 +245,11 @@ look until its next card.
 **Revisions.** Every new screen gets the next number from the inventory's
 per-tag allocator (`Database.allocate_revision`, never decreasing, continued
 above the `desired_revision`/`displayed_revision` Cremind reports at `sync`). A
-revision lists the deliveries it **shows** (`delivery_ids`) and those only
-counted in its footer (`pending_delivery_ids`). A newer revision supersedes an
+revision lists the deliveries it **shows** (`delivery_ids`) and those it only
+counts under "+N MORE" (`pending_delivery_ids`). A newer revision supersedes an
 undelivered older one; the shown cards move with it. When revision R is
 displayed, exactly its `delivery_ids` are receipted `displayed` (with revision,
-frame digest and timing); footer-only cards stay active until a later screen
+frame digest and timing); cards only counted stay active until a later screen
 shows them, they expire, are resolved or cancelled. A redraw after a design or
 font-pack change is an ordinary new revision of the same card set: cards
 already receipted `displayed` are not receipted again.

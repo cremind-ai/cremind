@@ -175,7 +175,9 @@ and `unknown` receipts are dropped.
 ```json
 {"tag_id": "1A2B3C4D", "epoch": 3, "revision": 18, "kind": "desired|displayed", "png_base64": "…", "delivery_ids": [501, 502]}
 ```
-Stores the latest rendered preview (1-bit PNG, ≤ 64 KiB) for the Tags page.
+Stores the latest rendered preview for the Tags page: a 1-bit PNG for a
+black/white panel, a white/black/red palette PNG for a black/white/red one,
+one pixel per panel pixel in the orientation the tag is read, ≤ 64 KiB.
 Revisions are compared within one epoch; a preview for a non-current epoch is
 refused with 409 `epoch_mismatch`, and every change of owner deletes the tag's
 previews.
@@ -207,13 +209,17 @@ command is still accepted.
 ## Screen model
 
 A tag shows one screen. The runtime composes it from the tag's **active
-cards** (unexpired, unresolved), highest priority first, then newest:
-headline card (icon, title, optional body, progress), up to three more titles
-with timestamps, and a footer "N more updates waiting for this tag · Updated
-HH:MM". Every composition is a new **revision** that includes a set of
-delivery ids. A newer revision supersedes an undisplayed older one without
-losing cards (the newer screen includes them). When revision R is displayed,
-every delivery it includes is receipted `displayed`.
+cards** (unexpired, unresolved), highest priority first, then newest: under
+a masthead (the tag's name, "Updated" and the time the screen was composed)
+the first card in full (its status label, bold title, progress, the body
+when excerpts are on, a QR link when allowed), then as many more cards as the
+panel holds as one-line rows with their times, and "+N MORE" counting the rest
+([layout.md](layout.md) "Screen model"). Every composition is a new
+**revision** that includes a set of delivery ids: the cards it shows. A newer
+revision supersedes an undisplayed older one without losing cards (the newer
+screen shows them or counts them). When revision R is displayed, every
+delivery it shows is receipted `displayed`; the cards it only counts stay
+active until a later screen shows them, or they expire or are resolved.
 
 ## Defaults
 

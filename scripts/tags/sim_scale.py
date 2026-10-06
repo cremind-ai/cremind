@@ -1050,9 +1050,9 @@ def analyze(world: World, acts: list[Act], live: dict[str, Any], db: dict[str, A
         tag = tag_index.get(int(d["tag"], 16))
         keys_shown = sorted(shown_in.get(did, []), key=lambda k: k[1])
         keys_footer = sorted(footer_in.get(did, []), key=lambda k: k[1])
-        # Footer-held: counted in a footer before any screen showing it was displayed — the screen model defers it
-        # (newer or higher-priority cards took the four places), even when an earlier screen that was never
-        # displayed had shown it.
+        # Footer-held: counted under a screen's "+N MORE" (pending_delivery_ids) before any screen showing it was
+        # displayed — the screen model defers it (newer or higher-priority cards took the places on the screen),
+        # even when an earlier screen that was never displayed had shown it.
         shown_displayed = [k[1] for k in keys_shown if rev_by_key.get(k, {}).get("state") == "displayed"]
         first_displayed = min(shown_displayed) if shown_displayed else None
         footer_held = bool(keys_footer) and (first_displayed is None or keys_footer[0][1] < first_displayed)
