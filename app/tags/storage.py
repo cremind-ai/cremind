@@ -1061,7 +1061,8 @@ class TagStorage:
             ahead_owners = sorted({
                 row.owner_profile for kind, hw_id, item in wanted
                 if kind == "tag" and (row := existing.get((kind, hw_id))) is not None
-                and row.owner_profile and (_reported_epoch(item) or 0) > int(row.epoch or 0)
+                and row.owner_profile and row.status != "pairing"
+                and (_reported_epoch(item) or 0) > int(row.epoch or 0)
             })
             for owner in ahead_owners:
                 await lock_stream(conn, owner, now)
@@ -1090,7 +1091,11 @@ class TagStorage:
                     continue
                 info = dict(row.info or {})
                 info.update(values.pop("info", {}) or {})
-                if reported is not None and reported > int(row.epoch or 0):
+                # A tag still pairing (a pair or import operation runs) is at the
+                # epoch its operation assigned, which the operation records when
+                # it finishes: raising it here would queue an assignment above it
+                # that cancels the operation's own CLEAR.
+                if reported is not None and reported > int(row.epoch or 0) and row.status != "pairing":
                     locked = (await conn.execute(
                         select(DEVICES).where(DEVICES.c.id == row.id).with_for_update()
                     )).first()

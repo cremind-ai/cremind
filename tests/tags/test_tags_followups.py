@@ -17,6 +17,7 @@ import asyncio
 import json
 
 import pytest
+from sqlalchemy import text
 
 pytest.importorskip("a2a")
 
@@ -127,6 +128,21 @@ def test_a_report_ahead_of_an_owned_tag_requeues_its_work(tagenv) -> None:
     ]
     assert scalar(tagenv, "SELECT epoch FROM tag_deliveries WHERE id=:i", i=note["id"]) == 6
     assert run(tagenv.store.get_device(pending))["clear_required"] is True
+
+
+def test_a_report_ahead_of_a_tag_still_pairing_leaves_its_epoch_to_the_operation(tagenv) -> None:
+    # A pair or import operation assigned the tag at the worker (epoch 1) and
+    # waits for its first screen. An inventory meanwhile (after a gateway
+    # reboot) must not queue an assignment above it: that cancels its CLEAR.
+    hw = hardware(tagenv, tags=("T1",))
+    tag = hw["tags"]["T1"]
+    with tagenv.engine.begin() as c:
+        c.execute(text("UPDATE tag_devices SET owner_profile='p1', bridge_device_id=:b, status='pairing', "
+                       "clear_required=:t WHERE id=:i"), {"b": hw["bridges"]["B1"], "t": True, "i": tag})
+    inventory(hw, [{"tag_id": "T1", "epoch": 1}])
+    assert queued(tagenv, "T1") == []
+    device = run(tagenv.store.get_device(tag))
+    assert (device["epoch"], device["status"], device["clear_required"]) == (0, "pairing", True)
 
 
 # ── 2. renames ──────────────────────────────────────────────────────────────
