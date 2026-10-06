@@ -13,6 +13,10 @@ feature's version range leaves the old package in place (Codex's SDK is the
 case that forced this: an old one cannot read the account's live model list).
 `list` flags such a feature under UPDATE, and `install` updates it; the process
 still has the old package loaded, so an update always needs a restart.
+
+Some features can't be installed on some computers at all (Vector Embedding
+needs PyTorch, which has no build for an Intel Mac): `list` says so under the
+table, and `install` refuses them while still installing the rest.
 """
 
 from __future__ import annotations
@@ -41,7 +45,8 @@ def features_list(ctx: typer.Context) -> None:
     UPDATE is `required` when an installed feature's packages are outside the
     version range this Cremind needs, and `restart` once it has been updated
     but the server still runs the old code. A server that predates version
-    checks sends neither field, which reads as `-`.
+    checks sends neither field, which reads as `-`. A feature the server's
+    computer can't install gets a note saying why.
     """
     import asyncio
 
@@ -82,6 +87,9 @@ def features_list(ctx: typer.Context) -> None:
         # loop again.
         if info.get("outdated") is True and info.get("restart_pending") is not True:
             notes.append(_outdated_note(fid, info))
+        reason = info.get("unsupported_reason")
+        if reason and not info.get("installed"):
+            notes.append(f"({fid}: can't be installed on this computer - {reason})")
     table.render()
     for note in notes:
         sys.stderr.write(note + "\n")

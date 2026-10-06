@@ -168,6 +168,42 @@ def test_list_from_an_older_server_reads_as_up_to_date(
     assert result.stderr.strip() == ""
 
 
+def test_list_notes_a_feature_this_computer_cannot_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On an Intel Mac the server reports why Vector Embedding can't install;
+    the note says so instead of leaving a bare `false` to retry forever."""
+    from app.cli.main import app
+
+    reason = "Vector Embedding runs on PyTorch, which publishes no builds for Intel Macs."
+    payload = json.loads(json.dumps(_FEATURES))
+    payload["embedding.me5"]["installed"] = False
+    payload["embedding.me5"]["unsupported_reason"] = reason
+    payload["claude_code"]["unsupported_reason"] = None
+    _patch_features(monkeypatch, payload)
+    result = CliRunner().invoke(app, ["--token", "t", "features", "list"])
+    assert result.exit_code == 0, result.output
+
+    assert result.stderr.strip().splitlines() == [
+        _CODEX_NOTE,
+        f"(embedding.me5: can't be installed on this computer - {reason})",
+    ]
+
+
+def test_list_has_no_note_for_an_installed_feature_with_a_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.cli.main import app
+
+    payload = json.loads(json.dumps(_FEATURES))
+    payload["embedding.me5"]["unsupported_reason"] = "no PyTorch build"  # installed: True
+    _patch_features(monkeypatch, payload)
+    result = CliRunner().invoke(app, ["--token", "t", "features", "list"])
+    assert result.exit_code == 0, result.output
+
+    assert result.stderr.strip().splitlines() == [_CODEX_NOTE]
+
+
 def test_list_json_passes_the_new_fields_through(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.cli.main import app
 

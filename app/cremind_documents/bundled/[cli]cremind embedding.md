@@ -1,5 +1,5 @@
 ---
-description: "Inspect and control the vector-embedding subsystem with `cremind embedding` (admin) — the semantic search behind Cremind documentation search, Documentation search (the user's own files) and memory recall: read live `status`, `get` or `set` the persisted embedding config (provider + vector store), kick off an `initialize`/rebuild, and `--follow` the load progress over SSE. Setting a provider whose optional extras aren't installed returns a FeatureNotInstalled error listing the missing keys — install them with `cremind features install` first."
+description: "Inspect and control the vector-embedding subsystem with `cremind embedding` (admin) — the semantic search behind Cremind documentation search, Documentation search (the user's own files) and memory recall: read live `status`, `get` or `set` the persisted embedding config (provider + vector store), kick off an `initialize`/rebuild, and `--follow` the load progress over SSE. Setting a provider whose optional extras aren't installed returns a FeatureNotInstalled error listing the missing keys — install them with `cremind features install` first. On an Intel Mac or Windows on ARM, Vector Embedding can't be turned on at all: PyTorch publishes no build there."
 ---
 
 # `cremind embedding` — Vector Embedding Subsystem
@@ -105,7 +105,9 @@ mirrors the wizard's `embedding_config`, e.g.
 background (watch it with `cremind embedding status --follow`). If the chosen
 provider's extras aren't installed, the server returns **FeatureNotInstalled**
 and the command prints the missing feature keys plus the exact
-`cremind features install …` command to run first. Requires an admin token.
+`cremind features install …` command to run first — unless this computer can't
+install them at all, in which case it returns an error saying why (see
+Troubleshooting). Requires an admin token.
 
 **Example.**
 
@@ -135,6 +137,13 @@ until Ctrl-C.
 **`FeatureNotInstalled` on `set`** — The provider needs optional extras. Run the
 printed `cremind features install <key>`, then (if it reported `RESTART_AFTER`)
 `cremind server restart`, then re-run `embedding set`.
+
+**`set` says "Vector Embedding runs on PyTorch, which publishes no builds for
+…"** — Both embedding models need PyTorch, and PyTorch has no build for an
+Intel Mac on Python 3.13+ (Cremind's Python) or for Windows on ARM, so pip has
+nothing to install. Vector Embedding can't be enabled on that computer; the
+Setup Wizard and Settings → Embedding grey the switch out for the same reason.
+On an Intel Mac, a Docker install of Cremind (Linux x86_64 inside) can run it.
 
 **`set` returns 409 "currently … please wait"** — A rebuild is in progress.
 Watch `cremind embedding status --follow` and retry once it's `ready`.

@@ -14,6 +14,12 @@ would keep it forever. An update only takes effect after a restart — the old
 modules may already be loaded — so :func:`restart_pending` remembers each
 updated feature for the rest of the process's life.
 
+One feature that can't install must not take the others down with it. A
+feature this computer has no wheels for
+(:func:`app.features.manifest.unsupported_reason`) is refused before pip
+runs, and when one pip run for several features fails, each is retried on
+its own.
+
 Public surface:
 
 - :func:`install_features` — install the union of extras groups needed by
@@ -43,10 +49,11 @@ from app.features.manifest import (
     missing_features,
     outdated_features,
     pip_requirements,
+    unsupported_reason,
     version_checks,
     version_report,
 )
-from app.upgrade.channel import get_channel
+from app.upgrade.channel import Channel, get_channel
 from app.upgrade.runner import (
     ProgressCallback,
     UpgradeEvent,
@@ -126,6 +133,15 @@ _WINDOWS_FILE_LOCK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# How pip reports that it could not reach the package index at all. Retrying
+# such a failure one feature at a time only fails the same way N times over.
+_NETWORK_ERROR_RE = re.compile(
+    r"NewConnectionError|ConnectTimeoutError|ReadTimeoutError|Max retries exceeded"
+    r"|ProxyError|SSLError|getaddrinfo failed|Temporary failure in name resolution"
+    r"|Name or service not known|nodename nor servname|Network is unreachable",
+    re.IGNORECASE,
+)
+
 
 def install_features(
     feature_keys: list[str],
@@ -139,7 +155,10 @@ def install_features(
     ``cremind[a,b,c]==<version>`` pin for the union of extras groups, plus
     the declared version range of every requested feature. After pip exits,
     runs each feature's :attr:`Feature.post_install` step and re-checks that
-    the deps landed — importable, and inside their range.
+    the deps landed — importable, and inside their range. A feature this
+    computer can't install is refused before pip runs, and a failed pip run
+    is retried feature by feature (:func:`_pip_install_features`); either
+    way the others still install.
 
     Returns immediately if every feature is already importable and up to
     date — useful for backwards compat with installs that ran ``pip install
@@ -172,7 +191,29 @@ def install_features(
             already_present=already_present,
         )
 
-    for key in outdated:
+    # What this computer can't install never reaches pip; the rest still does.
+    refused = {
+        key: f"{key} can't be installed on this computer: {reason}"
+        for key in needed
+        if (reason := unsupported_reason(key)) is not None
+    }
+    to_install = [k for k in needed if k not in refused]
+    for key, line in refused.items():
+        logger.warning(f"[features] {line}")
+        # The CLI stops reading at an ``error`` event, so while other
+        # features are still to come a refusal is only a failed log line.
+        _emit_event(emit, InstallEvent(
+            "log" if to_install else "error", line, ok=False, meta={"feature": key},
+        ))
+    if not to_install:
+        return InstallResult(
+            restart_required=False,
+            already_present=already_present,
+            failed=list(needed),
+            error="\n\n".join(refused.values()),
+        )
+
+    for key in (k for k in outdated if k in to_install):
         for check in version_checks(key):
             if check.satisfied:
                 continue
@@ -201,37 +242,7 @@ def install_features(
                 error=busy_error,
             )
 
-    channel = get_channel()
-    requirements = pip_requirements(needed, channel=channel)
-    _emit_event(emit, InstallEvent("log", f"pip install {' '.join(requirements)}"))
-
-    try:
-        # ``upgrade=False`` so pip doesn't touch the already-installed
-        # cremind wheel — only resolves the extras' transitive deps. This
-        # is critical for editable dev installs (otherwise pip would
-        # download a PyPI build over the live source tree). An outdated
-        # feature still gets updated: its version range rides in
-        # ``requirements``, and pip replaces an installed version that
-        # falls outside a range it was asked for.
-        _pip_install(
-            requirements,
-            _wrap_upgrade_callback(emit),
-            channel=channel,
-            upgrade=False,
-        )
-    except Exception as exc:  # noqa: BLE001 — pip failures surface as RuntimeError
-        error = str(exc)
-        hint = _file_lock_hint(error, outdated)
-        if hint:
-            error = f"{error}\n\n{hint}"
-        logger.error(f"[features] pip install failed for {' '.join(requirements)}: {error}")
-        _emit_event(emit, InstallEvent("error", f"pip install failed: {error}", ok=False))
-        return InstallResult(
-            restart_required=False,
-            already_present=already_present,
-            failed=list(needed),
-            error=error,
-        )
+    pip_failures = _pip_install_features(to_install, outdated, get_channel(), emit)
 
     # Pip wrote new files to ``site-packages``. Tell the import machinery to
     # forget any previous "module not found" lookups so subsequent
@@ -240,9 +251,12 @@ def install_features(
     # reads the freshly written dist-info.
     importlib.invalidate_caches()
 
-    # Post-install steps (e.g. ``playwright install chromium``).
+    # Post-install steps (e.g. ``playwright install chromium``), for the
+    # features pip installed.
     post_install_errors: list[str] = []
-    for key in needed:
+    for key in to_install:
+        if key in pip_failures:
+            continue
         for step in FEATURES[key].post_install:
             try:
                 _run_post_install_step(step, emit)
@@ -259,11 +273,13 @@ def install_features(
     # Re-check to determine which features actually landed. Importable is
     # not enough for an update: pip can exit 0 having kept the old version
     # (a constraint elsewhere, a resolver backtrack), and that is a failure.
+    # Neither is it after a failed pip run, which may have left part of a
+    # feature behind.
     installed_now: list[str] = []
     upgraded_now: list[str] = []
     failed_now: list[str] = []
     for key in needed:
-        if is_installed(key) and not is_outdated(key):
+        if key in to_install and key not in pip_failures and is_installed(key) and not is_outdated(key):
             (upgraded_now if key in outdated else installed_now).append(key)
         else:
             failed_now.append(key)
@@ -273,9 +289,17 @@ def install_features(
     restart_keys = [k for k in installed_now if FEATURES[k].requires_restart] + upgraded_now
     restart_required = bool(restart_keys)
 
+    # Refused, then what pip said (one entry when a single run failed for
+    # all of them), then what pip installed but didn't land.
+    problems = [*refused.values(), *dict.fromkeys(pip_failures.values())]
+    not_activated = [k for k in failed_now if k not in refused and k not in pip_failures]
+    if not_activated:
+        problems.append(
+            f"Some features could not be activated: {', '.join(_describe_failure(k) for k in not_activated)}"
+        )
     error: str | None = None
-    if failed_now:
-        error = f"Some features could not be activated: {', '.join(_describe_failure(k) for k in failed_now)}"
+    if problems:
+        error = "\n\n".join(problems)
     elif post_install_errors:
         error = "; ".join(post_install_errors)
 
@@ -288,7 +312,7 @@ def install_features(
         upgraded=upgraded_now,
     )
 
-    message = "Install complete."
+    message = "Install complete." if not failed_now else f"Install finished with failures: {', '.join(failed_now)}."
     if upgraded_now:
         message += f" Updated: {', '.join(upgraded_now)}."
     if restart_required:
@@ -308,9 +332,11 @@ def feature_status() -> dict[str, dict]:
     Returns a dict keyed by feature id:
     ``{installed: bool, requires_restart_after_install: bool, extras: [...],
     outdated: bool, required: [...], installed_versions: {dist: version},
-    restart_pending: bool}``. ``outdated`` is only ever true for an installed
-    feature; ``required`` / ``installed_versions`` are empty for a feature
-    that declares no version range. All system facts — the venv is shared by
+    restart_pending: bool, unsupported_reason: str | None}``. ``outdated`` is
+    only ever true for an installed feature; ``required`` /
+    ``installed_versions`` are empty for a feature that declares no version
+    range; ``unsupported_reason`` says why this computer can't install the
+    feature (``None`` when it can). All system facts — the venv is shared by
     every profile.
     """
     status: dict[str, dict] = {}
@@ -324,8 +350,95 @@ def feature_status() -> dict[str, dict]:
             "required": report["required"],
             "installed_versions": report["installed_versions"],
             "restart_pending": restart_pending(key),
+            "unsupported_reason": unsupported_reason(key),
         }
     return status
+
+
+# ── pip runs ────────────────────────────────────────────────────────────────
+
+def _pip_install_features(
+    keys: list[str],
+    outdated: list[str],
+    channel: Channel,
+    emit: EventCallback | None,
+) -> dict[str, str]:
+    """pip-install ``keys``; return ``{key: what to report}`` for each that failed.
+
+    One pip run takes them all. When it fails and more than one feature was
+    asked for, each is retried on its own: ``uv.lock`` resolves every extras
+    group together (pyproject declares no conflicts between them), so a joint
+    failure means one feature can't install here — a package with no wheel
+    for this computer, say — and it must not take the others down with it. A
+    network failure is not retried feature by feature: every run would fail
+    the same way, only slower.
+    """
+    error = _pip_install_requirements(keys, outdated, channel, emit)
+    if error is None:
+        return {}
+    if len(keys) == 1 or _NETWORK_ERROR_RE.search(error):
+        _emit_event(emit, InstallEvent("error", f"pip install failed: {error}", ok=False))
+        return dict.fromkeys(keys, error)
+
+    _emit_event(emit, InstallEvent(
+        "log", "pip could not install these features together - installing each on its own",
+    ))
+    failures: dict[str, str] = {}
+    for key in keys:
+        # A feature installed earlier in this loop may have brought this one
+        # along (llm.openai and llm.openai_compatible share an extras group).
+        importlib.invalidate_caches()
+        if is_installed(key) and not is_outdated(key):
+            continue
+        feature_error = _pip_install_requirements([key], outdated, channel, emit)
+        if feature_error is not None:
+            _emit_event(emit, InstallEvent(
+                "log", f"pip install failed for {key}: {feature_error}", ok=False, meta={"feature": key},
+            ))
+            failures[key] = f"{key}: {feature_error}"
+    return failures
+
+
+def _pip_install_requirements(
+    keys: list[str],
+    outdated: list[str],
+    channel: Channel,
+    emit: EventCallback | None,
+) -> str | None:
+    """Run one ``pip install`` for ``keys``; the error to report if it fails, else ``None``."""
+    requirements = pip_requirements(keys, channel=channel)
+    _emit_event(emit, InstallEvent("log", f"pip install {' '.join(requirements)}"))
+    try:
+        # ``upgrade=False`` so pip doesn't touch the already-installed
+        # cremind wheel — only resolves the extras' transitive deps. This
+        # is critical for editable dev installs (otherwise pip would
+        # download a PyPI build over the live source tree). An outdated
+        # feature still gets updated: its version range rides in
+        # ``requirements``, and pip replaces an installed version that
+        # falls outside a range it was asked for.
+        #
+        # ``channel="production"`` (PyPI alone, no ``--pre``) whatever this
+        # server runs on: the installed cremind already satisfies its own
+        # pin, so only dependencies are fetched, and Test PyPI offers those
+        # under names anyone can register there. Merged with PyPI on the
+        # test channel, pip took a stranger's broken ``fastapi`` sdist from
+        # it (and ran its setup.py) while backtracking on an Intel Mac.
+        # ``--pre`` let every dependency's pre-releases in, not just
+        # cremind's own.
+        _pip_install(
+            requirements,
+            _wrap_upgrade_callback(emit),
+            channel="production",
+            upgrade=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — pip failures surface as RuntimeError
+        error = str(exc)
+        hint = _file_lock_hint(error, [k for k in keys if k in outdated])
+        if hint:
+            error = f"{error}\n\n{hint}"
+        logger.error(f"[features] pip install failed for {' '.join(requirements)}: {error}")
+        return error
+    return None
 
 
 # ── update guards ───────────────────────────────────────────────────────────

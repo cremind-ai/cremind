@@ -2141,7 +2141,7 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # because the setup wizard only installed the extras for the
         # features that were on at setup time.
         if bool(body.get("enabled")):
-            from app.features.manifest import FEATURES, missing_features
+            from app.features.manifest import FEATURES, missing_features, unsupported_reason
 
             try:
                 required = _embedding_feature_keys(body)
@@ -2151,6 +2151,12 @@ def get_config_routes(state: BootedState) -> list[Route]:
                     {"error": f"Unknown feature in payload: {exc}"},
                     status_code=400,
                 )
+            # A dependency this computer can't install (no PyTorch for an
+            # Intel Mac): sending the caller to the install dialog would only
+            # end in a pip failure, so say why instead.
+            reasons = [reason for key in missing if (reason := unsupported_reason(key)) is not None]
+            if reasons:
+                return JSONResponse({"error": " ".join(dict.fromkeys(reasons))}, status_code=400)
             if missing:
                 return JSONResponse(
                     {

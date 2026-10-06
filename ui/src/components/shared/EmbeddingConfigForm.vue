@@ -9,6 +9,7 @@ import type {
   ServiceCapabilitiesResponse,
 } from '../../services/configApi';
 import type { InstallCatalog } from '../../services/installCatalogApi';
+import { embeddingProviderUnavailable, embeddingUnavailable } from '../../services/featureAvailability';
 
 /**
  * Shared Vector Embedding config form: the enable switch, the embedding-model
@@ -39,6 +40,8 @@ import type { InstallCatalog } from '../../services/installCatalogApi';
  *   warns that applying reloads and rebuilds the caches — so the built-in text
  *   is only a neutral fallback. The slot is scoped so a host can render the
  *   on/off wording without having to read back the payload it just received.
+ *   When the server can't run Vector Embedding at all (`unavailable_features`
+ *   in the capabilities), the form's own "not available" notice replaces it.
  * - `store-hint` — under the Vector Store provider select. Only Settings fills
  *   it ("switching stores triggers a full rebuild"); during setup there is
  *   nothing to rebuild yet.
@@ -84,6 +87,12 @@ const emit = defineEmits<{
 const qdrantCapability = computed(() => props.serviceCapabilities?.services?.qdrant ?? null);
 const chromaCapability = computed(() => props.serviceCapabilities?.services?.chroma ?? null);
 const dockerAvailable = computed(() => props.serviceCapabilities?.docker_available ?? false);
+
+// Why this server can't run Vector Embedding at all (no PyTorch build for an
+// Intel Mac), or null. The switch can't be turned on then, but stays usable
+// while on, so a config saved elsewhere can still be switched off.
+const unavailableReason = computed(() => embeddingUnavailable(props.serviceCapabilities));
+const modelUnavailable = (provider: string) => embeddingProviderUnavailable(props.serviceCapabilities, provider);
 
 // Modes left after both layers of filtering: the backend already trims what
 // the install mode can't honour (see app/api/features.py), and we drop Docker
@@ -244,8 +253,11 @@ onMounted(() => {
         <!-- ElForm's ``disabled`` already propagates here; kept explicit (as
              Settings had it) because this is the one control whose state the
              user is most likely to fight with mid-rebuild. -->
-        <ElSwitch v-model="form.enabled" :disabled="disabled" />
-        <slot name="enable-hint" :enabled="form.enabled">
+        <ElSwitch v-model="form.enabled" :disabled="disabled || (!!unavailableReason && !form.enabled)" />
+        <div v-if="unavailableReason" class="field-hint unavailable-hint">
+          Not available on this computer. {{ unavailableReason }}
+        </div>
+        <slot v-else name="enable-hint" :enabled="form.enabled">
           <div class="field-hint">
             {{ form.enabled
               ? 'Configure the embedding model and vector store below.'
@@ -260,8 +272,16 @@ onMounted(() => {
 
         <ElFormItem label="Model">
           <ElSelect v-model="form.provider" placeholder="Select an embedding model" style="width: 100%">
-            <ElOption value="me5" label="ME5 — Multilingual E5 Base (no auth required, 768 dims)" />
-            <ElOption value="gemma" label="Gemma 300M — Google (requires HuggingFace token, 768 dims)" />
+            <ElOption
+              value="me5"
+              label="ME5 — Multilingual E5 Base (no auth required, 768 dims)"
+              :disabled="!!modelUnavailable('me5')"
+            />
+            <ElOption
+              value="gemma"
+              label="Gemma 300M — Google (requires HuggingFace token, 768 dims)"
+              :disabled="!!modelUnavailable('gemma')"
+            />
           </ElSelect>
         </ElFormItem>
 
@@ -406,6 +426,10 @@ onMounted(() => {
   font-size: 0.775rem;
   color: var(--text-secondary);
   line-height: 1.4;
+}
+
+.unavailable-hint {
+  color: var(--warning-color);
 }
 
 .field-hint code {

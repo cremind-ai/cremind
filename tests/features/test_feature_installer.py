@@ -7,6 +7,11 @@ update path (one pip call carrying the range, ``upgraded`` + restart state),
 the Windows guards around it, and that a plain install of a missing feature
 behaves exactly as before.
 
+They also pin that one feature can't take the others down: a feature this
+computer can't install (Vector Embedding on an Intel Mac) never reaches pip,
+and a failed joint pip run is retried feature by feature — the Intel-Mac Setup
+Wizard once failed six features over the one that had no PyTorch build.
+
 pip never runs: ``_pip_install`` is replaced by a fake that edits an in-memory
 "venv" (which features import, which dist versions are recorded), and both the
 probe and ``importlib.metadata.version`` answer from that same venv.
@@ -35,6 +40,9 @@ class FakeVenv:
         # What the next pip run does to the venv; ``None`` leaves it untouched.
         self.on_pip: Any = None
         self.pip_error: Exception | None = None
+        # What a pip run does given its spec — for cases where pip runs more
+        # than once and the runs differ. May raise. Wins over the two above.
+        self.pip_run: Any = None
 
         def fake_is_installed(key: str) -> bool:
             if key not in manifest.FEATURES:
@@ -48,6 +56,9 @@ class FakeVenv:
 
         def fake_pip_install(spec, callback, *, channel, upgrade=True) -> None:
             self.pip_calls.append({"spec": spec, "channel": channel, "upgrade": upgrade})
+            if self.pip_run is not None:
+                self.pip_run(self, spec)
+                return
             if self.pip_error is not None:
                 raise self.pip_error
             if self.on_pip is not None:
@@ -67,7 +78,23 @@ def venv(monkeypatch: pytest.MonkeyPatch) -> FakeVenv:
     # Platform-independent by default; the Windows cases opt in. Only the
     # installer's own ``os`` reference is swapped, never the real module.
     monkeypatch.setattr(installer, "os", SimpleNamespace(name="posix"))
+    # Every feature installable here, even on an Intel Mac; the refusal
+    # cases opt in through ``_refuse``.
+    monkeypatch.setattr(installer, "unsupported_reason", lambda _key: None)
     return FakeVenv(monkeypatch)
+
+
+NO_TORCH = "Vector Embedding runs on PyTorch, which publishes no builds for Intel Macs on Python 3.13 or newer."
+
+
+def _refuse(monkeypatch: pytest.MonkeyPatch, reasons: dict[str, str]) -> None:
+    """Make the features in ``reasons`` uninstallable on this computer."""
+    monkeypatch.setattr(installer, "unsupported_reason", reasons.get)
+
+
+def _specs(venv: FakeVenv) -> list[str]:
+    """The ``cremind[...]`` pin of each pip run, in order."""
+    return [call["spec"][0] for call in venv.pip_calls]
 
 
 def _outdated_codex(venv: FakeVenv) -> None:
@@ -265,6 +292,151 @@ def test_unknown_feature_is_rejected_before_pip(venv: FakeVenv) -> None:
     assert result.error == "Unknown feature: 'nope'"
 
 
+def test_the_test_channel_installs_features_from_pypi_alone(
+    venv: FakeVenv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test PyPI is where cremind's own pre-releases live, and the installed
+    cremind already satisfies its pin. Anything else found there is whatever
+    someone registered under that name — on an Intel Mac pip once built a
+    stranger's broken ``fastapi`` from it — and ``--pre`` would have let in
+    every dependency's pre-releases too."""
+    monkeypatch.setattr(installer, "get_channel", lambda: "test")
+    venv.on_pip = lambda v: v.installed.add("vectorstore.qdrant")
+
+    result, _ = _install(["vectorstore.qdrant"])
+
+    assert venv.pip_calls == [{
+        "spec": [f"cremind[vectorstore-qdrant]=={__version__}"],
+        "channel": "production",
+        "upgrade": False,
+    }]
+    assert result.installed == ["vectorstore.qdrant"]
+
+
+# ── a feature this computer can't install ────────────────────────────────
+
+
+def test_a_feature_this_computer_cannot_install_never_reaches_pip(
+    venv: FakeVenv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse(monkeypatch, {"embedding.me5": NO_TORCH})
+
+    result, events = _install(["embedding.me5"])
+
+    assert venv.pip_calls == []
+    assert result.failed == ["embedding.me5"]
+    assert result.installed == []
+    assert result.error == f"embedding.me5 can't be installed on this computer: {NO_TORCH}"
+    # Nothing else to install, so the refusal ends it.
+    assert any(e.kind == "error" and e.ok is False and NO_TORCH in e.message for e in events)
+
+
+def test_the_rest_still_installs_beside_a_refused_feature(
+    venv: FakeVenv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Intel-Mac Setup Wizard: embedding refused, while the vector store
+    and LLM SDK picked with it install in a pip run that never names it."""
+    _refuse(monkeypatch, {"embedding.me5": NO_TORCH})
+    venv.on_pip = lambda v: v.installed.update({"vectorstore.chroma", "llm.anthropic"})
+
+    result, events = _install(["embedding.me5", "vectorstore.chroma", "llm.anthropic"])
+
+    assert _specs(venv) == [f"cremind[vectorstore-chroma,llm-anthropic]=={__version__}"]
+    assert result.installed == ["vectorstore.chroma", "llm.anthropic"]
+    assert result.failed == ["embedding.me5"]
+    assert result.error == f"embedding.me5 can't be installed on this computer: {NO_TORCH}"
+    # The CLI stops reading at an ``error`` event; while the others still
+    # install, the refusal is a failed log line.
+    refusal = next(e for e in events if NO_TORCH in e.message)
+    assert refusal.kind == "log" and refusal.ok is False
+    assert not any(e.kind == "error" for e in events)
+    assert events[-1].kind == "done" and events[-1].ok is False
+    assert events[-1].message == "Install finished with failures: embedding.me5."
+
+
+def test_an_intel_mac_refuses_embedding_without_running_pip(
+    venv: FakeVenv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest's real rule, end to end. Only the manifest's own ``sys``
+    and ``platform`` references are swapped."""
+    monkeypatch.setattr(installer, "unsupported_reason", manifest.unsupported_reason)
+    monkeypatch.setattr(manifest, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(manifest, "platform", SimpleNamespace(machine=lambda: "x86_64"))
+    venv.on_pip = lambda v: v.installed.add("llm.anthropic")
+
+    result, _ = _install(["embedding.me5", "embedding.gemma", "llm.anthropic"])
+
+    assert _specs(venv) == [f"cremind[llm-anthropic]=={__version__}"]
+    assert result.installed == ["llm.anthropic"]
+    assert result.failed == ["embedding.me5", "embedding.gemma"]
+    assert "PyTorch" in (result.error or "")
+
+
+# ── a failed pip run, retried feature by feature ─────────────────────────
+
+
+def _no_playwright(v: FakeVenv, spec: list[str]) -> None:
+    """pip fails any run naming the browser extra (resolution fails before
+    anything is installed) and installs whatever else the run names."""
+    if "browser" in spec[0]:
+        raise RuntimeError("ERROR: No matching distribution found for playwright")
+    for key in ("vectorstore.qdrant", "llm.anthropic", "llm.openai", "llm.openai_compatible"):
+        if manifest.FEATURES[key].extras[0] in spec[0]:
+            v.installed.add(key)
+
+
+def test_a_joint_pip_failure_retries_each_feature_alone(venv: FakeVenv) -> None:
+    venv.pip_run = _no_playwright
+
+    result, events = _install(["vectorstore.qdrant", "browser", "llm.anthropic"])
+
+    assert _specs(venv) == [
+        f"cremind[vectorstore-qdrant,browser,llm-anthropic]=={__version__}",
+        f"cremind[vectorstore-qdrant]=={__version__}",
+        f"cremind[browser]=={__version__}",
+        f"cremind[llm-anthropic]=={__version__}",
+    ]
+    assert result.installed == ["vectorstore.qdrant", "llm.anthropic"]
+    assert result.failed == ["browser"]
+    assert result.error == "browser: ERROR: No matching distribution found for playwright"
+    assert any(
+        e.kind == "log" and e.ok is False and e.message.startswith("pip install failed for browser: ")
+        for e in events
+    )
+    # The install carried on, so nothing may end it early for the CLI.
+    assert not any(e.kind == "error" for e in events)
+
+
+def test_a_feature_brought_along_is_not_retried(venv: FakeVenv) -> None:
+    """llm.openai and llm.openai_compatible share the llm-openai group: once
+    the first is in, the second already imports."""
+    venv.pip_run = _no_playwright
+
+    result, _ = _install(["llm.openai", "llm.openai_compatible", "browser"])
+
+    assert _specs(venv) == [
+        f"cremind[llm-openai,browser]=={__version__}",
+        f"cremind[llm-openai]=={__version__}",
+        f"cremind[browser]=={__version__}",
+    ]
+    assert result.installed == ["llm.openai", "llm.openai_compatible"]
+    assert result.failed == ["browser"]
+
+
+def test_a_network_failure_is_not_retried_per_feature(venv: FakeVenv) -> None:
+    venv.pip_error = RuntimeError(
+        "WARNING: Retrying (Retry(total=0)) after connection broken by "
+        "'NewConnectionError(Failed to establish a new connection)': /simple/qdrant-client/"
+    )
+
+    result, events = _install(["vectorstore.qdrant", "llm.anthropic"])
+
+    assert len(venv.pip_calls) == 1
+    assert result.failed == ["vectorstore.qdrant", "llm.anthropic"]
+    assert result.error == str(venv.pip_error)
+    assert any(e.kind == "error" and e.message.startswith("pip install failed: ") for e in events)
+
+
 # ── Windows: a running codex binary can't be replaced ────────────────────
 
 
@@ -387,6 +559,7 @@ def test_feature_status_reports_versions_and_restart_state(venv: FakeVenv) -> No
         "required": [CODEX_REQ],
         "installed_versions": {"openai-codex": "0.1.0b3"},
         "restart_pending": False,
+        "unsupported_reason": None,
     }
 
     venv.on_pip = _lands_0_154
@@ -410,4 +583,16 @@ def test_feature_status_for_a_feature_without_ranges(venv: FakeVenv) -> None:
         "required": [],
         "installed_versions": {},
         "restart_pending": False,
+        "unsupported_reason": None,
     }
+
+
+def test_feature_status_says_why_a_feature_cannot_install(
+    venv: FakeVenv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse(monkeypatch, {"embedding.me5": NO_TORCH})
+
+    status = installer.feature_status()
+
+    assert status["embedding.me5"]["unsupported_reason"] == NO_TORCH
+    assert status["browser"]["unsupported_reason"] is None

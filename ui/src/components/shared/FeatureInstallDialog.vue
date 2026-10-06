@@ -105,7 +105,9 @@ async function confirmInstall() {
   log.value = [];
 
   const handleEvent = (evt: FeatureInstallEvent) => {
-    const prefix = evt.event === 'error' ? '✖' : evt.event === 'done' ? '✓' : '•';
+    // ``ok: false`` also marks a failed line inside an install that carries
+    // on (a feature this computer can't install, a per-feature pip retry).
+    const prefix = evt.event === 'error' || !evt.ok ? '✖' : evt.event === 'done' ? '✓' : '•';
     if (evt.message) {
       log.value.push(`${prefix} ${evt.message}`);
     }

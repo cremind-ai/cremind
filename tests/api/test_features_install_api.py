@@ -92,6 +92,8 @@ def test_get_features_reports_update_fields(monkeypatch: pytest.MonkeyPatch) -> 
         "required": [CODEX_REQ],
         "installed_versions": {"openai-codex": "0.1.0b3"},
         "restart_pending": False,
+        # Codex installs everywhere; only the embedding models have a reason.
+        "unsupported_reason": None,
     }
     assert body["browser"]["outdated"] is False
     assert body["browser"]["required"] == []

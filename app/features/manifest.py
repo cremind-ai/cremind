@@ -30,6 +30,13 @@ Each :class:`Feature` declares:
   runtime venv. These strings let :func:`is_outdated` flag that install as
   "update required", and :func:`pip_requirements` hands them to pip
   verbatim so the update actually lands.
+- ``unsupported``: for a feature whose packages publish no wheels for some
+  computers, a function saying why *this* one can't install it (``None``
+  when it can). pip has nothing to install there, so instead of failing it
+  backtracks through old releases of everything else and dies on whatever
+  broken old sdist it reaches first — an error about some unrelated package.
+  :func:`unsupported_reason` asks it, the installer refuses such a feature
+  before pip runs, and the Setup Wizard / Settings grey it out.
 
 "Installed" and "outdated" are deliberately separate questions.
 :func:`is_installed` stays probe-only, and every gate that blocks a tool
@@ -45,8 +52,11 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import platform
 import re
+import sys
 from dataclasses import dataclass, field
+from typing import Callable
 
 from app.upgrade.channel import Channel
 
@@ -59,6 +69,7 @@ class Feature:
     post_install: tuple[str, ...] = field(default_factory=tuple)
     requires_restart: bool = False
     requirements: tuple[str, ...] = ()
+    unsupported: Callable[[], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,34 @@ class VersionCheck:
     satisfied: bool
 
 
+def _torch_unsupported() -> str | None:
+    """Why PyTorch can't be installed on this computer, or ``None``.
+
+    Both embedding models run on sentence-transformers, which needs torch, and
+    torch publishes no wheel — and no sdist — for an Intel Mac on any Python
+    Cremind runs on (its last Intel-Mac wheels are for 3.12), nor for Windows
+    on ARM. Checked against PyPI on 2026-10-06: torch 2.14.1 ships Linux
+    x86_64/aarch64, Apple Silicon and Windows x64 only. On an Intel Mac the
+    Setup Wizard's pip backtracked into a broken ``fastapi`` sdist instead and
+    failed every feature with it.
+
+    Decided by the interpreter, not the hardware: an x86_64 Python under
+    Rosetta needs the same missing wheels. The Docker image is linux/amd64,
+    which torch does build for — hence the hint on an Intel Mac only (on
+    Windows on ARM that image would run emulated).
+    """
+    machine = platform.machine().lower()
+    if sys.platform == "darwin" and machine == "x86_64":
+        return (
+            "Vector Embedding runs on PyTorch, which publishes no builds for "
+            "Intel Macs on Python 3.13 or newer. A Docker install of Cremind "
+            "can run it on this Mac."
+        )
+    if sys.platform == "win32" and machine == "arm64":
+        return "Vector Embedding runs on PyTorch, which publishes no builds for Windows on ARM."
+    return None
+
+
 FEATURES: dict[str, Feature] = {
     # ── Vector embedding (sentence-transformers + torch is the dominant cost) ──
     "embedding.me5": Feature(
@@ -83,12 +122,14 @@ FEATURES: dict[str, Feature] = {
         extras=("embeddings-me5",),
         probes=("sentence_transformers", "pandas"),
         requires_restart=True,
+        unsupported=_torch_unsupported,
     ),
     "embedding.gemma": Feature(
         key="embedding.gemma",
         extras=("embeddings-gemma",),
         probes=("sentence_transformers", "pandas"),
         requires_restart=True,
+        unsupported=_torch_unsupported,
     ),
 
     # ── Vector store back-ends ───────────────────────────────────────────────
@@ -320,6 +361,32 @@ def missing_features(feature_keys: list[str]) -> list[str]:
             raise KeyError(f"Unknown feature: {key!r}")
         if not is_installed(key):
             out.append(key)
+    return out
+
+
+def unsupported_reason(feature_key: str) -> str | None:
+    """Why ``feature_key`` can't be installed on this computer, or ``None``.
+
+    A system fact: the venv and the hardware are shared by every profile.
+    Raises ``KeyError`` for an unknown feature, like the other lookups here.
+    """
+    feature = _require_feature(feature_key)
+    return feature.unsupported() if feature.unsupported is not None else None
+
+
+def unavailable_features() -> dict[str, str]:
+    """``{feature key: why}`` for each feature this computer lacks and can't install.
+
+    An installed feature is never listed, whatever :func:`unsupported_reason`
+    says: whatever put it there worked, and the check exists to stop pip from
+    attempting the impossible, not to switch off something that runs. The probe
+    only runs for features that have a reason, so the usual answer costs nothing.
+    """
+    out: dict[str, str] = {}
+    for key in FEATURES:
+        reason = unsupported_reason(key)
+        if reason is not None and not is_installed(key):
+            out[key] = reason
     return out
 
 

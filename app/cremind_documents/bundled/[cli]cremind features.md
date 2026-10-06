@@ -1,5 +1,5 @@
 ---
-description: "List and install Cremind's optional feature extras with `cremind features`: `list` shows each feature's install state and whether an installed one is outdated (UPDATE required/restart); `install` installs one or more — or updates an outdated one, such as a Codex SDK too old to read the account's model list — streaming the live pip output over SSE. Covers the vector-embedding models, vector-store backends, coding-agent SDKs and other heavier dependencies kept off the slim `pip install cremind`. An update, or a feature marked requires_restart_after_install, only activates after `cremind server restart`."
+description: "List and install Cremind's optional feature extras with `cremind features`: `list` shows each feature's install state and whether an installed one is outdated (UPDATE required/restart); `install` installs one or more — or updates an outdated one, such as a Codex SDK too old to read the account's model list — streaming the live pip output over SSE. Covers the vector-embedding models, vector-store backends, coding-agent SDKs and other heavier dependencies kept off the slim `pip install cremind`. A feature the computer can't install (Vector Embedding on an Intel Mac or Windows on ARM: no PyTorch build) is refused with the reason, and one failing feature no longer stops the others. An update, or a feature marked requires_restart_after_install, only activates after `cremind server restart`."
 ---
 
 # `cremind features` — Optional Feature Extras
@@ -50,10 +50,12 @@ cremind features list
 | `EXTRAS`        | The pip extras the feature maps to.                            |
 
 Each `required` feature also gets a note on stderr naming both versions and the
-fix. With `--json`, returns the raw feature-id → state map; each entry also
-carries `outdated` (bool), `required` (the version specifiers, e.g.
-`["openai-codex>=0.154.0,<0.155"]`), `installed_versions` (`{dist: version}`)
-and `restart_pending` (bool).
+fix, and so does each feature this computer can't install, with the reason. With
+`--json`, returns the raw feature-id → state map; each entry also carries
+`outdated` (bool), `required` (the version specifiers, e.g.
+`["openai-codex>=0.154.0,<0.155"]`), `installed_versions` (`{dist: version}`),
+`restart_pending` (bool) and `unsupported_reason` (why this computer can't
+install it, or `null`).
 
 **Example.**
 
@@ -87,6 +89,19 @@ feature fails. A feature whose `RESTART_AFTER` is true (e.g. `embedding.me5`,
 which pulls torch) only takes effect after `cremind server restart`; the command
 says so when finished.
 
+One feature that can't install doesn't stop the others:
+
+- A feature the computer has no build for is refused before pip runs, with the
+  reason (`embedding.me5` / `embedding.gemma` on an Intel Mac or Windows on
+  ARM: PyTorch publishes none). The other features still install.
+- When pip can't install several features together, each is retried on its
+  own, so only the one that fails is reported as failed. A network failure is
+  not retried this way.
+
+Features are always fetched from PyPI, also on the test channel: the installed
+Cremind already satisfies its own pin, so Test PyPI (where anyone can publish
+under any free name) is never consulted for them.
+
 An installed feature whose `UPDATE` is `required` is **updated** instead of
 skipped (JSON `done` frame: `upgraded`). The running server keeps the old
 package loaded, so an update **always** needs `cremind server restart`; until
@@ -119,6 +134,12 @@ complete; use an admin `CREMIND_TOKEN`.
 **A feature failed to install** — The pip error is in the streamed log. Common
 causes are a missing system toolchain (for packages that compile) or no network
 access on the server host.
+
+**`can't be installed on this computer`** — No build of a package the feature
+needs exists for this computer, so pip is not even started. Vector Embedding
+(`embedding.me5`, `embedding.gemma`) runs on PyTorch, which publishes nothing
+for an Intel Mac on Python 3.13+ or for Windows on ARM. On an Intel Mac, a
+Docker install of Cremind (Linux x86_64 inside) can run it.
 
 **`UPDATE required`** — The feature imports, but its package is older than this
 Cremind needs (a runtime venv is never resynced on upgrade). Run

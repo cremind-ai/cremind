@@ -139,6 +139,8 @@ def test_put_with_enabled_returns_409_when_extras_missing(
         "app.features.manifest.is_installed",
         lambda _key: False,
     )
+    # A computer that can install them (an Intel Mac can't: see below).
+    monkeypatch.setattr("app.features.manifest.unsupported_reason", lambda _key: None)
 
     handler = _get_handler()
     body = {
@@ -163,6 +165,32 @@ def test_put_with_enabled_returns_409_when_extras_missing(
     assert me5_entry["requires_restart_after_install"] is True
 
 
+def test_put_with_enabled_says_why_when_this_computer_cannot_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Intel Mac has no PyTorch to install, so the 409 that sends the
+    caller to the install dialog would only end in a pip failure. The
+    preflight answers 400 with the reason instead, before any of it."""
+    _stub_admin_ok(monkeypatch)
+    _stub_embedding_state_idle(monkeypatch)
+    monkeypatch.setattr("app.features.manifest.is_installed", lambda _key: False)
+    reason = "Vector Embedding runs on PyTorch, which publishes no builds for Intel Macs."
+    monkeypatch.setattr(
+        "app.features.manifest.unsupported_reason",
+        lambda key: reason if key.startswith("embedding.") else None,
+    )
+
+    handler = _get_handler()
+    body = {
+        "enabled": True,
+        "provider": "me5",
+        "vectorstore": {"provider": "qdrant"},
+    }
+    response = asyncio.run(handler(_make_request(body)))
+    assert response.status_code == 400, response.body
+    assert json.loads(response.body) == {"error": reason}
+
+
 def test_put_with_enabled_proceeds_when_extras_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -176,6 +204,9 @@ def test_put_with_enabled_proceeds_when_extras_present(
         "app.features.manifest.is_installed",
         lambda _key: True,
     )
+    # Installed is installed: whatever put the packages there worked, so a
+    # platform the check calls unsupported doesn't block it.
+    monkeypatch.setattr("app.features.manifest.unsupported_reason", lambda _key: "no PyTorch build")
     monkeypatch.setattr(
         config_api,
         "_resolve_vectorstore",

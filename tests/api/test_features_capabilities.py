@@ -166,6 +166,28 @@ def test_capabilities_response_preserves_existing_fields(
     assert body["services"] == {"x": 1}
 
 
+def test_capabilities_name_the_features_this_computer_cannot_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wizard's and Settings' embedding form greys Vector Embedding out
+    from this map — on an Intel Mac, where no PyTorch build exists — instead
+    of letting the user start a pip install that cannot succeed."""
+    _stub_state(monkeypatch)
+    monkeypatch.setattr(features_api, "docker_available", lambda: False)
+    monkeypatch.setattr(features_api, "get_capabilities_payload", lambda: {})
+    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: None)
+    monkeypatch.setattr(features_api, "apply_mode_rule_to_services", lambda _p, _m: None)
+    monkeypatch.setattr(
+        features_api, "unavailable_features", lambda: {"embedding.me5": "no PyTorch build"},
+    )
+
+    response = asyncio.run(features_api.get_service_capabilities(_make_request()))
+    import json
+
+    body = json.loads(response.body)
+    assert body["unavailable_features"] == {"embedding.me5": "no PyTorch build"}
+
+
 def test_tray_capabilities_returns_features_without_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

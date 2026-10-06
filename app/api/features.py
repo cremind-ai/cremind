@@ -33,6 +33,7 @@ from app.config.install_catalog import (
 )
 from app.features import installer
 from app.features.installer import InstallEvent, InstallResult
+from app.features.manifest import unavailable_features
 from app.runtime import get_state
 from app.services import get_capabilities_payload
 from app.services.provisioner import docker_available
@@ -45,11 +46,12 @@ async def get_features(request: Request) -> JSONResponse:
     """Snapshot of every feature's install state.
 
     Returns ``{ feature_id: { installed, requires_restart_after_install,
-    extras, outdated, required, installed_versions, restart_pending } }``
-    (see :func:`app.features.installer.feature_status`). ``outdated`` means
-    the feature imports but sits below the version range this Cremind
-    needs; ``restart_pending`` means it was updated in place and the server
-    has not restarted since. Unauthenticated until setup is complete so the
+    extras, outdated, required, installed_versions, restart_pending,
+    unsupported_reason } }`` (see :func:`app.features.installer.feature_status`).
+    ``outdated`` means the feature imports but sits below the version range
+    this Cremind needs; ``restart_pending`` means it was updated in place and
+    the server has not restarted since; ``unsupported_reason`` says why this
+    computer can't install it. Unauthenticated until setup is complete so the
     wizard can render its "this will install …" hints before the admin
     token exists. The version fields are package names and versions only:
     no secrets, and nothing profile-scoped.
@@ -251,6 +253,11 @@ async def get_service_capabilities(request: Request) -> JSONResponse:
         "image_flavor": get_image_flavor(),
         # Tray/jumplist/dock gating list — see UI_FEATURES docstring above.
         "ui_features": list(UI_FEATURES),
+        # {feature key: why} for each feature this computer lacks and can't
+        # install — Vector Embedding on an Intel Mac. The wizard's and
+        # Settings' embedding form greys it out with the reason, instead of
+        # letting the user start a pip install that cannot succeed.
+        "unavailable_features": unavailable_features(),
         # What TLS this server is serving, and what it will serve next. The
         # wizard needs this BEFORE the admin token exists (to decide whether to
         # show the "trust the CA" step), which is exactly what this endpoint's

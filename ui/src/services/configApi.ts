@@ -712,6 +712,12 @@ export interface ServiceCapabilitiesResponse {
    *  entirely, and every consumer must degrade to the feature simply not
    *  existing rather than assuming plain HTTP forever. */
   tls?: TlsStatus;
+  /** Features this server lacks and can't install — no wheels for its
+   *  computer, e.g. ``embedding.me5`` on an Intel Mac — mapped to the reason
+   *  to show. Optional: an older server omits it, which reads as nothing
+   *  being known to be unavailable. Read it through
+   *  ``services/featureAvailability``. */
+  unavailable_features?: Record<string, string>;
 }
 
 export async function fetchServiceCapabilities(
