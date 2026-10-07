@@ -109,7 +109,9 @@ class Client:
         ``error`` reduced the second shape to a bare token — ``server returned
         400: unsupported_channel_type`` told an operator nothing, least of all
         which platforms would have worked. Both halves are kept whenever the
-        second adds something.
+        second adds something. A ``details`` map (key → why, as the config
+        endpoints send) is appended too: "validation failed" alone does not say
+        which value was refused, or what would have been accepted.
         """
         if resp.status_code < 400:
             return
@@ -127,6 +129,14 @@ class Client:
                     detail = detail.strip()
                     if detail and detail != body:
                         body = f"{body}: {detail}" if body else detail
+                details = decoded.get("details")
+                if isinstance(details, dict):
+                    reasons = "; ".join(
+                        f"{key}: {why.strip()}" for key, why in details.items()
+                        if isinstance(why, str) and why.strip()
+                    )
+                    if reasons:
+                        body = f"{body} — {reasons}" if body else reasons
             else:
                 body = raw.decode(errors="replace").strip()
         raise APIError(status=resp.status_code, body=body, raw=raw)
