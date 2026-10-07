@@ -52,23 +52,59 @@ def by_id(p: dict) -> dict[str, dict]:
     return {c["id"]: c for c in p["candidates"]}
 
 
-def test_the_week_about_to_expire_goes_first_among_accounts_with_room() -> None:
+def test_a_week_it_would_use_up_hours_before_its_reset_is_kept_for_later() -> None:
     """Real figures of 2026-10-07 11:23: the account in use reached 98% of its 5-hour window.
     One account's 16% of a week ends tomorrow 06:00, another's 51% lasts until Saturday; both
-    have an empty window."""
+    have an empty window. The first would be out of its week from mid-afternoon until 06:00 —
+    no cover when another account's 5-hour window fills — so the second goes first."""
     views = [
         view("cur", 98, 97, s_reset="2026-10-07 13:30", w_reset="2026-10-12 08:00", active=True, rate=23),
         view("late", 0, 48, w_reset="2026-10-10 18:59"),
         view("soon", 0, 83, s_reset="2026-10-07 15:00", w_reset="2026-10-08 06:00"),
     ]
     p = PL.plan(views, S, NOW, current_id="cur")
-    assert p["action"]["do"] == "switch" and p["action"]["to"] == "soon" and p["action"]["reason"] == "session"
-    soon = by_id(p)["soon"]
+    assert p["action"]["do"] == "switch" and p["action"]["to"] == "late" and p["action"]["reason"] == "session"
+    c = by_id(p)
+    soon = c["soon"]
     assert PL.room_class(soon["room"]) == 0, "16% of a week is still ~66 points of a 5-hour window: plenty"
     assert soon["perDay"] == pytest.approx(16 / (18 * 60 + 37) * 24 * 60, rel=1e-3)
     assert soon["stretchMin"] == pytest.approx(16 / (23 * 6.21 / 25.46) * 60, rel=1e-3), "its week, not its window, ends the stretch"
-    assert "06:00" in soon["why"] and "plenty of room" in soon["why"]
-    assert U.recommend(views, S) == {"id": "late"}, "the earlier rule: the lowest weekly figure"
+    assert soon["drainsUntil"] == at("2026-10-08 06:00") and soon["why"].endswith("then its week is used up until 06:00")
+    assert c["late"]["drainsUntil"] is None, "51% of a week outlasts a full window (~25%)"
+    assert U.recommend(views, S) == {"id": "late"}, "the earlier rule agrees here: the lowest weekly figure"
+
+
+def test_the_switch_of_15_51_goes_to_the_empty_account() -> None:
+    """Real figures of 2026-10-07 15:51: the account in use filled its 5-hour window. One account
+    has 17% of its week left until tomorrow 05:59, another a whole week until Monday."""
+    now = at("2026-10-07 15:51")
+    views = [
+        view("cur", 98, 73, s_reset="2026-10-07 16:29", w_reset="2026-10-10 18:59", active=True, rate=27),
+        view("nearly", 0, 83, w_reset="2026-10-08 05:59"),
+        view("empty", 0, 0, w_reset="2026-10-12 08:00"),
+    ]
+    p = PL.plan(views, S, now, current_id="cur")
+    assert p["action"]["to"] == "empty"
+    assert by_id(p)["nearly"]["drainsUntil"] == at("2026-10-08 05:59")
+
+    # The same week coming back at 21:00, ~2.5 h after it would run out: use it before it resets.
+    soon = [views[0], view("nearly", 0, 83, w_reset="2026-10-07 21:00"), views[2]]
+    p = PL.plan(soon, S, now, current_id="cur")
+    assert p["action"]["to"] == "nearly" and by_id(p)["nearly"]["drainsUntil"] is None
+
+
+def test_when_every_week_would_run_out_the_one_back_soonest_goes_first() -> None:
+    views = [
+        view("cur", 98, 50, s_reset="2026-10-07 13:00", active=True, rate=25),
+        view("sat", 0, 80, w_reset="2026-10-10 18:59"),  # more room, but out of its week until Saturday
+        view("thu", 0, 85, w_reset="2026-10-08 06:00"),
+        view("crumbs", 85, 10, s_reset="2026-10-07 14:30"),  # its week lasts, but 13 points carry ~30 min
+    ]
+    p = PL.plan(views, S, NOW, current_id="cur")
+    c = by_id(p)
+    assert c["sat"]["drainsUntil"] and c["thu"]["drainsUntil"] and c["crumbs"]["drainsUntil"] is None
+    assert PL.room_class(c["sat"]["room"]) == 0 and PL.room_class(c["thu"]["room"]) == 1 and PL.room_class(c["crumbs"]["room"]) == 2
+    assert [x["id"] for x in p["candidates"] if x["usable"]] == ["thu", "sat", "crumbs"]
 
 
 def test_more_room_beats_a_more_urgent_week() -> None:

@@ -12,6 +12,7 @@ while it is stopped they edit its saved state directly.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -571,7 +572,15 @@ def cmd_settings(args: argparse.Namespace, paths: C.Paths) -> dict:
     out = call_monitor(paths, "api/settings", body)
     if out is None:
         out = {"settings": Monitor(paths).apply_settings(body)}
-    return {"settings": out["settings"]}
+    result: dict[str, Any] = {"settings": out["settings"]}
+    if body.get("switchMode") == "auto":
+        result["note"] = (
+            "In automatic mode the account in use raises no heads-up alerts (limit_warning, switch_now, limit_soon): "
+            "switches are reported as auto_switched, no_account_available and auto_switch_failed. If the user gets "
+            "their Claude usage alerts in a conversation, check `cremind skill-events list` and subscribe that "
+            "conversation to these three too, with the same action — otherwise they hear nothing."
+        )
+    return result
 
 
 def cmd_label(args: argparse.Namespace, paths: C.Paths) -> dict:
@@ -715,7 +724,11 @@ def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     paths = C.default_paths()
     try:
-        _print(COMMANDS[args.command](args, paths))
+        # Stdout carries the one JSON answer. Anything else a command prints — the monitor's own
+        # log lines, when a setting changes while the monitor isn't running — goes to stderr.
+        with contextlib.redirect_stdout(sys.stderr):
+            out = COMMANDS[args.command](args, paths)
+        _print(out)
         return 0
     except Failure as e:
         _print({"error": str(e), **e.extra})

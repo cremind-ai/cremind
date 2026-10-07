@@ -375,6 +375,8 @@ function renderPlan(s) {
   } else if (auto) {
     head.append(el('strong', null, 'Automatic. '));
     head.append(document.createTextNode(`Your Claude Code moves to the best account at ${p.thresholds.session}% of the 5-hour limit or ${p.thresholds.weekly}% of the weekly one${p.early ? ', and early to use up a week that resets soon' : ''}.`));
+    line('plan-note').textContent =
+      'No heads-up alerts for the account in use in this mode: each switch is a Cremind event (auto_switched, no_account_available, auto_switch_failed), and only a conversation subscribed to them hears about it — ask Cremind to tell you about automatic switches.';
   } else {
     head.append(el('strong', null, 'Manual. '));
     head.append(document.createTextNode('Alerts only: pick an account above, or ask Cremind to switch.'));

@@ -445,6 +445,59 @@ def test_cremind_profile_home_is_tracked(rig: Rig, tmp_path: Path) -> None:
     assert code == 0 and Path(added["folder"]) == tmp_path / "sys" / "alice" / "coding-cli" / "claude-accounts" / "spare"
 
 
+def test_a_monitor_started_by_hand_finds_the_profiles_cremind_made(rig: Rig, tmp_path: Path) -> None:
+    """2026-10-07: the listener started by hand from a Cremind profile's copy of the skill — no
+    CREMIND_* variables — looked for the extra profiles in ~/.claude-accounts, reported every
+    one signed out and had no account to switch to. The copy's own place names its profile."""
+    sysdir = tmp_path / "sys"
+    home = sysdir / "alice" / "skills" / "claude-usage-monitor"
+    home.parent.mkdir(parents=True)
+    shutil.move(str(rig.skill), str(home))
+    rig.skill, rig.scripts, rig.data = home, home / "scripts", home / "scripts" / ".monitor"
+    (sysdir / "bootstrap.toml").write_text('db_provider = "sqlite"\n', encoding="utf-8")
+    spare = sysdir / "alice" / "coding-cli" / "claude-accounts" / "spare"
+    spare.mkdir(parents=True)
+    (spare / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": C3["uuid"], "emailAddress": C3["email"], "organizationRateLimitTier": TIER}}), encoding="utf-8")
+    (rig.data / "profiles.json").write_text(json.dumps({"profiles": [{"name": "spare"}]}), encoding="utf-8")
+    del rig.env["CLAUDE_USAGE_MONITOR_ACCOUNTS_DIR"]
+    rig.start()
+    s = rig.until(lambda x: x["ready"] and view(x, C3["uuid"])["signedIn"] == ["spare"])
+    assert Path(next(p for p in s["profiles"] if p["name"] == "spare")["dir"]).resolve() == spare.resolve()
+    assert not any("signed out" in e["text"] for e in s["events"])
+
+
+def test_turning_automatic_switching_on_names_the_events_that_report_it(rig: Rig) -> None:
+    """In automatic mode the account in use raises no heads-up alerts: a conversation that only
+    has the alert events subscribed hears nothing (2026-10-07), so the agent is told."""
+    code, out = rig.cli("settings", "--switching", "auto")
+    assert code == 0 and out["settings"]["switchMode"] == "auto"
+    assert all(name in out["note"] for name in ("auto_switched", "no_account_available", "auto_switch_failed", "cremind skill-events list"))
+    code, out = rig.cli("settings", "--auto-session-pct", "95")
+    assert code == 0 and out["settings"]["autoSessionPct"] == 95 and "note" not in out
+
+
+def test_a_page_that_leaves_before_its_answer_is_no_error(capsys: pytest.CaptureFixture[str]) -> None:
+    """2026-10-07: the dashboard closed during a refresh, and the monitor's log on Cremind's
+    Processes page showed a ConnectionAbortedError traceback (WinError 10053)."""
+    sys.path.insert(0, str(SKILL_SRC / "scripts"))
+    try:
+        from usage_monitor.server import DashboardServer
+    finally:
+        sys.path.remove(str(SKILL_SRC / "scripts"))
+    server = DashboardServer.__new__(DashboardServer)  # handle_error needs no socket
+    for gone in (ConnectionAbortedError(10053, "aborted by the software in your host machine"), BrokenPipeError(), ConnectionResetError()):
+        try:
+            raise gone
+        except ConnectionError:
+            server.handle_error(None, ("127.0.0.1", 62265))
+    assert capsys.readouterr().err == ""
+    try:
+        raise ValueError("a real fault")
+    except ValueError:
+        server.handle_error(None, ("127.0.0.1", 62265))
+    assert "ValueError: a real fault" in capsys.readouterr().err
+
+
 def test_event_writer_contract(tmp_path: Path) -> None:
     sys.path.insert(0, str(SKILL_SRC / "scripts"))
     try:

@@ -134,18 +134,21 @@ uv run scripts/__main__.py settings --switching auto     # or: --switching manua
   sessions carry on from their next message. It needs the monitor running (Cremind running).
 - **Manual** (the default): alerts only; the user, or you when they ask, switch.
 - **Which account it picks**: the one with the most room to work — its 5-hour room, capped by
-  what its week still allows, in coarse steps (plenty / some / little); among similar ones, the
-  one whose unused week would be lost soonest at its reset (weekly left ÷ days to its reset).
-  So weeks get used before they expire, and no account's week runs out early while the others
-  sit full. Only accounts whose login is saved here and that are in rotation
-  (`rotation <account> off` leaves one out).
+  what its week still allows, in coarse steps (plenty / some / little) — but not one whose week
+  it would use up hours before that week resets: such an account comes after accounts whose
+  week lasts, and stays as cover for when another account's 5-hour window fills. Among similar
+  ones, the one whose unused week would be lost soonest at its reset (weekly left ÷ days to its
+  reset). So no account's week runs out early while the others still have room, and a week that
+  resets soon is used before it expires. Only accounts whose login is saved here and that are in
+  rotation (`rotation <account> off` leaves one out).
 - `--early on` also switches before the thresholds, to an account whose leftover week would
   otherwise go unused within 24 hours. Off by default.
 - "Which account is next?", "why that one?", "what will it do?" → `plan`: `do` (switch / wait /
   stay), `what`, `switching.next_in_line`, and every account in `ranking` with `why`.
-- When automatic switching goes on, offer to subscribe the conversation to `auto_switched`,
-  `no_account_available` and `auto_switch_failed` if they want to hear about it (Telegram …):
-  in automatic mode the heads-up alerts for the account in use are not sent.
+- When automatic switching goes on, run `cremind skill-events list`: a conversation that gets
+  this skill's alerts must also be subscribed to `auto_switched`, `no_account_available` and
+  `auto_switch_failed` — subscribe it (same action) and say so. In automatic mode the heads-up
+  alerts for the account in use are not sent, so without these the user hears nothing.
 
 ## Alerts as Cremind events
 
@@ -165,8 +168,9 @@ Code uses raises only `limit_reached` of the first five (it is switched before t
 matter), and `account_available` isn't sent. **An alert reaches the user only through a
 subscription** — with none, Cremind drops the event (it still appears in the dashboard's
 Activity list). When the user wants to be told about their Claude usage, subscribe this
-conversation with the skill's `subscribe` object: every trigger they asked for (the first five
-by default; the three `auto_…` ones with automatic switching), and a short action such as:
+conversation with the skill's `subscribe` object: every trigger they asked for — all eight by
+default: the three `auto_…` ones are raised only in automatic mode, and then they are the only
+news of it — and a short action such as:
 
 > Report this Claude usage alert in one or two lines: the account, the limit (5-hour or
 > weekly), how much is used, when it resets or runs out, and which account to switch to.
@@ -246,7 +250,8 @@ and won't replace another status line without `--force`. VS Code sessions don't 
 ## Troubleshooting
 
 - **No alerts arrive** → is there a subscription (`cremind skill-events list`) and are alerts
-  on (`settings`)? `test-alert` checks the whole path.
+  on (`settings`)? `test-alert` checks the whole path. In automatic mode only `limit_reached`
+  and the three `auto_…` events are raised: subscriptions to the other four hear nothing.
 - **"not running"** → `dashboard` starts it. Its log is on Cremind's Processes page.
 - **Automatic switching didn't switch** → `plan` says why: `do: wait` (no account can take over;
   `switching.now` names the first one free again), another Cremind profile runs automatic

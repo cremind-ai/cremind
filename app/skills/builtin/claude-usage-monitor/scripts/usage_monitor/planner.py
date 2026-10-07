@@ -10,7 +10,9 @@ window, capped by what their week allows — in coarse classes, and within a cla
 their unused week would be lost at its reset. In a simulation of three accounts this beat
 both "most 5-hour room first" and "use up one week before the next": when the weeks reset
 together it keeps several accounts alive to the end, and when they reset on different days
-it spends the week that is about to expire first.
+it spends the week that is about to expire first. An account whose week the switch would use
+up hours before that week resets comes after those whose week lasts: out of its week, it can't
+cover for the others' 5-hour windows (the user's rule, 2026-10-07).
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ DAY = 24 * HOUR
 GATE_POINTS = 10
 PLENTY, SOME = 60, 30  # room classes, in points of a 5-hour window
 WEEKLY_STEP = 3  # weekly room per day is compared in steps of this many points
+# A week that a switch would use up but that comes back this soon after is used like any other.
+DRAIN_GRACE_MS = 5 * HOUR
 DEFAULT_PACE = 30.0  # % of a 5-hour window per hour, when the account in use isn't running
 EARLY_WITHIN_MS = 24 * HOUR  # the early switch: an unused week this close to its reset
 EARLY_MIN = 60  # ...in an account that can carry you this long
@@ -149,6 +153,25 @@ def weekly_per_day(v: dict, now: float, t7: float) -> float:
     return max(0.0, t7 - _pct(w)) / max((reset - now) / DAY, 1 / 48)
 
 
+def drains_until(v: dict, now: float, t7: float, points: float, stretch_min: float) -> float | None:
+    """When carrying the work it has room for would use up the account's week — leave less
+    than GATE_POINTS of it — and the week would stay used up for longer than a 5-hour window
+    lasts: when its week resets. Else None.
+
+    An account whose week is out can't take over when the others' 5-hour windows fill, which
+    is what keeps work going; a week used up hours before its reset costs that cover."""
+    w = v.get("weekly") or {}
+    reset = w.get("resetsAt")
+    if reset is None or reset <= now:
+        return None
+    usd5, usd7 = usd_per_point(v)
+    left = max(0.0, t7 - _pct(w)) * usd7 / usd5  # its week, in points of its 5-hour window
+    if left - points >= GATE_POINTS:
+        return None
+    ends = now + stretch_min * MIN if math.isfinite(stretch_min) else now
+    return reset if reset - ends > DRAIN_GRACE_MS else None
+
+
 def room_class(points: float) -> int:
     return 0 if points >= PLENTY else 1 if points >= SOME else 2
 
@@ -201,12 +224,15 @@ def assess(v: dict, *, now: float, s: dict, usd_per_hour: float, aside: dict, in
     if pts < GATE_POINTS:
         c["why"] = f"too little room left: 5-hour {_p(session)}, weekly {_p(weekly)}"
         return c
+    c["drainsUntil"] = drains = drains_until(v, now, t7, pts, st)
     week = (
         f"{U.js_round(max(0, t7 - _pct(weekly)))}% of its week left until {when_clock(weekly['resetsAt'], now)} (≈{U.js_round(per_day)}%/day)"
         if weekly.get("resetsAt") and weekly["resetsAt"] > now
         else "a fresh week"
     )
     c["why"] = f"5-hour {_p(session)}, weekly {_p(weekly)}: {_CLASS_TEXT[room_class(pts)]}, {week}; carries you ~{duration(st)}"
+    if drains:
+        c["why"] += f", then its week is used up until {when_clock(drains, now)}"
     c["usable"] = True
     if v.get("active"):
         c["why"] = "your Claude Code uses it already; " + c["why"]
@@ -221,9 +247,12 @@ def assess(v: dict, *, now: float, s: dict, usd_per_hour: float, aside: dict, in
 
 def _rank(c: dict) -> tuple:
     reset5 = c.get("sessionResetsAt")
+    drains = c.get("drainsUntil")
+    cls = room_class(c["room"])
     return (
         not c["ok"],  # one click (or none) away first
-        room_class(c["room"]),
+        max(1, cls) if drains else cls,  # a week it would use up: at best "some room", whatever its window has
+        drains or 0,  # in a class, an account whose week lasts first; then the week back soonest
         -math.floor(c["perDay"] / WEEKLY_STEP),
         -U.js_round(c["room"]),
         reset5 if reset5 else math.inf,  # a window already running before a fresh one

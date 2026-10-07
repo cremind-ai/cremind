@@ -99,7 +99,8 @@ def test_at_the_threshold_it_switches_to_the_best_account_and_says_so(auto: Simp
     assert read(auto.main / ".credentials.json")["claudeAiOauth"]["refreshToken"] == token(B, "rt")
     assert read(auto.accounts / "first-example-com" / ".credentials.json")["claudeAiOauth"]["refreshToken"] == token(A, "rt")
     assert m.state["activeId"] == B["uuid"]
-    assert any(t.startswith(f"Auto mode switched Claude Code to {B['email']} — {A['email']} reached 98% of its 5-hour limit") for t in texts(m))
+    [line] = [t for t in texts(m) if t.startswith(f"Auto mode switched Claude Code to {B['email']} — {A['email']} reached 98% of its 5-hour limit")]
+    assert f"; {B['email']}: 5-hour 10%, weekly 30%: plenty of room" in line, "why this account, not only why the switch"
 
     [event] = events(tmp_path, "auto_switched")
     fm = frontmatter(event)
@@ -218,14 +219,26 @@ def test_manual_mode_never_switches_and_its_alerts_name_the_best_account(auto: S
     m = start(auto, tmp_path, ("spare-b", B), ("spare-c", C3), mode="manual")
     figures(m, A, 98, 40, now)
     figures(m, B, 0, 48, now)  # its week lasts three more days
-    figures(m, C3, 0, 83, now, weekly_in=18 * HOUR)  # 16% of a week that ends tomorrow morning
+    figures(m, C3, 0, 83, now, weekly_in=18 * HOUR)  # 16% of a week that ends tomorrow morning: used up in ~3 h
     m.tick()
     settle(m)
     assert m.state["activeId"] == A["uuid"] and m.auto_thread is None
     fm = frontmatter(events(tmp_path, "switch_now")[0])
-    assert fm["switch_to"] == C3["email"] and fm["switch_command"] == f"switch {C3['email']}"
-    assert "plenty of room" in fm["switch_why"] and "16% of its week left" in fm["switch_why"]
+    assert fm["switch_to"] == B["email"] and fm["switch_command"] == f"switch {B['email']}"
+    assert "plenty of room" in fm["switch_why"] and "51% of its week left" in fm["switch_why"]
     assert not (auto.main / M.CLAIM_FILE).exists(), "manual mode claims nothing"
+
+
+def test_a_threshold_change_in_automatic_mode_is_logged(auto: SimpleNamespace, tmp_path: Path) -> None:
+    """A switch is explained by the thresholds of its moment: changing them leaves a line."""
+    m = start(auto, tmp_path, ("spare-b", B))
+    m.apply_settings({"autoSessionPct": 95})
+    assert texts(m)[-1] == "Automatic switching now at 95% of the 5-hour limit or 99% of the weekly one"
+    before = len(texts(m))
+    m.apply_settings({"autoSessionPct": 95, "autoWeeklyPct": 99, "autoEarly": False, "warnPct": 70})  # the dashboard sends every field
+    m.apply_settings({"switchMode": "manual", "autoSessionPct": 90})
+    m.apply_settings({"autoSessionPct": 92})
+    assert texts(m)[before:] == ["Automatic switching off: alerts only; you or the agent switch"]
 
 
 def test_heads_up_alerts_wait_for_manual_mode(auto: SimpleNamespace, tmp_path: Path) -> None:

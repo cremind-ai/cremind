@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -45,6 +46,13 @@ class DashboardServer(ThreadingHTTPServer):
         if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A page closed or reloaded, or a command that gave up, before its answer was written
+        # (WinError 10053 / broken pipe): nothing went wrong here, so no traceback in the log.
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
 
     @property
     def port(self) -> int:

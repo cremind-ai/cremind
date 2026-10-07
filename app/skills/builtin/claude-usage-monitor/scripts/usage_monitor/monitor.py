@@ -714,8 +714,9 @@ class Monitor:
     def _auto_switch(self, targets: list[str], act: dict, p: dict) -> None:
         failures: list[tuple[str, Exception]] = []
         for target in targets:
+            pick = next((c["why"] for c in p["candidates"] if c["id"] == target), None)
             try:
-                result = self.switch_account(target, why=act, accept=lambda reading, t=target: self._still_suitable(t, reading))
+                result = self.switch_account(target, why={**act, "pick": pick}, accept=lambda reading, t=target: self._still_suitable(t, reading))
             except switching.SwitchError as e:
                 if e.reason == "already":
                     return  # switched meanwhile, by you or the agent
@@ -1468,6 +1469,7 @@ class Monitor:
                 if self.poller is not None:
                     self.poller.refresh(0)
             # Auto mode needs a threshold below 100%: at 100% Claude Code has already stopped.
+            auto_was = (s.get("autoSessionPct"), s.get("autoWeeklyPct"), bool(s.get("autoEarly")))
             for k, lo, hi in (("autoSessionPct", 50, 99), ("autoWeeklyPct", 50, 100)):
                 if k in body:
                     value = to_int(body[k], lo, hi)
@@ -1476,6 +1478,13 @@ class Monitor:
             if isinstance(body.get("autoEarly"), bool):
                 s["autoEarly"] = body["autoEarly"]
             mode = body.get("switchMode")
+            if s.get("switchMode") == "auto" and mode != "manual" and auto_was != (s.get("autoSessionPct"), s.get("autoWeeklyPct"), bool(s.get("autoEarly"))):
+                # They decide when your Claude Code moves: a switch is explained by the values of the moment.
+                self.log_event(
+                    "auto",
+                    f"Automatic switching now at {s['autoSessionPct']}% of the 5-hour limit or {s['autoWeeklyPct']}% of the weekly one"
+                    + (", and early to use up a week that resets soon" if s.get("autoEarly") else ""),
+                )
             if mode in ("manual", "auto") and mode != s.get("switchMode"):
                 s["switchMode"] = mode
                 if mode == "auto":
@@ -1601,7 +1610,9 @@ class Monitor:
                 a = self.state["accounts"].get(account_id)
                 who = name_of(a) if a else result.get("email") or account_id[:8]
                 if why:
-                    text = f"Auto mode switched Claude Code to {who} — {why['because']} — with its login saved here, no sign-in"
+                    # Why this account, too: "why not that one?" is the question an automatic switch raises.
+                    picked = f"; {who}: {why['pick']}" if why.get("pick") else ""
+                    text = f"Auto mode switched Claude Code to {who} — {why['because']}{picked} — with its login saved here, no sign-in"
                 else:
                     text = f"Switched Claude Code to {who}, with its login saved here — no sign-in"
                 if pv:

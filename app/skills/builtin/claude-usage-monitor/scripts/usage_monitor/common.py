@@ -138,8 +138,21 @@ def cremind_claude_home() -> Path | None:
     return None if _same_path(home, main_claude_home()[0]) else home
 
 
+def cremind_install() -> tuple[Path, str] | None:
+    """(System Directory, profile) of the Cremind profile this copy of the skill is installed
+    in — Cremind keeps it at ``<System Directory>/<profile>/skills/claude-usage-monitor`` —
+    or None for a copy anywhere else."""
+    skills = SKILL_DIR.parent
+    sysdir = skills.parent.parent
+    if skills.name != "skills" or not ((sysdir / "bootstrap.toml").is_file() or (sysdir / "storage").is_dir()):
+        return None
+    return sysdir, skills.parent.name
+
+
 def accounts_root() -> Path:
-    """Where ``add-account`` creates the extra profiles."""
+    """Where ``add-account`` creates the extra profiles: this Cremind profile's own folder —
+    also for a monitor started by hand from the copy Cremind runs, which shares Cremind's
+    data folder and so its list of profiles."""
     override = os.environ.get("CLAUDE_USAGE_MONITOR_ACCOUNTS_DIR", "").strip()
     if override:
         return Path(override)
@@ -147,6 +160,9 @@ def accounts_root() -> Path:
     profile = os.environ.get("CREMIND_PROFILE", "").strip()
     if sysdir and profile:
         return Path(sysdir) / profile / "coding-cli" / "claude-accounts"
+    installed = cremind_install()
+    if installed:
+        return installed[0] / installed[1] / "coding-cli" / "claude-accounts"
     return Path.home() / ".claude-accounts"
 
 

@@ -140,20 +140,38 @@ is the throttle. Every view of "which account next" — the alerts, the dashboar
    the current pace counts as empty — capped by what its week still allows (weekly room in
    5-hour terms, through each plan's calibration), compared in classes: plenty (60+ points),
    some (30-60), little.
-3. **The week that would be lost soonest**: weekly room left ÷ days until that account's week
-   resets, in steps of 3 points a day. A week about to reset is used before it expires; weeks
-   that reset together drain together, so no account runs out days early while the others are
-   full — the situation where the last account's 5-hour window becomes the only one left.
-4. Then more 5-hour room, a window already running before a fresh one, and the least recently
+3. **A week it would use up**: when carrying the work it has room for would leave its week
+   used up (under 10 points of a window) and the week would stay out for longer than a 5-hour
+   window lasts, the account counts as "some room" at best, and within its class comes after
+   accounts whose week lasts. An account out of its week can't take over when another
+   account's 5-hour window fills, and several accounts with weekly room are what keep work
+   going — the last account's 5-hour window must not become the only one left. A week that
+   comes back within 5 hours of running out is used like any other; when every account would
+   use its week up, the one whose week comes back soonest goes first.
+4. **The week that would be lost soonest**: weekly room left ÷ days until that account's week
+   resets, in steps of 3 points a day. A week about to reset is used before it expires, and
+   weeks that reset together drain together.
+5. Then more 5-hour room, a window already running before a fresh one, and the least recently
    used.
 
-A simulation of three Max 20x accounts over four weeks (workdays of 3-12 hours at 15-70% of a
+Step 3 came from a switch on 2026-10-07 15:51: the account in use filled its 5-hour window; one
+other account had 17% of its week left until 06:00 the next morning, another a whole week. Without
+step 3 the first was picked — its leftover week would have been lost overnight — and it would
+have been out of its week from about 18:30 until 06:00. Now the empty account takes over and the
+nearly-full week stays as cover, used later in the evening if the work goes on.
+
+A simulation of three Max 20x accounts over four weeks (workdays of 3-16 hours at 15-70% of a
 window per hour, the accounts' real reset days and readings of 2026-10-07) compared rules:
 using up one account's week before the next blocked about 6× longer than these rules when the
 weeks reset together; "most 5-hour room first" (the earlier rule) left about half again more of
 each week unused when they reset on different days; ranking 5-hour room finely before the week
-did worse than these classes. Above about 5-6 hours of heavy work a day three such accounts run
-out whatever the order.
+did worse than these classes. Step 3, from that day's figures at 15-33% per hour: at 7 hours a
+day no block instead of 0.9 h, and 521 instead of 924 account-hours with a week used up; at 8
+hours, 15.6 instead of 21.6 h blocked. From random starting figures both orders block within
+minutes of each other. Its cost: past what three accounts allow (10+ hours a day), a week kept
+as cover sometimes resets partly unused — 6.5 h more blocked over four weeks at 10 hours a day.
+Above about 7 hours of heavy work a day (5-6 at the heaviest paces) three such accounts run out
+whatever the order.
 
 When nothing can take over, it says when the first account frees up.
 
