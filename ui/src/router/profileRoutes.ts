@@ -16,6 +16,7 @@ export const PROFILE_ROUTES = new Set([
   'llm-settings',
   'tools-skills-settings',
   'user-config-settings',
+  'appearance-settings',
   'embedding-settings',
   'documents-settings',
   'gsuite-settings',

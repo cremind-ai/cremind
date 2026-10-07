@@ -12,7 +12,7 @@ import './style.css'
 import './styles/markdown.css'
 import App from './App.vue'
 import router from './router'
-import { useSettingsStore } from './stores/settings'
+import { useAppearanceStore } from './stores/appearance'
 import { installExternalLinkInterceptor } from './utils/externalLinks'
 import { handleUnauthorized, shouldHandle401 } from './services/sessionExpiry'
 import { installConsentWindowOpener } from './services/oauthReturn'
@@ -168,12 +168,15 @@ async function boot() {
   // Do not instantiate App (and its Pinia settings refs) until that restore is
   // complete, otherwise preferences are cached from the empty HTTPS origin.
   await router.isReady()
+
+  // The profile's theme, font and text size — painted before the first
+  // render, then kept in step with the server (stores/appearance.ts).
+  const appearance = useAppearanceStore()
+  appearance.start()
   app.mount('#app')
 
-  // Apply theme attribute and highlight.js stylesheet reactively
-  const settingsStore = useSettingsStore()
-
-  function applyHljsTheme(theme: string) {
+  // Code blocks follow the theme's light or dark mode.
+  function applyHljsTheme(mode: string) {
     const id = 'hljs-theme'
     let link = document.getElementById(id) as HTMLLinkElement | null
     if (!link) {
@@ -182,13 +185,10 @@ async function boot() {
       link.rel = 'stylesheet'
       document.head.appendChild(link)
     }
-    link.href = theme === 'dark' ? hljsDarkUrl : hljsLightUrl
+    link.href = mode === 'dark' ? hljsDarkUrl : hljsLightUrl
   }
 
-  watchEffect(() => {
-    document.documentElement.setAttribute('data-theme', settingsStore.theme)
-    applyHljsTheme(settingsStore.theme)
-  })
+  watchEffect(() => applyHljsTheme(appearance.mode))
 }
 
 void boot()

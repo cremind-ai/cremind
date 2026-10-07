@@ -166,7 +166,7 @@ watch(() => props.visible, () => { revealed.value = false; });
 
 .mention-item:hover,
 .mention-item.active {
-  background: rgba(37, 99, 235, 0.1);
+  background: color-mix(in srgb, var(--primary-color) 10%, transparent);
 }
 
 .mention-name {

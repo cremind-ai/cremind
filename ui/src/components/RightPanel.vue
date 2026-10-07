@@ -100,8 +100,8 @@ onMounted(() => {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: #0b1220;
-  color: #e5e7eb;
+  background: var(--strip-bg-deep);
+  color: var(--strip-text-strong);
   overflow: hidden;
 }
 .right-panel-header {
@@ -109,11 +109,11 @@ onMounted(() => {
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  background: #0f172a;
-  border-bottom: 1px solid #1f2937;
+  background: var(--strip-bg);
+  border-bottom: 1px solid var(--strip-border);
   flex-shrink: 0;
   font-size: 0.78rem;
-  color: #94a3b8;
+  color: var(--strip-text);
 }
 .header-icon {
   font-size: 1rem;
@@ -123,7 +123,7 @@ onMounted(() => {
   flex: 1 1 auto;
   min-width: 0;
   font-weight: 500;
-  color: #cbd5f5;
+  color: var(--strip-title);
   /* The title is now caller-supplied (an agent name in a room), so it has to
      yield to the action buttons instead of pushing them off the panel. */
   overflow: hidden;
@@ -133,7 +133,7 @@ onMounted(() => {
 .header-action {
   background: transparent;
   border: none;
-  color: #94a3b8;
+  color: var(--strip-text);
   padding: 2px 6px;
   cursor: pointer;
   border-radius: 3px;
@@ -142,15 +142,15 @@ onMounted(() => {
   align-items: center;
 }
 .header-action:hover {
-  color: #e5e7eb;
-  background: #1e293b;
+  color: var(--strip-text-strong);
+  background: var(--strip-hover);
 }
 .header-action:disabled {
   opacity: 0.5;
   cursor: default;
 }
 .header-action:disabled:hover {
-  color: #94a3b8;
+  color: var(--strip-text);
   background: transparent;
 }
 .right-panel-body {
@@ -177,16 +177,16 @@ onMounted(() => {
   align-items: center;
   gap: 12px;
   padding: 10px 0;
-  background: #0f172a;
+  background: var(--strip-bg);
   border: none;
-  border-left: 1px solid #1f2937;
-  color: #94a3b8;
+  border-left: 1px solid var(--strip-border);
+  color: var(--strip-text);
   cursor: pointer;
   font-size: 1.05rem;
 }
 .collapsed-strip:hover {
-  color: #e5e7eb;
-  background: #1e293b;
+  color: var(--strip-text-strong);
+  background: var(--strip-hover);
 }
 .collapsed-chevron {
   font-size: 1rem;

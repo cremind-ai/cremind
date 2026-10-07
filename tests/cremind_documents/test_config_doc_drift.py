@@ -306,13 +306,32 @@ def test_no_documented_key_is_missing_from_the_schema():
 
 
 def test_each_group_states_its_real_card_position():
-    """The "(the Nth card on the page)" ordinals follow CONFIG_SCHEMA order."""
+    """The "(the Nth card on the page)" ordinals follow CONFIG_SCHEMA order.
+
+    A group edited somewhere else (Appearance on a page of its own, Chat in the
+    chat itself) is no card on the Config page: it counts toward no ordinal,
+    and its section says where it is changed instead.
+    """
     sections = _group_sections()
-    for index, group_name in enumerate(CONFIG_SCHEMA, start=1):
-        assert group_name in sections, (
-            f"CONFIG_SCHEMA group {group_name!r} has no '### Group "
-            f"`{group_name}`' section in {DOC.name}"
+    carded = [name for name, group in CONFIG_SCHEMA.items() if group.page is None]
+    for name, group in CONFIG_SCHEMA.items():
+        assert name in sections, (
+            f"CONFIG_SCHEMA group {name!r} has no '### Group `{name}`' section "
+            f"in {DOC.name}"
         )
+        if group.page is None:
+            continue
+        flat = " ".join(sections[name].split())
+        assert "not a card on the Config page" in flat, (
+            f"group {name!r} is edited outside the Config page ({group.page!r}); "
+            "its section must say where, and that it is 'not a card on the Config page'"
+        )
+        if group.page == "appearance":
+            assert "**Settings page:** **Settings → Appearance**" in flat
+        assert "card on the page" not in flat, (
+            f"group {name!r} is not on the Config page, so it has no card position"
+        )
+    for index, group_name in enumerate(carded, start=1):
         flat = " ".join(sections[group_name].split())
         match = re.search(r"\(the (\w+) card on the page\)", flat)
         assert match, (

@@ -117,7 +117,7 @@ onBeforeUnmount(() => { terminalPanel.setFocusConversation(null); });
   min-height: 0;
   /* Same ground as RightPanel, so the strip reads as part of the panel rather
      than as a floating toolbar over the room. */
-  background: #0b1220;
+  background: var(--strip-bg-deep);
   overflow: hidden;
 }
 
@@ -127,8 +127,8 @@ onBeforeUnmount(() => { terminalPanel.setFocusConversation(null); });
   gap: 4px;
   padding: 6px 6px 0 6px;
   overflow-x: auto;
-  background: #0f172a;
-  border-bottom: 1px solid #1f2937;
+  background: var(--strip-bg);
+  border-bottom: 1px solid var(--strip-border);
 }
 
 .agent-tab {
@@ -142,20 +142,20 @@ onBeforeUnmount(() => { terminalPanel.setFocusConversation(null); });
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: 6px 6px 0 0;
-  color: #94a3b8;
+  color: var(--strip-text);
   font-size: 0.78rem;
   cursor: pointer;
 }
 
 .agent-tab:hover {
-  background: #1e293b;
-  color: #e5e7eb;
+  background: var(--strip-hover);
+  color: var(--strip-text-strong);
 }
 
 .agent-tab.active {
-  background: #0b1220;
-  border-color: #1f2937;
-  color: #e5e7eb;
+  background: var(--strip-bg-deep);
+  border-color: var(--strip-border);
+  color: var(--strip-text-strong);
 }
 
 .tab-avatar {

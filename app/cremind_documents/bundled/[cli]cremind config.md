@@ -1,17 +1,19 @@
 ---
-description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: the system timezone schedules fire in, whether the agent asks for approval before messaging channel clients (`channels.confirm_before_send`; override per client with `cremind channels set-confirm`), the reasoning-agent loop (max steps, retries, temperature, max tokens, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Distinct from `cremind llm` (models and providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file — re-download my config, lost my setup file, recover my token, agent URL, database and VNC details — from **Sidebar → Settings → Profiles → Configuration File**, or with `cremind config export`, as `cremind-<profile>-config.md`, `.json` or `.env`. Any profile may download its own; the admin profile's file also carries the database, vector-store, VNC and Kubernetes details, including the `kubectl port-forward` command that reconnects to the install."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: the system timezone schedules fire in, whether the agent asks for approval before messaging channel clients (`channels.confirm_before_send`; override per client with `cremind channels set-confirm`), the reasoning-agent loop (max steps, retries, temperature, max tokens, prompt caching, trace replay), conversation compaction, tool-result truncation, and long-term memory — the app's look (`appearance.*`: dark/light mode, color themes, custom colors, font, text size), and whether the Thinking Process auto-opens (`chat.*`). Distinct from `cremind llm` (models and providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file — re-download my config, lost my setup file, recover my token, agent URL, database and VNC details — from **Sidebar → Settings → Profiles → Configuration File**, or with `cremind config export`, as `cremind-<profile>-config.md`, `.json` or `.env`. Any profile may download its own; the admin's also carries the database, vector-store, VNC and Kubernetes details, with the `kubectl port-forward` reconnect command."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
 
 `cremind config` is the CLI for inspecting and changing per-profile settings
-that control the Cremind reasoning agent. Each subcommand maps one-to-one
-to an action on the **Settings → Config** page in the web UI, so you can
+that control the Cremind reasoning agent and how the app looks. Each
+subcommand maps one-to-one to an action on the **Settings → Config** page in
+the web UI (the appearance settings: **Settings → Appearance**; the chat
+setting: on the Thinking Process row of any reply), so you can
 freely switch between the two: anything you change in the CLI shows up
 on that page, and anything you change there is visible to `cremind config
 get`.
 
-The settings are grouped into six areas:
+The settings are grouped into eight areas:
 
 - **System** — install-level preferences. The **timezone** sets the
   wall-clock zone the scheduler fires time-based events in and the agent
@@ -30,6 +32,12 @@ The settings are grouped into six areas:
   back to the reasoning LLM (the full result is always kept in the
   database and shown in the web UI).
 - **Memory** — long-term, cross-conversation facts about the user.
+- **Appearance** — how the app looks for this profile: the color theme,
+  and the font and text size. It has a page of its own, **Settings →
+  Appearance**, instead of a card on the Config page.
+- **Chat** — whether a reply's Thinking Process opens by itself while the
+  agent works. It is changed in the chat itself, with the **Auto-open**
+  switch on the Thinking Process row of any reply.
 
 Every setting has a built-in **default**. When you change a setting
 with `cremind config set`, your value becomes an **override** that takes
@@ -66,6 +74,16 @@ changes** commits all pending edits in one go (**Discard** drops them);
 leaving the page with edits still pending asks first. The per-group
 tables below list the exact UI label for every key so you can match it
 to the row you see in the card.
+
+The `appearance.*` keys are not on the Config page. They have a page of their
+own, with a preview of every theme:
+
+> **Sidebar → Settings → Appearance**
+
+The palette button in the sidebar's icon rail opens a quick theme picker with a
+link to the same page. A change there applies at once and is saved for the
+profile, with no save bar; a change made with `cremind config set` reaches open
+windows within a moment, without a reload.
 
 ## Re-downloading the setup configuration file
 
@@ -492,6 +510,70 @@ relevance; otherwise they live in a small size-capped queue. Off by default.
 | `memory.long_term_max_tokens`    | Long-term entry max tokens | number  | `50`    | 10 – 500 | Each long-term fact is clipped to at most this many tokens.                              |
 | `memory.long_term_retrieve_limit`| Long-term retrieval limit  | number  | `10`    | 1 – 50   | Top-K long-term facts retrieved from the vector store for the prompt (Vector-Embedding-ON mode). |
 
+### Group `appearance` — Appearance
+
+How the Cremind app looks for this profile: the color theme, and the font and
+text size. The settings are per profile, so every device the profile signs in on looks the same, and two
+profiles on one computer can each keep their own look.
+
+**Settings page:** **Settings → Appearance** (its own page, not a card on the
+Config page).
+
+| Key                            | On the page                | Type   | Default     | Range                      | Meaning |
+|--------------------------------|----------------------------|--------|-------------|----------------------------|---------|
+| `appearance.theme`             | Theme                      | enum   | `light`     | see the theme list below   | The color theme. |
+| `appearance.font`              | Font                       | enum   | `default`   | see the font list below    | The typeface for the whole app. |
+| `appearance.font_size`         | Text size                  | number | `100`       | 80 – 140 (±5)              | Text size as a percentage of the normal size. |
+| `appearance.custom_font`       | Font → Custom              | string | `system-ui` | a CSS font-family list     | The fonts `custom` uses, e.g. `Georgia, serif`. The first one installed on the device wins. |
+| `appearance.custom_accent`     | Custom colors → Accent     | string | `#2563eb`   | `#rrggbb`                  | Buttons, links, your own messages and highlights. |
+| `appearance.custom_background` | Custom colors → Background | string | `#f8fafc`   | `#rrggbb`                  | The page behind everything. A dark background makes the custom theme a dark one. |
+| `appearance.custom_surface`    | Custom colors → Panels     | string | `#ffffff`   | `#rrggbb`                  | Panels, cards, menus and the agent's messages. |
+| `appearance.custom_text`       | Custom colors → Text       | string | `#334155`   | `#rrggbb`                  | Body text; secondary text, borders and hover shades are derived from it. |
+
+**Themes** (`appearance.theme`):
+
+- `light` — Light, the default: white panels and a blue accent.
+- `dark` — Dark: deep navy panels and a blue accent.
+- `system` — Light or Dark, following the device's own setting, and switching
+  when the device does.
+- `paper` — warm cream and sepia, a softer light theme.
+- `mint` — pale sage with a green accent.
+- `rose` — blush pink with a rose accent.
+- `dim` — soft charcoal, a dark theme with less contrast than Dark.
+- `nord` — the cool arctic blue-grey Nord palette.
+- `midnight` — true black, for OLED screens and dark rooms.
+- `high_contrast` — black on white with strong borders, for the most legible text.
+- `custom` — your own four `appearance.custom_*` colors. Everything else
+  (hover shades, borders, secondary text, whether it is a light or a dark
+  theme) is derived from them; the page warns when text would be hard to read.
+
+**Fonts** (`appearance.font`). A font is used only if the device has it, so each
+preset lists a few that look alike and falls back to the system font:
+
+- `default` — Inter.
+- `system` — the device's own interface font (Segoe UI, San Francisco, Roboto).
+- `humanist` — a warm, open sans-serif (Seravek, Gill Sans, Ubuntu, Calibri).
+- `rounded` — soft rounded letters (SF Pro Rounded, Quicksand, Arial Rounded).
+- `serif` — a reading serif (Charter, Sitka, Cambria, Georgia).
+- `legible` — wide, distinct letters for easier reading (Atkinson Hyperlegible,
+  Verdana).
+- `mono` — monospace (Cascadia Code, SF Mono, Menlo, Consolas).
+- `custom` — the fonts in `appearance.custom_font`.
+
+### Group `chat` — Chat
+
+How a conversation shows the agent's work. Per profile, like the rest.
+
+**Where to change it:** the **Auto-open** switch on the Thinking Process row of
+any agent reply — it shows while a reply is being written, when the row is
+open, and when the pointer is over it (not a card on the Config page). It sets
+the mode for every reply in the profile, and a reply still being written
+follows the change at once.
+
+| Key                     | Type | Default     | Range               | Meaning |
+|-------------------------|------|-------------|---------------------|---------|
+| `chat.thinking_process` | enum | `collapsed` | `collapsed`, `live` | `collapsed` (Auto-open off): a reply's Thinking Process stays closed until you click it. `live` (Auto-open on): it opens while the agent works and closes when the reply is done. Either way, a row you opened or closed yourself stays that way. |
+
 ## Worked examples
 
 ### Inspect everything
@@ -547,6 +629,40 @@ $ cremind config set compaction.enabled true
 $ cremind config set memory.enabled true
 ```
 
+### Switch the app to dark mode (or any theme)
+
+```bash
+$ cremind config set appearance.theme dark
+$ cremind config set appearance.theme system   # follow the device's light/dark setting
+$ cremind config reset appearance.theme        # back to Light
+```
+
+### Use your own colors, font and text size
+
+Quote the colors: unquoted, the shell reads `#` as the start of a comment and
+the value never reaches Cremind.
+
+```bash
+$ cremind config set appearance.custom_background "#1c1917"
+$ cremind config set appearance.custom_surface "#292524"
+$ cremind config set appearance.custom_text "#f5f5f4"
+$ cremind config set appearance.custom_accent "#ea580c"
+$ cremind config set appearance.theme custom
+$ cremind config set appearance.font serif
+$ cremind config set appearance.font_size 115
+```
+
+### Watch the Thinking Process while the agent works
+
+Collapsed is the default: a reply shows only its answer and a closed **Thinking
+Process** row to click. To have it open by itself during each reply again, turn
+on **Auto-open** on that row, or:
+
+```bash
+$ cremind config set chat.thinking_process live
+$ cremind config reset chat.thinking_process   # back to collapsed
+```
+
 ### Pipe the schema into `jq`
 
 ```bash
@@ -576,6 +692,10 @@ validation. Common causes:
 
 Run `cremind config schema` to confirm the exact key name and allowed
 range, then retry.
+
+**`cremind config set appearance.custom_accent #2563eb` says a value is
+missing** — The shell took `#2563eb` for a comment. Quote it:
+`cremind config set appearance.custom_accent "#2563eb"`.
 
 **`memory.enabled` is on but nothing is remembered** — Long-term memory is
 generated at the compaction fold, so it requires `compaction.enabled` to be

@@ -1217,7 +1217,7 @@ export async function reconfigure(
 export type UserConfigFieldType = 'number' | 'string' | 'boolean' | 'enum';
 
 /** Optional semantic format hint for a `string` field (e.g. a timezone picker). */
-export type UserConfigFieldFormat = 'timezone';
+export type UserConfigFieldFormat = 'timezone' | 'color' | 'font_family';
 
 export interface UserConfigField {
   type: UserConfigFieldType;
@@ -1235,6 +1235,8 @@ export interface UserConfigGroup {
   label: string;
   description?: string;
   fields: Record<string, UserConfigField>;
+  /** The Settings page that edits this group instead of the Config page. */
+  page?: string;
 }
 
 export interface UserConfigSchema {

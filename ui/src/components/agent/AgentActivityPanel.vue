@@ -251,7 +251,7 @@ onBeforeUnmount(() => {
 
 .aa-panel.bright {
   opacity: 1;
-  box-shadow: 0 6px 20px rgba(37, 99, 235, 0.18);
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--primary-color) 18%, transparent);
 }
 
 .aa-panel:hover {
@@ -377,7 +377,7 @@ onBeforeUnmount(() => {
 }
 
 .aa-item.flash {
-  background: rgba(37, 99, 235, 0.1);
+  background: color-mix(in srgb, var(--primary-color) 10%, transparent);
 }
 
 .aa-item-icon {

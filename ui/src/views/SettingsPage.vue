@@ -42,6 +42,12 @@ const allCards: SettingsCard[] = [
     route: 'config',
   },
   {
+    title: 'Appearance',
+    description: 'Color theme, custom colors, font and text size',
+    icon: 'mdi:palette-outline',
+    route: 'appearance',
+  },
+  {
     title: 'Vector Embedding',
     description: 'Enable semantic search, choose the embedding model, and configure the vector store',
     icon: 'mdi:vector-square',

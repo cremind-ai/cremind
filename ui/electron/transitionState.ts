@@ -4,7 +4,8 @@ export type TransitionState = {
 }
 
 const PREFERENCES = [
-  'theme', 'auto_connect', 'conversations_panel_collapsed', 'sidebar_collapsed',
+  'theme', 'appearance_last', 'appearance_legacy_theme',
+  'auto_connect', 'conversations_panel_collapsed', 'sidebar_collapsed',
   'usage_chip_hover', 'events_view_mode', 'terminalPanelWidth', 'rightPanelSplitRatio',
   'rightPanelShowHidden', 'rightPanelViewMode', 'rightPanelCollapsed',
   'agent_activity_panel_maximized', 'eventRunDrawerMaximized',
@@ -26,7 +27,8 @@ export function transitionProfile(url: string, fallback?: string): string | null
 export function transitionLocalKeys(url: string, fallback?: string): string[] {
   const profile = transitionProfile(url, fallback)
   return profile
-    ? [...PREFERENCES, `agent_token_${profile}`, `chat_mode_${profile}`, `reasoning_enabled_${profile}`]
+    ? [...PREFERENCES, `agent_token_${profile}`, `chat_mode_${profile}`, `reasoning_enabled_${profile}`,
+      `appearance_${profile}`, `appearance_migrated_${profile}`]
     : [...PREFERENCES]
 }
 

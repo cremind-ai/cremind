@@ -663,7 +663,7 @@ watch(
 
 .agent-avatar {
   background: var(--primary-color);
-  color: white;
+  color: var(--on-primary);
   overflow: hidden;
 }
 
@@ -704,22 +704,22 @@ watch(
 /* User Message - Modern Blue Bubble */
 .user-message {
   background: var(--primary-color);
-  color: white;
+  color: var(--on-primary);
   border-radius: 18px 18px 4px 18px;
-  box-shadow: 0 1px 6px rgba(37, 99, 235, 0.2);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--primary-color) 20%, transparent);
 }
 
 .user-message:hover {
-  box-shadow: 0 2px 10px rgba(37, 99, 235, 0.3);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--primary-color) 30%, transparent);
 }
 
 [data-theme="dark"] .user-message {
   background: var(--primary-color);
-  box-shadow: 0 1px 6px rgba(59, 130, 246, 0.3);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--primary-color) 30%, transparent);
 }
 
 [data-theme="dark"] .user-message:hover {
-  box-shadow: 0 2px 10px rgba(59, 130, 246, 0.4);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--primary-color) 40%, transparent);
 }
 
 /* Agent Message - Refined Card Style */
@@ -785,7 +785,7 @@ watch(
   padding: 6px 10px;
   margin-bottom: 8px;
   border-radius: 8px;
-  background: var(--primary-bg, rgba(59, 130, 246, 0.1));
+  background: var(--primary-bg, color-mix(in srgb, var(--primary-color) 10%, transparent));
   border: 1px solid var(--primary-color, #3b82f6);
 }
 .event-result-icon {
@@ -849,7 +849,7 @@ watch(
 }
 
 .user-message .message-role {
-  color: rgba(255, 255, 255, 0.9);
+  color: color-mix(in srgb, var(--on-primary) 90%, transparent);
 }
 
 .mode-chip {
@@ -860,8 +860,8 @@ watch(
   border-radius: 8px;
   font-size: 0.65rem;
   font-weight: 600;
-  background: rgba(255, 255, 255, 0.18);
-  color: rgba(255, 255, 255, 0.95);
+  background: color-mix(in srgb, var(--on-primary) 18%, transparent);
+  color: color-mix(in srgb, var(--on-primary) 95%, transparent);
 }
 
 .message-time {
@@ -882,7 +882,7 @@ watch(
   font-size: 0.85rem;
   opacity: 0;
   transition: opacity 0.15s ease, color 0.15s ease;
-  color: rgba(255, 255, 255, 0.7);
+  color: color-mix(in srgb, var(--on-primary) 70%, transparent);
 }
 
 .agent-message .copy-btn {
@@ -903,7 +903,7 @@ watch(
 }
 
 .copy-btn:hover {
-  color: rgba(255, 255, 255, 0.95);
+  color: color-mix(in srgb, var(--on-primary) 95%, transparent);
 }
 
 .agent-message .copy-btn:hover {
@@ -915,7 +915,7 @@ watch(
 }
 
 .user-message .message-time {
-  color: rgba(255, 255, 255, 0.7);
+  color: color-mix(in srgb, var(--on-primary) 70%, transparent);
 }
 
 /* Message Content */
@@ -930,34 +930,35 @@ watch(
   line-height: 1.25; /* Plain text line spacing */
 }
 
-/* User Message - Override text colors for white-on-blue */
+/* User Message - text in the color that reads on the accent */
 .user-message .message-content {
-  color: white;
+  color: var(--on-primary);
 }
 
 /* Markdown content styles */
 /* The neutral Markdown rules live in styles/markdown.css, shared with the group
-   room's bubble. What stays here is only what this bubble inverts: white text on
-   the blue "you" bubble, where the shared surface colours would vanish. */
+   room's bubble. What stays here is only what this bubble inverts: text on the
+   accent-colored "you" bubble (white, or dark on a light accent — --on-primary),
+   where the shared surface colours would vanish. */
 
 .user-message :deep(.marked-content code) {
-  background: rgba(255, 255, 255, 0.2);
-  color: white;
-  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: color-mix(in srgb, var(--on-primary) 20%, transparent);
+  color: var(--on-primary);
+  border: 1px solid color-mix(in srgb, var(--on-primary) 30%, transparent);
 }
 
 .user-message :deep(.marked-content pre) {
   background: rgba(0, 0, 0, 0.15);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: 1px solid color-mix(in srgb, var(--on-primary) 20%, transparent);
 }
 
 .user-message :deep(.marked-content a) {
-  color: #bfdbfe;
+  color: color-mix(in srgb, var(--on-primary) 78%, var(--primary-color));
   text-decoration: underline;
 }
 
 .user-message :deep(.marked-content a:hover) {
-  color: white;
+  color: var(--on-primary);
 }
 
 /* Streaming cursor */
@@ -985,9 +986,9 @@ watch(
 }
 
 .user-message .token-usage {
-  background: rgba(255, 255, 255, 0.15);
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  color: rgba(255, 255, 255, 0.85);
+  background: color-mix(in srgb, var(--on-primary) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--on-primary) 25%, transparent);
+  color: color-mix(in srgb, var(--on-primary) 85%, transparent);
 }
 
 /* Latency info */
@@ -1175,15 +1176,11 @@ watch(
   align-items: center;
   justify-content: center;
   gap: 4px;
-  background: rgba(var(--surface-rgb, 255,255,255), 0.85);
+  background: color-mix(in srgb, var(--surface-color) 88%, transparent);
   border-radius: 8px;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease;
-}
-
-[data-theme="dark"] .file-chip-actions {
-  background: rgba(30, 30, 30, 0.88);
 }
 
 .file-chip:hover .file-chip-actions {

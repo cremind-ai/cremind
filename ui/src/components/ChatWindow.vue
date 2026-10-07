@@ -187,7 +187,7 @@ const scrollToBottom = () => {
 .compaction-btn.primary {
   background: var(--primary-color);
   border-color: var(--primary-color);
-  color: #fff;
+  color: var(--on-primary);
 }
 .compaction-btn:disabled { opacity: 0.6; cursor: default; }
 .compaction-fade-enter-active, .compaction-fade-leave-active { transition: opacity 0.2s ease; }

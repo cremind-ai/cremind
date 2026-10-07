@@ -637,7 +637,7 @@ const close = () => emit('update:modelValue', false);
   border-radius: 6px;
   border: 1px solid var(--primary-color);
   background: var(--primary-color);
-  color: white;
+  color: var(--on-primary);
   font: inherit;
   font-size: 0.8rem;
   text-decoration: none;

@@ -150,7 +150,7 @@ const toggleExpand = () => {
   height: 28px;
   border-radius: 50%;
   background: var(--primary-color);
-  color: white;
+  color: var(--on-primary);
   display: flex;
   align-items: center;
   justify-content: center;

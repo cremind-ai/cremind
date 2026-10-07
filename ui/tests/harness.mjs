@@ -52,10 +52,21 @@ const STUBS = {
         },
       }
     }
+    // Settings-state pings (a setting changed somewhere): tests send one with
+    // globalThis.__settingsSubscribers[i]().
+    export function subscribeSettingsState(agentUrl, token, onChange) {
+      const subs = (globalThis.__settingsSubscribers ||= [])
+      subs.push(onChange)
+      return {
+        close() {
+          const i = subs.indexOf(onChange)
+          if (i >= 0) subs.splice(i, 1)
+        },
+      }
+    }
     const idle = () => ({ close() {} })
     export const subscribeConversationsList = idle
     export const subscribeNotifications = idle
-    export const subscribeSettingsState = idle
     export const subscribeProcesses = idle
   `,
   // The real router imports every view (.vue files esbuild cannot load); the
@@ -221,6 +232,7 @@ export function installBrowser({ href = 'http://localhost:1515/#/alice/c/42' } =
   globalThis.__transportSubscribers = []
   globalThis.__documentsSubscribers = []
   globalThis.__embeddingSubscribers = []
+  globalThis.__settingsSubscribers = []
   globalThis.fetch = async (input, init = {}) => {
     const requested = String(input)
     calls.push({ url: requested, init })

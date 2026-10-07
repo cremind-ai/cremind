@@ -45,6 +45,11 @@ async function scrollToSection(section: string | null) {
 }
 
 const schema = ref<UserConfigSchema | null>(null);
+/** The groups this page edits: one with a page of its own (Appearance) is
+ *  left to that page. */
+const cardGroups = computed<UserConfigSchema['groups']>(() => Object.fromEntries(
+  Object.entries(schema.value?.groups ?? {}).filter(([, group]) => !group.page),
+));
 const values = ref<Record<string, unknown>>({});
 const defaults = ref<Record<string, unknown>>({});
 /** The values as last loaded (or reset): what an edit is a change from. */
@@ -175,7 +180,7 @@ watch(() => route.query.section, (s) => {
       <div v-if="loading" class="loading">Loading…</div>
       <div v-else-if="schema">
         <div
-          v-for="(group, groupKey) in schema.groups"
+          v-for="(group, groupKey) in cardGroups"
           :key="groupKey"
           :ref="(el) => setGroupRef(String(groupKey), el as Element | null)"
           class="config-group-anchor"

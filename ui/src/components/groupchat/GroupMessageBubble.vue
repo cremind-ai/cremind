@@ -315,13 +315,13 @@ const openTerminal = async (term: TerminalAttachment) => {
 .own-post {
   max-width: 75%;
   background: var(--primary-color);
-  color: white;
+  color: var(--on-primary);
   border-radius: 18px 18px 4px 18px;
-  box-shadow: 0 1px 6px rgba(37, 99, 235, 0.2);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--primary-color) 20%, transparent);
 }
 
 .own-post:hover {
-  box-shadow: 0 2px 10px rgba(37, 99, 235, 0.28);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--primary-color) 28%, transparent);
 }
 
 .peer-post,
@@ -351,11 +351,11 @@ const openTerminal = async (term: TerminalAttachment) => {
 }
 
 [data-theme="dark"] .own-post {
-  box-shadow: 0 1px 6px rgba(59, 130, 246, 0.3);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--primary-color) 30%, transparent);
 }
 
 [data-theme="dark"] .own-post:hover {
-  box-shadow: 0 2px 10px rgba(59, 130, 246, 0.4);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--primary-color) 40%, transparent);
 }
 
 [data-theme="dark"] .peer-post {
@@ -399,7 +399,7 @@ const openTerminal = async (term: TerminalAttachment) => {
 .kind-tag.kind-agent {
   color: var(--primary-color);
   border-color: var(--primary-color);
-  background: rgba(37, 99, 235, 0.08);
+  background: color-mix(in srgb, var(--primary-color) 8%, transparent);
 }
 
 .kind-tag.kind-system {
@@ -408,12 +408,12 @@ const openTerminal = async (term: TerminalAttachment) => {
   background: rgba(245, 158, 11, 0.1);
 }
 
-/* On the blue bubble the surface-toned chips disappear, so they invert too. */
+/* On the accent bubble the surface-toned chips disappear, so they invert too. */
 .own-post .kind-tag,
 .own-post .meta-tag {
-  background: rgba(255, 255, 255, 0.18);
-  border-color: rgba(255, 255, 255, 0.3);
-  color: rgba(255, 255, 255, 0.92);
+  background: color-mix(in srgb, var(--on-primary) 18%, transparent);
+  border-color: color-mix(in srgb, var(--on-primary) 30%, transparent);
+  color: color-mix(in srgb, var(--on-primary) 92%, transparent);
 }
 
 .hop-tag {
@@ -430,7 +430,7 @@ const openTerminal = async (term: TerminalAttachment) => {
 }
 
 .own-post .message-time {
-  color: rgba(255, 255, 255, 0.7);
+  color: color-mix(in srgb, var(--on-primary) 70%, transparent);
 }
 
 .copy-btn {
@@ -449,7 +449,7 @@ const openTerminal = async (term: TerminalAttachment) => {
 }
 
 .own-post .copy-btn {
-  color: rgba(255, 255, 255, 0.7);
+  color: color-mix(in srgb, var(--on-primary) 70%, transparent);
 }
 
 .message-bubble:hover .copy-btn {
@@ -461,7 +461,7 @@ const openTerminal = async (term: TerminalAttachment) => {
 }
 
 .own-post .copy-btn:hover {
-  color: rgba(255, 255, 255, 0.95);
+  color: color-mix(in srgb, var(--on-primary) 95%, transparent);
 }
 
 .copy-btn.copied {
@@ -475,30 +475,30 @@ const openTerminal = async (term: TerminalAttachment) => {
 }
 
 /* The neutral Markdown rules are shared with the two-party chat
-   (styles/markdown.css). Only the inversions for the blue bubble live here. */
+   (styles/markdown.css). Only the inversions for the accent bubble live here. */
 .own-post :deep(.marked-content code) {
-  background: rgba(255, 255, 255, 0.2);
-  color: white;
-  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: color-mix(in srgb, var(--on-primary) 20%, transparent);
+  color: var(--on-primary);
+  border: 1px solid color-mix(in srgb, var(--on-primary) 30%, transparent);
 }
 
 .own-post :deep(.marked-content pre) {
   background: rgba(0, 0, 0, 0.15);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: 1px solid color-mix(in srgb, var(--on-primary) 20%, transparent);
 }
 
 .own-post :deep(.marked-content blockquote) {
-  background: rgba(255, 255, 255, 0.12);
-  border-left-color: rgba(255, 255, 255, 0.6);
+  background: color-mix(in srgb, var(--on-primary) 12%, transparent);
+  border-left-color: color-mix(in srgb, var(--on-primary) 60%, transparent);
 }
 
 .own-post :deep(.marked-content a) {
-  color: #bfdbfe;
+  color: color-mix(in srgb, var(--on-primary) 78%, var(--primary-color));
   text-decoration: underline;
 }
 
 .own-post :deep(.marked-content a:hover) {
-  color: white;
+  color: var(--on-primary);
 }
 
 .steps-note {

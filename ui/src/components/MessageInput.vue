@@ -861,7 +861,7 @@ const selectMode = (mode: ChatMode) => {
 
 .composer-input:focus {
   border-color: var(--primary-color);
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 15%, transparent);
 }
 
 .composer-input:disabled {
@@ -873,7 +873,7 @@ const selectMode = (mode: ChatMode) => {
    selection background shows but with a transparent foreground; this keeps
    the selected text faintly visible against the highlighted layer. */
 .composer-input::selection {
-  background: rgba(37, 99, 235, 0.25);
+  background: color-mix(in srgb, var(--primary-color) 25%, transparent);
   color: transparent;
 }
 
@@ -893,7 +893,7 @@ const selectMode = (mode: ChatMode) => {
 }
 
 .hl-token--sys {
-  background: rgba(37, 99, 235, 0.14);
+  background: color-mix(in srgb, var(--primary-color) 14%, transparent);
   color: var(--primary-color);
 }
 
@@ -957,7 +957,7 @@ const selectMode = (mode: ChatMode) => {
 .mode-toggle-button.mode-reasoning {
   color: var(--primary-color);
   border-color: var(--primary-color);
-  background: rgba(37, 99, 235, 0.08);
+  background: color-mix(in srgb, var(--primary-color) 8%, transparent);
 }
 
 .mode-toggle-button.mode-plan {
@@ -980,7 +980,7 @@ const selectMode = (mode: ChatMode) => {
   background: var(--primary-color);
   border: none;
   border-radius: 6px;
-  color: white;
+  color: var(--on-primary);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -1138,11 +1138,11 @@ const selectMode = (mode: ChatMode) => {
 }
 
 .mode-menu .mode-item:hover {
-  background: rgba(37, 99, 235, 0.08);
+  background: color-mix(in srgb, var(--primary-color) 8%, transparent);
 }
 
 .mode-menu .mode-item.active {
-  background: rgba(37, 99, 235, 0.10);
+  background: color-mix(in srgb, var(--primary-color) 10%, transparent);
 }
 
 .mode-menu .mode-item-icon {

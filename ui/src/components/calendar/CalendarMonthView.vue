@@ -139,7 +139,7 @@ function barClass(seg: DaySegment) {
 
 .cal-daynum { height: 24px; display: flex; justify-content: flex-end; padding: 0 2px; }
 .cal-daynum span { font-size: .78rem; color: var(--text-secondary); width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; }
-.cal-daynum span.is-today { background: var(--primary-color); color: #fff; font-weight: 600; }
+.cal-daynum span.is-today { background: var(--primary-color); color: var(--on-primary); font-weight: 600; }
 
 .cal-bars-space { height: var(--bars-space, 0); flex: none; }
 
@@ -162,7 +162,7 @@ function barClass(seg: DaySegment) {
 .cal-mbar {
   position: absolute; height: 18px; pointer-events: auto;
   border: none; cursor: pointer;
-  background: var(--primary-color); color: #fff;
+  background: var(--primary-color); color: var(--on-primary);
   border-radius: 4px; padding: 0 8px;
   font-size: .72rem; font-weight: 500; line-height: 18px;
   display: flex; align-items: center; overflow: hidden;

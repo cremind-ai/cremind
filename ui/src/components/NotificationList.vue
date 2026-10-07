@@ -366,7 +366,7 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
 }
 
 .notification-item.unseen {
-  background: rgba(37, 99, 235, 0.06);
+  background: color-mix(in srgb, var(--primary-color) 6%, transparent);
 }
 
 .notification-item.unseen.error {

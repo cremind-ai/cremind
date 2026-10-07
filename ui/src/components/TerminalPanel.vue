@@ -79,15 +79,15 @@ function handleClose(term: TerminalAttachment) {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: #0b1220;
-  color: #e5e7eb;
+  background: var(--strip-bg-deep);
+  color: var(--strip-text-strong);
   overflow: hidden;
 }
 .panel-header {
   display: flex;
   align-items: stretch;
-  background: #0f172a;
-  border-bottom: 1px solid #1f2937;
+  background: var(--strip-bg);
+  border-bottom: 1px solid var(--strip-border);
   flex-shrink: 0;
 }
 .tabs {
@@ -103,8 +103,8 @@ function handleClose(term: TerminalAttachment) {
   padding: 8px 10px;
   background: transparent;
   border: none;
-  border-right: 1px solid #1f2937;
-  color: #94a3b8;
+  border-right: 1px solid var(--strip-border);
+  color: var(--strip-text);
   font-family: Consolas, Monaco, monospace;
   font-size: 0.8rem;
   cursor: pointer;
@@ -116,8 +116,8 @@ function handleClose(term: TerminalAttachment) {
   color: #e5e7eb;
 }
 .tab:hover:not(.active) {
-  background: #1e293b;
-  color: #cbd5f5;
+  background: var(--strip-hover);
+  color: var(--strip-title);
 }
 .tab-icon {
   flex-shrink: 0;
@@ -153,8 +153,8 @@ function handleClose(term: TerminalAttachment) {
   flex-shrink: 0;
 }
 .tab-close:hover {
-  background: #334155;
-  color: #e5e7eb;
+  background: var(--strip-hover);
+  color: var(--strip-text-strong);
 }
 .panel-body {
   flex: 1 1 auto;

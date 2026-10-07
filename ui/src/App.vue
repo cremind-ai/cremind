@@ -147,13 +147,6 @@ const phaseLabel = computed(() => {
   } as Record<string, string>)[p] ?? p;
 });
 
-// Apply theme to document
-const applyTheme = () => {
-  document.documentElement.setAttribute('data-theme', settingsStore.theme);
-};
-
-watch(() => settingsStore.theme, applyTheme);
-
 watch(
   () => [settingsStore.agentUrl, settingsStore.authToken] as const,
   ([agentUrl, token]) => {
@@ -261,7 +254,6 @@ onUnmounted(() => {
 });
 
 onMounted(async () => {
-  applyTheme();
   stopMigrationResponder = installMigrationReadinessResponder();
   stopElectronMigrationRelease = window.cremind?.server?.onMigrationReleased?.(
     () => {

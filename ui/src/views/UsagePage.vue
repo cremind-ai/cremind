@@ -7,6 +7,7 @@ import {
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
+import { useAppearanceStore } from '../stores/appearance';
 import { useUsageStore } from '../stores/usage';
 import UsageChart from '../components/usage/UsageChart.vue';
 import UsageStatTile from '../components/usage/UsageStatTile.vue';
@@ -18,6 +19,7 @@ import type { UsageGroupSlice, UsageTimePoint } from '../services/usageApi';
 
 const props = defineProps<{ profile: string }>();
 const settings = useSettingsStore();
+const appearance = useAppearanceStore();
 const usage = useUsageStore();
 const router = useRouter();
 
@@ -59,8 +61,8 @@ function cssVar(name: string, fallback: string): string {
   return v || fallback;
 }
 const palette = computed(() => {
-  // Reference theme so the palette recomputes when it flips.
-  void settings.theme;
+  // Read after every repaint, so a new theme recolors the charts.
+  void appearance.revision;
   return {
     text: cssVar('--text-primary', '#334155'),
     textSecondary: cssVar('--text-secondary', '#64748b'),

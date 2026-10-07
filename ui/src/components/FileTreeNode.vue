@@ -491,11 +491,11 @@ async function onFileInputChange(ev: Event) {
 }
 .tree-row.selected {
   background: var(--primary-color);
-  color: #fff;
+  color: var(--on-primary);
 }
 .tree-row.drop-hover {
   outline: 1px dashed var(--primary-light);
-  background: rgba(59, 130, 246, 0.18);
+  background: color-mix(in srgb, var(--primary-color) 18%, transparent);
 }
 .rename-input {
   flex: 1 1 auto;

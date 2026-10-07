@@ -349,15 +349,15 @@ function statusColor(s: string): TagType {
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  background: #0f172a;
-  border-bottom: 1px solid #1f2937;
-  color: #e5e7eb;
+  background: var(--strip-bg);
+  border-bottom: 1px solid var(--strip-border);
+  color: var(--strip-text-strong);
   flex-shrink: 0;
   overflow: hidden;
 }
 .pty-pill {
-  background: #1e293b;
-  color: #94a3b8;
+  background: var(--strip-hover);
+  color: var(--strip-text);
   border-radius: 4px;
   padding: 0 6px;
   font-size: 0.7rem;
@@ -366,7 +366,7 @@ function statusColor(s: string): TagType {
 .cmd {
   font-family: Consolas, Monaco, monospace;
   font-size: 0.8rem;
-  color: #cbd5f5;
+  color: var(--strip-title);
   background: transparent;
   white-space: nowrap;
   overflow: hidden;

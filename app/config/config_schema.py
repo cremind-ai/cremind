@@ -3,7 +3,9 @@
 Each :class:`Field` describes one user-tunable runtime setting: its primitive
 type, the dotted TOML path of its default, and optional validation hints
 (``min``/``max``/``step``, ``enum``). Fields are grouped into
-:class:`ConfigGroup`s which become the sections in the UI.
+:class:`ConfigGroup`s which become the sections in the UI — except a group with
+a ``page`` of its own (Appearance; Chat, which the chat itself edits), which is
+changed there instead.
 
 Stored values live in the per-profile ``user_config`` SQLite table. Reads
 follow the priority chain: SQLite override > ``settings.toml`` default. The
@@ -19,6 +21,7 @@ Adding a new tunable knob is a 3-step process:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Literal
 
@@ -27,7 +30,26 @@ FieldType = Literal["number", "string", "boolean", "enum"]
 #: Optional semantic format hint for a ``string`` field. ``"timezone"`` makes
 #: :meth:`Field.validate` reject anything that is not a valid IANA zone name (or
 #: the sentinel ``"auto"``), and lets the UI render a timezone picker.
-FieldFormat = Literal["timezone"]
+#: ``"color"`` takes a ``#rrggbb`` hex color only. ``"font_family"`` takes a CSS
+#: font-family list (names, commas, quotes) and nothing that could end the
+#: declaration it is written into.
+FieldFormat = Literal["timezone", "color", "font_family"]
+
+_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+_FONT_FAMILY = re.compile(r"^[A-Za-z0-9 ,'\"._-]{1,200}$")
+
+#: The color themes the web UI ships (ui/src/appearance/presets.ts lists the
+#: same ids, with their colors), plus "system" (light or dark, as the device
+#: is set) and "custom" (the ``appearance.custom_*`` colors).
+THEME_IDS: tuple[str, ...] = (
+    "light", "dark", "system", "paper", "mint", "rose",
+    "dim", "nord", "midnight", "high_contrast", "custom",
+)
+
+#: The web UI's font presets, plus "custom" (``appearance.custom_font``).
+FONT_IDS: tuple[str, ...] = (
+    "default", "system", "humanist", "rounded", "serif", "legible", "mono", "custom",
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +119,16 @@ class Field:
                     "(e.g. 'Asia/Tokyo', 'America/New_York', 'UTC'), a whole-hour "
                     "UTC offset (e.g. '+07:00', '-05:00'), or 'auto'"
                 )
+        elif self.format == "color":
+            if not _COLOR.match(str(value)):
+                raise ValueError(f"{str(value)!r} is not a #rrggbb hex color (e.g. '#2563eb')")
+        elif self.format == "font_family":
+            if not _FONT_FAMILY.match(str(value)) or not str(value).strip(" ,'\""):
+                raise ValueError(
+                    f"{str(value)!r} is not a font-family list: give font names "
+                    "separated by commas (e.g. 'Georgia, serif'), using letters, "
+                    "digits, spaces, quotes, '.', '_' and '-' only"
+                )
 
 
 @dataclass(frozen=True)
@@ -106,6 +138,11 @@ class ConfigGroup:
     label: str
     description: str
     fields: dict[str, Field] = dataclass_field(default_factory=dict)
+    #: Where this group is edited when that is not the Config page: a Settings
+    #: page of its own (``"appearance"`` → Settings → Appearance), or ``"chat"``
+    #: — in the chat itself, next to what it changes. The Config page leaves
+    #: such a group out; the API and ``cremind config`` treat it like any other.
+    page: str | None = None
 
 
 CONFIG_SCHEMA: dict[str, ConfigGroup] = {
@@ -324,6 +361,97 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 label="Long-term retrieval limit",
                 description="Top-K long-term facts retrieved from the vector store for the prompt (Vector-Embedding-ON mode).",
                 min=1, max=50,
+            ),
+        },
+    ),
+    "appearance": ConfigGroup(
+        label="Appearance",
+        description=(
+            "How the Cremind app looks for this profile: the color theme, and "
+            "the font and text size. Every device the profile signs in on "
+            "follows it."
+        ),
+        page="appearance",
+        fields={
+            "theme": Field(
+                type="enum", default_toml="appearance.theme",
+                enum=THEME_IDS,
+                label="Theme",
+                description=(
+                    "The color theme. 'system' follows the device's light or dark "
+                    "setting; 'custom' uses the four appearance.custom_* colors."
+                ),
+            ),
+            "font": Field(
+                type="enum", default_toml="appearance.font",
+                enum=FONT_IDS,
+                label="Font",
+                description=(
+                    "The typeface for the whole app. 'custom' uses "
+                    "appearance.custom_font, which must be installed on the device."
+                ),
+            ),
+            "font_size": Field(
+                type="number", default_toml="appearance.font_size",
+                label="Text size (%)",
+                description="Text size as a percentage of the normal size.",
+                min=80, max=140, step=5,
+            ),
+            "custom_font": Field(
+                type="string", default_toml="appearance.custom_font",
+                format="font_family",
+                label="Custom font",
+                description=(
+                    "The font-family list the 'custom' font uses, e.g. "
+                    "'Georgia, serif'. The first one installed on the device wins."
+                ),
+            ),
+            "custom_accent": Field(
+                type="string", default_toml="appearance.custom_accent",
+                format="color",
+                label="Custom accent color",
+                description="Buttons, links, your own messages and highlights, in the custom theme.",
+            ),
+            "custom_background": Field(
+                type="string", default_toml="appearance.custom_background",
+                format="color",
+                label="Custom background color",
+                description=(
+                    "The page behind everything, in the custom theme. A dark "
+                    "background makes it a dark theme."
+                ),
+            ),
+            "custom_surface": Field(
+                type="string", default_toml="appearance.custom_surface",
+                format="color",
+                label="Custom panel color",
+                description="Panels, cards, menus and the agent's messages, in the custom theme.",
+            ),
+            "custom_text": Field(
+                type="string", default_toml="appearance.custom_text",
+                format="color",
+                label="Custom text color",
+                description="Body text, in the custom theme; secondary text and borders are derived from it.",
+            ),
+        },
+    ),
+    "chat": ConfigGroup(
+        label="Chat",
+        description=(
+            "How a conversation shows the agent's work. Changed in the chat "
+            "itself: the Auto-open switch on any reply's Thinking Process row."
+        ),
+        page="chat",
+        fields={
+            "thinking_process": Field(
+                type="enum", default_toml="chat.thinking_process",
+                enum=("collapsed", "live"),
+                label="Thinking Process",
+                description=(
+                    "'collapsed' keeps every reply's Thinking Process closed until "
+                    "you click it. 'live' opens it while the agent works and closes "
+                    "it when the reply is done."
+                ),
             ),
         },
     ),

@@ -99,8 +99,8 @@ function statusColor(s: string): TagType {
   align-items: center;
   gap: 16px;
   padding: 12px 16px;
-  border-bottom: 1px solid #1f2937;
-  background: #0f172a;
+  border-bottom: 1px solid var(--strip-border);
+  background: var(--strip-bg);
 }
 .back-btn {
   display: flex;
@@ -108,12 +108,12 @@ function statusColor(s: string): TagType {
   gap: 6px;
   background: none;
   border: none;
-  color: #94a3b8;
+  color: var(--strip-text);
   cursor: pointer;
   font-size: 0.875rem;
 }
 .back-btn:hover {
-  color: #e2e8f0;
+  color: var(--strip-text-strong);
 }
 .header-meta {
   flex: 1;

@@ -9,6 +9,7 @@ import { useNotificationsStore } from '../stores/notifications';
 import AgentCard from './AgentCard.vue';
 import NotificationList from './NotificationList.vue';
 import DocumentsSyncChip from './documents/DocumentsSyncChip.vue';
+import ThemeQuickPicker from './appearance/ThemeQuickPicker.vue';
 import { openNotificationsStream, type NotificationStreamHandle } from '../services/notificationsStream';
 import { NAV_ITEMS, SETTINGS_ITEM, type NavItem } from '../constants/navigation';
 
@@ -84,8 +85,14 @@ const handleOverflowClick = (item: NavItem) => {
 };
 
 // ── Theme + settings ──
-const toggleTheme = () => {
-  settingsStore.setTheme(settingsStore.theme === 'dark' ? 'light' : 'dark');
+const themeMenuTriggerRef = ref<HTMLElement | null>(null);
+const themeMenuVisible = ref(false);
+
+const handleOpenAppearance = () => {
+  themeMenuVisible.value = false;
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'appearance-settings', params: { profile } });
 };
 
 const handleOpenSettings = () => {
@@ -459,18 +466,27 @@ onBeforeUnmount(closeNotificationsStream);
       <!-- Documentation search: only while it is indexing or needs the user. -->
       <DocumentsSyncChip />
 
-      <ElTooltip
-        :content="settingsStore.theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
-        placement="right"
-        :show-after="300"
-      >
-        <button class="rail-item" @click="toggleTheme">
-          <Icon
-            :icon="settingsStore.theme === 'dark' ? 'mdi:weather-night' : 'mdi:weather-sunny'"
-            class="rail-icon"
-          />
+      <ElTooltip content="Theme" placement="right" :show-after="300" :disabled="themeMenuVisible">
+        <button
+          ref="themeMenuTriggerRef"
+          class="rail-item"
+          aria-label="Theme"
+          @click="themeMenuVisible = !themeMenuVisible"
+        >
+          <Icon icon="mdi:palette-outline" class="rail-icon" />
         </button>
       </ElTooltip>
+      <ElPopover
+        :visible="themeMenuVisible"
+        :virtual-ref="themeMenuTriggerRef ?? undefined"
+        virtual-triggering
+        placement="right-end"
+        :width="292"
+        popper-class="rail-menu-popover"
+        @update:visible="themeMenuVisible = $event"
+      >
+        <ThemeQuickPicker @open-settings="handleOpenAppearance" />
+      </ElPopover>
 
       <ElTooltip :content="settingsItem.label" placement="right" :show-after="300">
         <button

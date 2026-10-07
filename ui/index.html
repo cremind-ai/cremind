@@ -8,6 +8,36 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <title>Cremind</title>
+    <script>
+      // Paint the profile's theme before anything else: without this a dark
+      // theme flashes white on every load. src/appearance/apply.ts writes
+      // these copies (computed CSS variables, per profile and the last one
+      // shown); the app replaces them with the server's values once loaded.
+      (function () {
+        try {
+          var store = window.localStorage;
+          var root = document.documentElement;
+          var m = /^#\/(?:login\/)?([^/?#]+)/.exec(location.hash);
+          var raw = (m && store.getItem('appearance_' + decodeURIComponent(m[1]))) || store.getItem('appearance_last');
+          if (!raw) {
+            // Before the first load of this version: the old light/dark switch.
+            if (store.getItem('theme') === 'dark') root.setAttribute('data-theme', 'dark');
+            return;
+          }
+          var cached = JSON.parse(raw);
+          var look = cached.applied;
+          if (cached.system && window.matchMedia) {
+            look = window.matchMedia('(prefers-color-scheme: dark)').matches ? cached.system.dark : cached.system.light;
+          }
+          root.setAttribute('data-theme', look.mode);
+          root.setAttribute('data-on-primary', look.onPrimary);
+          for (var name in look.vars) root.style.setProperty(name, look.vars[name]);
+        } catch (e) {
+          // No storage, or a copy this version cannot read: the stylesheet's
+          // Light theme shows until the app paints the real one.
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -14,6 +14,7 @@ from starlette.routing import Route
 
 from app.config.config_schema import CONFIG_SCHEMA, all_keys, lookup
 from app.config.user_config import get_user_config, resolve_default
+from app.events.settings_state_bus import publish_settings_state_changed
 from app.storage.dynamic_config_storage import DynamicConfigStorage
 
 
@@ -57,6 +58,8 @@ def _serialize_schema() -> dict:
             "description": group.description,
             "fields": fields,
         }
+        if group.page is not None:
+            groups[group_name]["page"] = group.page
     return {"groups": groups}
 
 
@@ -127,6 +130,10 @@ def get_user_config_routes(config_storage: DynamicConfigStorage) -> list[Route]:
 
         for key, stored_value in coerced.items():
             config_storage.set("user_config", key, stored_value, profile=profile)
+        if coerced:
+            # Open apps re-read what they show: a theme set with `cremind config
+            # set` (or on another device) applies without a reload.
+            publish_settings_state_changed(profile)
 
         return JSONResponse({"success": True, "updated": list(coerced)})
 
@@ -143,6 +150,8 @@ def get_user_config_routes(config_storage: DynamicConfigStorage) -> list[Route]:
         if not profile:
             return JSONResponse({"error": "Profile is required"}, status_code=400)
         deleted = config_storage.delete("user_config", key, profile=profile)
+        if deleted:
+            publish_settings_state_changed(profile)
         return JSONResponse({"success": True, "deleted": deleted})
 
     return [

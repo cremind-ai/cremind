@@ -372,7 +372,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(59, 130, 246, 0.12);
+  background: color-mix(in srgb, var(--primary-color) 12%, transparent);
   outline: 2px dashed var(--primary-light);
   outline-offset: -8px;
   color: var(--primary-color);

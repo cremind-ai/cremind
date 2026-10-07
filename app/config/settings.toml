@@ -105,6 +105,23 @@ long_term_queue_size = 20      # max long-term facts kept in the DB queue (embed
 long_term_max_tokens = 50      # clip each long-term fact to this many tokens (both modes)
 long_term_retrieve_limit = 10  # top-K long-term facts retrieved from the vector store for the ## Memory block (embedding-on mode)
 
+[appearance]
+# How the web UI looks for a profile; edited on Settings → Appearance. The theme
+# and font ids are the presets in ui/src/appearance/presets.ts.
+theme = "light"                # light | dark | system | paper | mint | rose | dim | nord | midnight | high_contrast | custom
+font = "default"               # default | system | humanist | rounded | serif | legible | mono | custom
+font_size = 100                # percent of the normal text size (80–140)
+custom_font = "system-ui"      # font-family list for font = "custom"
+custom_accent = "#2563eb"      # the four colors of theme = "custom"
+custom_background = "#f8fafc"
+custom_surface = "#ffffff"
+custom_text = "#334155"
+
+[chat]
+# How a conversation shows the agent's work; changed from the Auto-open switch
+# on any reply's Thinking Process row.
+thinking_process = "collapsed" # collapsed (open on click) | live (open while the agent works)
+
 [event_runs]
 # Each fired event trigger (skill / file-watcher / schedule) runs in its own
 # hidden conversation, in parallel. These are process-global engine knobs.

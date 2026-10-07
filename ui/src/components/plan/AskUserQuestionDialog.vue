@@ -186,7 +186,7 @@ function dismiss() {
 
 .q-option.selected {
   border-color: var(--primary-color);
-  background: rgba(37, 99, 235, 0.08);
+  background: color-mix(in srgb, var(--primary-color) 8%, transparent);
 }
 
 .q-option-icon {

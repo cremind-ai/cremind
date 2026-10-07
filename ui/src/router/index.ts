@@ -214,6 +214,13 @@ const routes = [
     meta: { title: 'Config' },
   },
   {
+    path: '/:profile/settings/appearance',
+    name: 'appearance-settings',
+    component: () => import('../views/AppearanceSettings.vue'),
+    props: true,
+    meta: { title: 'Appearance' },
+  },
+  {
     path: '/:profile/settings/embedding',
     name: 'embedding-settings',
     component: () => import('../views/EmbeddingSettings.vue'),

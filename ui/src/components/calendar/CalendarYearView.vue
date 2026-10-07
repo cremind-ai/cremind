@@ -136,7 +136,7 @@ function countFor(day: Date): number {
 .mini-day.today {
   background: var(--primary-color);
 }
-.mini-day.today .num { color: #fff; font-weight: 600; }
+.mini-day.today .num { color: var(--on-primary); font-weight: 600; }
 
 .mini-day .dot {
   position: absolute;

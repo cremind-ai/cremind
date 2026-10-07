@@ -91,12 +91,14 @@ test('handoffs retain only this window profile, preferences and its drafts', () 
       profile_id: 'bob', agent_token_alice: 'alice-token', agent_token_bob: 'bob-token',
       theme: 'dark', terminalPanelWidth: '520', chat_mode_alice: 'thinking',
       chat_mode_bob: 'instant', unknown: 'drop',
+      appearance_alice: '{"v":1}', appearance_bob: '{"v":1}', appearance_last: '{"v":1}',
     },
     session: { 'cremind:draft:alice:42': 'draft', 'cremind:draft:bob:99': 'other draft', unrelated: 'drop' },
   })
   assert.deepEqual(state.local, {
     agent_token_alice: 'alice-token', theme: 'dark', terminalPanelWidth: '520',
     chat_mode_alice: 'thinking', profile_id: 'alice', logged_in_profiles: '["alice"]',
+    appearance_alice: '{"v":1}', appearance_last: '{"v":1}',
   })
   assert.deepEqual(state.session, { 'cremind:draft:alice:42': 'draft' })
   assert.equal(stateHelpers.transitionProfile('http://localhost/#/setup', 'alice'), 'alice')

@@ -414,7 +414,7 @@ onUnmounted(() => {
   height: 32px;
   border-radius: 8px;
   background: var(--primary-color);
-  color: white;
+  color: var(--on-primary);
   display: flex;
   align-items: center;
   justify-content: center;

@@ -791,9 +791,9 @@ p { color: var(--text-secondary); line-height: 1.6; margin: 7px 0; }
 .steps span { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border-color); }
 .steps .active { color: var(--primary-color); font-weight: 600; }
 .steps .active span { border-color: var(--primary-color); }
-.steps .done span { background: var(--primary-color); color: white; border-color: var(--primary-color); }
+.steps .done span { background: var(--primary-color); color: var(--on-primary); border-color: var(--primary-color); }
 .primary-btn, .secondary-btn { display: inline-flex; align-items: center; gap: 7px; border-radius: 6px; padding: 9px 16px; cursor: pointer; font-weight: 600; }
-.primary-btn { border: 1px solid var(--primary-color); background: var(--primary-color); color: white; }
+.primary-btn { border: 1px solid var(--primary-color); background: var(--primary-color); color: var(--on-primary); }
 .secondary-btn { border: 1px solid var(--border-color); background: transparent; color: var(--text-primary); }
 button:disabled { opacity: .55; cursor: not-allowed; }
 .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }

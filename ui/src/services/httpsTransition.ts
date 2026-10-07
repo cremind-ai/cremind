@@ -40,6 +40,8 @@ const CHANNEL_NAME = 'cremind:https-transition';
 const RECOVERY_HINT_AFTER_MS = 45_000;
 const PREFERENCES = [
   'theme',
+  'appearance_last',
+  'appearance_legacy_theme',
   'auto_connect',
   'conversations_panel_collapsed',
   'sidebar_collapsed',
@@ -57,7 +59,10 @@ const PREFERENCES = [
 function preferenceKeys(profile: string): string[] {
   return [
     ...PREFERENCES,
-    ...(profile ? [`chat_mode_${profile}`, `reasoning_enabled_${profile}`] : []),
+    ...(profile
+      ? [`chat_mode_${profile}`, `reasoning_enabled_${profile}`,
+        `appearance_${profile}`, `appearance_migrated_${profile}`]
+      : []),
   ];
 }
 

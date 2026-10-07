@@ -458,11 +458,11 @@ watch(() => panel.viewMode, () => {
 }
 .grid-tile.selected {
   background: var(--primary-color);
-  color: #fff;
+  color: var(--on-primary);
 }
 .grid-tile.drop-hover {
   outline: 1px dashed var(--primary-light);
-  background: rgba(59, 130, 246, 0.15);
+  background: color-mix(in srgb, var(--primary-color) 15%, transparent);
 }.tile-icon {
   font-size: 36px;
   flex-shrink: 0;

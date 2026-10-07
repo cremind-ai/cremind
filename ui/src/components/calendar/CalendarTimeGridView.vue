@@ -132,14 +132,14 @@ onMounted(() => { if (bodyRef.value) bodyRef.value.scrollTop = 7 * HOUR_H; }); /
 .tg-colhead:last-child { border-right: none; }
 .tg-colhead .dow { font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-tertiary); }
 .tg-colhead .num { font-size: 1rem; font-weight: 600; color: var(--text-secondary); width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; }
-.tg-colhead .num.is-today { background: var(--primary-color); color: #fff; }
+.tg-colhead .num.is-today { background: var(--primary-color); color: var(--on-primary); }
 
 .tg-allday { border-bottom: 1px solid var(--border-color); }
 .tg-allday-gutter { font-size: .64rem; color: var(--text-tertiary); padding: 4px 6px; text-align: right; border-right: 1px solid var(--border-color); }
 .tg-allday-lanes { position: relative; grid-column: 2 / -1; }
 .tg-allday-bar {
   position: absolute; height: 19px; line-height: 19px;
-  border: none; cursor: pointer; background: var(--primary-color); color: #fff;
+  border: none; cursor: pointer; background: var(--primary-color); color: var(--on-primary);
   border-radius: 4px; padding: 0 8px; font-size: .72rem; font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -158,7 +158,7 @@ onMounted(() => { if (bodyRef.value) bodyRef.value.scrollTop = 7 * HOUR_H; }); /
 .tg-block {
   position: absolute; z-index: 2; overflow: hidden;
   border: none; border-left: 3px solid color-mix(in srgb, var(--primary-color) 60%, #000);
-  background: var(--primary-color); color: #fff;
+  background: var(--primary-color); color: var(--on-primary);
   border-radius: 5px; padding: 2px 6px; text-align: left; cursor: pointer;
   display: flex; flex-direction: column; gap: 1px;
 }

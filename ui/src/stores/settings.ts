@@ -60,11 +60,6 @@ export const useSettingsStore = defineStore('settings', () => {
     await persistAgentUrl(url);
   }
 
-  // UI theme
-  const theme = ref<'light' | 'dark'>(
-    (localStorage.getItem('theme') as 'light' | 'dark') || 'light'
-  );
-
   // Conversations panel collapsed state (two-rail sidebar). The narrow icon
   // rail always stays; only the conversation-history panel collapses. Seeded
   // from the legacy ``sidebar_collapsed`` key (the old single-sidebar collapse
@@ -209,11 +204,6 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem('auto_connect', String(value));
   }
 
-  function setTheme(newTheme: 'light' | 'dark') {
-    theme.value = newTheme;
-    localStorage.setItem('theme', newTheme);
-  }
-
   function setConversationsPanelCollapsed(value: boolean) {
     conversationsPanelCollapsed.value = value;
     localStorage.setItem('conversations_panel_collapsed', String(value));
@@ -257,7 +247,6 @@ export const useSettingsStore = defineStore('settings', () => {
     autoConnect,
     agentUrl,
     setAgentUrl: setAgentUrlAction,
-    theme,
     conversationsPanelCollapsed,
     usageChipHover,
     eventsViewMode,
@@ -266,7 +255,6 @@ export const useSettingsStore = defineStore('settings', () => {
     workingDir,
     isElectron,
     setAutoConnect,
-    setTheme,
     setConversationsPanelCollapsed,
     setUsageChipHover,
     setEventsViewMode,

@@ -15,12 +15,16 @@ import type { ThinkingStep } from '../stores/chat';
 import { formatTokens } from '../utils/usageFormat';
 import { stepElapsedLabel } from '../utils/latencyLabels';
 import { groupThinkingSteps } from '../utils/streamFrames';
+import { openAfterModeChange, shouldAutoClose, shouldAutoOpen } from '../utils/thinkingDisclosure';
 import { useSettingsStore } from '../stores/settings';
+import { useAppearanceStore } from '../stores/appearance';
+import type { ThinkingProcessMode } from '../appearance/presets';
 
 const props = withDefaults(
   defineProps<{
     steps: ThinkingStep[];
-    // Drives the auto-expand-while-working / auto-collapse-at-the-end pair.
+    // With the "live" Thinking Process setting, drives the open-while-working
+    // / close-at-the-end pair (utils/thinkingDisclosure).
     isStreaming?: boolean;
     // The conversation these steps belong to. Nothing in the timeline reads it
     // yet; it is in the contract so a caller rendering steps from a
@@ -37,6 +41,7 @@ const props = withDefaults(
 );
 
 const settingsStore = useSettingsStore();
+const appearance = useAppearanceStore();
 
 // Per-tool thinking steps grouped by step (see utils/streamFrames): parallel
 // calls of one model turn share a row and its reasoning-call token usage, and
@@ -153,8 +158,13 @@ const getFileIcon = (mime: string): string => {
   return 'mdi:file-outline';
 };
 
-// Collapse state for thinking process timeline
+// Collapse state for thinking process timeline. Closed until clicked, unless
+// the profile chose the "live" Thinking Process (utils/thinkingDisclosure).
 const activeCollapse = ref<string[]>([]);
+
+// Set once the user opens or closes the section: from then on nothing opens
+// or closes it by itself.
+const userToggled = ref(false);
 
 // Track when the collapse was last expanded to prevent expand-then-immediately-collapse
 const lastExpandTime = ref<number>(0);
@@ -172,31 +182,79 @@ watch(activeCollapse, (newVal, oldVal) => {
   }
 });
 
-// Auto-expand thinking section during streaming so user sees real-time steps.
+// "live": open while the agent works, so its steps show as they arrive.
 // ``immediate`` because this component only exists once there IS a step: the
 // arrival that would have tripped the watcher is the same one that mounts it,
 // so waiting for a change would mean never expanding at all.
 watch(
   () => props.steps.length,
-  (newLen) => {
-    if (newLen && newLen > 0 && props.isStreaming) {
-      if (!activeCollapse.value.includes('thinking')) {
-        activeCollapse.value = ['thinking'];
-      }
+  (stepCount) => {
+    const state = { isStreaming: !!props.isStreaming, stepCount, userToggled: userToggled.value };
+    if (shouldAutoOpen(appearance.settings.thinkingProcess, state) && !activeCollapse.value.includes('thinking')) {
+      activeCollapse.value = ['thinking'];
     }
   },
   { immediate: true },
 );
 
-// Collapse automatically when streaming finishes
+// "live": close again when the reply is done.
 watch(
   () => props.isStreaming,
   (streaming) => {
-    if (!streaming && activeCollapse.value.includes('thinking')) {
+    if (
+      !streaming
+      && activeCollapse.value.includes('thinking')
+      && shouldAutoClose(appearance.settings.thinkingProcess, { userToggled: userToggled.value })
+    ) {
       activeCollapse.value = [];
     }
   }
 );
+
+// ── Auto-open: the profile's mode, switched right on this row ──
+//
+// It sets the mode for every reply (it is the profile's chat.thinking_process,
+// the same one `cremind config set` changes), so a reply still being written
+// follows a switch made on any row at once.
+const autoOpen = computed(() => appearance.settings.thinkingProcess === 'live');
+const isOpen = computed(() => activeCollapse.value.includes('thinking'));
+const autoOpenHint = computed(() => (autoOpen.value
+  ? 'Opens while the agent works, closes when it is done — in every reply. Click to turn off.'
+  : 'Stays closed until you click it. Turn on to open it while the agent works — in every reply.'));
+
+watch(
+  () => appearance.settings.thinkingProcess,
+  (mode) => {
+    const next = openAfterModeChange(mode, {
+      isStreaming: !!props.isStreaming,
+      stepCount: props.steps.length,
+      userToggled: userToggled.value,
+      open: isOpen.value,
+    });
+    if (next !== null) activeCollapse.value = next ? ['thinking'] : [];
+  },
+);
+
+// Said once it is saved, and only for the last of quick clicks (one save).
+let toggleSeq = 0;
+const toggleAutoOpen = () => {
+  const mode: ThinkingProcessMode = autoOpen.value ? 'collapsed' : 'live';
+  const seq = ++toggleSeq;
+  appearance.update({ thinkingProcess: mode })
+    .then(() => {
+      if (seq !== toggleSeq) return;
+      ElMessage({
+        type: 'success',
+        duration: 2500,
+        message: mode === 'live'
+          ? 'Auto-open on: the Thinking Process opens while the agent works, in every reply.'
+          : 'Auto-open off: the Thinking Process stays closed until you open it, in every reply.',
+      });
+    })
+    .catch((e: unknown) => {
+      ElMessage.error(e instanceof Error ? e.message : 'Could not save the Auto-open setting');
+    });
+};
 
 // Handle mouse down to track position for drag detection
 const handleMouseDown = (event: MouseEvent) => {
@@ -247,6 +305,7 @@ const handleThinkingClick = (event: MouseEvent) => {
   }
 
   // All guards passed - collapse the thinking section
+  userToggled.value = true;
   activeCollapse.value = [];
 };
 </script>
@@ -255,16 +314,46 @@ const handleThinkingClick = (event: MouseEvent) => {
   <div
     v-if="steps.length"
     class="thinking-section"
+    :class="{ streaming: isStreaming, open: isOpen }"
     @mousedown="handleMouseDown"
     @click="handleThinkingClick"
   >
-    <el-collapse v-model="activeCollapse">
+    <!-- `change` fires on a click on the header, never for the watchers above. -->
+    <el-collapse v-model="activeCollapse" @change="userToggled = true">
       <el-collapse-item name="thinking">
         <template #title>
           <span class="collapse-title">
             <Icon icon="mdi:brain" class="collapse-icon" />
-            {{ title }} ({{ thinkingGroups.length }} steps)
+            {{ title }} ({{ thinkingGroups.length }} {{ thinkingGroups.length === 1 ? 'step' : 'steps' }})
           </span>
+          <!-- Inside the header, so its clicks and keys must not reach the
+               header's own open/close handlers. Shown while the reply is
+               written, while the row is open, and on hover or focus.
+               `trigger-keys` empty: the tooltip otherwise takes Enter and
+               Space (preventDefault) and the switch never toggles from the
+               keyboard. -->
+          <el-tooltip
+            :content="autoOpenHint"
+            placement="top"
+            :show-after="400"
+            :hide-after="0"
+            :trigger-keys="[]"
+          >
+            <button
+              type="button"
+              class="auto-open"
+              :class="{ on: autoOpen }"
+              role="switch"
+              :aria-checked="autoOpen"
+              aria-label="Auto-open the Thinking Process while the agent works"
+              @click.stop="toggleAutoOpen"
+              @keydown.enter.stop
+              @keydown.space.stop
+            >
+              <span class="auto-open-track" aria-hidden="true"><span class="auto-open-thumb" /></span>
+              <span class="auto-open-label">Auto-open</span>
+            </button>
+          </el-tooltip>
         </template>
         <el-timeline>
           <el-timeline-item
@@ -389,6 +478,85 @@ const handleThinkingClick = (event: MouseEvent) => {
   gap: 8px;
   font-weight: 600;
   color: var(--primary-color);
+}
+
+/* The title slot: the label on the left, the Auto-open switch on the right
+   (before Element Plus's arrow). */
+.thinking-section :deep(.el-collapse-item__title) {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* ── Auto-open switch ── */
+.auto-open {
+  margin-left: auto;
+  margin-right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px 0 4px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  /* Hidden (and out of the tab order) until the row is in use. */
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.thinking-section:hover .auto-open,
+.thinking-section:focus-within .auto-open,
+.thinking-section.streaming .auto-open,
+.thinking-section.open .auto-open {
+  visibility: visible;
+  opacity: 1;
+}
+.auto-open:hover {
+  color: var(--text-secondary);
+  border-color: var(--border-color);
+  background: var(--surface-color);
+}
+.auto-open:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 1px;
+}
+.auto-open.on {
+  color: var(--primary-color);
+}
+.auto-open-track {
+  position: relative;
+  width: 22px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--border-hover);
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+.auto-open-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--surface-color);
+  transition: transform 0.15s ease;
+}
+.auto-open.on .auto-open-track {
+  background: var(--primary-color);
+}
+.auto-open.on .auto-open-thumb {
+  background: var(--on-primary);
+  transform: translateX(10px);
 }
 
 .collapse-icon {

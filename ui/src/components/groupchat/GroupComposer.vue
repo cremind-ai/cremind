@@ -341,7 +341,7 @@ const handleBlur = () => {
 
 .composer-input:focus {
   border-color: var(--primary-color);
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 15%, transparent);
 }
 
 /* Mirrors MessageInput's toolbar row, so the send button sits in the same spot
@@ -379,7 +379,7 @@ const handleBlur = () => {
   justify-content: center;
   padding: 0;
   font-size: 16px;
-  color: white;
+  color: var(--on-primary);
   background: var(--primary-color);
   border: none;
   border-radius: 6px;

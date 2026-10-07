@@ -73,7 +73,7 @@ function statusIcon(status: string): string {
 }
 
 .todo-item.flash {
-  background: rgba(37, 99, 235, 0.1);
+  background: color-mix(in srgb, var(--primary-color) 10%, transparent);
 }
 
 .todo-item-icon {
