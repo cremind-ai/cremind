@@ -4781,7 +4781,10 @@ install_python_via_uv() {
         err "uv failed to install Python 3.13 — see $LOG_FILE."
         exit 1
     fi
-    PYTHON="$("$UV_BIN" python find '>=3.13.9,<3.14' 2>/dev/null | tr -d '[:space:]')"
+    # Taken exactly as printed: on macOS the path runs through "Application
+    # Support", so it must keep its spaces. If find fails, PYTHON is empty and
+    # the error below says so, instead of set -e ending the run silently.
+    PYTHON="$("$UV_BIN" python find '>=3.13.9,<3.14' 2>/dev/null)" || PYTHON=""
     if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
         err "Python install completed but the interpreter could not be located."
         exit 1

@@ -143,6 +143,57 @@ def test_venv_python_problem() -> None:
             assert problem in row, (os_name, ver, row)
 
 
+_ISOLATED = "cpython-3.13.12-macos-x86_64-none/bin/python3.13"
+
+
+def _install_python_via_uv(tmp_path: Path, find: str) -> subprocess.CompletedProcess[str]:
+    """Run install_python_via_uv under a Mac's Install Dir, with stand-ins for
+    uv (its ``python find`` runs *find*) and the interpreter it installs."""
+    install_dir = tmp_path / "Library" / "Application Support" / "Cremind"
+    python = install_dir / "python" / _ISOLATED
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\necho 'Python 3.13.12'\n", encoding="utf-8", newline="\n")
+    python.chmod(0o755)
+    uv = tmp_path / "uv"
+    uv.write_text(f'#!/bin/sh\n[ "$2" = install ] && exit 0\n{find}\n', encoding="utf-8", newline="\n")
+    uv.chmod(0o755)
+    script = "\n".join([
+        "set -euo pipefail",
+        _MESSAGES,
+        "info() { :; }",
+        "ok() { printf 'OK %s\\n' \"$1\"; }",
+        f"CREMIND_INSTALL_DIR='{install_dir.as_posix()}'",
+        f"LOG_FILE='{(tmp_path / 'install.log').as_posix()}'",
+        f"UV_BIN='{uv.as_posix()}'",
+        _sh_function("install_python_via_uv"),
+        "install_python_via_uv",
+        'echo "PYTHON=$PYTHON"',
+    ]) + "\n"
+    return _run_bash(script)
+
+
+def test_install_python_via_uv_keeps_the_spaces_in_the_path(tmp_path: Path) -> None:
+    """A Mac's Install Dir is under "Application Support". With whitespace
+    stripped from the path uv printed, it named a folder that doesn't exist,
+    and every Mac that needed the isolated 3.13 stopped at "the interpreter
+    could not be located"."""
+    result = _install_python_via_uv(tmp_path, f'echo "$UV_PYTHON_INSTALL_DIR/{_ISOLATED}"')
+    python = f"{tmp_path.as_posix()}/Library/Application Support/Cremind/python/{_ISOLATED}"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"OK Python: Python 3.13.12 at {python} (isolated)",
+        f"PYTHON={python}",
+    ]
+
+
+def test_install_python_via_uv_says_so_when_uv_finds_nothing(tmp_path: Path) -> None:
+    """Not set -e's silent exit at the failed find."""
+    result = _install_python_via_uv(tmp_path, "exit 2")
+    assert result.returncode == 1
+    assert result.stderr == "ERR Python install completed but the interpreter could not be located.\n"
+    assert "PYTHON=" not in result.stdout
+
+
 @pytest.mark.parametrize("log_exists", [True, False])
 def test_run_logged_stops_and_shows_the_end_of_the_output(tmp_path: Path, log_exists: bool) -> None:
     log = tmp_path / "install.log"
