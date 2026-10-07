@@ -406,6 +406,10 @@ details[open] summary { margin-bottom: 14px; }
 .cell-sub b { color: var(--ink-2); font-weight: 600; }
 td.when { font-size: 13px; color: var(--ink-2); white-space: nowrap; }
 td.when .cell-sub { white-space: normal; }
+/* No live figures for an account: a triangle + the reason, never colour alone */
+.live-problem { color: var(--ink-2); }
+.live-problem::before { content: '▲ '; color: var(--warning); }
+td.when .live-problem { max-width: 260px; }
 .mark-dot { fill: var(--surface-1); stroke: var(--series-1); stroke-width: 2; }
 .tooltip .t-note { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
@@ -416,6 +420,55 @@ code {
   border-radius: 6px;
   padding: 1px 6px;
 }
+
+/* ---------- quick switch ---------- */
+
+.switcher { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr)); }
+.switch-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  min-width: 0;
+}
+.switch-tile .t-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.switch-tile .t-name { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.switch-tile .t-tag { margin-left: auto; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.switch-tile .t-figs { font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.switch-tile:not(:disabled):hover { border-color: var(--series-1); }
+.switch-tile[aria-pressed='true'] {
+  border-color: var(--series-1);
+  background: color-mix(in oklab, var(--series-1) 8%, var(--surface-1));
+  cursor: default;
+}
+.switch-tile[aria-pressed='true'] .t-tag { color: var(--ink); font-weight: 600; }
+.switch-tile:disabled:not([aria-pressed='true']) { cursor: not-allowed; opacity: 0.6; }
+.switch-msg { margin-top: 12px; font-size: 14px; color: var(--ink-2); }
+.switch-msg::before { color: var(--level); margin-right: 6px; }
+.switch-msg[data-level='good']::before { content: '✓'; }
+.switch-msg[data-level='critical']::before { content: '⚠'; }
+.switch-msg .fix { color: var(--ink); }
+
+/* Manual | Automatic: two radios drawn as one control */
+.segmented { display: inline-flex; margin: 0; padding: 2px; border: 1px solid var(--border); border-radius: 9px; background: var(--wash); }
+.segmented input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.segmented label { padding: 4px 12px; border-radius: 7px; font-size: 13px; color: var(--ink-2); cursor: pointer; }
+.segmented input:checked + label { background: var(--surface-1); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(11, 11, 11, 0.12); }
+.segmented input:focus-visible + label { outline: 2px solid var(--series-1); outline-offset: 1px; }
+
+.plan { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 14px; color: var(--ink-2); }
+.plan p { margin: 0; overflow-wrap: anywhere; }
+.plan strong { color: var(--ink); font-weight: 600; }
+.plan .plan-mode::before, .plan .plan-action::before { color: var(--level); margin-right: 6px; }
+.plan .plan-mode[data-level='good']::before { content: '●'; }
+.plan .plan-mode[data-level='warning']::before, .plan .plan-action[data-level='warning']::before { content: '▲'; }
+.plan .plan-action[data-level='critical']::before { content: '⚠'; }
+.plan .plan-action { color: var(--ink); }
+.plan .plan-note { font-size: 13px; color: var(--muted); }
+.rotation { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.rotation-field { flex: 1 1 100%; }
 
 /* ---------- profiles ---------- */
 

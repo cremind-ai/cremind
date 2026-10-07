@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from . import common as C
+from .live import LivePoller
 from .monitor import TICK_MS, Monitor
 from .server import bind, serve_in_background
 
@@ -115,6 +116,8 @@ def run(argv: list[str]) -> int:
     _touch_heartbeat()
     atexit.register(_remove_runtime_files, paths, pid)
     serve_in_background(server)
+    monitor.poller = LivePoller(monitor)  # official figures from Anthropic, in its own thread
+    monitor.poller.start()
 
     moved = "" if server.port == port else f" (port {port} was taken)"
     print(f"Claude Usage Monitor running at {server.url}{moved}", flush=True)
@@ -144,6 +147,11 @@ def run(argv: list[str]) -> int:
     finally:
         server.shutdown()
         server.server_close()
+        # A switch runs in a request thread, which won't hold the process open: let it finish
+        # moving the logins first.
+        if monitor.switch_lock.acquire(timeout=30):
+            monitor.switch_lock.release()
+        monitor.poller.stop()
         monitor.close()
         _remove_runtime_files(paths, pid)
     print("Claude Usage Monitor stopped", flush=True)

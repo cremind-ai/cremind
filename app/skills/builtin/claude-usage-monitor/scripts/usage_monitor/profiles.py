@@ -2,9 +2,10 @@
 in to its own account, so several accounts stay signed in at once.
 
 "main" is the Claude Code configuration you work in; "cremind" is this Cremind profile's
-own Claude Code home; the rest are extra profiles that exist so the monitor can track
-other accounts without touching the main login — Claude Code's documented way to use
-multiple accounts (code.claude.com/docs/en/authentication).
+own Claude Code home; the rest are extra profiles, which keep the other accounts' logins —
+so the monitor can track them, and a switch (``switch.py``) can move any of them into the
+main profile in one step. Claude Code's documented way to use multiple accounts
+(code.claude.com/docs/en/authentication).
 """
 
 from __future__ import annotations
@@ -13,8 +14,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import common as C
 
@@ -65,7 +68,9 @@ def extra_profile(name: str) -> ClaudeProfile:
 
 
 def read_registry(paths: C.Paths) -> list[dict]:
-    """Extra profiles registered with ``add-account``: ``[{name, addedAt}]``.
+    """Extra profiles registered with ``add-account`` (or created by a switch):
+    ``[{name, addedAt, account?, createdBy?}]`` — ``account`` is the account whose place the
+    profile keeps once a switch has moved its login out.
 
     Folders are always derived from the name, never read from the file, so the registry
     cannot point the monitor anywhere outside this profile's accounts folder.
@@ -79,13 +84,62 @@ def read_registry(paths: C.Paths) -> list[dict]:
         if not isinstance(name, str) or not NAME_RE.match(name) or name.lower() in RESERVED or name.lower() in seen:
             continue
         seen.add(name.lower())
-        out.append({"name": name, "addedAt": e.get("addedAt")})
+        row = {"name": name, "addedAt": e.get("addedAt")}
+        for k in ("account", "createdBy"):
+            if isinstance(e.get(k), str) and e[k]:
+                row[k] = e[k]
+        out.append(row)
     return out
 
 
 def write_registry(paths: C.Paths, entries: list[dict]) -> None:
-    rows = [{"name": e["name"], "dir": str(extra_profile(e["name"]).dir), "addedAt": e.get("addedAt")} for e in entries]
+    rows = []
+    for e in entries:
+        row = {"name": e["name"], "dir": str(extra_profile(e["name"]).dir), "addedAt": e.get("addedAt")}
+        row.update({k: e[k] for k in ("account", "createdBy") if e.get(k)})
+        rows.append(row)
     C.write_json_atomic(paths.profiles, {"profiles": rows}, indent=2)
+
+
+def update_registry(paths: C.Paths, change: Callable[[list[dict]], list[dict]]) -> list[dict]:
+    """Read, change and write the registry under a lock, as the monitor and the CLI may both
+    write it."""
+    lock = paths.profiles.with_name(paths.profiles.name + ".lock")
+    paths.data.mkdir(parents=True, exist_ok=True)
+    held = False
+    for attempt in range(50):
+        try:
+            os.mkdir(lock)
+            held = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > 10:
+                    os.rmdir(lock)  # its holder died
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05 + 0.01 * attempt)
+    try:
+        entries = change(read_registry(paths))
+        write_registry(paths, entries)
+        return entries
+    finally:
+        if held:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+
+
+def prepare_profile_dir(profile: ClaudeProfile) -> None:
+    """A new extra profile's folder, with this skill's status line in its settings."""
+    profile.dir.mkdir(parents=True, exist_ok=True)
+    settings = C.read_json(profile.settings_file)
+    settings = settings if isinstance(settings, dict) else {}
+    if not settings.get("statusLine"):
+        settings["statusLine"] = {"type": "command", "command": C.statusline_command(), "padding": 0}
+        C.write_json_atomic(profile.settings_file, settings, indent=2)
 
 
 def list_profiles(paths: C.Paths) -> list[ClaudeProfile]:

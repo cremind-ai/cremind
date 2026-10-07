@@ -32,6 +32,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "etaAlertMin": 15,  # alert when either limit is projected this close
     "events": True,  # send alerts to Cremind events
     "sound": False,  # beep in the dashboard tab
+    "live": True,  # ask Anthropic for the official figures (each profile's Claude login)
+    # Switching: "manual" (alerts; you or the agent switch) or "auto" (the monitor switches
+    # your Claude Code itself when the account in use reaches either threshold).
+    "switchMode": "manual",
+    "autoSessionPct": 98,
+    "autoWeeklyPct": 99,  # ...and the account is set aside until its week resets
+    "autoEarly": False,  # also switch early to spend a week that would otherwise expire unused
 }
 
 IDLE_PER_HOUR = 1.2  # % of the 5-hour window per hour; slower than this counts as idle
@@ -177,6 +184,52 @@ def from_claude_cache(c: Any) -> dict | None:
     return u if (u["session"] or u["weekly"]) else None
 
 
+def from_usage_api(body: Any, at: float) -> dict | None:
+    """From Anthropic's usage API — what Claude Code's ``/usage`` and claude.ai show. The same
+    shape Claude Code caches; a limit the answer names as null has no usage in progress."""
+    if not isinstance(body, dict):
+        return None
+    limits = body.get("limits") if isinstance(body.get("limits"), list) else []
+    named = {item.get("kind") for item in limits if isinstance(item, dict)}
+    filled = dict(body)
+    for key, kind in (("five_hour", "session"), ("seven_day", "weekly_all")):
+        if key in body and body[key] is None and kind not in named:
+            filled[key] = {"utilization": 0, "resets_at": None}
+    u = from_claude_cache({"utilization": filled, "fetchedAtMs": at})
+    if not u:
+        return None
+    u["source"] = "api"
+    u["spend"] = _extra_usage(body)
+    return u
+
+
+def _extra_usage(body: dict) -> dict | None:
+    """Extra usage (paid past the plan's limits) in the status line's ``spend`` shape, when it
+    is turned on and counted in US dollars."""
+    x = body.get("extra_usage")
+    if not isinstance(x, dict) or x.get("is_enabled") is not True:
+        return None
+    s = body.get("spend") if isinstance(body.get("spend"), dict) else {}
+
+    def money(o: Any) -> float | None:
+        minor = to_num(_get(o, "amount_minor"))
+        exp = to_num(_get(o, "exponent"))
+        return None if minor is None or exp is None else minor / 10**exp
+
+    used, limit = money(s.get("used")), money(s.get("limit"))
+    if used is None or limit is None:
+        places = to_num(x.get("decimal_places"))
+        scale = 10 ** (2 if places is None else places)
+        raw_used, raw_limit = to_num(x.get("used_credits")), to_num(x.get("monthly_limit"))
+        used = None if raw_used is None else raw_used / scale
+        limit = None if raw_limit is None else raw_limit / scale
+    if (_get(s.get("used"), "currency") or x.get("currency") or "USD") != "USD":
+        return None
+    pct = to_num(x.get("utilization"))
+    pct = to_num(s.get("percent")) if pct is None else pct
+    return {"pct": max(0, pct or 0), "resetsAt": None, "usedUsd": used, "limitUsd": limit, "period": "monthly"}
+
+
 def project(win: dict | None, now: float) -> dict | None:
     """The window as of ``now``: once its reset time has passed, usage is back to 0."""
     if not win:
@@ -292,6 +345,11 @@ def status_of(v: dict, s: dict) -> dict:
     s_warn = sp is not None and sp >= s["warnPct"]
     w_warn = wp is not None and wp >= s["weeklyWarnPct"]
     if v.get("active"):
+        if s.get("switchMode") == "auto" and (s_warn or w_warn or s_crit or w_crit):
+            # Automatic switching moves it at its own thresholds: nothing to do but know.
+            near_s, near_w = s_warn or s_crit, w_warn or w_crit
+            label = "Near both limits" if near_s and near_w else "Near 5-hour limit" if near_s else "Near weekly limit"
+            return {"level": "warning", "icon": "▲", "label": label}
         if s_crit or w_crit:
             label = "Switch now" if s_crit and w_crit else "Switch now (5-hour)" if s_crit else "Switch now (weekly)"
             return {"level": "critical", "icon": "⚠", "label": label}
@@ -336,10 +394,11 @@ def recommend(views: list[dict], s: dict) -> dict | None:
 
 # ---------------------------------------------------------------- estimates from spend
 #
-# Official readings arrive only now and then (a status line reply, Claude Code refreshing
-# its cache, a limit being hit). In between, the monitor rolls the last reading forward
-# with what the account's sessions have spent since, priced at API list rates and
-# converted with a per-plan calibration: list-price USD per 1% of each window.
+# Official readings come from Anthropic's usage API every minute or so while live figures
+# work, and otherwise only now and then (a status line reply, Claude Code refreshing its
+# cache, a limit being hit). In between, the monitor rolls the last reading forward with
+# what the account's sessions have spent since, priced at API list rates and converted
+# with a per-plan calibration: list-price USD per 1% of each window.
 
 
 class SpendLog:
@@ -423,13 +482,15 @@ def blend_calibration(cal: dict, sample: float) -> dict | None:
     return {"usdPerPct": cal["usdPerPct"] * (1 - w) + sample * w, "n": cal["n"] + 1}
 
 
-def estimate_window(reading: dict | None, log: SpendLog | None, usd_per_pct: float, kind: str, now: float) -> dict | None:
+def estimate_window(reading: dict | None, log: SpendLog | None, usd_per_pct: float, kind: str, now: float, exact_ms: float | None = None) -> dict | None:
     """A usage window as of ``now``: its last official reading plus the spend since, rolled
     through resets. A 5-hour window opens at the first use after the previous one ends
     (aligned to 10 minutes); a weekly one likewise, aligned to the hour.
 
     reading   ``{"pct", "resetsAt", "at"}`` — official figure, or None when never seen
     kind      ``"session"`` | ``"weekly"``
+    exact_ms  a reading younger than this is shown as it is — Anthropic's own figure, the
+              one claude.ai shows — rather than rolled forward with estimated spend
     """
     if not reading or reading.get("pct") is None:
         return None
@@ -456,6 +517,9 @@ def estimate_window(reading: dict | None, log: SpendLog | None, usd_per_pct: flo
     resets_at = reading.get("resetsAt")
     approx_reset = False
     rolled = None
+
+    if exact_ms is not None and base_at is not None and now - base_at <= exact_ms and (resets_at is None or now < resets_at):
+        return result(base, resets_at, {"estimated": False, **({"windowStart": resets_at - length} if resets_at is not None else {})})
 
     # Spend can't take a used-up window past 100%, so an official 100% stays official (a reply
     # sharing its minute with the limit notice would otherwise mark it as an estimate).
@@ -531,4 +595,28 @@ def window_series(win: dict | None, reading: dict | None, log: SpendLog | None, 
         out.append([t, at(t)])
         t += step
     out.append([now, at(now)])
+    return out
+
+
+def official_series(marks: Iterable[list], start: float, now: float, pct_now: float, step: float = 2 * MIN) -> list[list[float]]:
+    """Points for the window chart from official readings alone (``marks``: ``[t, pct]``):
+    straight lines between them, from 0% when the window opened to the figure now."""
+    pts = [(start, 0.0), *sorted((m[0], m[1]) for m in marks if start <= m[0] <= now), (now, pct_now)]
+    j = 0
+
+    def at(t: float) -> float:
+        nonlocal j
+        while j + 1 < len(pts) and pts[j + 1][0] <= t:
+            j += 1
+        if j + 1 >= len(pts):
+            return pts[-1][1]
+        (t0, p0), (t1, p1) = pts[j], pts[j + 1]
+        return p0 + (p1 - p0) * (t - t0) / (t1 - t0)
+
+    out: list[list[float]] = []
+    t = start
+    while t < now:
+        out.append([t, min(100, max(0, at(t)))])
+        t += step
+    out.append([now, min(100, max(0, pct_now))])
     return out

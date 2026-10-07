@@ -25,7 +25,13 @@ ALERT_EVENT_TYPES = {
     "limit": "limit_reached",
     "back": "account_available",  # a used-up account is available again
 }
-EVENT_TYPES = tuple(ALERT_EVENT_TYPES.values())
+# Automatic switching's own events (monitor.py, planner.py).
+AUTO_EVENT_TYPES = (
+    "auto_switched",  # it switched your Claude Code to another account
+    "no_account_available",  # the account in use reached a threshold and no account can take over
+    "auto_switch_failed",  # it tried three times and could not switch
+)
+EVENT_TYPES = (*ALERT_EVENT_TYPES.values(), *AUTO_EVENT_TYPES)
 
 _WINDOWS_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 

@@ -38,6 +38,24 @@
         </div>
       </section>
 
+      <!-- Quick switch: the account your Claude Code (VS Code, terminals) uses -->
+      <section class="card" id="switch-card" aria-labelledby="switch-heading" hidden>
+        <div class="card-head">
+          <h2 id="switch-heading">Your Claude Code uses</h2>
+          <div class="spacer"></div>
+          <fieldset class="segmented" id="switch-mode">
+            <legend class="sr-only">Switching</legend>
+            <input type="radio" name="switchMode" id="mode-manual" value="manual" />
+            <label for="mode-manual" title="Alerts only: you or Cremind switch">Manual</label>
+            <input type="radio" name="switchMode" id="mode-auto" value="auto" />
+            <label for="mode-auto" title="The monitor switches your Claude Code by itself">Automatic</label>
+          </fieldset>
+        </div>
+        <div class="switcher" id="switcher" role="group" aria-labelledby="switch-heading"></div>
+        <p class="switch-msg" id="switch-msg" role="status" aria-live="polite" hidden></p>
+        <div class="plan" id="plan" aria-live="polite"></div>
+      </section>
+
       <!-- 5-hour window chart -->
       <section class="card" id="chart-card" hidden aria-labelledby="chart-heading">
         <div class="card-head">
@@ -86,14 +104,15 @@
           <h2 id="profiles-heading">Tracking more accounts</h2>
         </div>
         <p class="sub" style="margin-bottom: 12px">
-          Claude only reveals an account's usage to a session signed in to it. Give each extra account its own
-          Claude Code profile — a separate config folder with its own login — and it is tracked alongside your main one
-          without ever changing which account your sessions use.
+          Anthropic reveals an account's usage only to that account's login. Give each extra account its own Claude
+          Code profile — a separate config folder with its own login — and it is tracked alongside the one your Claude
+          Code uses. A switch signs nothing out: the chosen account's login moves into your Claude Code, and the one it
+          replaces moves to a profile of its own, so every account stays signed in here.
         </p>
         <ol class="steps">
-          <li>Ask Cremind to <b>add a Claude account profile</b>, e.g. “add a Claude usage profile named spare1”. A window opens with Claude Code in the new profile.</li>
-          <li>Sign in there with the account to track, type <code>/usage</code>, then <code>/exit</code>.</li>
-          <li>To refresh it later, press <b>Open</b> below and run <code>/usage</code> again. Idle accounts stay accurate on their own — usage only grows when an account is used.</li>
+          <li>Ask Cremind to <b>add a Claude account</b>, e.g. “add a Claude account named spare1”. A window opens with Claude Code in the new profile.</li>
+          <li>Sign in there with that account, then <code>/exit</code>. Its official figures appear within seconds, and it joins <b>Your Claude Code uses</b> above: one click switches to it.</li>
+          <li>That's all: the monitor keeps every login renewed while it is idle. Only if an account shows “sign in again”, press <b>Open</b> below and run <code>/login</code>. Switch with the button rather than <code>/login</code> in VS Code: <code>/login</code> drops the account it replaces from this computer.</li>
         </ol>
         <ul class="profiles" id="profiles-list"></ul>
       </section>
@@ -109,12 +128,37 @@
       <!-- Settings -->
       <section class="card">
         <details id="settings">
-          <summary>Alert settings</summary>
+          <summary>Settings: switching and alerts</summary>
           <p class="sub" style="margin-bottom: 14px">
             Either limit interrupts a session when it runs out, so each has the same two alerts. An account past a
-            switch-now threshold isn't suggested as the next one until that limit resets.
+            switch-now threshold isn't suggested as the next one until that limit resets. With automatic switching
+            on, the account your Claude Code uses gets no heads-up alerts: it is switched instead.
           </p>
           <div class="settings-grid">
+            <fieldset class="limit-group" id="auto-group">
+              <legend>Automatic switching</legend>
+              <div class="field">
+                <label for="autoSessionPct">Switch at, 5-hour</label>
+                <div class="row"><input type="number" id="autoSessionPct" min="50" max="99" step="1" /> <span class="sub">%</span></div>
+              </div>
+              <div class="field">
+                <label for="autoWeeklyPct">Switch and set aside at, weekly</label>
+                <div class="row"><input type="number" id="autoWeeklyPct" min="50" max="100" step="1" /> <span class="sub">%</span></div>
+              </div>
+              <span class="hint">
+                Used when the switch above is on Automatic. An account whose week is full is set aside until its week
+                resets.
+              </span>
+              <span class="row"><input type="checkbox" id="autoEarly" /> <label for="autoEarly">Use up a week that resets soon</label></span>
+              <span class="hint">
+                Also switches before the thresholds, to an account whose leftover weekly allowance would otherwise go
+                unused within 24 hours.
+              </span>
+              <div class="field rotation-field">
+                <span class="sub">Accounts it may suggest and switch to</span>
+                <div class="rotation" id="rotation"></div>
+              </div>
+            </fieldset>
             <fieldset class="limit-group">
               <legend>5-hour limit</legend>
               <div class="field">
@@ -147,6 +191,11 @@
               <span class="hint">Based on the measured burn rate. 0 turns this off.</span>
             </div>
             <div class="field">
+              <span class="row"><input type="checkbox" id="live" /> <label for="live">Official figures from Anthropic</label></span>
+              <span class="hint">
+                Asks Anthropic for each account's usage with its Claude login, the way Claude Code's /usage does —
+                the figures claude.ai shows. Off: estimates between Claude Code's own readings.
+              </span>
               <span class="row"><input type="checkbox" id="events" /> <label for="events">Send alerts to Cremind events</label></span>
               <span class="row"><input type="checkbox" id="sound" /> <label for="sound">Beep in this tab</label></span>
               <button id="test-alert" class="small" type="button" style="align-self: start; margin-top: 4px">Send a test alert</button>
@@ -165,18 +214,19 @@
           <summary>How the figures are measured</summary>
           <div class="method">
             <p>
-              <b>Official readings</b> come from Claude Code itself: its own usage cache (refreshed when you sign in or
-              run <code>/usage</code>), the terminal status line after each reply, and limit-reached notices.
+              <b>Official figures from Anthropic</b> — the same as claude.ai's Settings → Usage, including usage on
+              claude.ai, the apps and other computers. The monitor asks Anthropic's usage API with each profile's Claude
+              login, as Claude Code's <code>/usage</code> does. <span id="live-note"></span>
             </p>
             <p>
-              <b>Between readings</b> — and for VS Code sessions, which never run a status line — the monitor adds up what
-              each reply cost at API list prices, from the session transcripts, and converts it with a calibration:
-              <span id="calibration-note">…</span> Figures built this way are marked <b>≈</b>. Each new official
-              reading replaces the estimate and refines the calibration.
+              <b>Claude Code's own readings</b> count too: its usage cache, the terminal status line after each reply,
+              and limit-reached notices.
             </p>
             <p>
-              Usage made outside this computer (claude.ai, the mobile apps, another machine) only shows up at the next
-              official reading.
+              <b>Estimates</b> fill in only when no recent official figure is at hand (live figures off, a profile
+              without a usable login, no network): the monitor adds up what each reply cost at API list prices, from
+              the session transcripts, and converts it with a calibration: <span id="calibration-note">…</span>
+              Figures built this way are marked <b>≈</b>.
             </p>
             <p id="statusline-note" class="sub"></p>
           </div>
@@ -184,8 +234,9 @@
       </section>
 
       <p class="sub" style="text-align: center">
-        Reads only usage figures, token counts and the signed-in account from Claude Code's own files. Login tokens and
-        conversation content are never read.
+        Each profile's Claude login is sent only to Anthropic, to ask for its usage (and renew it when it expired, as
+        Claude Code does); it is never copied, logged or shown — a switch moves it between Claude Code's own folders on
+        this computer. Conversation content is never read.
       </p>
     </div>
     <script src="/app.js"></script>

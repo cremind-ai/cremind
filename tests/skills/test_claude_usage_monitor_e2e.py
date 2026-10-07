@@ -104,6 +104,9 @@ class Rig:
                 "CLAUDE_USAGE_MONITOR_ACCOUNTS_DIR": str(self.accounts),
                 "CLAUDE_USAGE_MONITOR_RESCAN_MS": "1000",
                 "CLAUDE_USAGE_MONITOR_TICK_MS": "250",
+                # Never the real Anthropic: a closed loopback port, unless a test brings a fake.
+                "CLAUDE_USAGE_MONITOR_API_URL": "http://127.0.0.1:9",
+                "CLAUDE_USAGE_MONITOR_TOKEN_URL": "http://127.0.0.1:9/v1/oauth/token",
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUNBUFFERED": "1",
             }

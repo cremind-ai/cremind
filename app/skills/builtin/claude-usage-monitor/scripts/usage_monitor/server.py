@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 from . import common as C
 from .events import EVENT_TYPES
 from .monitor import STATIC_FILES, Monitor
+from .switch import SwitchError
 
 HOST = "127.0.0.1"
 MIME = {
@@ -27,6 +28,7 @@ MIME = {
     ".svg": "image/svg+xml",
 }
 MAX_BODY = 16_000
+REFRESH_WAIT_S = 8.0  # how long /api/refresh waits for Anthropic's answers
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -162,8 +164,25 @@ class _Handler(BaseHTTPRequestHandler):
 
         path = unquote(urlsplit(self.path).path)
         monitor = self.server.monitor
+        if method == "POST" and path == "/api/refresh":
+            # Official figures now: the dashboard opening, or the agent asking for the status.
+            fresh = monitor.refresh_live(REFRESH_WAIT_S if body.get("wait") is True else 0)
+            return self._json(200, {"ok": True, "fresh": fresh, "state": monitor.api_state()})
         if method == "POST" and path == "/api/settings":
             return self._json(200, {"ok": True, "settings": monitor.apply_settings(body)})
+        if method == "POST" and path == "/api/switch":
+            # Your Claude Code's account becomes this one, with its login saved here.
+            ref = body.get("account")
+            account = monitor.find_account(ref) if isinstance(ref, str) and ref.strip() else None
+            if account is None:
+                return self._json(404, {"ok": False, "reason": "unknown", "error": "no such account"})
+            try:
+                result = monitor.switch_account(account["id"], force=body.get("force") is True)
+            except SwitchError as e:
+                ok = e.reason == "already"
+                return self._json(200 if ok else 409, {"ok": ok, "reason": e.reason, "error": str(e), "fix": e.fix, "state": monitor.api_state()})
+            result = {k: v for k, v in result.items() if k != "reading"}
+            return self._json(200, {"ok": True, "result": result, "state": monitor.api_state()})
         if method == "POST" and path == "/api/test-alert":
             event_type = body.get("type") or "limit_warning"
             if event_type not in EVENT_TYPES:
@@ -186,7 +205,9 @@ class _Handler(BaseHTTPRequestHandler):
                 ok = monitor.forget_account(account_id)
             elif isinstance(body.get("label"), str):
                 ok = monitor.set_label(account_id, body["label"])
+            elif isinstance(body.get("rotation"), bool):
+                ok = monitor.set_rotation(account_id, body["rotation"])
             else:
-                return self._json(400, {"error": "expected a label"})
+                return self._json(400, {"error": "expected a label or rotation"})
             return self._json(200 if ok else 404, {"ok": True} if ok else {"error": "unknown account"})
         return self._json(404, {"error": "not found"})

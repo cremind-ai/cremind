@@ -58,6 +58,12 @@ def default_paths() -> Paths:
     return Paths(Path(override) if override else SCRIPTS_DIR / ".monitor")
 
 
+def owner_label(paths: Paths) -> str:
+    """Who runs a monitor, for people: its Cremind profile, or its data folder."""
+    profile = os.environ.get("CREMIND_PROFILE", "").strip()
+    return f'Cremind profile "{profile}"' if profile else str(paths.data)
+
+
 def now_ms() -> float:
     return time.time() * 1000
 
@@ -196,8 +202,8 @@ def js_safe(value: Any) -> Any:
 
 
 def pick_account(o: Any) -> dict | None:
-    """The non-secret account metadata Claude Code keeps in its config.
-    Login tokens live elsewhere (``.credentials.json``) and are never read."""
+    """The non-secret account metadata Claude Code keeps in its config. Login tokens live
+    elsewhere (``.credentials.json``); only ``live.py`` reads them, to ask Anthropic."""
     if not isinstance(o, dict) or not o.get("accountUuid"):
         return None
     return {
@@ -205,6 +211,7 @@ def pick_account(o: Any) -> dict | None:
         "email": o.get("emailAddress") or None,
         "name": o.get("displayName") or o.get("fullName") or None,
         "org": o.get("organizationName") or None,
+        "orgId": o.get("organizationUuid") or None,
         "orgType": o.get("organizationType") or None,
         "tier": o.get("organizationRateLimitTier") or o.get("userRateLimitTier") or None,
     }

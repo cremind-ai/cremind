@@ -44,18 +44,27 @@ function ago(ms) {
   if (m < 48 * 60) return `${Math.round(m / 60)} h ago`;
   return `${Math.round(m / 1440)} days ago`;
 }
+/** Like ago(), to the second under a minute: live figures are a few seconds old. */
+const agoShort = (ms) => (ms < MIN ? `${Math.max(0, Math.round(ms / 1000))} s ago` : ago(ms));
 const approx = (w) => (w && w.estimated ? '≈' : '');
 const pct = (w) => (w ? `${approx(w)}${Math.round(w.pct)}%` : '—');
 const pctOf = (w) => (w ? w.pct : 0);
 const rateText = (r) => `${r.perHour < 10 ? r.perHour.toFixed(1) : Math.round(r.perHour)}%/h`;
-const SOURCE = { statusline: 'status line', 'claude-cache': 'Claude Code', limit: 'limit reached' };
+const SOURCE = { api: 'Anthropic', statusline: 'status line', 'claude-cache': 'Claude Code', limit: 'limit reached' };
 const LIMIT_NAME = { session: '5-hour', weekly: 'weekly' };
+const LIVE_PROBLEMS = ['no_login', 'expired', 'signin', 'slow', 'denied', 'error'];
+const liveProblem = (a) => (a.live && LIVE_PROBLEMS.includes(a.live.state) ? a.live.detail : null);
+const isOfficial = (a) => a.source === 'api' && !['session', 'weekly'].some((k) => a[k] && a[k].estimated);
+/** Profile names as people know them: "main" is the Claude Code they work in. */
+const whereText = (names) => names.map((n) => (n === 'main' ? 'your Claude Code' : n)).join(', ');
 
 let state = null;
 let build = null; // dashboard files' version: reload when the server reports a newer one
 let shownAlertId = null;
 let selectedIndex = null; // chart hover/focus position
 let failures = 0;
+let switching = null; // id of the account being switched to
+let switchNote = null; // {level, text, fix} after a switch
 
 /* ---------------------------------------------------------------- theme */
 
@@ -131,7 +140,7 @@ function renderHero(s) {
   }
   nameRow.append(document.createTextNode(hero.displayName));
   idBox.append(nameRow);
-  const meta = [hero.plan, hero.label && hero.email ? hero.email : null, hero.signedIn.length ? `${hero.signedIn.join(', ')} profile` : null]
+  const meta = [hero.plan, hero.label && hero.email ? hero.email : null, hero.signedIn.length ? `signed in: ${whereText(hero.signedIn)}` : null]
     .filter(Boolean)
     .join(' · ');
   if (meta) idBox.append(el('p', 'sub', meta));
@@ -146,7 +155,12 @@ function renderHero(s) {
   // Where the figures come from
   const src = el('p', 'source-line');
   const read = ['session', 'weekly'].filter((k) => hero[k] && hero[k].officialAt);
-  if (read.some((k) => hero[k].estimated)) {
+  if (isOfficial(hero)) {
+    src.append(document.createTextNode('Official figures from '));
+    src.append(el('b', null, 'Anthropic'));
+    src.append(document.createTextNode(` — the same as claude.ai · updated ${agoShort(s.now - hero.updatedAt)} `));
+    src.append(refreshButton());
+  } else if (read.some((k) => hero[k].estimated)) {
     const sameTime = read.length === 2 && Math.abs(hero.session.officialAt - hero.weekly.officialAt) < MIN;
     src.append(document.createTextNode('Estimated from session activity · last official reading'));
     read.forEach((k, i) => {
@@ -159,6 +173,11 @@ function renderHero(s) {
     src.append(document.createTextNode('Official reading from '));
     src.append(el('b', null, SOURCE[hero.source] || hero.source || 'Claude Code'));
     src.append(document.createTextNode(` · ${ago(s.now - hero.updatedAt)}`));
+  }
+  const problem = liveProblem(hero);
+  if (problem) {
+    if (src.childNodes.length) src.append(document.createTextNode(' · '));
+    src.append(el('span', 'live-problem', `No live figures: ${problem}.`));
   }
   if (src.childNodes.length) body.append(src);
 
@@ -233,7 +252,14 @@ function renderRec(s, hero) {
   let icon = '✓';
   const text = el('div', 'text');
 
-  if (rec && rec.id) {
+  const auto = s.plan && s.plan.mode === 'auto' && !s.plan.owner && hero && hero.active;
+  if (rec && rec.id && auto) {
+    // Automatic switching: nothing to do but know where it goes next.
+    const next = s.accounts.find((a) => a.id === rec.id);
+    text.append(document.createTextNode('Automatic switching moves your Claude Code to '));
+    text.append(el('strong', null, next.displayName));
+    text.append(document.createTextNode(` at ${s.plan.thresholds.session}% of the 5-hour limit or ${s.plan.thresholds.weekly}% of the weekly one (now 5-hour ${pct(next.session)}, weekly ${pct(next.weekly)}).`));
+  } else if (rec && rec.id) {
     const next = s.accounts.find((a) => a.id === rec.id);
     if (urgent) {
       level = past(1) ? 'critical' : 'warning';
@@ -246,10 +272,16 @@ function renderRec(s, hero) {
       text.append(document.createTextNode(` (5-hour ${pct(next.session)}, weekly ${pct(next.weekly)}).`));
     }
     const how = el('p', 'sub');
-    how.style.marginTop = '4px';
-    how.append(document.createTextNode('In Claude Code: run '));
-    how.append(el('code', null, '/login'));
-    how.append(document.createTextNode(' and pick that account.'));
+    how.style.marginTop = '6px';
+    if (next.switchable && !(hero && hero.id === next.id)) {
+      const btn = el('button', 'small', switching === next.id ? 'Switching…' : `Switch to ${next.displayName}`);
+      btn.type = 'button';
+      btn.disabled = switching !== null;
+      btn.addEventListener('click', () => switchTo(next));
+      how.append(btn, document.createTextNode(' — no sign-in: its login is saved here.'));
+    } else {
+      how.append(document.createTextNode('Its login isn’t saved on this computer yet: add it once (Tracking more accounts, below), then switch in one click.'));
+    }
     text.append(how);
   } else if (rec && rec.freeAt) {
     level = 'serious';
@@ -264,12 +296,190 @@ function renderRec(s, hero) {
   } else {
     level = 'none';
     icon = '…';
-    text.append(document.createTextNode('No usage figures for the other accounts yet — open their profiles below and run /usage.'));
+    text.append(document.createTextNode('No usage figures for the other accounts yet — they appear once their profiles below are signed in.'));
   }
 
   box.dataset.level = level;
   box.append(el('span', 'icon', icon), text);
   return box;
+}
+
+/* ---------------------------------------------------------------- quick switch */
+
+/** One button per account: the one your Claude Code uses is pressed; any other whose login
+    is saved in a profile here switches to it in one click. */
+function renderSwitcher(s) {
+  const card = $('switch-card');
+  const box = $('switcher');
+  card.hidden = s.accounts.length < 2;
+  box.textContent = '';
+  for (const a of s.accounts) {
+    const current = a.active;
+    const btn = el('button', 'switch-tile');
+    btn.type = 'button';
+    btn.setAttribute('aria-pressed', String(current));
+    btn.dataset.level = current || a.running ? a.status.level : 'none';
+    const top = el('span', 't-top');
+    const dot = el('span', 'dot-live');
+    if (!current && !a.running) dot.style.background = 'transparent';
+    top.append(dot, el('span', 't-name', a.displayName));
+    const tag = current
+      ? 'In use'
+      : switching === a.id
+        ? 'Switching…'
+        : a.setAsideUntil
+          ? `Week full · back ${whenClock(a.setAsideUntil, s.now)}`
+          : a.switchable
+            ? a.status.label
+            : 'Not saved here';
+    top.append(el('span', 't-tag', tag));
+    btn.append(top, el('span', 't-figs', a.hasData ? `5-hour ${pct(a.session)} · weekly ${pct(a.weekly)}` : 'no figures yet'));
+    btn.disabled = current || !a.switchable || switching !== null;
+    btn.title = current
+      ? 'VS Code and terminal Claude Code sessions use this account'
+      : a.switchable
+        ? `Switch your Claude Code to ${a.displayName}`
+        : 'Its login is not saved in a profile on this computer: add it once under Tracking more accounts';
+    if (!current && a.switchable) btn.addEventListener('click', () => switchTo(a));
+    box.append(btn);
+  }
+  const msg = $('switch-msg');
+  msg.hidden = !switchNote;
+  msg.textContent = '';
+  if (switchNote) {
+    msg.dataset.level = switchNote.level;
+    msg.append(document.createTextNode(switchNote.text));
+    if (switchNote.fix) msg.append(document.createTextNode(' '), el('span', 'fix', switchNote.fix));
+  }
+  renderPlan(s);
+}
+
+/** Manual or automatic switching, what happens next, and why that account. */
+function renderPlan(s) {
+  const box = $('plan');
+  box.textContent = '';
+  const p = s.plan;
+  if (!p) return;
+  if (!modeSaving) for (const r of document.querySelectorAll('input[name="switchMode"]')) r.checked = r.value === p.mode;
+  const auto = p.mode === 'auto';
+  const line = (cls, level) => {
+    const node = el('p', cls);
+    if (level) node.dataset.level = level;
+    box.append(node);
+    return node;
+  };
+  const head = line('plan-mode', auto ? (p.owner ? 'warning' : 'good') : 'none');
+  if (auto && p.owner) {
+    head.append(el('strong', null, 'Automatic — but not from here. '));
+    head.append(document.createTextNode(`${p.owner} already switches this computer’s Claude Code by itself; turn it off there to run it here.`));
+  } else if (auto) {
+    head.append(el('strong', null, 'Automatic. '));
+    head.append(document.createTextNode(`Your Claude Code moves to the best account at ${p.thresholds.session}% of the 5-hour limit or ${p.thresholds.weekly}% of the weekly one${p.early ? ', and early to use up a week that resets soon' : ''}.`));
+  } else {
+    head.append(el('strong', null, 'Manual. '));
+    head.append(document.createTextNode('Alerts only: pick an account above, or ask Cremind to switch.'));
+  }
+  if (p.action && (p.action.do === 'switch' || p.action.do === 'wait')) {
+    const act = line('plan-action', p.action.do === 'wait' ? 'critical' : 'warning');
+    act.append(document.createTextNode(p.action.text));
+  } else if (p.action && p.action.text) {
+    line('plan-note').textContent = p.action.text;
+  }
+  if (p.next) {
+    const nxt = line('plan-next');
+    nxt.append(document.createTextNode('Next in line: '), el('strong', null, p.next.account), document.createTextNode(` — ${p.next.why}.`));
+  }
+  if (p.setAside && p.setAside.length) {
+    line('plan-note').textContent = `Set aside, week full: ${p.setAside.map((x) => `${x.account} (back ${whenClock(x.until, s.now)})`).join(', ')}.`;
+  }
+  if (p.hoursLeft != null && p.pace) {
+    const hours = p.hoursLeft >= 10 ? Math.round(p.hoursLeft) : Math.round(p.hoursLeft * 10) / 10;
+    line('plan-note').textContent =
+      `About ${hours} h of work left in the weeks of your accounts at ${p.pace.measured ? 'your current pace' : 'a typical pace'} (${p.pace.pctPerHour}% of a 5-hour window per hour), before their weekly resets.`;
+  }
+}
+
+let modeSaving = false;
+for (const r of document.querySelectorAll('input[name="switchMode"]')) {
+  r.addEventListener('change', async () => {
+    if (!r.checked) return;
+    modeSaving = true;
+    const out = await post('/api/settings', { switchMode: r.value });
+    modeSaving = false;
+    if (out && out.settings && state) state.settings = out.settings;
+    refresh();
+  });
+}
+
+/** Which accounts may be suggested and switched to: re-drawn only when they change. */
+let rotationSig = '';
+function renderRotation(s) {
+  const box = $('rotation');
+  const sig = JSON.stringify(s.accounts.map((a) => [a.id, a.displayName, a.rotation]));
+  if (sig === rotationSig) return;
+  rotationSig = sig;
+  box.textContent = '';
+  for (const a of s.accounts) {
+    const id = `rot-${a.id}`;
+    const row = el('span', 'row');
+    const box2 = el('input');
+    box2.type = 'checkbox';
+    box2.id = id;
+    box2.checked = a.rotation !== false;
+    box2.addEventListener('change', async () => {
+      await post(`/api/accounts/${encodeURIComponent(a.id)}`, { rotation: box2.checked });
+      rotationSig = '';
+      refresh();
+    });
+    const label = el('label', null, a.displayName);
+    label.htmlFor = id;
+    row.append(box2, label);
+    box.append(row);
+  }
+}
+
+async function postJson(url, body) {
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {}
+    return { status: res.status, body: data };
+  } catch {
+    return null;
+  }
+}
+
+async function switchTo(a, force = false) {
+  if (switching) return;
+  switching = a.id;
+  switchNote = { level: 'none', text: `Switching your Claude Code to ${a.displayName}…` };
+  if (state) render(state);
+  let res = null;
+  try {
+    res = await postJson('/api/switch', { account: a.id, force });
+  } finally {
+    switching = null;
+  }
+  const out = res && res.body;
+  if (out && out.reason === 'in_use' && !force) {
+    if (confirm(`${out.error}.\n\nSwitch anyway? That window then continues with the account your Claude Code uses now.`)) return switchTo(a, true);
+    switchNote = null;
+  } else if (out && out.reason === 'auto_blocked') {
+    switchNote = { level: 'critical', text: `${out.error}.`, fix: 'Set the switch above to Manual first to use it anyway.' };
+  } else if (out && out.ok && out.result) {
+    const r = out.result;
+    let text = `Switched to ${a.displayName} — VS Code and terminal sessions use it from their next message.`;
+    if (r.parkedIn) text += ` ${r.fromEmail || 'The previous account'}’s login is kept in profile “${r.parkedIn}”, ready to switch back.`;
+    switchNote = { level: 'good', text };
+  } else if (out && out.ok) {
+    switchNote = { level: 'none', text: `${out.error}.` };
+  } else {
+    switchNote = { level: 'critical', text: out && out.error ? `Could not switch: ${out.error}.` : 'Could not switch: the monitor did not answer.', fix: out && out.fix ? `Fix: ${out.fix}.` : null };
+  }
+  if (out && out.state) render(out.state);
+  else refresh();
 }
 
 /* ---------------------------------------------------------------- chart */
@@ -288,7 +498,9 @@ function renderChart(s) {
 
   const resetsAt = session.resetsAt;
   const startsAt = resetsAt - 5 * HOUR;
-  const critPct = s.settings.critPct;
+  // In automatic mode the line is where it switches; otherwise the switch-now alert.
+  const autoLine = s.plan && s.plan.mode === 'auto' && !s.plan.owner && hero.active;
+  const critPct = autoLine ? s.settings.autoSessionPct : s.settings.critPct;
   // The weekly limit stops the account too: when it runs out inside this window, mark it.
   const fc = hero.forecast;
   const fw = fc && fc.weekly;
@@ -298,8 +510,14 @@ function renderChart(s) {
   caption.textContent = '';
   caption.append(document.createTextNode('Share of the 5-hour limit used by '));
   caption.append(el('b', null, hero.displayName));
-  caption.append(document.createTextNode(`, ${clock(startsAt)}–${clock(resetsAt)}. Line: estimated from session activity; dots: official readings.`));
-  if (weeklyAt != null) caption.append(document.createTextNode(` At this pace the weekly limit runs out first, at ~${clock(weeklyAt)}.`));
+  const official = hero.seriesKind === 'official';
+  const lineText = official ? "Dots: Anthropic's official figures; the line joins them." : 'Line: estimated from session activity; dots: official readings.';
+  caption.append(document.createTextNode(`, ${clock(startsAt)}–${clock(resetsAt)}. ${lineText}`));
+  if (weeklyAt != null) {
+    const fs = fc.session;
+    const sessionAt = fs && !fs.idle && !fs.resetsFirst ? fs.limitAt : Infinity;
+    caption.append(document.createTextNode(` At this pace the weekly limit runs out ${weeklyAt < sessionAt ? 'first' : 'too'}, at ~${clock(weeklyAt)}.`));
+  }
 
   const W = 880;
   const H = 250;
@@ -320,7 +538,7 @@ function renderChart(s) {
   // The switch threshold — a status rule, labelled so it is never colour alone
   svg.append(svgEl('line', { class: 'limit-line', x1: m.left, x2: W - m.right, y1: y(critPct), y2: y(critPct) }));
   const limitLabel = svgEl('text', { class: 'limit-text', x: W - m.right + 6, y: y(critPct) + 4 });
-  limitLabel.textContent = `${critPct}% switch`;
+  limitLabel.textContent = `${critPct}% ${autoLine ? 'auto' : 'switch'}`;
   svg.append(limitLabel);
 
   const pts = series.map((p) => [x(p[0]), y(p[1])]);
@@ -401,7 +619,8 @@ function renderChart(s) {
     tip.textContent = '';
     tip.append(el('div', 't-time', clock(sm[0])));
     const row = el('div', 't-row');
-    row.append(el('span', 't-key'), el('span', 't-val', `≈${Math.round(sm[1])}%`), el('span', 't-name', '5-hour'));
+    const last = i === series.length - 1;
+    row.append(el('span', 't-key'), el('span', 't-val', last ? pct(session) : `≈${Math.round(sm[1])}%`), el('span', 't-name', '5-hour'));
     tip.append(row);
     const near = marks.find((mk) => Math.abs(mk[0] - sm[0]) <= 2 * MIN);
     if (near) tip.append(el('div', 't-note', `Official reading: ${Math.round(near[1])}%`));
@@ -437,16 +656,17 @@ function renderChart(s) {
     else if (e.key === 'Escape') hide();
   });
 
-  renderChartTable(series, marks);
+  renderChartTable(series, marks, official);
 }
 
-function renderChartTable(series, marks) {
+function renderChartTable(series, marks, official) {
   const host = $('chart-table');
   host.textContent = '';
-  const rows = [
-    ...series.filter((p, i) => i === series.length - 1 || new Date(p[0]).getMinutes() % 10 === 0).map((p) => [p[0], `≈${Math.round(p[1])}%`, 'estimate']),
-    ...marks.map((p) => [p[0], `${Math.round(p[1])}%`, 'official reading']),
-  ].sort((a, b) => b[0] - a[0]);
+  // With live readings the dots are the data; the line between them adds nothing to a table.
+  const lineRows = official
+    ? []
+    : series.filter((p, i) => i === series.length - 1 || new Date(p[0]).getMinutes() % 10 === 0).map((p) => [p[0], `≈${Math.round(p[1])}%`, 'estimate']);
+  const rows = [...lineRows, ...marks.map((p) => [p[0], `${Math.round(p[1])}%`, 'official reading'])].sort((a, b) => b[0] - a[0]);
   const table = el('table');
   const thead = el('thead');
   const hr = el('tr');
@@ -525,7 +745,7 @@ function renderAccounts(s) {
     acct.append(dot);
     const who = el('div', 'who');
     who.append(el('div', 'nm', a.displayName));
-    const where = a.signedIn.length ? `signed in: ${a.signedIn.join(', ')}` : 'not signed in here';
+    const where = a.signedIn.length ? `signed in: ${whereText(a.signedIn)}` : 'not signed in here';
     const bits = [a.plan, a.label && a.email ? a.email : null, where].filter(Boolean).join(' · ');
     who.append(el('div', 'meta', bits));
     acct.append(who);
@@ -550,10 +770,17 @@ function renderAccounts(s) {
 
     // Freshness
     const tdWhen = el('td', 'when hide-sm');
-    if (a.running) tdWhen.append(document.createTextNode('live'));
+    if (isOfficial(a)) tdWhen.append(document.createTextNode(agoShort(s.now - a.updatedAt)));
+    else if (a.running) tdWhen.append(document.createTextNode('live'));
     else if (a.updatedAt) tdWhen.append(document.createTextNode(ago(s.now - a.updatedAt)));
     else tdWhen.append(document.createTextNode('—'));
     if (a.updatedAt) tdWhen.append(el('div', 'cell-sub', `official ${clock(a.updatedAt)}${a.source ? ` · ${SOURCE[a.source] || a.source}` : ''}`));
+    const problem = liveProblem(a);
+    if (problem) {
+      const note = el('div', 'cell-sub live-problem', `No live figures: ${problem}`);
+      note.title = problem;
+      tdWhen.append(note);
+    }
     tr.append(tdWhen);
 
     // Actions
@@ -596,9 +823,9 @@ function renderProfiles(s) {
   for (const p of s.profiles) {
     const li = el('li');
     li.append(el('span', 'pname', p.main ? 'main' : p.name));
-    const acct = el('span', 'pacct', p.account ? `Signed in: ${p.account}` : 'Not signed in yet');
+    const acct = el('span', 'pacct', p.account ? `Signed in: ${p.account}` : p.keeps ? `Keeps ${p.keeps}’s place: its login returns here when you switch away from it` : 'Not signed in yet');
     const where = p.main
-      ? 'Your normal Claude Code configuration'
+      ? 'Your Claude Code: VS Code and terminals'
       : p.kind === 'cremind'
         ? `This Cremind profile's own Claude Code login (${p.dir})`
         : p.dir;
@@ -606,7 +833,7 @@ function renderProfiles(s) {
     li.append(acct);
     if (!p.main) {
       const btn = el('button', 'small', 'Open');
-      btn.title = 'Open Claude Code in this profile to sign in or run /usage';
+      btn.title = 'Open Claude Code in this profile, e.g. to sign in again';
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         const res = await post(`/api/profiles/${encodeURIComponent(p.name)}/open`, {});
@@ -683,16 +910,26 @@ function renderHeader(s) {
   bits.push(s.ready ? 'live' : 'reading session transcripts…');
   $('subtitle').textContent = bits.join(' · ');
 
-  // Only a conflicting status line is worth a banner: VS Code sessions don't need one.
+  // Only a conflicting status line is worth a banner, and only without live figures: with
+  // them every account's figures are official anyway, and VS Code sessions never needed one.
   const banner = $('link-banner');
   const text = $('link-banner-text');
-  banner.hidden = !s.link.other;
-  if (s.link.other) {
+  const showBanner = s.link.other && !(s.live && s.live.enabled);
+  banner.hidden = !showBanner;
+  if (showBanner) {
     text.textContent = '';
     text.append(el('strong', null, 'Another status line is configured in Claude Code.'));
     text.append(document.createTextNode(' Terminal sessions will not send exact readings. Ask Cremind to replace it ('));
     text.append(el('code', null, 'statusline install --force'));
     text.append(document.createTextNode(') if you like; estimates from session activity work either way.'));
+  }
+
+  const liveNote = $('live-note');
+  if (s.live && liveNote) {
+    const e = s.live.everySec;
+    liveNote.textContent = s.live.enabled
+      ? `On: every ${Math.round(e.inUse / 60)} min for the account in use, every ${Math.round(e.watched / 60)} min for the others while this page is open (${Math.round(e.idle / 60)} min otherwise), less often for a while after Anthropic asks to slow down, and at once when this page opens. In between, the figures move with every reply.`
+      : 'Off: every figure is an estimate between Claude Code’s own readings. Turn it on in the settings below.';
   }
 
   const hero = s.accounts.find((a) => a.id === s.heroId) || s.accounts[0];
@@ -704,8 +941,8 @@ function renderHeader(s) {
     }).`;
   }
   $('statusline-note').textContent = s.link.installed
-    ? 'Terminal status line: connected — terminal sessions also report exact figures after every reply.'
-    : 'Terminal status line: not installed (optional — ask Cremind to install the Claude usage status line for exact figures from terminal sessions).';
+    ? 'Terminal status line: connected — terminal sessions also report exact figures after every reply, and show them in the terminal.'
+    : 'Terminal status line: not installed (optional — ask Cremind to install the Claude usage status line to see usage in the terminal after every reply).';
   if (s.eventTypes && s.eventTypes.length) {
     $('events-hint').textContent =
       `Each alert is a Cremind skill event (${s.eventTypes.join(', ')}). Ask Cremind to notify you about Claude usage alerts and it subscribes to them; with no subscription an alert only appears here.`;
@@ -713,9 +950,10 @@ function renderHeader(s) {
 }
 
 let settingsTouched = false;
-const settingFields = ['warnPct', 'critPct', 'weeklyWarnPct', 'weeklyCritPct', 'etaAlertMin', 'events', 'sound'];
+const settingFields = ['warnPct', 'critPct', 'weeklyWarnPct', 'weeklyCritPct', 'etaAlertMin', 'events', 'sound', 'live', 'autoSessionPct', 'autoWeeklyPct', 'autoEarly'];
 
 function renderSettings(s) {
+  if (s.accounts) renderRotation(s);
   if (settingsTouched) return;
   for (const k of settingFields) {
     const node = $(k);
@@ -731,6 +969,31 @@ async function post(url, body) {
   } catch {
     return null;
   }
+}
+
+/** Asks Anthropic for every account now, then shows the answers. */
+let asking = false;
+async function refreshFromAnthropic() {
+  if (asking) return;
+  asking = true;
+  if (state) renderHero(state);
+  let out = null;
+  try {
+    out = await post('/api/refresh', { wait: true });
+  } finally {
+    asking = false;
+  }
+  if (out && out.state) render(out.state);
+  else if (state) renderHero(state);
+}
+
+function refreshButton() {
+  const btn = el('button', 'ghost small', asking ? 'Asking Anthropic…' : 'Refresh');
+  btn.type = 'button';
+  btn.disabled = asking;
+  btn.title = 'Ask Anthropic for every account’s figures now';
+  btn.addEventListener('click', refreshFromAnthropic);
+  return btn;
 }
 
 let saveTimer = null;
@@ -774,6 +1037,7 @@ function render(s) {
   state = s;
   renderHeader(s);
   renderHero(s);
+  renderSwitcher(s);
   renderChart(s);
   renderAccounts(s);
   renderProfiles(s);
@@ -802,5 +1066,6 @@ async function refresh() {
 }
 
 refresh();
+refreshFromAnthropic(); // fresh official figures as the page opens
 setInterval(refresh, POLL_MS);
 document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && refresh());
