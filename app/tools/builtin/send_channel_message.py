@@ -91,31 +91,44 @@ TOOL_CONFIG: ToolConfig = {
 # everything else about the tool is identical either way, and both tell the model
 # to make one call and react to what comes back, so it behaves correctly even if
 # the setting changes between the schema it saw and the call it makes.
+#
+# Neither may read as "get approval before calling". The approval rule is applied
+# per recipient, by the tool, after resolution — a client the user marked "send
+# directly" is exempt even while the profile asks — so a model that asks first,
+# or previews with dry_run and asks after, overrides the user's own setting. In
+# an event run that parks the automation pending for an approval nobody needed.
 _CONFIRM_STEPS = (
-    "GET APPROVAL FIRST. Call it with the recipients and no confirm flag. "
-    "Anyone who needs the user's approval is held back and listed under "
-    "'needs_confirmation', and nothing at all is delivered in that case — you "
-    "get back who each entry resolves to, who has never been messaged before, "
-    "and which entries failed to resolve. Show that list to the user, get their "
-    "approval, then call again with confirm=true to deliver. Never set "
-    "confirm=true on the user's behalf.\n\n"
+    "CALL FIRST, ASK ONLY IF HELD BACK. This profile asks before messaging "
+    "clients, but the tool applies that rule itself, per recipient — so call "
+    "it straight away with the recipients and neither dry_run nor confirm. Do "
+    "not ask the user beforehand, and do not dry_run it to check first: a "
+    "preview is not an approval step. Anyone who still needs the user's "
+    "approval is held back and listed under 'needs_confirmation', and nothing "
+    "at all is delivered in that case — you get back who each entry resolves "
+    "to, who has never been messaged before, and which entries failed to "
+    "resolve. Show that list to the user, get their approval, then call again "
+    "with confirm=true to deliver. Never set confirm=true on the user's "
+    "behalf.\n\n"
     "ALWAYS READ THE RESULT BEFORE YOU SPEAK. The user may have marked "
     "individual clients as 'send directly', and a call whose recipients are all "
     "marked that way delivers immediately — 'sent' will be non-zero and there "
     "will be no 'needs_confirmation'. Tell the user it was sent, and do NOT "
     "call again with confirm=true: that would deliver the message a second "
-    "time.\n\n"
+    "time. Only a 'needs_confirmation' list is a reason to ask; never ask the "
+    "user to approve a send the tool did not hold back.\n\n"
 )
 
 _DIRECT_STEPS = (
     "SEND DIRECTLY. This profile has turned off confirmation for messaging "
-    "clients, so a single call delivers — you do not need to preview first, and "
-    "in an unattended automation you should not stop to ask. Two kinds of "
-    "recipient are still held back: a client the user marked 'always ask', and "
-    "anyone who has never messaged this channel. If the result comes back with "
-    "'needs_confirmation' then nothing was sent — show that list to the user "
-    "and call again with confirm=true once they approve. Pass dry_run=true if "
-    "you want a preview on purpose.\n\n"
+    "clients, so a single call delivers — do not preview first, and do not "
+    "stop to ask (in an unattended automation there is nobody to answer). Two "
+    "kinds of recipient are still held back: a client the user marked 'always "
+    "ask', and anyone who has never messaged this channel. If the result comes "
+    "back with 'needs_confirmation' then nothing was sent — show that list to "
+    "the user and call again with confirm=true once they approve. Only that "
+    "list is a reason to ask; never ask the user to approve a send the tool "
+    "did not hold back. Pass dry_run=true only when the user asked to see a "
+    "preview.\n\n"
 )
 
 
@@ -230,9 +243,14 @@ class SendChannelMessageTool(BuiltInTool):
             "dry_run": {
                 "type": "boolean",
                 "description": (
-                    "Set true to resolve and preview the recipients without "
-                    "sending, whatever the profile's confirmation setting is. "
-                    "Omit it to let that setting decide."
+                    "Preview only: resolve the recipients and report who would "
+                    "be messaged, sending nothing, whatever the confirmation "
+                    "settings. Set it only when the user asked to see a "
+                    "preview — never as a check before sending, because a call "
+                    "without it already holds back anyone who needs approval. "
+                    "A preview reports 'approval_needed'; false means "
+                    "delivering needs no approval, so there is nothing to ask "
+                    "the user."
                 ),
             },
             "confirm": {
@@ -390,8 +408,12 @@ class SendChannelMessageTool(BuiltInTool):
                 structured_content={"error": "SendFailed", "message": str(exc)}
             )
 
+        # No profile-level "confirmation required" flag here: the profile setting
+        # is only the fallback for clients without an override, so on a call to
+        # clients marked "send directly" it reads as "ask" when nothing needs
+        # asking. Which recipients need approval is per call — 'needs_confirmation'
+        # and the preview's 'approval_needed', each held recipient with its reason.
         summary["available_channels"] = available_types
-        summary["confirmation_required_by_default"] = profile_default
         if summary.get("sent"):
             summary["note"] = (
                 "Delivered messages were saved to each recipient's conversation. "

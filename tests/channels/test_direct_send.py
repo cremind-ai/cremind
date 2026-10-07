@@ -536,6 +536,7 @@ def test_policy_holds_the_send_and_reports_who_needs_approval(monkeypatch):
     assert wa.sent == [] and storage.messages == []
     assert [r["to"] for r in out["needs_confirmation"]] == [jid]
     assert "approval" in out["message"]
+    assert out["approval_needed"] is True
     # Not a dry run — the caller asked to send, the policy held it.
     assert out["dry_run"] is False
 
@@ -647,6 +648,35 @@ def test_explicit_dry_run_still_previews_under_a_permissive_policy(monkeypatch):
     assert "needs_confirmation" not in out
     # The old two-step wording must not leak into a plain preview any more.
     assert "confirm=true" not in out["message"]
+    # The verdict is stated, not left to be guessed: a preview that only says
+    # "nothing was sent" is what led the agent to ask for an approval nobody
+    # needed (event run 02868071, a client marked "send directly").
+    assert out["approval_needed"] is False
+    assert "no approval to ask for" in out["message"]
+
+
+def test_a_dry_run_names_who_would_need_approval(monkeypatch):
+    monkeypatch.setattr(ds, "_delay_for", lambda adapter: 0.0)
+    wa, storage, jid = _wa_with()
+    out = asyncio.run(ds.send_direct_messages(
+        adapters=[wa], storage=storage, recipients=[{"to": jid}], message="hi",
+        dry_run=True, confirm_policy=lambda sender, cold: True,
+    ))
+    assert out["dry_run"] is True and out["sent"] == 0 and wa.sent == []
+    assert out["approval_needed"] is True
+    assert [r["to"] for r in out["needs_confirmation"]] == [jid]
+
+
+def test_a_preview_without_a_policy_states_no_verdict(monkeypatch):
+    """REST and the CLI pass no policy (`--send` is the approval): nothing to report."""
+    monkeypatch.setattr(ds, "_delay_for", lambda adapter: 0.0)
+    wa, storage, jid = _wa_with()
+    out = asyncio.run(ds.send_direct_messages(
+        adapters=[wa], storage=storage, recipients=[{"to": jid}], message="hi",
+        dry_run=True,
+    ))
+    assert "approval_needed" not in out
+    assert out["message"].endswith("Call again without dry_run to deliver.")
 
 
 def test_unresolvable_recipients_are_not_offered_for_confirmation(monkeypatch):

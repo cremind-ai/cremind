@@ -617,7 +617,8 @@ async def send_direct_messages(
 
     # ── the configurable confirmation gate ──
     pending: list[dict[str, Any]] = []
-    if confirm_policy is not None and not confirm:
+    policy_checked = confirm_policy is not None and not confirm
+    if policy_checked:
         for slot in sendable:
             try:
                 needs = bool(confirm_policy(slot["sender"], bool(slot["info"].get("cold"))))
@@ -631,6 +632,7 @@ async def send_direct_messages(
     if dry_run or pending:
         return _preview_summary(
             plan, pending, dry_run=dry_run, attachments=attachments,
+            policy_checked=policy_checked,
         )
 
     results: list[RecipientOutcome] = []
@@ -705,12 +707,20 @@ def _preview_summary(
     *,
     dry_run: bool,
     attachments: list[dict] | None = None,
+    policy_checked: bool = False,
 ) -> dict:
     """Summarize a call that resolved recipients but sent nothing.
 
     Two reasons land here and the message has to distinguish them, because the
     operator's next move differs: an explicitly requested preview is finished
     business, while a confirmation hold is waiting on an answer.
+
+    ``policy_checked`` says the confirmation policy was consulted, so the
+    summary carries its verdict as ``approval_needed``. A preview has to say so
+    when the answer is *no*: a model that previewed before sending otherwise
+    sees "nothing was sent" with no word on approval, and asks the user to
+    approve a send that every recipient's own setting already allows, which
+    parks an unattended automation for nothing.
     """
     from app.channels import send_policy
 
@@ -733,6 +743,8 @@ def _preview_summary(
         )
         if unsupported:
             summary["files_unsupported_recipients"] = unsupported
+    if policy_checked:
+        summary["approval_needed"] = bool(pending)
 
     if pending:
         summary["needs_confirmation"] = [
@@ -758,7 +770,12 @@ def _preview_summary(
         f"Preview only — nothing was sent. {resolved} of {len(results)} "
         f"recipient(s) resolved"
         + (f", {cold} of them never messaged this channel before" if cold else "")
-        + ". Call again without dry_run to deliver."
+        + (
+            ". None of them needs the user's approval, so there is no approval "
+            "to ask for: call again without dry_run to deliver."
+            if policy_checked and resolved
+            else ". Call again without dry_run to deliver."
+        )
     )
     return summary
 

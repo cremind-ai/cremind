@@ -185,7 +185,8 @@ def test_known_client_is_held_while_the_profile_setting_is_on():
         registry=registry,
     )
     assert out["sent"] == 0
-    assert out["confirmation_required_by_default"] is True
+    assert out["approval_needed"] is True
+    assert out["needs_confirmation"][0]["reason"] == "profile requires confirmation"
     assert adapter.sent == []
 
 
@@ -202,7 +203,6 @@ def test_profile_setting_off_sends_a_known_client_on_the_first_call(monkeypatch)
     )
     assert out["sent"] == 1
     assert adapter.sent == [(jid, "hi")]
-    assert out["confirmation_required_by_default"] is False
     assert "needs_confirmation" not in out
 
 
@@ -217,6 +217,50 @@ def test_per_client_skip_sends_even_though_the_profile_asks():
         registry=registry,
     )
     assert out["sent"] == 1 and adapter.sent == [(jid, "hi")]
+
+
+def test_a_preview_of_a_send_directly_client_says_there_is_nothing_to_ask():
+    """Event run 02868071: the profile asks, the client is marked "send directly".
+
+    The agent previewed with dry_run and then asked the user anyway, parking the
+    automation: the preview said only "nothing was sent", and its one word on
+    approval was a profile-level ``confirmation_required_by_default: True``.
+    The preview now states the per-call verdict, with no profile flag to
+    contradict it, and the call it points at delivers without confirm.
+    """
+    jid = "84901234567@s.whatsapp.net"
+    registry, adapter, storage = _wa_registry(
+        {"c-wa": [_known(jid, send_confirmation="skip")]},
+    )
+    out = _run(
+        {"recipients": [{"to": jid}], "message": "hi", "_profile": "p",
+         "dry_run": True},
+        registry=registry,
+    )
+    assert out["dry_run"] is True and out["sent"] == 0 and adapter.sent == []
+    assert out["approval_needed"] is False
+    assert "needs_confirmation" not in out
+    assert "confirmation_required_by_default" not in out
+    assert "no approval to ask for" in out["message"]
+
+    out = _run(
+        {"recipients": [{"to": jid}], "message": "hi", "_profile": "p"},
+        registry=registry,
+    )
+    assert out["sent"] == 1 and adapter.sent == [(jid, "hi")]
+
+
+def test_a_preview_of_a_held_client_says_approval_is_needed():
+    jid = "84901234567@s.whatsapp.net"
+    registry, adapter, _s = _wa_registry({"c-wa": [_known(jid)]})
+    out = _run(
+        {"recipients": [{"to": jid}], "message": "hi", "_profile": "p",
+         "dry_run": True},
+        registry=registry,
+    )
+    assert out["dry_run"] is True and out["sent"] == 0 and adapter.sent == []
+    assert out["approval_needed"] is True
+    assert [r["to"] for r in out["needs_confirmation"]] == [jid]
 
 
 def test_per_client_required_still_asks_with_the_setting_off(monkeypatch):
@@ -316,15 +360,39 @@ def test_the_description_matches_the_profile_setting(monkeypatch):
 
     monkeypatch.setattr(sp, "confirm_before_send_default", lambda profile: True)
     out = prepare("q", [dict(f) for f in spec], profile="p")
-    assert "GET APPROVAL FIRST" in out[0]["function"]["description"]
+    assert "CALL FIRST, ASK ONLY IF HELD BACK" in out[0]["function"]["description"]
 
     monkeypatch.setattr(sp, "confirm_before_send_default", lambda profile: False)
     out = prepare("q", [dict(f) for f in spec], profile="p")
     assert "SEND DIRECTLY" in out[0]["function"]["description"]
-    assert "GET APPROVAL FIRST" not in out[0]["function"]["description"]
+    assert "CALL FIRST" not in out[0]["function"]["description"]
 
     # The shared singleton's own attribute must never be rewritten.
-    assert "GET APPROVAL FIRST" in mod.SendChannelMessageTool.description
+    assert "CALL FIRST, ASK ONLY IF HELD BACK" in mod.SendChannelMessageTool.description
+
+
+@pytest.mark.parametrize("confirm_by_default", [True, False])
+def test_no_contract_has_the_model_ask_before_the_tool_decides(
+    monkeypatch, confirm_by_default,
+):
+    """Asking first, or previewing and asking after, overrides 'send directly'.
+
+    Under "GET APPROVAL FIRST" the agent previewed with dry_run and asked about
+    a client the user had exempted (event run 02868071).
+    """
+    import app.channels.send_policy as sp
+    import app.tools.builtin.send_channel_message as mod
+
+    monkeypatch.setattr(
+        sp, "confirm_before_send_default", lambda profile: confirm_by_default,
+    )
+    text = mod._describe_for("p")
+    assert "GET APPROVAL FIRST" not in text
+    assert "never ask the user to approve a send the tool did not hold back" in text
+
+    dry_run = mod.SendChannelMessageTool.parameters["properties"]["dry_run"]
+    assert "only when the user asked" in dry_run["description"]
+    assert "approval_needed" in dry_run["description"]
 
 
 def test_prepare_tools_is_a_noop_without_a_profile():
