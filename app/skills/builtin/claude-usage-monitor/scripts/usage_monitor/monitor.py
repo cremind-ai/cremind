@@ -24,7 +24,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import common as C
 from . import live
@@ -54,6 +54,8 @@ AUTO_GIVE_UP = 3  # failed rounds before auto_switch_failed is sent; then a try 
 CLAIM_FILE = ".claude-usage-monitor-auto.json"  # in the main Claude home: the monitor running auto mode
 CLAIM_STALE_MS = 2 * MIN
 IN_USE_CHECK_MS = 30_000
+# A switch refused for one of these reasons is that account's: the next one may well take over.
+TRY_NEXT = ("unsuitable", "in_use", "busy", "changed", "no_login", "signin", "mismatch", "not_here", "cremind_only", "disabled")
 
 
 def _session_key(type_: str, id_: str, resets_at: float) -> str:
@@ -97,6 +99,13 @@ def iso(ms: float | None) -> str | None:
     if ms is None or not math.isfinite(ms):
         return None
     return datetime.fromtimestamp(ms / 1000).astimezone().isoformat(timespec="minutes")
+
+
+def disabled_error(a: dict) -> switching.SwitchError:
+    """A switch to an account the user disabled, refused."""
+    return switching.SwitchError(
+        "disabled", f"{name_of(a)} is disabled: it isn't used or switched to until it is enabled again", f"enable {a.get('email') or a['id']}, then switch to it"
+    )
 
 
 def _migrate_account(a: dict) -> None:
@@ -500,10 +509,10 @@ class Monitor:
         return (last_spend is not None and now - last_spend < RUNNING_MS) or (bool(last_running) and now - last_running < RUNNING_MS)
 
     def live_targets(self, now: float) -> list[dict] | None:
-        """What the poller asks Anthropic about: every account signed in to a tracked profile,
-        with its organization, those profiles (and the config stamp this monitor last read in
-        each), whether it is in use, and whether the dashboard is open. None when live figures
-        are off."""
+        """What the poller asks Anthropic about: every account signed in to a tracked profile
+        but the disabled ones, with its organization, those profiles (and the config stamp this
+        monitor last read in each), whether it is in use, and whether the dashboard is open.
+        None when live figures are off."""
         with self.lock:
             if not self.state["settings"].get("live", True):
                 return None
@@ -511,7 +520,7 @@ class Monitor:
             groups: dict[str, dict] = {}
             for rt in self.profiles:
                 account_id = self.current_account(rt.name)
-                if not account_id or account_id not in self.state["accounts"]:
+                if not account_id or account_id not in self.state["accounts"] or self._hidden(self.state["accounts"][account_id]):
                     continue
                 org_id = self.state["accounts"][account_id].get("orgId")
                 g = groups.setdefault(account_id, {"account": account_id, "orgId": org_id, "profiles": [], "busy": False, "watched": watched})
@@ -603,7 +612,7 @@ class Monitor:
             "mode": s.get("switchMode", "manual"),
             "early": bool(s.get("autoEarly")),
             "owner": self.auto_owner,  # another Cremind profile runs auto mode for this Claude Code
-            "setAside": [{"id": k, "account": name_of(accounts[k]), "until": e["until"]} for k, e in self.state["setAside"].items() if k in accounts],
+            "setAside": [{"id": k, "account": name_of(accounts[k]), "until": e["until"]} for k, e in self.state["setAside"].items() if k in accounts and not self._hidden(accounts[k])],
             "hoursLeft": PL.hours_left(views, s, now, p["pace"]["usdPerHour"]),
         }
 
@@ -721,7 +730,7 @@ class Monitor:
                 if e.reason == "already":
                     return  # switched meanwhile, by you or the agent
                 failures.append((target, e))
-                if e.reason in ("unsuitable", "in_use", "busy", "changed", "no_login", "signin", "mismatch", "not_here", "cremind_only"):
+                if e.reason in TRY_NEXT:
                     continue  # this account can't; the next may
                 break
             except Exception as e:  # noqa: BLE001 - a failed switch must not end the listener
@@ -1062,6 +1071,7 @@ class Monitor:
         scoped = a.get("scoped") if isinstance(a.get("scoped"), dict) else None
         signed_in = self.profiles_of(a["id"])
         extra = {p.name for p in self.profiles if p.p.kind == "extra"}
+        disabled = bool(a.get("disabledAt"))
         v = {
             "id": a["id"],
             "label": a.get("label") or "",
@@ -1071,9 +1081,11 @@ class Monitor:
             "plan": C.plan_label(a),
             "active": active,
             "running": running,
+            # Shown only while your Claude Code still uses it (a /login, or a disable on its way).
+            "disabled": disabled,
             "signedIn": signed_in,
             # Its login is saved in an extra profile: one step makes it your Claude Code's account.
-            "switchable": not active and any(n in extra for n in signed_in),
+            "switchable": not active and not disabled and any(n in extra for n in signed_in),
             "rotation": a.get("rotation", True) is not False,  # may be suggested and switched to
             "setAsideUntil": (self.state["setAside"].get(a["id"]) or {}).get("until"),  # its week is full
             "hasData": bool(latest),
@@ -1299,7 +1311,7 @@ class Monitor:
             now = C.now_ms()
             self.viewed_at = now  # the poller asks more often while someone is watching
             s = self.state["settings"]
-            views = self.sort_views([self.view_of(a, now) for a in self.state["accounts"].values()])
+            views = self.sort_views(self._views(now))
             p = self.plan_for(views, now)
             rec = PL.recommendation(p)
             hero = next((v for v in views if v["active"]), None)
@@ -1334,6 +1346,12 @@ class Monitor:
                     "recommendation": rec,
                     "plan": self._plan_view(p, views, now),
                     "accounts": views,
+                    # Hidden everywhere else; listed so they can be enabled again.
+                    "disabledAccounts": [
+                        {"id": a["id"], "displayName": name_of(a), "email": a.get("email") or None, "plan": C.plan_label(a), "since": a["disabledAt"], "signedIn": self.profiles_of(a["id"])}
+                        for a in sorted(self.state["accounts"].values(), key=lambda a: name_of(a).casefold())
+                        if self._hidden(a)
+                    ],
                     "profiles": [
                         {
                             "name": p.name,
@@ -1342,6 +1360,7 @@ class Monitor:
                             "dir": str(p.p.dir),
                             "accountId": self.current_account(p.name),
                             "account": name_of(self.state["accounts"][aid]) if (aid := self.current_account(p.name)) in self.state["accounts"] else None,
+                            "accountDisabled": bool(aid in self.state["accounts"] and self.state["accounts"][aid].get("disabledAt")),
                             # Emptied by a switch: the account whose place it keeps.
                             "keeps": name_of(self.state["accounts"][kid]) if (kid := self.kept.get(p.name)) in self.state["accounts"] and not aid else None,
                         }
@@ -1404,7 +1423,7 @@ class Monitor:
                 self.warn("inbox", e)
             if self.ready:
                 try:
-                    views = [self.view_of(a, now) for a in self.state["accounts"].values()]
+                    views = self._views(now)
                     self._update_set_aside(views, now)
                     p = self.plan_for(views, now)
                     rec = PL.recommendation(p)
@@ -1550,6 +1569,107 @@ class Monitor:
             self.save_state(True)
             return True
 
+    # ------------------------------------------------------------ disabled accounts
+
+    def _hidden(self, a: dict) -> bool:
+        """Disabled, and not the account your Claude Code uses (that one shows until Claude Code
+        moves off it: a /login, or a disable on its way): hidden, never suggested nor switched
+        to, no alerts, no live figures."""
+        return bool(a.get("disabledAt")) and a["id"] != self.state["activeId"]
+
+    def _views(self, now: float) -> list[dict]:
+        """Every account the monitor looks after: all but the hidden ones."""
+        return [self.view_of(a, now) for a in self.state["accounts"].values() if not self._hidden(a)]
+
+    def takeover(self, account_id: str, now: float) -> list[dict]:
+        """Who takes over your Claude Code from an account being disabled, best first: the
+        accounts automatic switching would pick, then any other in rotation whose login is saved
+        here, even one at a limit — leaving the account is the user's call."""
+        p = self.plan_for(self._views(now), now, current_id=account_id)
+        ok = [c for c in p["candidates"] if c["ok"]]
+        return ok + [c for c in p["candidates"] if not c["ok"] and c["switchable"] and c["inRotation"]]
+
+    def set_disabled(self, account_id: str, disabled: bool, *, confirm: bool = False, switch: Callable[[str, dict], dict] | None = None) -> dict | None:
+        """Disable an account (see ``_hidden``), or enable it again; None for an unknown account.
+        Raises ``switching.SwitchError``.
+
+        The account your Claude Code uses is left first, for the best other account
+        (``takeover``), and only with the user's ``confirm``: without it, the refusal ("confirm")
+        names the account that would take over. When no switch succeeds, the account stays as
+        it was. ``switch(account_id, why)`` moves the logins: the monitor's own switch, or the
+        CLI's while the monitor is stopped."""
+        with self.lock:
+            now = C.now_ms()
+            a = self.state["accounts"].get(account_id)
+            if not a:
+                return None
+            name = name_of(a)
+            if not disabled:
+                if a.pop("disabledAt", None):
+                    self.log_event("account", f"{name} is enabled again: shown, suggested and switched to like any other account")
+                    self.save_state(True)
+                    if self.poller is not None:
+                        self.poller.refresh(0)  # its figures, at once
+                return {"account": name, "disabled": False}
+            was = a.get("disabledAt")
+            if account_id != self.state["activeId"]:
+                if not was:
+                    a["disabledAt"] = now
+                    self.log_event("account", f"Disabled {name}: hidden, never suggested nor switched to until it is enabled again")
+                    self.save_state(True)
+                return {"account": name, "disabled": True}
+            options = self.takeover(account_id, now)
+            if not options:
+                raise switching.SwitchError(
+                    "no_replacement",
+                    f"{name} is the account your Claude Code uses, and no other account here can take over from it",
+                    "add the account to use instead (add-account <name>, then /login with it in the window that opens), or switch to another account yourself, then disable this one",
+                )
+            if not confirm:
+                first = options[0]
+                raise switching.SwitchError(
+                    "confirm",
+                    f"{name} is the account your Claude Code uses now. Disabling it first switches your Claude Code to {first['account']} ({first['why']}): "
+                    f"VS Code and terminal sessions carry on with {first['account']} from their next message, and {name} is hidden, not used or switched to until it is enabled again",
+                    "ask the user, and disable it again with their confirmation only if they give it",
+                )
+            a["disabledAt"] = was or now  # nothing switches to it from now on
+            self.dirty = True
+        moved = None
+        try:
+            moved = self._leave(a, options, switch or (lambda target, why: self.switch_account(target, why=why)))
+        finally:
+            if moved is None and not was:
+                with self.lock:
+                    a.pop("disabledAt", None)
+        with self.lock:
+            to = self.state["accounts"].get(moved["account"])
+            self.log_event("account", f"Disabled {name}: hidden, never suggested nor switched to until it is enabled again")
+            self.save_state(True)
+        return {
+            "account": name,
+            "disabled": True,
+            "switchedTo": name_of(to) if to else moved.get("email") or moved["account"][:8],
+            "switch": {k: v for k, v in moved.items() if k != "reading"},
+        }
+
+    def _leave(self, a: dict, options: list[dict], switch: Callable[[str, dict], dict]) -> dict:
+        """Switch your Claude Code from an account being disabled to the first of ``options``
+        that takes it (up to three are tried). Raises ``switching.SwitchError``."""
+        failures: list[tuple[dict, switching.SwitchError]] = []
+        for c in options[:3]:
+            try:
+                return switch(c["id"], {"by": "disable", "because": f"{name_of(a)} is being disabled", "pick": c["why"]})
+            except switching.SwitchError as e:
+                if e.reason == "already":
+                    return {"account": c["id"]}  # switched there meanwhile
+                failures.append((c, e))
+                if e.reason not in TRY_NEXT:
+                    break
+        detail = "; ".join(f"{c['account']}: {e}" for c, e in failures)
+        fix = next((e.fix for _, e in failures if e.fix), None)
+        raise switching.SwitchError(failures[-1][1].reason, f"{name_of(a)} was not disabled: your Claude Code couldn't be switched to another account ({detail})", fix)
+
     def forget_account(self, account_id: str) -> bool:
         with self.lock:
             a = self.state["accounts"].pop(account_id, None)
@@ -1575,11 +1695,15 @@ class Monitor:
         (``switch.py``). Raises ``switching.SwitchError``. Claude Code's locks and Anthropic
         are waited on without holding the monitor's lock.
 
-        ``why``: auto mode's action (planner.py) when auto mode switches; ``accept``: checks the
+        ``why``: auto mode's action (planner.py) when auto mode switches, or ``{"by": "disable",
+        ...}`` when your Claude Code leaves an account being disabled; ``accept``: checks the
         account's fresh figures before anything moves."""
         with self.switch_lock:
             with self.lock:
                 now = C.now_ms()
+                target = self.state["accounts"].get(account_id)
+                if target and target.get("disabledAt") and account_id != self.state["activeId"]:
+                    raise disabled_error(target)
                 if why is None and self.state["settings"].get("switchMode") == "auto" and account_id != self.state["activeId"]:
                     blocked = self._auto_would_leave(account_id, now)
                     if blocked:
@@ -1609,17 +1733,18 @@ class Monitor:
                 self._profiles_sig = None  # the registry changed; a profile may be new
                 a = self.state["accounts"].get(account_id)
                 who = name_of(a) if a else result.get("email") or account_id[:8]
+                leaving = bool(why) and why.get("by") == "disable"  # the account it replaces is being disabled
                 if why:
                     # Why this account, too: "why not that one?" is the question an automatic switch raises.
                     picked = f"; {who}: {why['pick']}" if why.get("pick") else ""
-                    text = f"Auto mode switched Claude Code to {who} — {why['because']}{picked} — with its login saved here, no sign-in"
+                    text = f"{'Switched' if leaving else 'Auto mode switched'} Claude Code to {who} — {why['because']}{picked} — with its login saved here, no sign-in"
                 else:
                     text = f"Switched Claude Code to {who}, with its login saved here — no sign-in"
                 if pv:
                     text += f" (from {name_of(prev)} at 5-hour {pct_text(pv['session'])}, weekly {pct_text(pv['weekly'])})"
                 gone = name_of(prev) if prev else result.get("fromEmail") or "The previous account"
                 if result.get("parkedIn"):
-                    text += f'. {gone}\'s login is kept in profile "{result["parkedIn"]}"{" (new)" if result.get("createdProfile") else ""}, ready to switch back'
+                    text += f'. {gone}\'s login is kept in profile "{result["parkedIn"]}"{" (new)" if result.get("createdProfile") else ""}{"" if leaving else ", ready to switch back"}'
                 elif result.get("dropped"):
                     text += f". {gone} stays signed in through its own profile"
                 if not result.get("verified"):

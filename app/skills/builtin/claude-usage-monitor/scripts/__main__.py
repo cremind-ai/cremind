@@ -35,7 +35,7 @@ from usage_monitor import switch as switching  # noqa: E402
 from usage_monitor import usage as U  # noqa: E402
 from usage_monitor.events import EVENT_TYPES  # noqa: E402
 from usage_monitor.live import poll_once  # noqa: E402
-from usage_monitor.monitor import Monitor, iso, send_test_alert, when_clock  # noqa: E402
+from usage_monitor.monitor import Monitor, disabled_error, iso, send_test_alert, when_clock  # noqa: E402
 
 START_COMMAND = f"cremind skill-events listener-start {C.SKILL_NAME}"
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback only, never via a proxy
@@ -196,6 +196,8 @@ def _recommendation_text(state: dict, hero: dict | None) -> str:
         name = who["displayName"] if who else "The first one"
         return f"Every other account is used up. {name} frees up at {when_clock(rec['freeAt'], now)} (in {_dur(rec['freeAt'] - now)})."
     others = [a for a in accounts if a["id"] != (hero or {}).get("id")]
+    if not others and state.get("disabledAccounts"):
+        return "Every other account is disabled, so there is none to switch to (enable <account> brings one back)."
     if not others:
         return "Only one account is known so far. Add the others with add-account."
     return "No usage figures for the other accounts yet — they appear once their profiles are signed in (open-account, then /login)."
@@ -245,6 +247,12 @@ def _figures(a: dict) -> str:
     return "estimated since the last official reading" if estimated else f"official ({a.get('source') or 'Claude Code'})"
 
 
+def _disabled_accounts(state: dict) -> list[dict] | None:
+    """Accounts the user disabled: left out of everything else, never suggested nor switched to."""
+    rows = [{"account": d["displayName"], "disabled_since": when_clock(d["since"], state["now"]), "enable_with": f"enable {_ref(d)}"} for d in state.get("disabledAccounts") or []]
+    return rows or None
+
+
 def summarize(state: dict, running: bool, url: str | None) -> dict:
     now = state["now"]
     s = state["settings"]
@@ -267,6 +275,8 @@ def summarize(state: dict, running: bool, url: str | None) -> dict:
         }
         if a.get("switchable"):
             row["switch_with"] = f"switch {_ref(a)}"
+        if a.get("disabled"):
+            row["disabled"] = f"yes: shown only while your Claude Code still uses it, never switched to again (enable {_ref(a)} undoes it)"
         if live.get("state") in LIVE_PROBLEMS and live.get("detail"):
             row["live_figures_problem"] = live["detail"]
         accounts.append(row)
@@ -297,7 +307,10 @@ def summarize(state: dict, running: bool, url: str | None) -> dict:
         ready = sum(1 for a in known if U.pct_of(a["session"]) < s["critPct"] and U.pct_of(a["weekly"]) < s["weeklyCritPct"])
         out["weekly_headroom"] = f"{U.js_round(left)}% (≈ {left / 100:.1f} accounts); {ready} ready now"
     out["accounts"] = accounts
-    out["recent_alerts"] = [f"{datetime.fromtimestamp(e['t'] / 1000):%a %H:%M} {e['text']}" for e in state["events"] if e.get("kind") == "alert"][:5]
+    disabled = _disabled_accounts(state)
+    if disabled:
+        out["disabled_accounts"] = disabled
+    out["recent_alerts"] =[f"{datetime.fromtimestamp(e['t'] / 1000):%a %H:%M} {e['text']}" for e in state["events"] if e.get("kind") == "alert"][:5]
     out["alert_settings"] = {k: s[k] for k in ("warnPct", "critPct", "weeklyWarnPct", "weeklyCritPct", "etaAlertMin", "events")}
     return out
 
@@ -363,6 +376,9 @@ def _cached_usage(profile: P.ClaudeProfile) -> str:
 
 def cmd_accounts(args: argparse.Namespace, paths: C.Paths) -> dict:
     kept = {e["name"]: e.get("account") for e in P.read_registry(paths)}
+    state = C.read_json(paths.state)
+    saved = state.get("accounts") if isinstance(state, dict) and isinstance(state.get("accounts"), dict) else {}
+    disabled = {k for k, v in saved.items() if isinstance(v, dict) and v.get("disabledAt")}
     known = {}
     rows = []
     for p in P.list_profiles(paths):
@@ -376,7 +392,9 @@ def cmd_accounts(args: argparse.Namespace, paths: C.Paths) -> dict:
             "account": f"{a.get('email') or a['id']} · {C.plan_label(a)}".rstrip(" ·") if a else "not signed in",
             "usage": _cached_usage(p) if a else None,
         }
-        if a and p.kind == "extra":
+        if a and a["id"] in disabled:
+            row["disabled"] = f"yes: never switched to until it is enabled again (enable {a.get('email') or a['id']})"
+        elif a and p.kind == "extra":
             row["switch_with"] = f"switch {a.get('email') or a['id']}"
         elif not a and kept.get(p.name):
             row["keeps_place_of"] = kept[p.name]  # its login is in your Claude Code now
@@ -489,6 +507,9 @@ def cmd_switch(args: argparse.Namespace, paths: C.Paths) -> dict:
     account = monitor.find_account(args.account)
     if not account:
         raise Failure(f'No account matches "{args.account}".', fix="status (each account's switch_with names it)")
+    if account.get("disabledAt") and account["id"] != monitor.state["activeId"]:
+        e = disabled_error(account)
+        raise Failure(str(e), reason=e.reason, fix=e.fix)
     try:
         result = switching.switch_to(paths, account["id"], force=args.force)
     except switching.SwitchError as e:
@@ -523,6 +544,9 @@ def cmd_plan(args: argparse.Namespace, paths: C.Paths) -> dict:
         cur = p["current"]
         out["your_claude_code_uses"] = f"{cur['account']}: 5-hour {cur['session']}%, weekly {cur['weekly']}%"
     out["ranking"] = [{"account": c["account"], "can_switch_to_it_now": c["ok"], "why": c["why"]} for c in p["candidates"]]
+    disabled = _disabled_accounts(state)
+    if disabled:
+        out["disabled_accounts"] = disabled
     if not runtime:
         out["note"] = f"The monitor is not running, so nothing switches automatically and the figures may be old. Start it with: {START_COMMAND}"
     return out
@@ -541,6 +565,81 @@ def cmd_rotation(args: argparse.Namespace, paths: C.Paths) -> dict:
         monitor.set_rotation(account["id"], on)
     who = account.get("email") or account["id"]
     return {"account": who, "in_rotation": on, "note": f"{who} {'may be suggested and switched to again' if on else 'is never suggested nor switched to'}."}
+
+
+def _disabled(r: dict) -> dict:
+    out: dict[str, Any] = {"disabled": r["account"]}
+    if r.get("switchedTo"):
+        moved = r.get("switch") or {}
+        out["your_claude_code_now_uses"] = r["switchedTo"]
+        if moved.get("parkedIn"):
+            out["its_login_kept_in"] = f"profile {moved['parkedIn']}" + (" (new)" if moved.get("createdProfile") else "")
+        out["checked_with_anthropic"] = bool(moved.get("verified"))
+        if moved.get("warning"):
+            out["warning"] = moved["warning"]
+    out["note"] = f"{r['account']} is hidden from the dashboard, status and plan, and is never suggested nor switched to — by hand or automatically — until `enable` brings it back."
+    if r.get("switchedTo"):
+        out["note"] += f" VS Code and terminal Claude Code sessions carry on with {r['switchedTo']} from their next message, with no sign-in."
+    return out
+
+
+def cmd_disable(args: argparse.Namespace, paths: C.Paths) -> dict:
+    """Hide an account and keep Claude Code off it. Disabling the account your Claude Code uses
+    switches it to another account first, which takes the user's confirmation (--confirm)."""
+    runtime = running_monitor(paths)
+    monitor = Monitor(paths, readonly=bool(runtime))  # while the monitor is stopped, its saved state is changed here
+    monitor.refresh_readonly()
+    account = monitor.find_account(args.account)
+    if not account:
+        raise Failure(f'No account matches "{args.account}".', fix="status")
+    try:
+        if runtime:
+            try:
+                result = _request(f"{runtime['url']}api/accounts/{account['id']}", "POST", {"disabled": True, "confirm": args.confirm}, timeout=90.0)["result"]
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    raise Failure(f'No account matches "{args.account}".', fix="status") from None
+                if e.code == 400:
+                    raise Failure("The running monitor is older than this command.", fix="restart the claude-usage-monitor listener (Cremind's Processes page), then try again") from None
+                if e.code != 409:
+                    raise
+                try:
+                    body = json.loads(e.read() or b"{}")
+                except ValueError:
+                    body = {}
+                raise switching.SwitchError(body.get("reason") or "error", body.get("error") or "Could not disable it", body.get("fix")) from None
+        else:
+            if account["id"] == monitor.state["activeId"] and monitor.state["settings"].get("live", True):
+                poll_once(monitor)  # fresh figures pick the account that takes over
+
+            def switch(target: str, why: dict) -> dict:
+                moved = switching.switch_to(paths, target)
+                monitor.refresh_readonly()  # your Claude Code's account, as the files say now
+                return moved
+
+            result = monitor.set_disabled(account["id"], True, confirm=args.confirm, switch=switch)
+    except switching.SwitchError as e:
+        fix = f"Tell the user and ask them to confirm. Only if they do: disable {_ref(account)} --confirm" if e.reason == "confirm" else e.fix
+        raise Failure(str(e), reason=e.reason, fix=fix) from None
+    return _disabled(result)
+
+
+def cmd_enable(args: argparse.Namespace, paths: C.Paths) -> dict:
+    runtime = running_monitor(paths)
+    monitor = Monitor(paths, readonly=bool(runtime))
+    monitor.refresh_readonly()
+    account = monitor.find_account(args.account)
+    if not account:
+        raise Failure(f'No account matches "{args.account}".', fix="status")
+    if runtime:
+        call_monitor(paths, f"api/accounts/{account['id']}", {"disabled": False})
+    else:
+        monitor.set_disabled(account["id"], False)
+    who = _ref(account)
+    out: dict[str, Any] = {"enabled": who, "note": f"{who} is shown again, and may be suggested and switched to like any other account."}
+    if any(rt.p.kind == "extra" and monitor.current_account(rt.name) == account["id"] for rt in monitor.profiles):
+        out["switch_with"] = f"switch {who}"
+    return out
 
 
 def cmd_settings(args: argparse.Namespace, paths: C.Paths) -> dict:
@@ -675,6 +774,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rotation", help="whether an account may be suggested and switched to")
     p.add_argument("account", help="email, short name, profile name, or account id")
     p.add_argument("state", choices=("on", "off"))
+    p = sub.add_parser("disable", help="hide an account, and never use nor switch to it until it is enabled again")
+    p.add_argument("account", help="email, short name, profile name, or account id")
+    p.add_argument("--confirm", action="store_true", help="the user confirmed: the account your Claude Code uses is switched away from first")
+    p = sub.add_parser("enable", help="bring a disabled account back")
+    p.add_argument("account", help="email, short name, profile name, or account id")
     p = sub.add_parser("settings", help="show or change switching and alert settings")
     p.add_argument("--switching", choices=("auto", "manual"), help="switch your Claude Code automatically, or alerts only")
     p.add_argument("--auto-session-pct", type=int, help="automatic switching: 5-hour threshold, %% (50-99)")
@@ -705,6 +809,8 @@ COMMANDS = {
     "switch": cmd_switch,
     "plan": cmd_plan,
     "rotation": cmd_rotation,
+    "disable": cmd_disable,
+    "enable": cmd_enable,
     "add-account": cmd_add_account,
     "open-account": cmd_open_account,
     "remove-account": cmd_remove_account,

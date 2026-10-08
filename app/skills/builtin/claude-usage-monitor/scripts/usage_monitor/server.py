@@ -215,7 +215,17 @@ class _Handler(BaseHTTPRequestHandler):
                 ok = monitor.set_label(account_id, body["label"])
             elif isinstance(body.get("rotation"), bool):
                 ok = monitor.set_rotation(account_id, body["rotation"])
+            elif isinstance(body.get("disabled"), bool):
+                # Disabling the account your Claude Code uses switches away from it first: refused
+                # as "confirm" until the user confirms, then answered like /api/switch.
+                try:
+                    result = monitor.set_disabled(account_id, body["disabled"], confirm=body.get("confirm") is True)
+                except SwitchError as e:
+                    return self._json(409, {"ok": False, "reason": e.reason, "error": str(e), "fix": e.fix, "state": monitor.api_state()})
+                if result is None:
+                    return self._json(404, {"error": "unknown account"})
+                return self._json(200, {"ok": True, "result": result, "state": monitor.api_state()})
             else:
-                return self._json(400, {"error": "expected a label or rotation"})
+                return self._json(400, {"error": "expected a label, rotation or disabled"})
             return self._json(200 if ok else 404, {"ok": True} if ok else {"error": "unknown account"})
         return self._json(404, {"error": "not found"})

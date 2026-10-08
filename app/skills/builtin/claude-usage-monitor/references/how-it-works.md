@@ -133,7 +133,7 @@ $6.21 / $25.46 per 1%), so an account's week holds about four full windows. The 
 is the throttle. Every view of "which account next" — the alerts, the dashboard, `status`,
 `plan` and automatic switching — ranks the other accounts the same way (`planner.py`):
 
-1. **Can it take over?** It has figures, it is in rotation, its week isn't set aside, it is below
+1. **Can it take over?** It has figures, it is in rotation and not disabled, its week isn't set aside, it is below
    automatic switching's thresholds (98% / 99%), and it has room for at least 10% of a 5-hour
    window. Accounts whose login is saved here come before ones that would need a sign-in.
 2. **Room**: the room left in its 5-hour window — a window that resets before it would fill at
@@ -207,6 +207,22 @@ share `~/.claude`. The monitor that turns automatic switching on claims it in
 removed when switched off or stopped); another one shows who has it and doesn't switch. In
 automatic mode a manual switch to an account it would leave at once is refused
 (`auto_blocked`), and the heads-up alerts for the account in use are not sent.
+
+## Disabled accounts
+
+A disabled account (`disable`, or its switch in the dashboard's account table) is left out of
+everything: the dashboard (but for the Disabled list, where its switch brings it back),
+`status`, `plan`, the ranking above, alerts, and the requests to Anthropic for figures. A switch
+to it is refused (`disabled`), by hand or automatically. Its login isn't touched — it stays in its
+profile — so `enable` brings the account back as it was, and its figures are asked for at once.
+
+Disabling the account your Claude Code uses moves your Claude Code first, and only once the user
+has confirmed: the question names the account that takes over — the one automatic switching
+would pick, else any other in rotation whose login is saved here, even one at a limit (leaving
+was the user's call). Its login goes to a profile of its own, as with any switch. If no switch
+works (up to three accounts are tried), nothing is disabled. A `/login` with a disabled account
+isn't undone: the account shows while your Claude Code uses it, and is hidden again once Claude
+Code moves off it.
 
 ## Limits of the method
 

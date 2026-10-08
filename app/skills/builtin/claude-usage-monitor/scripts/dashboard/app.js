@@ -65,6 +65,18 @@ let selectedIndex = null; // chart hover/focus position
 let failures = 0;
 let switching = null; // id of the account being switched to
 let switchNote = null; // {level, text, fix} after a switch
+let toggling = null; // id of the account being disabled or enabled
+let accountsNote = null; // {level, text, fix} after a disable
+
+/** A status line under a card's controls: {level, text, fix}, or nothing. */
+function showNote(node, note) {
+  node.hidden = !note;
+  node.textContent = '';
+  if (!note) return;
+  node.dataset.level = note.level;
+  node.append(document.createTextNode(note.text));
+  if (note.fix) node.append(document.createTextNode(' '), el('span', 'fix', note.fix));
+}
 
 /* ---------------------------------------------------------------- theme */
 
@@ -289,6 +301,10 @@ function renderRec(s, hero) {
     const who = s.accounts.find((a) => a.id === rec.freeId);
     text.append(el('strong', null, 'Every other account is used up.'));
     text.append(document.createTextNode(` ${who ? who.displayName : 'The first one'} frees up at ${whenClock(rec.freeAt, s.now)} (in ${dur(rec.freeAt - s.now)}).`));
+  } else if (!other.length && (s.disabledAccounts || []).length) {
+    level = 'none';
+    icon = '…';
+    text.append(document.createTextNode('Every other account is disabled: turn one back on under All accounts to have an account to switch to.'));
   } else if (!other.length) {
     level = 'none';
     icon = '…';
@@ -324,7 +340,9 @@ function renderSwitcher(s) {
     if (!current && !a.running) dot.style.background = 'transparent';
     top.append(dot, el('span', 't-name', a.displayName));
     const tag = current
-      ? 'In use'
+      ? a.disabled
+        ? 'In use · disabled'
+        : 'In use'
       : switching === a.id
         ? 'Switching…'
         : a.setAsideUntil
@@ -334,7 +352,7 @@ function renderSwitcher(s) {
             : 'Not saved here';
     top.append(el('span', 't-tag', tag));
     btn.append(top, el('span', 't-figs', a.hasData ? `5-hour ${pct(a.session)} · weekly ${pct(a.weekly)}` : 'no figures yet'));
-    btn.disabled = current || !a.switchable || switching !== null;
+    btn.disabled = current || !a.switchable || switching !== null || toggling !== null;
     btn.title = current
       ? 'VS Code and terminal Claude Code sessions use this account'
       : a.switchable
@@ -343,14 +361,7 @@ function renderSwitcher(s) {
     if (!current && a.switchable) btn.addEventListener('click', () => switchTo(a));
     box.append(btn);
   }
-  const msg = $('switch-msg');
-  msg.hidden = !switchNote;
-  msg.textContent = '';
-  if (switchNote) {
-    msg.dataset.level = switchNote.level;
-    msg.append(document.createTextNode(switchNote.text));
-    if (switchNote.fix) msg.append(document.createTextNode(' '), el('span', 'fix', switchNote.fix));
-  }
+  showNote($('switch-msg'), switchNote);
   renderPlan(s);
 }
 
@@ -454,7 +465,7 @@ async function postJson(url, body) {
 }
 
 async function switchTo(a, force = false) {
-  if (switching) return;
+  if (switching || toggling) return;
   switching = a.id;
   switchNote = { level: 'none', text: `Switching your Claude Code to ${a.displayName}…` };
   if (state) render(state);
@@ -721,6 +732,90 @@ function leftLine(w, now) {
   return sub;
 }
 
+/** On: used like any other account. Off: disabled — hidden, never suggested nor switched to. */
+function enabledSwitch(a) {
+  const wrap = el('label', 'toggle');
+  const box = el('input');
+  box.type = 'checkbox';
+  box.setAttribute('role', 'switch');
+  box.setAttribute('aria-label', `${a.displayName} enabled`);
+  box.checked = !a.disabled;
+  box.disabled = toggling !== null || switching !== null;
+  wrap.title = a.disabled
+    ? `Turn on to use ${a.displayName} again`
+    : `Turn off to disable ${a.displayName}: hidden, never suggested nor switched to until you turn it back on`;
+  box.addEventListener('change', () => setEnabled(a, box.checked));
+  wrap.append(box, el('span', 'track'));
+  return wrap;
+}
+
+/** Disabling the account your Claude Code uses switches Claude Code to another account first:
+    the monitor refuses it as "confirm", naming that account, until the user agrees. */
+async function setEnabled(a, on) {
+  if (toggling || switching) return;
+  toggling = a.id;
+  accountsNote = null;
+  const url = `/api/accounts/${encodeURIComponent(a.id)}`;
+  let out = null;
+  let cancelled = false;
+  try {
+    const res = await postJson(url, { disabled: !on });
+    out = res && res.body;
+    if (out && out.reason === 'confirm') {
+      cancelled = !confirm(`${out.error}.\n\nDisable ${a.displayName}?`);
+      if (!cancelled) {
+        accountsNote = { level: 'none', text: `Disabling ${a.displayName}: switching your Claude Code to another account…` };
+        if (state) render(state);
+        const again = await postJson(url, { disabled: true, confirm: true });
+        out = again && again.body;
+      }
+    }
+  } finally {
+    toggling = null;
+  }
+  if (cancelled) accountsNote = null;
+  else if (out && out.ok && out.result) {
+    const r = out.result;
+    accountsNote = r.switchedTo
+      ? { level: 'good', text: `Disabled ${a.displayName}. Your Claude Code uses ${r.switchedTo} now — VS Code and terminal sessions carry on with it from their next message, no sign-in.` }
+      : on
+        ? { level: 'good', text: `${a.displayName} is back: suggested and switched to like any other account.` }
+        : { level: 'good', text: `Disabled ${a.displayName}: hidden, never suggested nor switched to until you turn it back on below.` };
+  } else {
+    accountsNote = {
+      level: 'critical',
+      text: out && out.error ? `${out.error}.` : `Could not ${on ? 'enable' : 'disable'} ${a.displayName}: the monitor did not answer.`,
+      fix: out && out.fix ? `Fix: ${out.fix}.` : null,
+    };
+  }
+  if (out && out.state) render(out.state);
+  else refresh();
+}
+
+/** Disabled accounts: left out of everything else; each one's switch brings it back. */
+function renderDisabled(s) {
+  const items = s.disabledAccounts || [];
+  $('disabled-box').hidden = !items.length;
+  const list = $('disabled-list');
+  list.textContent = '';
+  for (const d of items) {
+    const li = el('li');
+    const who = el('div', 'who');
+    who.append(el('div', 'nm', d.displayName));
+    const meta = [
+      d.plan,
+      d.email && d.email !== d.displayName ? d.email : null,
+      `disabled since ${whenClock(d.since, s.now)}`,
+      d.signedIn.length ? `login saved in ${whereText(d.signedIn)}` : 'no login saved here',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    who.append(el('div', 'meta', meta));
+    li.append(enabledSwitch({ ...d, disabled: true }), who);
+    list.append(li);
+  }
+}
+
 function renderAccounts(s) {
   const body = $('accounts-body');
   body.textContent = '';
@@ -729,7 +824,11 @@ function renderAccounts(s) {
     const tr = el('tr');
     const td = el('td', 'empty');
     td.colSpan = 6;
-    td.textContent = s.ready ? 'No accounts yet. Sign in to Claude Code and it will appear here.' : 'Reading session transcripts…';
+    td.textContent = !s.ready
+      ? 'Reading session transcripts…'
+      : (s.disabledAccounts || []).length
+        ? 'Every account is disabled: turn one back on below.'
+        : 'No accounts yet. Sign in to Claude Code and it will appear here.';
     tr.append(td);
     body.append(tr);
   }
@@ -738,9 +837,10 @@ function renderAccounts(s) {
     const tr = el('tr');
     tr.dataset.active = String(a.active);
 
-    // Account
+    // Account, led by its switch: first in the row, so the table's sideways scroll never hides it
     const tdName = el('td');
     const acct = el('div', 'acct');
+    acct.append(enabledSwitch(a));
     const dot = el('span', 'dot-live');
     dot.dataset.level = a.active || a.running ? a.status.level : 'none';
     if (!a.active && !a.running) dot.style.background = 'transparent';
@@ -748,7 +848,8 @@ function renderAccounts(s) {
     const who = el('div', 'who');
     who.append(el('div', 'nm', a.displayName));
     const where = a.signedIn.length ? `signed in: ${whereText(a.signedIn)}` : 'not signed in here';
-    const bits = [a.plan, a.label && a.email ? a.email : null, where].filter(Boolean).join(' · ');
+    const off = a.disabled ? 'disabled: hidden once your Claude Code moves off it' : null;
+    const bits = [a.plan, a.label && a.email ? a.email : null, where, off].filter(Boolean).join(' · ');
     who.append(el('div', 'meta', bits));
     acct.append(who);
     tdName.append(acct);
@@ -817,6 +918,8 @@ function renderAccounts(s) {
   $('accounts-note').textContent = known.length
     ? `${ready} ready now · weekly headroom ${Math.round(weeklyLeft)}% (≈ ${(weeklyLeft / 100).toFixed(1)} accounts)`
     : '';
+  showNote($('accounts-msg'), accountsNote);
+  renderDisabled(s);
 }
 
 function renderProfiles(s) {
@@ -825,7 +928,15 @@ function renderProfiles(s) {
   for (const p of s.profiles) {
     const li = el('li');
     li.append(el('span', 'pname', p.main ? 'main' : p.name));
-    const acct = el('span', 'pacct', p.account ? `Signed in: ${p.account}` : p.keeps ? `Keeps ${p.keeps}’s place: its login returns here when you switch away from it` : 'Not signed in yet');
+    const acct = el(
+      'span',
+      'pacct',
+      p.account
+        ? `Signed in: ${p.account}${p.accountDisabled ? ' (disabled)' : ''}`
+        : p.keeps
+          ? `Keeps ${p.keeps}’s place: its login returns here when you switch away from it`
+          : 'Not signed in yet',
+    );
     const where = p.main
       ? 'Your Claude Code: VS Code and terminals'
       : p.kind === 'cremind'
@@ -907,6 +1018,8 @@ function renderHeader(s) {
   const bits = [];
   const n = s.accounts.length;
   bits.push(`${n} account${n === 1 ? '' : 's'}`);
+  const off = (s.disabledAccounts || []).length;
+  if (off) bits.push(`${off} disabled`);
   const extra = s.profiles.length - 1;
   if (extra > 0) bits.push(`${extra} extra profile${extra === 1 ? '' : 's'}`);
   bits.push(s.ready ? 'live' : 'reading session transcripts…');

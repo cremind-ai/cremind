@@ -1,6 +1,6 @@
 ---
 name: claude-usage-monitor
-description: "Track Claude subscription usage across every Claude account used with Claude Code on this computer — each account's 5-hour and weekly limits used and left, the burn rate, when the running account hits a limit, which account to switch to — and switch Claude Code (VS Code, terminals) to another account in one step with the login saved here: no /login, no browser. When the user asks to switch their Claude account, run `switch <account>`. Automatic switching (`settings --switching auto`) moves it to the best account by itself at 98% of the 5-hour or 99% of the weekly limit; `plan` says what it would do and why. The figures are Anthropic's own, as claude.ai shows them. Raises Cremind events when an account nears or hits a limit, is available again, or was switched automatically. Serves a live dashboard with one-click switching: when the user asks to open it, run `dashboard --open` (it opens in the browser of the computer running Cremind and returns the link). Never reads conversation content."
+description: "Track Claude subscription usage across every Claude account used with Claude Code on this computer — each account's 5-hour and weekly limits used and left, the burn rate, when the running account hits a limit, which account to switch to — and switch Claude Code (VS Code, terminals) to another account in one step with the login saved here: no /login, no browser. When the user asks to switch their Claude account, run `switch <account>`; to stop using one, `disable <account>`. Automatic switching (`settings --switching auto`) moves it to the best account by itself at 98% of the 5-hour or 99% of the weekly limit; `plan` says what it would do and why. The figures are Anthropic's own, as on claude.ai. Raises Cremind events when an account nears or hits a limit, is available again, or was switched automatically. Serves a live dashboard with one-click switching: when the user asks to open it, run `dashboard --open` (opens it in a browser on the Cremind computer, returns the link). Never reads conversation content."
 metadata:
   environment_variables:
     - name: DASHBOARD_PORT
@@ -86,7 +86,8 @@ uv run scripts/__main__.py status
 It asks Anthropic for fresh figures first (a few seconds). Answer from `running_account`
 (`forecast`, `pace_per_hour`), `recommendation`, `accounts[]` (`five_hour` / `weekly`: `used`,
 `left_pct`, `resets`; `figures`; `figures_as_of`; `your_claude_code_uses_it`; `switch_with`) and
-`weekly_headroom`. Report the numbers as given: `figures` starting with "official" means
+`weekly_headroom`; `disabled_accounts` are the ones the user disabled (no figures, never switched
+to). Report the numbers as given: `figures` starting with "official" means
 Anthropic's own figures, identical to claude.ai's; an `estimated` one comes with a
 `live_figures_problem` saying why (e.g. the profile must sign in again — `open-account <name>`,
 then `/login`). When `monitor_running` is false no alerts are raised; run `dashboard` (without
@@ -116,8 +117,32 @@ uv run scripts/__main__.py switch <account>
   `--force` if they say so; `signin` — its saved login was refused: `open-account <profile>`,
   `/login`, `/exit`, then switch; `busy` — retry in a few seconds; `auto_blocked` — automatic
   switching is on and would move away from that account at once (its limit is nearly full):
-  say so, and offer `settings --switching manual` if they still want it. Otherwise report it
-  with its `fix`.
+  say so, and offer `settings --switching manual` if they still want it; `disabled` — the user
+  disabled that account: say so, and only if they ask, `enable <account>`, then switch.
+  Otherwise report it with its `fix`.
+
+## Disable an account
+
+"Disable my work account", "stop using li@ for now", "hide that account", "turn it back on":
+
+```bash
+uv run scripts/__main__.py disable <account>     # enable <account> brings it back
+```
+
+- A disabled account is hidden — from the dashboard (but for its switch, under All accounts →
+  Disabled), `status` and `plan` — and never suggested nor switched to, by hand or
+  automatically; it raises no alerts and its figures aren't fetched. Its login stays where it
+  is, so `enable` brings it back as it was. (`rotation <account> off` is lighter: the account
+  stays visible and can still be switched to by hand.)
+- **The account your Claude Code uses** is refused with `reason: confirm`, whose `error` names
+  the account that would take over. Tell the user and ask. **Only if they confirm**, run it
+  again with `--confirm`: Claude Code switches to that account first (no sign-in), then the
+  account is disabled — report `your_claude_code_now_uses`. Never add `--confirm` on your own.
+- `no_replacement` — no other account here can take over: report it with its `fix`. A switch
+  that failed (`busy`, `in_use`, `signin` …) leaves the account enabled: act on it as for
+  `switch`.
+- A `/login` with a disabled account in VS Code isn't undone: the account shows while your
+  Claude Code uses it, and is hidden again once Claude Code moves off it.
 
 ## Automatic switching
 
@@ -139,8 +164,8 @@ uv run scripts/__main__.py settings --switching auto     # or: --switching manua
   week lasts, and stays as cover for when another account's 5-hour window fills. Among similar
   ones, the one whose unused week would be lost soonest at its reset (weekly left ÷ days to its
   reset). So no account's week runs out early while the others still have room, and a week that
-  resets soon is used before it expires. Only accounts whose login is saved here and that are in
-  rotation (`rotation <account> off` leaves one out).
+  resets soon is used before it expires. Only accounts whose login is saved here, that are in
+  rotation (`rotation <account> off` leaves one out) and not disabled.
 - `--early on` also switches before the thresholds, to an account whose leftover week would
   otherwise go unused within 24 hours. Off by default.
 - "Which account is next?", "why that one?", "what will it do?" → `plan`: `do` (switch / wait /
@@ -198,6 +223,8 @@ Run `uv run scripts/__main__.py <command>`. Every command prints JSON.
 | `switch <account> [--force]` | Make another account the one your Claude Code uses, with its saved login — no sign-in |
 | `plan` | What should happen to the account your Claude Code uses now (`do`: switch / wait / stay, with `switch_command`), every other account ranked with `why` |
 | `rotation <account> on\|off` | Whether an account may be suggested and switched to (on by default) |
+| `disable <account> [--confirm]` | Hide an account and never use nor switch to it; for the one your Claude Code uses, only with the user's confirmation (`--confirm`): Claude Code switches to another account first |
+| `enable <account>` | Bring a disabled account back |
 | `dashboard [--open] [--no-start]` | The dashboard link; starts the monitor if needed; `--open` opens it on the Cremind computer |
 | `accounts` | Claude Code profiles and the account signed in to each |
 | `add-account <name> [--no-open]` | Create a profile for another account and open Claude Code in it to sign in once |

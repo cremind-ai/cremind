@@ -81,11 +81,12 @@
           <div class="spacer"></div>
           <span class="sub" id="accounts-note"></span>
         </div>
-        <div style="overflow-x: auto">
+        <!-- position: the visually hidden header label stays inside the scroll box, not stretching the page -->
+        <div style="overflow-x: auto; position: relative">
           <table>
             <thead>
               <tr>
-                <th>Account</th>
+                <th title="An account's switch turns it off: disabled, it is hidden, never suggested nor switched to">Account</th>
                 <th>Status</th>
                 <th>5-hour session</th>
                 <th>Weekly</th>
@@ -95,6 +96,15 @@
             </thead>
             <tbody id="accounts-body"></tbody>
           </table>
+        </div>
+        <p class="switch-msg accounts-msg" id="accounts-msg" role="status" aria-live="polite" hidden></p>
+        <div class="disabled-box" id="disabled-box" hidden>
+          <h3>Disabled</h3>
+          <p class="sub">
+            Hidden everywhere else, never suggested nor switched to — by hand or automatically — and no alerts. Turn one
+            on to bring it back.
+          </p>
+          <ul class="disabled-list" id="disabled-list"></ul>
         </div>
       </section>
 
