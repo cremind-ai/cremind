@@ -79,6 +79,11 @@ const streamScratch = new Map<string, StreamScratch>();
 // isn't trapped in Vue's reactivity.
 let conversationsListHandle: ConversationsListStreamHandle | null = null;
 
+// The create the new-chat slot is waiting on, shared by everything that needs
+// the id while it is in flight (see `newChatConversation`). `profile` keeps a
+// profile switch from adopting the previous profile's conversation.
+let pendingNewConversation: { profile: string; id: Promise<string> } | null = null;
+
 type TrackReason = 'active' | 'streaming' | 'manual';
 
 // Sentinel key for the empty "new chat" landing slot before a real id is allocated.
@@ -187,6 +192,11 @@ export interface ChatMessage {
   // flicker). Usage records are keyed by this server id, so the usage chip
   // matches on `backendId ?? id` to show cost live, not only after a reload.
   backendId?: string;
+  // A user bubble this tab drew on send, until the stream's `user_message`
+  // frame for it arrives. An ordinary send's POST answers before the row
+  // exists, so there is no id to know the frame by: it claims the oldest
+  // bubble still waiting with the same text.
+  awaitingEcho?: boolean;
   role: 'user' | 'assistant';
   content: string;
   parts: Part[];
@@ -743,18 +753,38 @@ export const useChatStore = defineStore('chat', {
      */
     async ensureConversation(): Promise<string | null> {
       if (this.activeConversationId) return this.activeConversationId;
+      try {
+        const id = await this.newChatConversation();
+        this.activeConversationId = id;
+        this.trackConversation(id, 'active');
+        return id;
+      } catch (e: any) {
+        this.error = e?.message || 'Failed to create conversation';
+        console.error('Failed to create conversation:', e);
+        return null;
+      }
+    },
+
+    /**
+     * Create the conversation the new-chat slot becomes and return its id;
+     * rejects if the create fails. Callers arriving while one is in flight
+     * share it: two first messages sent back to back (or a send racing an
+     * upload) belong to ONE conversation, and each used to open its own.
+     */
+    newChatConversation(): Promise<string> {
       const settings = useSettingsStore();
-      const agentUrl = settings.agentUrl;
-      const authToken = settings.authToken;
+      const profile = settings.profileId || '';
+      if (pendingNewConversation?.profile === profile) return pendingNewConversation.id;
       // The new-chat slot's search-tools draft rides the create, so the
       // conversation exists with the selection already saved — no follow-up
       // save for the first message to wait on or race.
       const searchTools = useSearchToolsStore();
-      try {
-        const conv = await apiCreateConversation(agentUrl, authToken, undefined, {
-          searchTools: searchTools.newChatSelection(),
-        });
+      const id = apiCreateConversation(settings.agentUrl, settings.authToken, undefined, {
+        searchTools: searchTools.newChatSelection(),
+      }).then((conv) => {
         searchTools.clearNewChatDraft();
+        // Inject into the saved-conversations list so the sidebar shows it
+        // immediately, even before the first event arrives.
         this.conversations = [
           {
             id: conv.id,
@@ -769,14 +799,17 @@ export const useChatStore = defineStore('chat', {
           ...this.conversations,
         ];
         this.channelIdsByConversation[conv.id] = conv.channel_id ?? null;
-        this.activeConversationId = conv.id;
-        this.trackConversation(conv.id, 'active');
         return conv.id;
-      } catch (e: any) {
-        this.error = e?.message || 'Failed to create conversation';
-        console.error('Failed to create conversation:', e);
-        return null;
-      }
+      });
+      const pending = { profile, id };
+      pendingNewConversation = pending;
+      // Released before any caller resumes; each of them makes the conversation
+      // active without yielding again, so a later send finds it there instead.
+      const release = () => {
+        if (pendingNewConversation === pending) pendingNewConversation = null;
+      };
+      id.then(release, release);
+      return id;
     },
 
     async sendMessage(
@@ -788,7 +821,10 @@ export const useChatStore = defineStore('chat', {
         attachments?: { name: string; path: string }[];
       },
     ) {
-      if (!text.trim()) return;
+      // The server stores a message stripped, which is also what the stream
+      // announces and a reload shows — so that is the text to render and send.
+      text = text.trim();
+      if (!text) return;
 
       this.error = null;
 
@@ -808,32 +844,11 @@ export const useChatStore = defineStore('chat', {
       let cid = options?.conversationId ?? this.activeConversationId ?? null;
       let createdNew = false;
       if (!cid) {
-        // Carry the new-chat search-tools draft into the create (see
-        // ensureConversation); the message POST below never resends it.
-        const searchTools = useSearchToolsStore();
+        // The create carries the new-chat search-tools draft; the message POST
+        // below never resends it.
         try {
-          const conv = await apiCreateConversation(agentUrl, authToken, undefined, {
-            searchTools: searchTools.newChatSelection(),
-          });
-          searchTools.clearNewChatDraft();
-          cid = conv.id;
+          cid = await this.newChatConversation();
           createdNew = true;
-          // Inject into the saved-conversations list so the sidebar shows it
-          // immediately, even before the first event arrives.
-          this.conversations = [
-            {
-              id: conv.id,
-              title: conv.title,
-              channelId: conv.channel_id ?? null,
-              contextId: conv.context_id ?? undefined,
-              taskId: conv.task_id ?? undefined,
-              createdAt: conv.created_at,
-              updatedAt: conv.updated_at,
-              messageCount: 0,
-            },
-            ...this.conversations,
-          ];
-          this.channelIdsByConversation[conv.id] = conv.channel_id ?? null;
         } catch (e: any) {
           this.error = e?.message || 'Failed to create conversation';
           console.error('Failed to create conversation:', e);
@@ -873,6 +888,7 @@ export const useChatStore = defineStore('chat', {
         timestamp: new Date(),
         fileAttachments: optimisticFileAttachments,
         mode: options?.mode && options.mode !== 'reasoning' ? options.mode : undefined,
+        awaitingEcho: true,
       };
       // Plain append, even mid-turn: the server answers a mid-turn send with a
       // `flow_break` frame that closes the assistant bubble above, so the next
@@ -941,6 +957,8 @@ export const useChatStore = defineStore('chat', {
         }
       } catch (e: any) {
         this.error = e?.message || 'Failed to send message';
+        // Nothing was stored, so no frame is coming for this bubble.
+        userMessage.awaitingEcho = undefined;
         // Only tear the streaming UI down if WE started it. A failed mid-turn
         // send must not kill the turn that is still running and streaming.
         if (!wasStreaming) {
@@ -1716,35 +1734,33 @@ export const useChatStore = defineStore('chat', {
         case 'user_message': {
           const id: string | undefined = data.id;
           const content: string = data.content ?? '';
-          // Dedup against an optimistic user message we may have just pushed
-          // for our own POST: if the most recent user bubble has matching
-          // text, treat that bubble as the canonical one. Crucially we do
-          // NOT mutate its `id` — that would change ChatWindow's v-for key
-          // and force Vue to unmount/remount the bubble, flashing it in an
-          // unstyled position before the new element settles in.
+          // Is this the bubble this tab already drew when it sent the message?
           //
-          // The streaming assistant bubble is SKIPPED rather than treated as a
-          // wall: a mid-turn send inserts its optimistic bubble above that
-          // bubble, so stopping there would miss it and duplicate the message
-          // when this frame beats the POST response (which is what stamps
-          // `backendId`).
-          const lastUserIdx = (() => {
-            for (let i = bucket.length - 1; i >= 0; i--) {
-              if (bucket[i].id === runtime.streamingAssistantId) continue;
-              if (bucket[i].role === 'user') return i;
-              if (bucket[i].role === 'assistant') return -1;
-            }
-            return -1;
-          })();
-          const alreadyPresent =
-            (lastUserIdx >= 0 && bucket[lastUserIdx].content === content)
-            || (id !== undefined && bucket.some(m => m.id === id))
-            // A mid-turn send stamps the server id onto its optimistic bubble;
-            // the frame for it can land after the assistant has already
-            // streamed more text, so the "last user bubble" check above may
-            // have stopped at an assistant message.
-            || (id !== undefined && bucket.some(m => m.backendId === id));
-          if (!alreadyPresent) {
+          // By id where the bubble has one: a frame delivered before (a
+          // replay), or a mid-turn send whose POST answer carried the row id.
+          // Otherwise it is the oldest bubble still waiting for its echo with
+          // this text — an ordinary send, whose POST answers before the row
+          // exists, or a mid-turn one whose frame beat the POST answer.
+          //
+          // Position says nothing: this used to ask whether the LAST user
+          // bubble had the same text, so a second message sent before the
+          // first one's frame arrived hid the first from its own echo, and the
+          // first message was drawn twice.
+          //
+          // The bubble keeps its `id` — changing it would change ChatWindow's
+          // v-for key and force Vue to unmount/remount the bubble, flashing it
+          // in an unstyled position before the new element settles in. The row
+          // id is recorded as `backendId`, which is what a replay matches on.
+          let shown = id !== undefined
+            ? bucket.find(m => m.id === id || m.backendId === id)
+            : undefined;
+          if (!shown) {
+            shown = bucket.find(m => m.awaitingEcho && m.content === content);
+            if (shown && id !== undefined) shown.backendId = id;
+          }
+          if (shown) {
+            shown.awaitingEcho = undefined;
+          } else {
             const evtMode = data.metadata?.mode;
             const incoming: ChatMessage = {
               id: id ?? this.generateId(),
