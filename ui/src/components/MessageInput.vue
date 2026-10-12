@@ -9,6 +9,7 @@ import { uploadTempFiles } from '../services/filesApi';
 import { beginMigrationUpload, migrationReadiness } from '../services/migrationReadiness';
 import { CHAT_MODES, chatModeMeta, type ChatMode } from '../constants/chatModes';
 import { composerSearchToolsTarget, useSearchToolsStore } from '../stores/searchTools';
+import { isImeKeyEvent } from '../utils/ime';
 import MentionMenu, { type MentionItem } from './MentionMenu.vue';
 import SearchToolsControl from './SearchToolsControl.vue';
 
@@ -563,6 +564,10 @@ const handleClick = () => {
 };
 
 const handleKeydown = (event: KeyboardEvent) => {
+  // A key the input method is still using (Enter commits the underlined word)
+  // is not ours: sending on it posts the message twice — see isImeKeyEvent.
+  if (isImeKeyEvent(event)) return;
+
   if (menuVisible.value && items.value.length > 0) {
     if (event.key === 'ArrowDown') {
       event.preventDefault();

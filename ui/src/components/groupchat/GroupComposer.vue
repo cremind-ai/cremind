@@ -14,6 +14,7 @@ import { Icon } from '@iconify/vue';
 import MentionMenu, { type MentionItem } from '../MentionMenu.vue';
 import SearchToolsControl from '../SearchToolsControl.vue';
 import { useSearchToolsStore, type SearchToolsTarget } from '../../stores/searchTools';
+import { isImeKeyEvent } from '../../utils/ime';
 
 const props = withDefaults(defineProps<{
   members: { profile: string; name: string }[];
@@ -208,6 +209,9 @@ const submit = async () => {
 };
 
 const handleKeydown = (event: KeyboardEvent) => {
+  // Not ours while the input method is composing — see isImeKeyEvent.
+  if (isImeKeyEvent(event)) return;
+
   if (menuVisible.value) {
     if (event.key === 'ArrowDown') {
       event.preventDefault();
