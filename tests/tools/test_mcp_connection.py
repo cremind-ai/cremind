@@ -30,7 +30,9 @@ from mcp.types import (
 from app.tools.mcp.mcp_connection import MCPConnection
 
 
-def _create_mock_init_result(name: str = "test-mcp-server", instructions: str = "Test instructions") -> InitializeResult:
+def _create_mock_init_result(
+    name: str = "test-mcp-server", instructions: str = "Test instructions"
+) -> InitializeResult:
     """Create an official MCP InitializeResult model for tests."""
     return InitializeResult(
         protocolVersion="2024-11-05",
@@ -119,6 +121,7 @@ def test_connect_stdio_success_and_metadata():
 
 def test_connect_stdio_environment_merging_and_isolation(monkeypatch):
     """Verify that stdio environment merges system os.environ and custom env, and handles overrides."""
+
     async def _test():
         monkeypatch.setenv("SYSTEM_KEY", "system_default")
         monkeypatch.setenv("OVERRIDE_KEY", "system_override_me")
@@ -171,6 +174,7 @@ def test_connect_stdio_environment_merging_and_isolation(monkeypatch):
 
 def test_connect_http_header_propagation_and_token_extraction():
     """Verify streamablehttp_client receives exact headers and Bearer token parsing behaves correctly."""
+
     async def _test():
         conn = MCPConnection()
 
@@ -220,6 +224,7 @@ def test_connect_http_header_propagation_and_token_extraction():
 
 def test_reconnect_http_success_and_state_refresh():
     """Verify reconnect_http closes old resources, resets state, and connects with new headers."""
+
     async def _test():
         conn = MCPConnection()
 
@@ -279,6 +284,7 @@ def test_reconnect_http_success_and_state_refresh():
 
 def test_call_tool_execution_with_real_mcp_result_and_timeout():
     """Verify tool execution returning CallToolResult and timeout enforcement."""
+
     async def _test():
         conn = MCPConnection()
         mock_session = AsyncMock()
@@ -311,6 +317,7 @@ def test_call_tool_execution_with_real_mcp_result_and_timeout():
 
 def test_cleanup_normal_and_exception_handling():
     """Verify cleanup succeeds under normal conditions and catches standard exceptions."""
+
     async def _test():
         conn = MCPConnection()
         mock_stack = AsyncMock()
@@ -326,6 +333,7 @@ def test_cleanup_normal_and_exception_handling():
 
 def test_cleanup_safe_handling_of_cancelled_error():
     """Verify cleanup safely catches and suppresses asyncio.CancelledError (BaseException)."""
+
     async def _test():
         conn = MCPConnection()
         mock_stack = AsyncMock()
