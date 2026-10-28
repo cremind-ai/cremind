@@ -228,9 +228,14 @@ def standalone(monkeypatch) -> None:
 
 
 def _drop_in_inbox(inbox: Path, query: str, state: str = STATE) -> None:
-    """What the backend's ``GET /api/oauth/callback`` handler writes."""
+    """What the backend's ``GET /api/oauth/callback`` handler writes, and the way
+    it writes it: whole, via a temp file and a rename. A plain ``write_text``
+    creates the file before filling it, and the waiter polling every 10 ms could
+    read it empty and report a state mismatch."""
     inbox.mkdir(parents=True, exist_ok=True)
-    (inbox / f"{state}.txt").write_text(query, encoding="utf-8")
+    tmp = inbox / f"{state}.txt.tmp"
+    tmp.write_text(query, encoding="utf-8")
+    tmp.replace(inbox / f"{state}.txt")
 
 
 def _token_path(tmp_path: Path) -> Path:
