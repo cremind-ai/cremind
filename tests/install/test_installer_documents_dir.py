@@ -149,7 +149,7 @@ def test_a_bad_value_fails_early_in_every_mode() -> None:
     assert 'err "Invalid $DOCUMENTS_ACCESS_SOURCE: $DOCUMENTS_ACCESS_INPUT (must be rw or ro)"' in sh
     ps1 = _ps1()
     check = ps1.index("Write-Err2 \"Invalid $DocumentsDirSource '$DocumentsDir'")
-    assert check < ps1.index("\nInvoke-InstallerTuiBootstrap\n")
+    assert check < ps1.index("\nInvoke-InstallerTuiBootstrap -Selections $TuiSelections\n")
     assert "Invalid CREMIND_DOCUMENTS_ACCESS:" in ps1
     # ValidateSet and -in ignore case; the TUI's argparse choices do not.
     assert "$DocumentsAccess = $DocumentsAccess.ToLowerInvariant()" in ps1
@@ -176,10 +176,10 @@ def test_powershell_reads_every_answer_back() -> None:
     ps1 = _ps1()
     for key, _flag, param in ANSWER_KEYS:
         assert re.search(
-            rf"'{re.escape(key)}'\s*\{{[^}}]*Set-Variable -Scope Script {param}\b", ps1
+            rf"'{re.escape(key)}'\s*\{{[^}}]*\$Into\['{param}'\] = \$v", ps1
         ), key
     # The access is only taken when it is one the ValidateSet accepts.
-    assert "$v -in @('rw', 'ro')) { Set-Variable -Scope Script DocumentsAccess $v }" in ps1
+    assert "$v -in @('rw', 'ro')) { $Into['DocumentsAccess'] = $v }" in ps1
 
 
 def test_the_answer_keys_are_the_tui_output_keys_and_never_the_env_keys() -> None:
@@ -206,7 +206,7 @@ def test_the_previous_install_is_read_before_the_tui() -> None:
     assert "sed -n 's/^CREMIND_HOST_DOCUMENTS=//p'" in sh
     assert "sed -n 's/^CREMIND_DOCUMENTS_READ_ONLY=//p'" in sh
     ps1 = _ps1()
-    tui = ps1.index("\nInvoke-InstallerTuiBootstrap\n")
+    tui = ps1.index("\nInvoke-InstallerTuiBootstrap -Selections $TuiSelections\n")
     assert ps1.index("$PrevDocumentsDir = $prevDocs.Path") < tui
     assert ps1.index("$DocumentsDefault = $PrevDocumentsDir") < tui
     assert "[Environment]::GetFolderPath('MyDocuments')" in ps1

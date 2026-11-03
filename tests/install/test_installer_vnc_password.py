@@ -113,9 +113,9 @@ def test_powershell_reads_the_key_back() -> None:
     discards the user's answer with no error anywhere."""
     ps1 = _ps1()
     assert "'VNC_PASSWORD_INPUT'" in ps1
-    # And it must actually assign the script-scope variable the install reads.
+    # And it must hand the answer back as the parameter the install reads.
     assert re.search(
-        r"'VNC_PASSWORD_INPUT'\s*\{[^}]*Set-Variable -Scope Script VncPassword",
+        r"'VNC_PASSWORD_INPUT'\s*\{[^}]*\$Into\['VncPassword'\] = \$v",
         ps1,
     )
 
