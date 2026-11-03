@@ -61,10 +61,15 @@ def build_alembic_config() -> Config:
     application (WAL on SQLite, etc.) matches the runtime exactly. Setting
     ``sqlalchemy.url`` here would only matter for offline mode, where it
     would re-read the bootstrap anyway.
+
+    ``version_locations`` is deliberately left unset. Alembic then reads
+    ``<script_location>/versions`` as one path. A set value is split on spaces
+    and commas (no ``path_separator`` here), and folders that don't exist are
+    skipped silently, so an install under ``C:\\Users\\Tiep Vu\\`` found no
+    migrations at all and booted on an empty database.
     """
     cfg = Config()
     cfg.set_main_option("script_location", str(_alembic_dir()))
-    cfg.set_main_option("version_locations", str(_alembic_dir() / "versions"))
     cfg.set_main_option("file_template", "%%(year)d%%(month).2d%%(day).2d_%%(slug)s")
     return cfg
 
@@ -108,6 +113,14 @@ async def ensure_at_head() -> None:
 
 
 def _ensure_at_head_sync() -> None:
+    # An empty script directory makes ``upgrade head`` a silent no-op, and the
+    # first query then fails far from the cause ("no such table: profiles").
+    if not heads():
+        raise RuntimeError(
+            f"No Alembic migrations found under {_alembic_dir()}; refusing to "
+            "boot on a database whose schema cannot be created or upgraded."
+        )
+
     provider = get_database_provider()
     engine = provider.sync_engine()
 
