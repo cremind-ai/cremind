@@ -316,6 +316,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Script scope. Passing parameters to the one-liner means running this file
+# as a script block, `& ([scriptblock]::Create((iwr -useb <url>))) -Channel
+# test`, and then the script runs in a child scope while $script: still
+# names the caller's scope. So that a variable reads the same however the
+# script was started (file, `iwr | iex`, script block), two rules hold:
+#   - a variable that is ever reached through $script: or -Scope Script is
+#     assigned through it too, everywhere it is assigned;
+#   - parameters are never reached through it. A function hands its answers
+#     back for the top level to assign (see Read-TuiSelections).
+# tests/install/test_installer_scope.py checks both.
+
 # The RFC 1123 label Kubernetes wants for a namespace and Helm for a release
 # name. Mirrored verbatim in install.sh and app/installer/tui.py.
 $KubeNameRe = '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
@@ -1419,7 +1430,7 @@ if ($RuntimeOnly) {
 }
 
 # Paths in the Install Dir (scratch - safely deletable on uninstall -Keep)
-$LogFile       = Join-Path $CremindInstallDir 'install.log'
+$script:LogFile = Join-Path $CremindInstallDir 'install.log'
 $PidFile       = Join-Path $CremindInstallDir 'install.pid'
 
 # Scope pip's cache under the Install Dir so a wipe of the System Dir
@@ -1454,15 +1465,15 @@ if (-not $ModifyPath -and -not $NoModifyPath) {
 # dev reads from the checkout's install\templates\ directly. The
 # $TemplateMode flag tells Get-TemplateContent which branch to use.
 if ($Channel -eq 'dev') {
-    $TemplateBase = Join-Path $RepoRoot 'install\templates'
-    $TemplateMode = 'local'
+    $script:TemplateBase = Join-Path $RepoRoot 'install\templates'
+    $script:TemplateMode = 'local'
 } else {
-    $TemplateBase = if ($env:CREMIND_TEMPLATE_BASE) {
+    $script:TemplateBase = if ($env:CREMIND_TEMPLATE_BASE) {
         $env:CREMIND_TEMPLATE_BASE
     } else {
         'https://raw.githubusercontent.com/cremind-ai/cremind/main/install/templates'
     }
-    $TemplateMode = 'remote'
+    $script:TemplateMode = 'remote'
 }
 
 # Centralized template loader. Returns the raw text of a template; the
@@ -1712,7 +1723,7 @@ function Find-SystemPython {
     }
     return $null
 }
-$Python = Find-SystemPython
+$script:Python = Find-SystemPython
 
 if ($Python) {
     Write-Ok "Python: $(& $Python --version) at $Python"
@@ -1999,7 +2010,56 @@ if (-not $DocumentsDefault) {
 # keyboard-driven walk through channel / version / deployment / mode in
 # one screen flow. Any failure falls through to the legacy numbered
 # prompts below.
+
+# The TUI's answers, read from its KEY='value' output into $Into and keyed by
+# the parameter each one fills. A parameter the operator already passed keeps
+# its value, so its key is left out. The top level assigns the parameters
+# (see "Script scope" near the top).
+function Read-TuiSelections {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][hashtable] $Into
+    )
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+            $k = $Matches[1]
+            $v = $Matches[2]
+            # Strip the surrounding single quotes the bash quoter adds, then
+            # undo its only escape: a quote inside the value is written as
+            # '\'' (close, escaped quote, reopen), so John's comes back from
+            # 'John'\''s'. A literal Replace, not -replace: this used to be
+            # a regex that matched '\\'' instead and returned John'\''s.
+            if ($v -match "^'(.*)'$") { $v = $Matches[1].Replace("'\''", "'") }
+            switch ($k) {
+                'CHANNEL'              { if (-not $Channel)        { $Into['Channel'] = $v } }
+                'VERSION_SPEC'         { if (-not $Version)        { $Into['Version'] = $v } }
+                'DEPLOYMENT'           { if (-not $Deployment)     { $Into['Deployment'] = $v } }
+                'APP_HOST'             { if (-not $AppHost)        { $Into['AppHost'] = $v } }
+                'MODE'                 { if (-not $Mode)           { $Into['Mode'] = $v } }
+                'SSL_CHOICE'           { if (-not $Ssl -and $v -in @('none', 'auto', 'after-setup')) { $Into['Ssl'] = $v } }
+                'DESKTOP_UI'           { if (-not $DesktopUi)      { $Into['DesktopUi'] = $v } }
+                'VNC_PASSWORD_INPUT'   { if (-not $VncPassword)    { $Into['VncPassword'] = $v } }
+                'DOCUMENTS_DIR_INPUT'  { if (-not $DocumentsDir)   { $Into['DocumentsDir'] = $v } }
+                'DOCUMENTS_ACCESS_INPUT' { if (-not $DocumentsAccess -and $v -in @('rw', 'ro')) { $Into['DocumentsAccess'] = $v } }
+                'CUSTOM_listen_host'   { if (-not $ListenHost)     { $Into['ListenHost'] = $v } }
+                'CUSTOM_public_url'    { if (-not $PublicUrl)      { $Into['PublicUrl'] = $v } }
+                'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { $Into['AllowedOrigins'] = $v } }
+                'CUSTOM_wizard_preset' { if (-not $WizardPreset)   { $Into['WizardPreset'] = $v } }
+                'KUBE_CONTEXT'         { if (-not $KubeContext)    { $Into['KubeContext'] = $v } }
+                'KUBE_CONFIG_FILE'     { if (-not $KubeConfig)     { $Into['KubeConfig'] = $v } }
+                'KUBE_NAMESPACE'       { if (-not $KubeNamespace)  { $Into['KubeNamespace'] = $v } }
+                'K8S_release_name'     { if (-not $K8sReleaseName) { $Into['K8sReleaseName'] = $v } }
+                'K8S_app_url'          { if (-not $K8sAppUrl)      { $Into['K8sAppUrl'] = $v } }
+                'K8S_legacy_postgres_image' { if (-not $K8sLegacyPostgresImage -and $v -in @('yes', 'no')) { $Into['K8sLegacyPostgresImage'] = $v } }
+                'K8S_delete_postgres_data'  { if (-not $K8sDeletePostgresData -and $v -in @('yes', 'no')) { $Into['K8sDeletePostgresData'] = $v } }
+                'K8S_extra_set'        { if (-not $K8sExtraSet)    { $Into['K8sExtraSet'] = $v } }
+            }
+        }
+    }
+}
+
 function Invoke-InstallerTuiBootstrap {
+    param([Parameter(Mandatory)][hashtable] $Selections)
     if ($Unattended) { return }
     if ($NoTui)      { return }
     if (-not $InstallerTuiPyz -or -not (Test-Path -LiteralPath $InstallerTuiPyz)) { return }
@@ -2126,42 +2186,7 @@ function Invoke-InstallerTuiBootstrap {
     }
 
     if (Test-Path -LiteralPath $tuiOut) {
-        Get-Content -LiteralPath $tuiOut | ForEach-Object {
-            if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
-                $k = $Matches[1]
-                $v = $Matches[2]
-                # Strip the surrounding single quotes the bash quoter adds, then
-                # undo its only escape: a quote inside the value is written as
-                # '\'' (close, escaped quote, reopen), so John's comes back from
-                # 'John'\''s'. A literal Replace, not -replace: this used to be
-                # a regex that matched '\\'' instead and returned John'\''s.
-                if ($v -match "^'(.*)'$") { $v = $Matches[1].Replace("'\''", "'") }
-                switch ($k) {
-                    'CHANNEL'              { if (-not $Channel)        { Set-Variable -Scope Script Channel $v } }
-                    'VERSION_SPEC'         { if (-not $Version)        { Set-Variable -Scope Script Version $v } }
-                    'DEPLOYMENT'           { if (-not $Deployment)     { Set-Variable -Scope Script Deployment $v } }
-                    'APP_HOST'             { if (-not $AppHost)        { Set-Variable -Scope Script AppHost $v } }
-                    'MODE'                 { if (-not $Mode)           { Set-Variable -Scope Script Mode $v } }
-                    'SSL_CHOICE'           { if (-not $Ssl -and $v -in @('none', 'auto', 'after-setup')) { Set-Variable -Scope Script Ssl $v } }
-                    'DESKTOP_UI'           { if (-not $DesktopUi)      { Set-Variable -Scope Script DesktopUi $v } }
-                    'VNC_PASSWORD_INPUT'   { if (-not $VncPassword)    { Set-Variable -Scope Script VncPassword $v } }
-                    'DOCUMENTS_DIR_INPUT'  { if (-not $DocumentsDir)   { Set-Variable -Scope Script DocumentsDir $v } }
-                    'DOCUMENTS_ACCESS_INPUT' { if (-not $DocumentsAccess -and $v -in @('rw', 'ro')) { Set-Variable -Scope Script DocumentsAccess $v } }
-                    'CUSTOM_listen_host'   { if (-not $ListenHost)     { Set-Variable -Scope Script ListenHost $v } }
-                    'CUSTOM_public_url'    { if (-not $PublicUrl)      { Set-Variable -Scope Script PublicUrl $v } }
-                    'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
-                    'CUSTOM_wizard_preset' { if (-not $WizardPreset)   { Set-Variable -Scope Script WizardPreset $v } }
-                    'KUBE_CONTEXT'         { if (-not $KubeContext)    { Set-Variable -Scope Script KubeContext $v } }
-                    'KUBE_CONFIG_FILE'     { if (-not $KubeConfig)     { Set-Variable -Scope Script KubeConfig $v } }
-                    'KUBE_NAMESPACE'       { if (-not $KubeNamespace)  { Set-Variable -Scope Script KubeNamespace $v } }
-                    'K8S_release_name'     { if (-not $K8sReleaseName) { Set-Variable -Scope Script K8sReleaseName $v } }
-                    'K8S_app_url'          { if (-not $K8sAppUrl)      { Set-Variable -Scope Script K8sAppUrl $v } }
-                    'K8S_legacy_postgres_image' { if (-not $K8sLegacyPostgresImage -and $v -in @('yes', 'no')) { Set-Variable -Scope Script K8sLegacyPostgresImage $v } }
-                    'K8S_delete_postgres_data'  { if (-not $K8sDeletePostgresData -and $v -in @('yes', 'no')) { Set-Variable -Scope Script K8sDeletePostgresData $v } }
-                    'K8S_extra_set'        { if (-not $K8sExtraSet)    { Set-Variable -Scope Script K8sExtraSet $v } }
-                }
-            }
-        }
+        Read-TuiSelections -Path $tuiOut -Into $Selections
         Remove-Item -LiteralPath $tuiOut -Force -ErrorAction SilentlyContinue
         $script:TuiApplied = $true
         Write-Ok "TUI selections applied."
@@ -2171,8 +2196,14 @@ function Invoke-InstallerTuiBootstrap {
 # 1 once the TUI's answers were applied. The text-mode kubernetes flow adds
 # its own final confirmation; the TUI already has a confirm screen.
 # Pre-declared for StrictMode, which faults on reading an unassigned variable.
-$TuiApplied = $false
-Invoke-InstallerTuiBootstrap
+$script:TuiApplied = $false
+$TuiSelections = @{}
+Invoke-InstallerTuiBootstrap -Selections $TuiSelections
+# Assigned here, in the scope the parameters live in, whichever way the script
+# was started (see "Script scope" near the top).
+foreach ($tuiParam in @($TuiSelections.Keys)) {
+    Set-Variable -Name $tuiParam -Value $TuiSelections[$tuiParam]
+}
 
 # -- mode (how Cremind is installed) ---------------------------------------
 #
@@ -2342,10 +2373,9 @@ if ($Deployment -eq 'custom') {
     foreach ($key in $script:CustomFieldIds) {
         $field = $script:CustomFields[$key]
         $paramName = $paramFor[$key]
-        $current = (Get-Variable -Name $paramName -Scope Script -ErrorAction SilentlyContinue).Value
-        if (-not $current) {
-            $current = (Get-Variable -Name $paramName -ErrorAction SilentlyContinue).Value
-        }
+        # The parameters live in this (top-level) scope however the script
+        # was started; a -Scope Script lookup could find a stale copy instead.
+        $current = (Get-Variable -Name $paramName -ErrorAction SilentlyContinue).Value
         if ($current) {
             $CustomValues[$key] = $current
             Write-Ok "$key`: $current"

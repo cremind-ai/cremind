@@ -288,7 +288,7 @@ def test_powershell_reads_every_answer_back() -> None:
     ps1 = _ps1()
     for key, _flag, param in ANSWER_KEYS:
         assert re.search(
-            rf"'{re.escape(key)}'\s*\{{[^}}]*Set-Variable -Scope Script {param}\b", ps1
+            rf"'{re.escape(key)}'\s*\{{[^}}]*\$Into\['{param}'\] = \$v", ps1
         ), key
 
 
