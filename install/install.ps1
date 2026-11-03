@@ -1,9 +1,9 @@
-﻿<#
+<#
 .SYNOPSIS
     Cremind installer for Windows (PowerShell).
 
 .DESCRIPTION
-    The Phase 2 installer. Native install only — Docker mode is detected
+    The Phase 2 installer. Native install only - Docker mode is detected
     and recommended, but the actual containerized bundle ships in Phase 3.
 
 .EXAMPLE
@@ -20,7 +20,7 @@
 .PARAMETER Deployment
     'local', 'server', or 'custom'. Skips the deployment-type prompt.
     'custom' exposes advanced fields (listen host, public URL, allowed
-    origins, wizard preset) so you can configure unusual setups —
+    origins, wizard preset) so you can configure unusual setups -
     running inside a container, behind a reverse proxy, etc. 'container'
     is accepted as a deprecated alias for 'custom' with container
     defaults.
@@ -62,7 +62,7 @@
 
 .PARAMETER K8sLegacyPostgresImage
     (kubernetes) 'yes' or 'no'. Point the bundled PostgreSQL at
-    docker.io/bitnamilegacy/postgresql. Default: yes — Bitnami froze its free
+    docker.io/bitnamilegacy/postgresql. Default: yes - Bitnami froze its free
     images there, so the chart default no longer pulls.
 
 .PARAMETER K8sDeletePostgresData
@@ -107,7 +107,7 @@
                    walks you through trusting it BEFORE any https page exists,
                    so the first https load never warns.
       auto         HTTPS from the first boot, with the same generated CA.
-                   Browsers warn until it is trusted — the Setup Wizard is
+                   Browsers warn until it is trusted - the Setup Wizard is
                    already behind the certificate.
       none         (default) Plain HTTP. Enable HTTPS later in Settings > Security.
 
@@ -120,17 +120,17 @@
     Electron-driven installs support the same HTTPS modes.
 
 .PARAMETER Desktop
-    (Docker mode) Include the VNC Desktop UI — pulls cremind/cremind-desktop
+    (Docker mode) Include the VNC Desktop UI - pulls cremind/cremind-desktop
     (XFCE + VNC). Default when neither -Desktop nor -NoDesktop is given.
 
 .PARAMETER NoDesktop
-    (Docker mode) Skip the VNC Desktop UI — pulls the smaller headless
+    (Docker mode) Skip the VNC Desktop UI - pulls the smaller headless
     cremind/cremind image (no noVNC/VNC ports). A re-install keeps the
     previous choice unless you pass a flag. Setting both flags is an error.
 
 .PARAMETER VncPassword
     (Docker mode, desktop UI only) Password for the VNC Desktop at
-    http://<host>:6080/vnc.html. 6-8 characters from [A-Za-z0-9@%_+=:,.-] —
+    http://<host>:6080/vnc.html. 6-8 characters from [A-Za-z0-9@%_+=:,.-] -
     VNC ignores anything past the 8th character. Interactive installs ask for
     it (entered twice) when the desktop UI is included; with -Unattended or no
     console this flag wins, else the previous install's password is kept, else
@@ -231,7 +231,7 @@
     the switch is the confirmation.
 
 .NOTES
-    Service selection (database backend, vector store backend, …) is no
+    Service selection (database backend, vector store backend, ...) is no
     longer made at install time. The Setup Wizard now lets you pick each
     backing service's deployment mode (Docker / Native / External)
     per-service, independent of how Cremind itself is installed.
@@ -264,7 +264,7 @@ param(
     [switch] $NoPortForward,
     # TLS on the public origin. '' = not specified (fresh installs default to
     # plain HTTP; a re-install carries the previous choice forward). See
-    # the ── ssl mode ── section below for the full precedence chain.
+    # the -- ssl mode -- section below for the full precedence chain.
     [ValidateSet('','none','auto','after-setup')] [string] $Ssl = '',
     # Docker mode only: include the VNC Desktop UI? -Desktop pulls
     # cremind/cremind-desktop; -NoDesktop pulls the headless cremind/cremind.
@@ -272,8 +272,8 @@ param(
     [switch] $Desktop,
     [switch] $NoDesktop,
     # Password for the VNC Desktop at http://<host>:6080/vnc.html. Docker +
-    # desktop only. Empty = ask interactively (twice), or — with -Unattended
-    # / no console — keep the previous install's password, else generate one.
+    # desktop only. Empty = ask interactively (twice), or - with -Unattended
+    # / no console - keep the previous install's password, else generate one.
     # 6-8 characters from [A-Za-z0-9@%_+=:,.-]; see $VncPasswordRe below.
     [string] $VncPassword = '',
     # Docker mode only: the host folder mounted at /root/Documents, and how.
@@ -285,7 +285,7 @@ param(
     [ValidateSet('','rw','ro')] [string] $DocumentsAccess = '',
     # Register a logon Scheduled Task that starts and supervises the server?
     # Neither set = on for native installs, unless a previous install opted
-    # out. Setting both is an error. See the ── boot service ── section.
+    # out. Setting both is an error. See the -- boot service -- section.
     [switch] $BootService,
     [switch] $NoBootService,
     [switch] $NoLaunch,
@@ -308,7 +308,7 @@ param(
     # Only the Cremind Tag gateway runtime (see "-RuntimeOnly" below).
     [switch] $RuntimeOnly,
     # Skip the prompt_toolkit TUI bootstrap and fall back to the legacy
-    # numbered prompts. CI/debugging only — interactive users benefit
+    # numbered prompts. CI/debugging only - interactive users benefit
     # from the TUI's keyboard navigation and version picker.
     [switch] $NoTui
 )
@@ -325,7 +325,7 @@ $KubeNameRe = '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
 #
 # Windows PowerShell 5.1 turns every redirected stderr line into a
 # NativeCommandError record, and under $ErrorActionPreference = 'Stop' the
-# first one terminates — on a command that SUCCEEDED. kubectl and helm write
+# first one terminates - on a command that SUCCEEDED. kubectl and helm write
 # perfectly routine notices there (deprecated kubeconfig fields, "release not
 # found"), so the redirect has to run under 'Continue' and the error records
 # have to be unwrapped by hand.
@@ -368,14 +368,14 @@ function Invoke-NativeCapture {
 # Defined here, above the uninstall flow, because that flow needs it too
 # (it rewrites the kubernetes release record it just preserved).
 # Write a file as UTF-8 with no BOM, LF line endings and exactly one trailing
-# newline — the bytes install.sh's heredocs produce.
+# newline - the bytes install.sh's heredocs produce.
 #
 # ``Set-Content -Encoding utf8`` under Windows PowerShell 5.1 prepends EF BB BF,
 # and the ``toml`` parser the backend reads bootstrap.toml and credentials.toml
 # with does not skip it: the BOM glues onto the leading ``#`` of the first
 # comment and the file fails as "invalid character in key name". That takes down
 # ``cremind db upgrade``, ``cremind db current`` and every later ``cremind
-# serve`` — a boot loop out of a file the installer itself wrote. .NET's
+# serve`` - a boot loop out of a file the installer itself wrote. .NET's
 # UTF8Encoding($false) emits the content and nothing else.
 #
 # Line endings are normalised because a here-string carries whatever this script
@@ -401,7 +401,7 @@ function Write-Utf8NoBomFile {
     [System.IO.File]::WriteAllText($full, $text, [System.Text.UTF8Encoding]::new($false))
 }
 
-# ── -Uninstall flow ───────────────────────────────────────────────────────
+# -- -Uninstall flow -------------------------------------------------------
 # Inline uninstaller. Runs before banner / catalog / TUI setup so the
 # install path's interactive scaffolding never touches an uninstall run.
 #
@@ -411,7 +411,7 @@ function Write-Utf8NoBomFile {
 #       Native installs: runtime + user content (.env, bootstrap.toml,
 #       storage\, tokens\, venv\, bin\, per-profile dirs, server.log,
 #       upgrade artifacts). Docker installs leave the host's ~\.cremind
-#       untouched — runtime state lives in the ``cremind-data`` named
+#       untouched - runtime state lives in the ``cremind-data`` named
 #       Docker volume.
 #
 #   Install Dir ($env:CREMIND_INSTALL_DIR / default %LOCALAPPDATA%\Cremind)
@@ -435,7 +435,7 @@ function Write-Utf8NoBomFile {
 # computer whose Cremind runs elsewhere (this computer's own Docker install,
 # which cannot see its USB ports, or another machine): a venv with
 # ``cremind[tags]`` under the Install Dir (``<INSTALL_DIR>\tag-host\venv``) and
-# nothing else — no .env, no database, no APP_URL rewrite, no server start, no
+# nothing else - no .env, no database, no APP_URL rewrite, no server start, no
 # boot service, no PATH change. The Cremind app runs ``cremind tags host``
 # from it. A newer runtime already there is kept (never downgraded).
 if ($RuntimeOnly) {
@@ -713,7 +713,7 @@ if ($Uninstall) {
         }
     }
 
-    # ── Docker pre-check (Docker-mode installs only) ─────────────────────
+    # -- Docker pre-check (Docker-mode installs only) ---------------------
     #
     # Runs BEFORE process-kill / file removal so the user can Abort
     # without leaving the install half-torn-down. Three outcomes:
@@ -863,7 +863,7 @@ if ($Uninstall) {
         }
     }
 
-    # ── Helm release teardown ────────────────────────────────────────────
+    # -- Helm release teardown --------------------------------------------
     #
     # Runs whenever a release is tracked, regardless of $Kind: a machine can
     # hold a docker or native install and still be the one that installed
@@ -1102,7 +1102,7 @@ if ($Uninstall) {
 
 # RepoRoot is the repo containing this script. Required for dev mode (we
 # install from there and read templates from there). Empty when piped via
-# iwr|iex — the dev-mode check below uses that to reject pipe invocation.
+# iwr|iex - the dev-mode check below uses that to reject pipe invocation.
 $RepoRoot = ''
 if ($PSCommandPath) {
     $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
@@ -1115,12 +1115,12 @@ if ($Channel -eq 'dev') {
     }
 }
 
-# ── -Version validation ───────────────────────────────────────────────────
+# -- -Version validation ---------------------------------------------------
 #
 # Two layers of check, mirroring install.sh:
-#   1. Channel-shape — production = X.Y.Z, test = X.Y.ZrcN. Dev ignores
+#   1. Channel-shape - production = X.Y.Z, test = X.Y.ZrcN. Dev ignores
 #      -Version (editable install).
-#   2. Electron-line — only when -ElectronVersion is also provided.
+#   2. Electron-line - only when -ElectronVersion is also provided.
 #      Production: exact match. Test: same X.Y.Z, rcN suffix.
 #
 # The error messages are the strings the Cremind desktop app surfaces in
@@ -1193,7 +1193,7 @@ if ($Version -and $ElectronVersion) {
     switch ($Channel) {
         'production' {
             if ($Version -ne $ElectronVersion) {
-                Write-Host "ERR Invalid version: '$Version' is not a valid production release for this Electron build (v$ElectronVersion). Production requires an exact version match — use the in-app update flow to install a different version." -ForegroundColor Red
+                Write-Host "ERR Invalid version: '$Version' is not a valid production release for this Electron build (v$ElectronVersion). Production requires an exact version match - use the in-app update flow to install a different version." -ForegroundColor Red
                 exit 2
             }
         }
@@ -1207,8 +1207,8 @@ if ($Version -and $ElectronVersion) {
 }
 # Windows PowerShell 5.1 defaults [Console]::OutputEncoding to the OEM
 # code page (cp437 on US-English Windows), which mojibakes multi-byte
-# UTF-8 like the em-dashes and box-drawing chars in our section headers
-# when stdout is consumed by a UTF-8 reader (the Electron log viewer).
+# UTF-8 like the box-drawing rule Write-Step prints when stdout is
+# consumed by a UTF-8 reader (the Electron log viewer).
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
 
@@ -1216,13 +1216,15 @@ try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catc
 # Windows PowerShell 5.1. We stick to explicit if/else throughout so the
 # script works on the default PS that ships with Windows 10/11.
 
-# ── logging helpers ───────────────────────────────────────────────────────
+# -- logging helpers -------------------------------------------------------
 
+# Write-Step's rule is U+2500 built at runtime: this file must stay pure ASCII,
+# because `iwr | iex` decodes it as ASCII (tests/install/test_installer_encoding.py).
 function Write-Info  { param($Msg) Write-Host "==> $Msg"      -ForegroundColor Cyan }
 function Write-Ok    { param($Msg) Write-Host " OK $Msg"      -ForegroundColor Green }
 function Write-Warn2 { param($Msg) Write-Host "!!! $Msg"      -ForegroundColor Yellow }
 function Write-Err2  { param($Msg) Write-Host "ERR $Msg"      -ForegroundColor Red }
-function Write-Step  { param($Msg) Write-Host "`n── $Msg ──"  -ForegroundColor White }
+function Write-Step  { param($Msg) $rule = [string]::new([char]0x2500, 2); Write-Host "`n$rule $Msg $rule" -ForegroundColor White }
 # Native executables (docker, uv, pip) write progress to stderr; PS 5.1
 # wraps each line as a NativeCommandError record, which trips
 # $ErrorActionPreference='Stop' on benign output. We scope it to
@@ -1237,7 +1239,7 @@ function Invoke-NativeLogged {
         # as PS 5.1's default UTF-16 LE (which makes every byte appear
         # spaced out in any UTF-8 reader). The ForEach-Object unwraps
         # stderr lines that PS 5.1 wraps as NativeCommandError
-        # ErrorRecords — otherwise each benign stderr line (docker/pip/uv
+        # ErrorRecords - otherwise each benign stderr line (docker/pip/uv
         # progress) gets the full "At C:\...:line char:N" error decoration
         # in the log even on successful runs.
         & $Action 2>&1 | ForEach-Object {
@@ -1250,7 +1252,7 @@ function Invoke-NativeLogged {
     } finally { $ErrorActionPreference = $prev }
 }
 
-# ── unattended sanity check ──────────────────────────────────────────────
+# -- unattended sanity check ----------------------------------------------
 
 # Kubernetes has no host to bind - the chart sets HOST and APP_URL on the pod
 # - so it never gets a deployment, not even an unattended default.
@@ -1277,14 +1279,14 @@ $DesktopUi = if ($Desktop) { '1' } elseif ($NoDesktop) { '0' } else { '' }
 
 # The one rule for a VNC password, mirrored verbatim in install.sh and
 # app/installer/tui.py (a drift test pins the three together). 6-8 is VNC's
-# own range — vncpasswd rejects under 6 and the DES scheme keys off the first
+# own range - vncpasswd rejects under 6 and the DES scheme keys off the first
 # 8 only. The charset excludes | & \ $ # space and quotes because the value
 # passes through a -replace into the .env template, an unquoted compose .env,
 # and a TOML basic string in credentials.toml.
 $VncPasswordRe = '^[A-Za-z0-9@%_+=:,.-]{6,8}$'
 # A bad -VncPassword fails now, in every mode. Unattended installs never
 # prompt, but they must not silently install a password the container will
-# mangle either — failing fast beats debugging a desktop you cannot unlock.
+# mangle either - failing fast beats debugging a desktop you cannot unlock.
 if ($VncPassword -and $VncPassword -notmatch $VncPasswordRe) {
     Write-Err2 "Invalid -VncPassword: use 6-8 characters from letters, digits and @ % _ + = : , . -"
     Write-Err2 "(VNC itself ignores anything past the 8th character.)"
@@ -1297,13 +1299,13 @@ $PrevVncPassword = ''
 # The one rule for a Docker documents folder, mirrored in install.sh
 # (documents_dir_normalize) and app/installer/tui.py.
 #
-# Resolve-DocumentsDir RAW → an object whose Path is RAW as an absolute path
+# Resolve-DocumentsDir RAW -> an object whose Path is RAW as an absolute path
 # with forward slashes, or whose Problem says why RAW cannot be used.
 #
 # The path is appended UNQUOTED to docker\.env as CREMIND_HOST_DOCUMENTS, and
 # compose's .env parser expands $, reads # as a comment, treats " as quoting
 # and trims surrounding whitespace. Escaping would have to match that parser
-# exactly, so those are refused instead — naming the character, because a
+# exactly, so those are refused instead - naming the character, because a
 # "valid path" error for a real folder is baffling otherwise. Apostrophes and
 # inner spaces are fine unquoted. The checks run on the RESULT too, since
 # $HOME or the current location can carry the same characters. Forward
@@ -1382,9 +1384,9 @@ if ($BootService -and $NoBootService) {
 }
 $BootExplicit = ($BootService -or $NoBootService)
 
-# ── paths ─────────────────────────────────────────────────────────────────
+# -- paths -----------------------------------------------------------------
 
-# Cremind System Directory — runtime state + user content root. Defaults to
+# Cremind System Directory - runtime state + user content root. Defaults to
 # %USERPROFILE%\.cremind (the conventional ~/.cremind on Windows) so the
 # layout users see hasn't changed since v0.1.9-test55. Override via
 # $env:CREMIND_SYSTEM_DIR so power users can install side-by-side.
@@ -1395,7 +1397,7 @@ $CremindSystemDir = if ($env:CREMIND_SYSTEM_DIR) {
 }
 $DefaultCremindSystemDir = Join-Path $env:USERPROFILE '.cremind'
 
-# Cremind Install Directory — install-time scratch (install.log, install.pid,
+# Cremind Install Directory - install-time scratch (install.log, install.pid,
 # docker compose bundle, pip/uv caches, downloaded Python). Defaults to
 # %LOCALAPPDATA%\Cremind so install artifacts never pollute ~/.cremind.
 $CremindInstallDir = if ($env:CREMIND_INSTALL_DIR) {
@@ -1416,7 +1418,7 @@ if ($RuntimeOnly) {
     $VenvDir = Join-Path (Join-Path $CremindInstallDir 'tag-host') 'venv'
 }
 
-# Paths in the Install Dir (scratch — safely deletable on uninstall -Keep)
+# Paths in the Install Dir (scratch - safely deletable on uninstall -Keep)
 $LogFile       = Join-Path $CremindInstallDir 'install.log'
 $PidFile       = Join-Path $CremindInstallDir 'install.pid'
 
@@ -1427,7 +1429,7 @@ $PidFile       = Join-Path $CremindInstallDir 'install.pid'
 $env:PIP_CACHE_DIR = Join-Path $CremindInstallDir 'pip-cache'
 
 # The Install Dir is always needed (install.log, docker compose bundle,
-# uv/pip caches). The System Dir is only created for native installs —
+# uv/pip caches). The System Dir is only created for native installs -
 # Docker installs keep runtime state inside the ``cremind-data`` named
 # volume and never touch the host's ~\.cremind.
 if (-not (Test-Path $CremindInstallDir)) { New-Item -ItemType Directory -Path $CremindInstallDir | Out-Null }
@@ -1480,7 +1482,7 @@ function Get-TemplateContent {
 }
 
 
-# ── catalog ───────────────────────────────────────────────────────────────
+# -- catalog ---------------------------------------------------------------
 #
 # Source the generated _catalog.ps1 so the prompts and rendered .env
 # files share their labels / descriptions / rules with install.sh and
@@ -1512,7 +1514,7 @@ if ($UseLocalInstallAssets) {
         exit 1
     }
     . $CatalogTmp
-    # JSON catalog + zipapp TUI bundle are optional — failing the fetch
+    # JSON catalog + zipapp TUI bundle are optional - failing the fetch
     # just drops us back to the legacy numbered prompts.
     $CatalogJson = Join-Path $CremindInstallDir '_catalog.json'
     $InstallerTuiPyz = Join-Path $CremindInstallDir 'installer_tui.pyz'
@@ -1528,7 +1530,7 @@ if ($UseLocalInstallAssets) {
     }
 }
 
-# ── version resolver (single source of truth) ──────────────────────────────
+# -- version resolver (single source of truth) ------------------------------
 #
 # Version / RC-tag parsing + PEP 440 ordering live in ONE place:
 # app/upgrade/channel.py. PowerShell can't import it, so we run that exact
@@ -1566,7 +1568,7 @@ function Get-CremindResolver {
 }
 
 # The resolver only needs a basic Python 3 (stdlib argparse/re), not the
-# strict 3.13+ that $Python (Find-SystemPython) requires — and in docker
+# strict 3.13+ that $Python (Find-SystemPython) requires - and in docker
 # mode $Python is often empty because the install runs inside the image.
 # Accept any python on PATH; '' when none is found.
 function Get-ResolverPython {
@@ -1603,7 +1605,7 @@ function Resolve-CremindWheel {
     return ($out | Select-Object -First 1).Trim()
 }
 
-# ── container alias ───────────────────────────────────────────────────────
+# -- container alias -------------------------------------------------------
 #
 # ``container`` was a separate deployment in earlier installs; it's now
 # a narrow case of ``custom`` (listen on 0.0.0.0, URLs at localhost).
@@ -1617,7 +1619,7 @@ if ($Deployment -eq 'container') {
     if (-not $WizardPreset) { $WizardPreset = 'local' }
 }
 
-# ── banner ────────────────────────────────────────────────────────────────
+# -- banner ----------------------------------------------------------------
 
 # Single-quoted here-string: every char ($, backtick, apostrophe) is literal.
 $Logo = @'
@@ -1678,7 +1680,7 @@ if ($Channel -ne 'production') {
     Write-Host ""
 }
 
-# ── detection ─────────────────────────────────────────────────────────────
+# -- detection -------------------------------------------------------------
 
 Write-Step "Environment"
 
@@ -1731,7 +1733,7 @@ if ($HasDocker) {
     Write-Info "Docker: not detected (or not running)"
 }
 
-# ── kubernetes capabilities ───────────────────────────────────────────────
+# -- kubernetes capabilities -----------------------------------------------
 #
 # kubectl and helm are what the ``kubernetes`` install mode needs, and the
 # catalog's ``requires`` turns their presence into whether the mode is even
@@ -1877,7 +1879,7 @@ if (Get-Command helm -ErrorAction SilentlyContinue) {
     Write-Info "helm: not detected"
 }
 
-# ── mode availability ─────────────────────────────────────────────────────
+# -- mode availability -----------------------------------------------------
 #
 # The catalog's per-mode ``requires`` decides what this machine may be
 # offered. install.sh and the TUI apply the same rule over the same data. An
@@ -1914,7 +1916,7 @@ function Test-ModeAvailable {
 
 $AvailableModeIds = @($script:ModeIds | Where-Object { Test-ModeAvailable $_ })
 
-# ── previous kubernetes release ───────────────────────────────────────────
+# -- previous kubernetes release -------------------------------------------
 #
 # A kubernetes install records what it did in k8s\release.env so a re-run can
 # offer the same answers and an uninstall knows what to tear down. Read -
@@ -1977,7 +1979,7 @@ if (Test-Path -LiteralPath $prevVncEnv) {
 }
 
 # What the documents folder is when nobody says otherwise: the previous
-# install's, else the Documents folder Windows reports — which follows OneDrive
+# install's, else the Documents folder Windows reports - which follows OneDrive
 # redirection, unlike $HOME\Documents. Empty only when that path holds a
 # character the .env cannot carry; the docker branch then leaves
 # CREMIND_HOST_DOCUMENTS unset and compose falls back to a folder inside the
@@ -1991,7 +1993,7 @@ if (-not $DocumentsDefault) {
     if (-not $docsDefaultCheck.Problem) { $DocumentsDefault = $docsDefaultCheck.Path }
 }
 
-# ── TUI bootstrap ─────────────────────────────────────────────────────────
+# -- TUI bootstrap ---------------------------------------------------------
 #
 # Mirror of the install.sh bootstrap: launch the prompt_toolkit TUI for a
 # keyboard-driven walk through channel / version / deployment / mode in
@@ -2005,10 +2007,10 @@ function Invoke-InstallerTuiBootstrap {
     if (-not [Environment]::UserInteractive) { return }
 
     # Decide how to launch the TUI:
-    #   1. Dev channel from a checkout — reuse the project's .venv. It
+    #   1. Dev channel from a checkout - reuse the project's .venv. It
     #      already has prompt_toolkit + rich installed (core deps in
     #      pyproject.toml), so we skip uv entirely.
-    #   2. Otherwise — install a private uv into $BinDir and let it
+    #   2. Otherwise - install a private uv into $BinDir and let it
     #      manage Python + the two TUI deps in an ephemeral env.
     $devPython = ''
     if ($Channel -eq 'dev' -and $RepoRoot) {
@@ -2044,7 +2046,7 @@ function Invoke-InstallerTuiBootstrap {
     # PowerShell drops empty strings from arrays when splatting to native
     # exes, which would turn ``--deployment ''`` into a bare ``--deployment``
     # and argparse would grab the next flag as its value. Only emit a flag
-    # when its value is non-empty — argparse's ``default=""`` covers the
+    # when its value is non-empty - argparse's ``default=""`` covers the
     # missing-flag case.
     $tuiArgs = [System.Collections.Generic.List[string]]::new()
     $tuiArgs.Add('--output'); $tuiArgs.Add($tuiOut)
@@ -2172,7 +2174,7 @@ function Invoke-InstallerTuiBootstrap {
 $TuiApplied = $false
 Invoke-InstallerTuiBootstrap
 
-# ── mode (how Cremind is installed) ───────────────────────────────────────
+# -- mode (how Cremind is installed) ---------------------------------------
 #
 # Asked before the deployment questions because it decides whether they are
 # asked at all: a kubernetes install has no host to bind and no .env to
@@ -2260,7 +2262,7 @@ if ($Mode -eq 'kubernetes' -and $env:CREMIND_INSTALLER_FRONTEND -eq 'electron') 
     exit 2
 }
 
-# ── deployment type ───────────────────────────────────────────────────────
+# -- deployment type -------------------------------------------------------
 
 if ($Mode -eq 'kubernetes') {
     # The chart sets HOST, APP_URL and CORS on the pod; there is nothing here
@@ -2320,7 +2322,7 @@ if ($Deployment -eq 'server' -and -not $AppHost) {
 }
 if ($AppHost) { Write-Ok "Host: $AppHost" }
 
-# ── custom-deployment fields ─────────────────────────────────────────────
+# -- custom-deployment fields ---------------------------------------------
 
 # When the user picks ``custom`` walk the advanced-field array from the
 # catalog and prompt for each one with its plain-English question +
@@ -2382,7 +2384,7 @@ if ($Deployment -eq 'custom') {
 
 }  # end: deployment questions (skipped for kubernetes)
 
-# ── desktop UI (docker mode only) ─────────────────────────────────────────
+# -- desktop UI (docker mode only) -----------------------------------------
 #
 # Docker installs choose an image flavor: the desktop image
 # (cremind/cremind-desktop, XFCE + VNC) or the basic headless image
@@ -2456,7 +2458,7 @@ if ($Mode -eq 'docker' -or $Mode -eq 'kubernetes') {
     }
 }
 
-# ── VNC password (container modes + desktop only) ─────────────────────────
+# -- VNC password (container modes + desktop only) -------------------------
 #
 # Asked here when the TUI didn't (-NoTui, TUI failure) and no -VncPassword was
 # passed. Unattended installs deliberately fall through without asking: the
@@ -2509,16 +2511,16 @@ if (($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and $DesktopUi -ne '0' -and
     }
 }
 
-# ── documents folder (docker mode only) ───────────────────────────────────
+# -- documents folder (docker mode only) -----------------------------------
 #
-# The host folder the container sees as /root/Documents — what Documentation search indexes and where the agent works by default. Without the bind it
+# The host folder the container sees as /root/Documents - what Documentation search indexes and where the agent works by default. Without the bind it
 # lives on the container's own layer and vanishes whenever compose recreates
 # the container. Kubernetes never gets here: the chart's persistence.work
 # volume is mounted at the same path.
 #
-# Precedence: -DocumentsDir → $env:CREMIND_DOCUMENTS_DIR (both folded into
-# $DocumentsDir and validated up front) → the TUI's or the prompt's answer →
-# the previous install's folder → the Windows Documents folder. Access runs
+# Precedence: -DocumentsDir -> $env:CREMIND_DOCUMENTS_DIR (both folded into
+# $DocumentsDir and validated up front) -> the TUI's or the prompt's answer ->
+# the previous install's folder -> the Windows Documents folder. Access runs
 # the same chain from -DocumentsAccess / $env:CREMIND_DOCUMENTS_ACCESS, default
 # rw. Each question is asked only when its value is still open and someone
 # can answer: not -Unattended, an interactive session, a console on stdin.
@@ -2624,7 +2626,7 @@ if ($Mode -eq 'docker') {
     Write-Info "The documents-folder setting applies to Docker installs only; ignoring it for $Mode."
 }
 
-# ── kubernetes questions ──────────────────────────────────────────────────
+# -- kubernetes questions --------------------------------------------------
 #
 # The fallback for everything the TUI would have asked: which cluster, which
 # namespace, and the Helm options. Reached with -NoTui, in a non-interactive
@@ -2849,17 +2851,17 @@ if ($Mode -eq 'kubernetes') {
     }
 }
 
-# ── https scheme ──────────────────────────────────────────────────────────
+# -- https scheme ----------------------------------------------------------
 
 # ``cremind serve`` puts TLS on the public origin (port 1515) when
 # CREMIND_SSL is set (``auto`` generates a locally-signed pair) or when an
 # explicit CREMIND_SSL_CERTFILE is configured. The env TEMPLATES ship those
 # keys commented out and the installer appends the resolved value below, so
-# only an uncommented assignment carrying a value counts — a leading '#' has
+# only an uncommented assignment carrying a value counts - a leading '#' has
 # to read as "off", or a plain-HTTP install would be handed an https:// URL
 # that nothing is listening on.
 #
-# -EnvPath is the env file this install just wrote — optional, and it may
+# -EnvPath is the env file this install just wrote - optional, and it may
 # not exist yet. Called with no argument (or a path that isn't there) the
 # answer comes from the process environment alone, which is what the
 # pre-write decision below needs. The environment wins in either case when
@@ -2868,7 +2870,7 @@ if ($Mode -eq 'kubernetes') {
 # into Env: before spawning the server.
 #
 # Note the internal API port (PORT, default 1112) stays plain HTTP even
-# with TLS on — it binds loopback only, for the CLI and the skills. This
+# with TLS on - it binds loopback only, for the CLI and the skills. This
 # helper is about the PUBLIC origin, so don't reach for it there.
 #
 # Only a mode the server recognises as enabled reads as HTTPS here.
@@ -2927,12 +2929,12 @@ function Get-CremindScheme {
 # Get-CremindScheme reports.
 #
 # ``CREMIND_SSL=after-setup`` serves plain HTTP until the Setup Wizard writes
-# bootstrap.toml, then restarts into https. Everything the installer WRITES —
-# APP_URL, CORS_ALLOWED_ORIGINS, credentials.toml — must say https, because
+# bootstrap.toml, then restarts into https. Everything the installer WRITES -
+# APP_URL, CORS_ALLOWED_ORIGINS, credentials.toml - must say https, because
 # that is the origin for the whole life of the install bar the wizard, so
 # those call sites keep using Get-CremindScheme. But the two things that touch
-# the freshly-started server — the health probe and the wizard URL we hand the
-# user — have to match the listener that exists at this moment, or we health-
+# the freshly-started server - the health probe and the wizard URL we hand the
+# user - have to match the listener that exists at this moment, or we health-
 # gate an https URL against an http listener and fail the install.
 #
 # An explicit certificate pair overrides the phase: with CREMIND_SSL_CERTFILE
@@ -2942,7 +2944,7 @@ function Get-CremindScheme {
 # -SetupComplete says the wizard has already run (bootstrap.toml exists), which
 # ends the deferral: the server binds TLS from boot one, exactly as
 # ``_resolve_tls`` decides it (app/server.py). Re-running the installer over a
-# finished install is the case that needs this — without it the health gate
+# finished install is the case that needs this - without it the health gate
 # probes http:// against a TLS listener, waits out its full budget, and hands
 # the user a wizard URL that cannot load. Caller-supplied rather than tested
 # here because only the caller knows where to look: the native path can see
@@ -2974,8 +2976,8 @@ function Get-CremindBootScheme {
 }
 
 # Health probe for a URL built by Get-CremindScheme. CREMIND_SSL=auto serves a
-# certificate signed by a CA that is in no trust store yet, so the handshake —
-# not the health endpoint — is what would fail. The probe only needs to know
+# certificate signed by a CA that is in no trust store yet, so the handshake -
+# not the health endpoint - is what would fail. The probe only needs to know
 # the listener answers, not to authenticate it. Plain HTTP takes the exact
 # call it always had, untouched.
 function Test-CremindHealth {
@@ -3003,7 +3005,7 @@ function Test-CremindHealth {
     # Windows PowerShell 5.1 has no such switch, and the obvious workaround is
     # a trap: ServerCertificateValidationCallback is invoked on the handshake
     # thread, which is not a PowerShell runspace, so a scriptblock delegate
-    # never runs and EVERY https probe comes back false — a silent two-minute
+    # never runs and EVERY https probe comes back false - a silent two-minute
     # stall waiting for a backend that is already up. The delegate has to be
     # compiled. Restored in ``finally`` so nothing else inherits it.
     if (-not ('CremindTlsBypass' -as [type])) {
@@ -3033,7 +3035,7 @@ public static class CremindTlsBypass {
 
 # Bring a rendered .env's public origin in line with a scheme. The
 # local/server templates hard-code http:// on APP_URL and
-# CORS_ALLOWED_ORIGINS — right for the overwhelmingly common plain-HTTP
+# CORS_ALLOWED_ORIGINS - right for the overwhelmingly common plain-HTTP
 # install, so this rewrites rather than adding a second pair of templates.
 # Returns without touching the file unless TLS is on, and even then it only
 # edits those two assignment lines: the surrounding comments keep their
@@ -3043,7 +3045,7 @@ public static class CremindTlsBypass {
 # with: a line-by-line Get-Content/Set-Content roundtrip would re-terminate
 # every line with CRLF, and Compose's env-file parser does not strip a
 # trailing carriage return from a value. ``-Encoding utf8`` on both sides
-# for the same reason the dev-channel CORS rewrite below needs it — Windows
+# for the same reason the dev-channel CORS rewrite below needs it - Windows
 # PowerShell 5.1 decodes BOM-less UTF-8 as cp1252 by default and would
 # mangle the em-dashes in the template comments.
 function Set-CremindEnvUrlScheme {
@@ -3053,7 +3055,7 @@ function Set-CremindEnvUrlScheme {
     )
     if ($Scheme -ne 'https') { return }
     $text = Get-Content -Path $Path -Raw -Encoding utf8
-    # ``.`` never matches \n, so ^...$ under (?m) is one line — and any \r
+    # ``.`` never matches \n, so ^...$ under (?m) is one line - and any \r
     # sits inside the match and is re-emitted with it.
     $text = [regex]::Replace($text, '(?m)^(APP_URL|CORS_ALLOWED_ORIGINS)=.*$', {
         param($m) $m.Value -replace 'http://', 'https://'
@@ -3116,27 +3118,27 @@ function Set-CremindEnvSslMode {
     Set-CremindEnvKey -Path $Path -Key 'CREMIND_SSL' -Value $Mode
 }
 
-# ── ssl mode ──────────────────────────────────────────────────────────────
+# -- ssl mode --------------------------------------------------------------
 #
 # Resolve the TLS mode BEFORE the scheme decision below, because that
 # decision reads $env:CREMIND_SSL and every file written afterwards has to
 # agree with it. Setting the process variable is deliberately the whole
 # propagation mechanism: Get-CremindScheme reads it, ``docker compose``
 # interpolates it into the container, and the native path re-asserts it from
-# the .env it stamps — no call site below needs to know this block exists.
+# the .env it stamps - no call site below needs to know this block exists.
 #
 # Precedence, highest first:
 #
 #   1. -Ssl on the command line. ``none`` is a real answer, not "unset": it
 #      clears an inherited CREMIND_SSL so the opt-out can't be undone by a
 #      variable left in the shell.
-#   2. An inherited $env:CREMIND_SSL / certificate pair — the pre-flag
+#   2. An inherited $env:CREMIND_SSL / certificate pair - the pre-flag
 #      way of asking, still honoured.
 #   3. The previous install's choice. Docker regenerates its bundle every
 #      run, so the old docker\.env is read before it's overwritten; a native
 #      .env is kept as-is and carries itself. An install that predates this
 #      flag has no CREMIND_SSL line and reads as "http", which is what it
-#      was — upgrades never flip scheme behind the user's back.
+#      was - upgrades never flip scheme behind the user's back.
 #   4. Fresh installs use HTTP. Interactive installs offer Enable HTTPS,
 #      which selects after-setup; unattended installs require -Ssl to opt in.
 #      The TUI only asks for fresh installs, after the install mode is known.
@@ -3227,7 +3229,7 @@ if ($SslMode) {
     # An explicit ``none`` has to beat the environment, or Get-CremindScheme
     # still answers https from a leftover variable and the opt-out is a lie.
     if ($SslExplicit -and $env:CREMIND_SSL_CERTFILE) {
-        Write-Warn2 "-Ssl none: ignoring the inherited CREMIND_SSL_CERTFILE — this install serves plain HTTP."
+        Write-Warn2 "-Ssl none: ignoring the inherited CREMIND_SSL_CERTFILE - this install serves plain HTTP."
     }
     Remove-Item Env:CREMIND_SSL -ErrorAction SilentlyContinue
 }
@@ -3240,7 +3242,7 @@ if ($ResolvedSslKeyFile) { $env:CREMIND_SSL_KEYFILE = $ResolvedSslKeyFile }
 if ($ResolvedSslKeyFilePassword) { $env:CREMIND_SSL_KEYFILE_PASSWORD = $ResolvedSslKeyFilePassword }
 if ($ResolvedSslAutoHosts) { $env:CREMIND_SSL_AUTO_HOSTS = $ResolvedSslAutoHosts }
 
-# ── boot service ──────────────────────────────────────────────────────────
+# -- boot service ----------------------------------------------------------
 #
 # Whether to register a logon Scheduled Task that starts ``cremind serve`` and
 # restarts it when it exits. Resolved here, next to the ssl block, because
@@ -3286,7 +3288,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -eq 'electron') {
 }
 $BootMarker = if ($BootServiceOn) { 'enabled' } else { 'disabled' }
 
-# The scheme of the public origin, decided ONCE here — before the first
+# The scheme of the public origin, decided ONCE here - before the first
 # file is written. Everything the installer bakes a public URL into has to
 # agree with it, not just the closing banner: APP_URL feeds the A2A agent
 # card and the OAuth redirect derivation (the server logs a boot warning
@@ -3295,14 +3297,14 @@ $BootMarker = if ($BootServiceOn) { 'enabled' } else { 'disabled' }
 # copies both.
 #
 # No env file exists at this point, so the process environment is the only
-# thing that can carry the setting — which is exactly what the block above
-# just settled. Plain HTTP → 'http', and every file and line below is
+# thing that can carry the setting - which is exactly what the block above
+# just settled. Plain HTTP -> 'http', and every file and line below is
 # exactly what it was before TLS existed.
 $UrlScheme = Get-CremindScheme
 
 # 'custom' carries an operator-supplied public URL and CORS list rather
 # than a preset the installer composes. They're still written through
-# verbatim — except that TLS on the public origin makes an http:// origin
+# verbatim - except that TLS on the public origin makes an http:// origin
 # simply wrong: the listener speaks TLS, and a page served from an https
 # origin can't call an http:// API. Upgrade the scheme in place and keep
 # the host, port and path the operator picked.
@@ -3317,7 +3319,7 @@ if ($Deployment -eq 'custom' -and $UrlScheme -eq 'https') {
 # install modes. Get-CremindWizardTrustHintUrl turns it into the hand-off.
 $script:HostCaTrustFingerprint = ''
 
-# ── host-side CA trust ─────────────────────────────────────
+# -- host-side CA trust -------------------------------------
 #
 # The CA lives inside the container (Docker) or the pod (Kubernetes), where
 # nothing can reach the HOST's trust store - but this script runs on the host,
@@ -3344,9 +3346,9 @@ function Invoke-HostCaTrust {
         Invoke-WebRequest -UseBasicParsing -Uri $CaUrl -OutFile $CaTmp -TimeoutSec 10 | Out-Null
         $CaCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CaTmp)
     } catch {
-        # No local CA (operator certificate pair → /ca.pem 404s, and there
+        # No local CA (operator certificate pair -> /ca.pem 404s, and there
         # is genuinely nothing of ours to trust) or an untrusted https
-        # listener — either way the wizard step has it covered.
+        # listener - either way the wizard step has it covered.
         Write-Info "Skipping host CA trust ($($_.Exception.Message.Trim()))."
     }
     if ($CaCert) {
@@ -3402,7 +3404,7 @@ function Get-CremindWizardTrustHintUrl {
     return "${Url}?ca_trusted=$($script:HostCaTrustFingerprint)"
 }
 
-# ── docker install ────────────────────────────────────────────────────────
+# -- docker install --------------------------------------------------------
 
 # Random secret generator. ``RNGCryptoServiceProvider`` would be the
 # pedantically-correct choice, but ``Get-Random`` with a wide enough
@@ -3413,7 +3415,7 @@ function New-Secret {
 }
 
 function Remove-DesktopOnly {
-    # Strip the ``# >>> desktop-only >>>`` … ``# <<< desktop-only <<<`` marker
+    # Strip the ``# >>> desktop-only >>>`` ... ``# <<< desktop-only <<<`` marker
     # blocks (noVNC/VNC ports + VNC env) from a rendered template so a basic
     # (headless) install carries no dead VNC config. Operates on the single
     # multi-line string Get-TemplateContent returns; a line filter (not a
@@ -3432,13 +3434,13 @@ function Remove-DesktopOnly {
 function Resolve-CremindVersion {
     # Pick the CREMIND_VERSION tag to bake into the rendered docker .env.
     # Channel-driven:
-    #   production → -Version → -ElectronVersion → latest stable from PyPI JSON
-    #   test       → -Version → highest rcN matching -ElectronVersion line
+    #   production -> -Version -> -ElectronVersion -> latest stable from PyPI JSON
+    #   test       -> -Version -> highest rcN matching -ElectronVersion line
     #                from Test PyPI's simple index
-    #   dev        → literal 'dev'; the docker-compose.override.yml
+    #   dev        -> literal 'dev'; the docker-compose.override.yml
     #                rebuilds locally and re-tags so the value is only
     #                a cosmetic image label
-    # Hard-fails on network errors for prod / test — the previous
+    # Hard-fails on network errors for prod / test - the previous
     # 'main' fallback silently mis-tagged the image and masked the
     # failure behind ``docker compose up --build``.
 
@@ -3491,7 +3493,7 @@ function Resolve-CremindVersion {
             $v = Resolve-CremindWheel -IndexBody $indexBody -ResolveChannel 'test' -Line $ElectronVersion -Emit 'version'
             if (-not $v) {
                 if ($ElectronVersion) {
-                    Write-Err2 "No cremind wheel matching ${ElectronVersion}rcN[.devM] found at https://test.pypi.org/simple/cremind/ — has a test prerelease been published for this Electron build?"
+                    Write-Err2 "No cremind wheel matching ${ElectronVersion}rcN[.devM] found at https://test.pypi.org/simple/cremind/ - has a test prerelease been published for this Electron build?"
                 } else {
                     Write-Err2 "No cremind wheel found at https://test.pypi.org/simple/cremind/"
                 }
@@ -3510,7 +3512,7 @@ function Resolve-CremindVersion {
     exit 1
 }
 
-# ── kubernetes install ────────────────────────────────────────────────────
+# -- kubernetes install ----------------------------------------------------
 #
 # Installs the Cremind Helm chart into the kubeconfig context the operator
 # chose. Nothing about this install is ambient: every helm and kubectl call
@@ -3600,7 +3602,7 @@ if ($Mode -eq 'kubernetes') {
     }
     Write-Ok "Cluster reachable."
 
-    # ── version + chart reference ─────────────────────────────────────────
+    # -- version + chart reference -----------------------------------------
     #
     # The image tag is a PEP 440 version (0.0.17rc13.dev1); the chart version
     # is its SemVer2 spelling (0.0.17-rc.13.dev.1). One release, two
@@ -3693,7 +3695,7 @@ if ($Mode -eq 'kubernetes') {
         }
     }
 
-    # ── Postgres password ─────────────────────────────────────────────────
+    # -- Postgres password -------------------------------------------------
     #
     # Pinned rather than left to the subchart's generator, because the
     # generated one lives only in a Secret: uninstall + reinstall regenerates
@@ -3765,7 +3767,7 @@ if ($Mode -eq 'kubernetes') {
         }
     }
 
-    # ── VNC password ──────────────────────────────────────────────────────
+    # -- VNC password ------------------------------------------------------
     $VncPwd = ''
     $VncGenerated = $false
     if ($DesktopUi -ne '0') {
@@ -3778,7 +3780,7 @@ if ($Mode -eq 'kubernetes') {
         }
     }
 
-    # ── app URL ───────────────────────────────────────────────────────────
+    # -- app URL -----------------------------------------------------------
     #
     # Left unset unless the operator named one: the chart derives
     # http://localhost:1515 (or https:// under cremind.ssl) by itself, which
@@ -3811,7 +3813,7 @@ if ($Mode -eq 'kubernetes') {
         exit 2
     }
 
-    # ── values the installer owns ─────────────────────────────────────────
+    # -- values the installer owns -----------------------------------------
     #
     # Rendered into a values file rather than a wall of --set arguments. Same
     # manifests either way, but: helm's --set parser treats commas as
@@ -3860,7 +3862,7 @@ if ($Mode -eq 'kubernetes') {
     Write-Info "Writing $K8sValuesFile"
     Write-Utf8NoBomFile -Path $K8sValuesFile -Content (($valuesLines -join "`n") + "`n")
 
-    # ── install ───────────────────────────────────────────────────────────
+    # -- install -----------------------------------------------------------
     #
     # No --wait (it hides a Pending Postgres volume behind a generic timeout),
     # no --atomic (a rollback on a slow first image pull would delete the
@@ -3911,7 +3913,7 @@ if ($Mode -eq 'kubernetes') {
     }
     Write-Ok "Chart installed."
 
-    # ── names ─────────────────────────────────────────────────────────────
+    # -- names -------------------------------------------------------------
     #
     # Ask the cluster rather than recomputing the chart's fullname rule: an
     # operator's nameOverride/fullnameOverride in -K8sExtraSet would otherwise
@@ -3924,7 +3926,7 @@ if ($Mode -eq 'kubernetes') {
         $HelmFullname = if ($HelmRelease -like '*cremind*') { $HelmRelease } else { "$HelmRelease-cremind" }
     }
 
-    # ── wait for the rollout ──────────────────────────────────────────────
+    # -- wait for the rollout ----------------------------------------------
     if (-not $K8sExternalPg) {
         $pgSts = (Invoke-KubectlNs -KubectlArgs @(
             'get', 'statefulset',
@@ -3958,7 +3960,7 @@ if ($Mode -eq 'kubernetes') {
     }
     Write-Ok "Cremind is running."
 
-    # ── how it is reached ─────────────────────────────────────────────────
+    # -- how it is reached -------------------------------------------------
     #
     # 1515 is the app, 1455 the transient Codex OAuth callback, 6080 noVNC -
     # the last only when the desktop image runs without the L7 proxy, which is
@@ -3971,7 +3973,7 @@ if ($Mode -eq 'kubernetes') {
     $K8sNovncUrl = (Invoke-KubectlNs -KubectlArgs @('get', 'configmap', "$HelmFullname-env", '-o', 'jsonpath={.data.CREMIND_NOVNC_URL}')).Stdout.Trim()
     $K8sPodAppUrl = (Invoke-KubectlNs -KubectlArgs @('get', 'configmap', "$HelmFullname-env", '-o', 'jsonpath={.data.APP_URL}')).Stdout.Trim()
 
-    # ── port-forward ──────────────────────────────────────────────────────
+    # -- port-forward ------------------------------------------------------
     #
     # Started in the background so the wizard is reachable the moment this
     # script ends. An ingress install has a real address and needs none.
@@ -4022,7 +4024,7 @@ if ($Mode -eq 'kubernetes') {
         }
     }
 
-    # ── health ────────────────────────────────────────────────────────────
+    # -- health ------------------------------------------------------------
     $BootScheme = Get-CremindBootScheme
     $K8sHealthOk = $false
     if ($PfRunning) {
@@ -4039,13 +4041,13 @@ if ($Mode -eq 'kubernetes') {
         }
     }
 
-    # ── CA trust ──────────────────────────────────────────────────────────
+    # -- CA trust ----------------------------------------------------------
     if ($PfRunning -and $K8sHealthOk -and $UrlScheme -eq 'https' -and -not $Unattended `
         -and $env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
         Invoke-HostCaTrust -CaUrl "${BootScheme}://localhost:1515/ca.pem"
     }
 
-    # ── state ─────────────────────────────────────────────────────────────
+    # -- state -------------------------------------------------------------
     #
     # What a re-run and an uninstall need. Read line by line, never
     # dot-sourced: it carries two secrets and free-form --set text.
@@ -4132,7 +4134,7 @@ if ($Mode -eq 'kubernetes') {
     $K8sCredsFile = Join-Path $CremindInstallDir 'credentials.toml'
     Write-Utf8NoBomFile -Path $K8sCredsFile -Content (($credLines -join "`n") + "`n")
 
-    # ── handoff ───────────────────────────────────────────────────────────
+    # -- handoff -----------------------------------------------------------
     $K8sWizardUrl = Get-CremindWizardTrustHintUrl "${BootScheme}://localhost:1515/#/setup"
     if ($K8sIngress -and $K8sPodAppUrl) {
         # No hand-off under an ingress: the trust we just offered was for the
@@ -4189,14 +4191,14 @@ if ($Mode -eq 'docker') {
     $EnvDocker   = Join-Path $DockerDir '.env'
 
     # Sidecar services (postgres / qdrant / chroma) are no longer
-    # provisioned here — the Setup Wizard activates each one on demand
+    # provisioned here - the Setup Wizard activates each one on demand
     # via its own per-service deployment-mode picker.
     #
     # Bundle regeneration is unconditional. Channel-dependent fields
     # (CREMIND_VERSION, CREMIND_UPGRADE_CHANNEL, CREMIND_PIP_INDEX_URL) all
     # drift if the .env is reused across runs, and a previous-channel
     # docker-compose.override.yml silently keeps a stale ``build:``
-    # context alive on dev→test/prod switches. Regenerating from
+    # context alive on dev->test/prod switches. Regenerating from
     # templates on every run is the only way to keep state honest.
     # VNC_PASSWORD is the one true secret here, and it is deliberately NOT
     # re-rolled: it is carried over from the previous .env (see the
@@ -4216,8 +4218,8 @@ if ($Mode -eq 'docker') {
     } else {
         $ImageRepo   = 'cremind/cremind-desktop'
         $BuildTarget = 'desktop'
-        # Precedence: what the operator chose (flag or prompt) → what the
-        # previous install used → a fresh secret. The middle step is what
+        # Precedence: what the operator chose (flag or prompt) -> what the
+        # previous install used -> a fresh secret. The middle step is what
         # keeps a re-run from silently rotating a password the user picked
         # and wrote down.
         $VncPwd = if ($VncPassword) { $VncPassword }
@@ -4226,8 +4228,8 @@ if ($Mode -eq 'docker') {
     }
     $CremindVer   = Resolve-CremindVersion
 
-    # $UrlScheme (decided before anything was written) — not a literal
-    # http:// — so the .env, the credentials.toml built from these two
+    # $UrlScheme (decided before anything was written) - not a literal
+    # http:// - so the .env, the credentials.toml built from these two
     # variables, and the closing banner all name the same origin.
     switch ($Deployment) {
         'local' {
@@ -4256,7 +4258,7 @@ if ($Mode -eq 'docker') {
 
     Write-Info "Fetching docker-compose template"
     # The cremind container's /root/.cremind lives in the ``cremind-data``
-    # named Docker volume — isolated from the host. No path substitution
+    # named Docker volume - isolated from the host. No path substitution
     # needed at render time; the volume is declared in the template's
     # ``volumes:`` block.
     $composeContent = Get-TemplateContent 'docker-compose.yml.tmpl'
@@ -4286,7 +4288,7 @@ if ($Mode -eq 'docker') {
 
     # Stamp the channel into docker.env so the running container's
     # upgrader and feature installer see it. Without this, dev images
-    # fall back to ``production`` semantics at runtime — which makes
+    # fall back to ``production`` semantics at runtime - which makes
     # ``pip_spec()`` pin to ``cremind==<version>`` and look up PyPI
     # for a release that may not be published yet during release prep.
     Add-Content -Path $EnvDocker -Value "CREMIND_UPGRADE_CHANNEL=$Channel" -Encoding utf8
@@ -4311,14 +4313,14 @@ if ($Mode -eq 'docker') {
         Add-Content -Path $EnvDocker -Value "CREMIND_SSL_KEYFILE_PASSWORD=$ResolvedSslKeyFilePassword" -Encoding utf8
     }
     # Generated certificates cover localhost, the container's hostname and its
-    # detected IPs — none of which is the name a server deployment is reached
+    # detected IPs - none of which is the name a server deployment is reached
     # by. Mirrors the commented AUTO_HOSTS pairs in server.env.tmpl.
     if ($ResolvedSslAutoHosts) {
         Add-Content -Path $EnvDocker -Value "CREMIND_SSL_AUTO_HOSTS=$ResolvedSslAutoHosts" -Encoding utf8
     } elseif ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
         Add-Content -Path $EnvDocker -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
     }
-    # The documents folder resolved in ── documents folder ── above, which
+    # The documents folder resolved in -- documents folder -- above, which
     # compose binds at /root/Documents. Appended like the TLS lines, never
     # -replace'd into a template placeholder: -replace treats its replacement
     # as a substitution pattern, and a free-text path should reach the file
@@ -4349,7 +4351,7 @@ if ($Mode -eq 'docker') {
     # build context at the local checkout, switches the pip install
     # to ``-e /src``, and bind-mounts the checkout for runtime
     # imports. Compose auto-merges this when running from $DockerDir.
-    # Backslashes are converted to forward slashes — Docker Desktop
+    # Backslashes are converted to forward slashes - Docker Desktop
     # accepts either, and forward slashes keep the YAML readable.
     #
     # Non-dev channels must remove any previously-written override:
@@ -4373,12 +4375,12 @@ if ($Mode -eq 'docker') {
     # ``docker compose`` resolves ``${VAR}`` from the invoking shell BEFORE the
     # sibling .env, and this script runs inside the operator's own PowerShell
     # (``iwr | iex``, ``.\install.ps1``): whatever that session carries, compose
-    # sees. INSTALL_MODE is the one interpolated name that is a constant here —
-    # this branch IS the Docker install — and a session that ran the native
+    # sees. INSTALL_MODE is the one interpolated name that is a constant here -
+    # this branch IS the Docker install - and a session that ran the native
     # ``cremind`` shim, or a native install, earlier carries
     # ``INSTALL_MODE=native`` (both used to load ~\.cremind\.env into the
     # session and never remove it). The compose file rendered above pins the
-    # literal, so this guards an OLD compose file — and it cleans the session,
+    # literal, so this guards an OLD compose file - and it cleans the session,
     # so the ``docker compose up -d`` the closing banner suggests starts clean
     # too. Not restored, on purpose. The CREMIND_SSL* variables are the opposite
     # case and stay: they are how the resolved TLS mode reaches compose (see the
@@ -4399,14 +4401,14 @@ if ($Mode -eq 'docker') {
     }
 
     # Per-channel pull / build strategy:
-    #   production / test → pull the pre-built image from Docker Hub
+    #   production / test -> pull the pre-built image from Docker Hub
     #                       and refuse to fall back to a local build.
     #                       The main compose template has no ``build:``
     #                       section, so a missing tag fails hard at
     #                       ``compose pull`` with a clear error rather
     #                       than silently rebuilding off the user's
     #                       checkout.
-    #   dev               → the docker-compose.override.yml re-adds a
+    #   dev               -> the docker-compose.override.yml re-adds a
     #                       ``build:`` section pointing at the local
     #                       checkout. ``compose pull`` is best-effort
     #                       (the dev image isn't published), and
@@ -4429,7 +4431,7 @@ if ($Mode -eq 'docker') {
             Write-Info "Pulling ${ImageRepo}:$CremindVer and sidecar images from Docker Hub"
             # Docker Hub's CDN drops large layer downloads mid-transfer with
             # an EOF more often than you'd like. Docker caches completed
-            # layers, so a retry resumes where the last attempt died — a
+            # layers, so a retry resumes where the last attempt died - a
             # bounded loop turns a transient CDN hiccup into a non-event. A
             # genuinely-missing tag (manifest unknown) can't be fixed by
             # retrying, so bail out of the loop early in that case.
@@ -4437,21 +4439,21 @@ if ($Mode -eq 'docker') {
             $pulled = $false
             for ($attempt = 1; $attempt -le $maxPullAttempts; $attempt++) {
                 if ($attempt -gt 1) {
-                    Write-Info "Retrying image pull (attempt $attempt/$maxPullAttempts)…"
+                    Write-Info "Retrying image pull (attempt $attempt/$maxPullAttempts)..."
                     Start-Sleep -Seconds 5
                 }
                 Invoke-NativeLogged { & docker compose pull }
                 if ($LASTEXITCODE -eq 0) { $pulled = $true; break }
                 $recent = (Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
                 if ($recent -match 'manifest unknown|not found|repository does not exist|manifest for .* not found') {
-                    throw "docker compose pull failed — ${ImageRepo}:$CremindVer is not on Docker Hub. Check the version/tag, or wait for the release to finish publishing (see $LogFile)."
+                    throw "docker compose pull failed - ${ImageRepo}:$CremindVer is not on Docker Hub. Check the version/tag, or wait for the release to finish publishing (see $LogFile)."
                 }
             }
             if (-not $pulled) {
                 throw @"
 docker compose pull failed after $maxPullAttempts attempts.
 The image is published, but layer downloads from Docker Hub's CDN kept
-dropping (look for 'EOF' / 'failed to copy' in $LogFile) — a network issue,
+dropping (look for 'EOF' / 'failed to copy' in $LogFile) - a network issue,
 not a missing image. Things that help:
   - Re-run this installer; Docker caches completed layers and resumes.
   - Pull directly, repeating until it finishes:
@@ -4460,7 +4462,7 @@ not a missing image. Things that help:
       "max-concurrent-downloads": 1
     then Apply & Restart and re-run. (Most effective when one big layer
     keeps getting cut.)
-  - If you're on a VPN or corporate proxy, try again off it — those often
+  - If you're on a VPN or corporate proxy, try again off it - those often
     truncate long CDN transfers.
 "@
             }
@@ -4477,7 +4479,7 @@ not a missing image. Things that help:
     if ($Deployment -eq 'local') {
         $HealthHost = 'localhost'
     } elseif ($Deployment -eq 'custom') {
-        # http://foo.bar:1515 → foo.bar
+        # http://foo.bar:1515 -> foo.bar
         $HealthHost = $CustomValues['public_url']
         if ($HealthHost -match '^https?://([^:/]+)') { $HealthHost = $Matches[1] }
         if (-not $HealthHost) { $HealthHost = 'localhost' }
@@ -4486,7 +4488,7 @@ not a missing image. Things that help:
     }
     # Docker publishes only the single public port (1515); probe it on the
     # host. That port is the public origin, so its scheme follows the
-    # container's CREMIND_SSL* settings — which compose reads from the .env
+    # container's CREMIND_SSL* settings - which compose reads from the .env
     # we just wrote. Re-checked against that file, but only when the
     # environment hasn't already settled it: the environment won when
     # $UrlScheme was decided, so this can never downgrade https to http and
@@ -4495,13 +4497,13 @@ not a missing image. Things that help:
         $UrlScheme = Get-CremindScheme -EnvPath $EnvDocker
     }
     # What the container is serving THIS MINUTE. Same inputs, but
-    # CREMIND_SSL=after-setup answers http until the wizard finishes — probing
+    # CREMIND_SSL=after-setup answers http until the wizard finishes - probing
     # https there would hang the health gate against a plaintext listener and
     # fail the install. $UrlScheme above stays the steady state, because the
     # URLs already written into .env describe the whole life of the install.
     #
     # Under after-setup the answer flips once the wizard has run, and the
-    # marker it flips on — bootstrap.toml — lives INSIDE the container's
+    # marker it flips on - bootstrap.toml - lives INSIDE the container's
     # cremind-data volume, where the host cannot see it. So a re-install of an
     # already-set-up install can't infer the phase; it has to ask. Probe both
     # candidates and believe whichever answers: that is the listener, whatever
@@ -4516,7 +4518,7 @@ not a missing image. Things that help:
         foreach ($candidate in $BootCandidates) {
             if (Test-CremindHealth -Url "${candidate}://${HealthHost}:1515/health") {
                 if ($candidate -ne $BootScheme) {
-                    Write-Info "Backend answered on ${candidate}:// — setup has already been completed on this install."
+                    Write-Info "Backend answered on ${candidate}:// - setup has already been completed on this install."
                     $BootScheme = $candidate
                 }
                 Write-Ok "Backend is up"
@@ -4531,17 +4533,17 @@ not a missing image. Things that help:
     # wizard. The banner below says so instead of pointing at a CA download.
     $SslDeferred = ($UrlScheme -eq 'https' -and $BootScheme -eq 'http')
 
-    # ── host-side CA trust ────────────────────────────────────────────────
+    # -- host-side CA trust ------------------------------------------------
     # The CA lives inside the container, where nothing can reach the HOST's
-    # trust store — but this script runs on the host, so it can. This is the
+    # trust store - but this script runs on the host, so it can. This is the
     # Docker counterpart of the wizard's one-click trust (which the server
     # can only offer on native installs): download /ca.pem from the running
     # container and offer to add it to the current user's Trusted Root store.
-    # Declining is fine — the wizard's "Secure this install" step shows the
+    # Declining is fine - the wizard's "Secure this install" step shows the
     # manual command, and every OTHER device needs that path anyway.
     #
     # Both listener phases serve /ca.pem: under after-setup it is plain http,
-    # and a finished install answers https — which Invoke-WebRequest accepts
+    # and a finished install answers https - which Invoke-WebRequest accepts
     # via Schannel exactly when this host already trusts the CA from a
     # previous run (and then the thumbprint check below skips the prompt).
     # A host that never trusted it gets a failed download and a pointer, not
@@ -4550,11 +4552,11 @@ not a missing image. Things that help:
         Invoke-HostCaTrust -CaUrl "${BootScheme}://${HealthHost}:1515/ca.pem"
     }
 
-    # Suppress the human-handoff block when the Electron app is driving —
+    # Suppress the human-handoff block when the Electron app is driving -
     # it navigates to the in-window wizard via vue-router and a "Wizard
     # URL: ..." instruction would mislead the user.
     # The wizard runs against the listener that exists now, so this URL is
-    # $BootScheme — under after-setup an https link here would simply not
+    # $BootScheme - under after-setup an https link here would simply not
     # open. It becomes https on its own once the wizard restarts the server.
     $WizardUrl = "${BootScheme}://${HealthHost}:1515/#/setup"
     # Hand the trust off only for a loopback address, i.e. the very machine
@@ -4579,15 +4581,15 @@ Open this URL in your browser to continue setup:
         if ($SslDeferred) {
             # after-setup: nothing to trust out of band, and pointing at
             # /ca.pem here would only duplicate what the wizard is about to
-            # walk the user through — on a page that has no warning to explain.
-            Write-Host "  Starts on http:// — the Setup Wizard walks you through trusting the certificate, then switches to https:// with no warning."
+            # walk the user through - on a page that has no warning to explain.
+            Write-Host "  Starts on http:// - the Setup Wizard walks you through trusting the certificate, then switches to https:// with no warning."
         }
         # With CREMIND_SSL=auto the certificate is signed by a CA generated
-        # for this install, which no browser knows yet — say so here rather
+        # for this install, which no browser knows yet - say so here rather
         # than letting the interstitial be the user's first surprise.
         elseif ($UrlScheme -eq 'https') {
             # The CA lives inside the container, and a Docker install puts no
-            # cremind CLI on the host — so point at the download, which every
+            # cremind CLI on the host - so point at the download, which every
             # device can reach, rather than a command that isn't there.
             Write-Host "  Browsers warn until you trust the local CA (one-time per device)."
             Write-Host "  Download it:  curl.exe -k -o cremind-ca.pem ${UrlScheme}://${HealthHost}:1515/ca.pem"
@@ -4625,10 +4627,10 @@ Open this URL in your browser to continue setup:
     # The Electron app's reconcileInstallStateWithDisk() detects a Docker
     # install via $DockerDir\.env (the compose env file written above),
     # so no host-side marker in $CremindSystemDir is required. Docker
-    # installs leave the host's ~\.cremind untouched — runtime state
+    # installs leave the host's ~\.cremind untouched - runtime state
     # lives in the cremind-data named volume.
 
-    # Consolidated post-install credentials file — see
+    # Consolidated post-install credentials file - see
     # app/config/credentials_file.py for the canonical Python writer
     # the Setup Wizard calls to refresh this on Postgres provisioning.
     $CredsFile = Join-Path $CremindInstallDir 'credentials.toml'
@@ -4692,7 +4694,7 @@ resolution = "$CredsResolution"
     exit 0
 }
 
-# ── native install ────────────────────────────────────────────────────────
+# -- native install --------------------------------------------------------
 
 # (Reaching here implies Mode = native. The Docker path exited above.)
 
@@ -4700,7 +4702,7 @@ resolution = "$CredsResolution"
 # tokens\, profile dirs) under the System Dir, so create it now.
 if (-not (Test-Path $CremindSystemDir)) { New-Item -ItemType Directory -Path $CremindSystemDir | Out-Null }
 
-# Advisory only — Node is needed by the WhatsApp/Zalo channel sidecars, which
+# Advisory only - Node is needed by the WhatsApp/Zalo channel sidecars, which
 # are optional and off by default, so a missing (or too old) Node must never
 # block the install. Docker installs skip this: their image bundles Node 22.
 $NodeMajor = $null
@@ -4835,7 +4837,7 @@ if (-not $Python -and $Channel -ne 'dev') {
     Install-PythonViaUv
 }
 
-# ── existing install detection ────────────────────────────────────────────
+# -- existing install detection --------------------------------------------
 
 Write-Step "Install"
 
@@ -4880,7 +4882,7 @@ if ($Channel -eq 'dev') {
     # rationale in the bash installer); production uses the bare
     # package name.
     #
-    # The bare ``cremind`` install is intentionally thin — it ships only
+    # The bare ``cremind`` install is intentionally thin - it ships only
     # the core deps the server + Setup Wizard + SQLite need. Optional
     # feature groups (vector embedding, vector stores, browser, channels,
     # LLM SDKs, postgres) are installed on demand by ``app/features/``
@@ -4890,7 +4892,7 @@ if ($Channel -eq 'dev') {
     $InstallSourceLabel = ''
     switch ($Channel) {
         'production' {
-            # Pin order: -Version → -ElectronVersion → bare ``cremind``
+            # Pin order: -Version -> -ElectronVersion -> bare ``cremind``
             # (CLI users running install.ps1 directly).
             if ($Version) {
                 $InstallSpec = "cremind==$Version"
@@ -4925,9 +4927,9 @@ if ($Channel -eq 'dev') {
             }
             if (-not $InstallSpec) {
                 if ($Version) {
-                    Write-Err2 "No cremind-$Version-py3-none-any.whl found at https://test.pypi.org/simple/cremind/ — has this version been published?"
+                    Write-Err2 "No cremind-$Version-py3-none-any.whl found at https://test.pypi.org/simple/cremind/ - has this version been published?"
                 } elseif ($ElectronVersion) {
-                    Write-Err2 "No cremind-${ElectronVersion}rc*-py3-none-any.whl found at https://test.pypi.org/simple/cremind/ — has a test prerelease been published for this Electron build?"
+                    Write-Err2 "No cremind-${ElectronVersion}rc*-py3-none-any.whl found at https://test.pypi.org/simple/cremind/ - has a test prerelease been published for this Electron build?"
                 } else {
                     Write-Err2 "No cremind wheel found at https://test.pypi.org/simple/cremind/"
                 }
@@ -4962,7 +4964,7 @@ if ($Channel -eq 'dev') {
     if ($RuntimeKept) {
         # nothing to install
     } elseif (Test-Path $VenvDir) {
-        Write-Info "Existing install detected at $VenvDir — upgrading in place."
+        Write-Info "Existing install detected at $VenvDir - upgrading in place."
         Invoke-NativeLogged { & $VenvPip install --upgrade pip }
         Invoke-NativeLogged { & $VenvPip install --upgrade $InstallSpec }
         if ($LASTEXITCODE -ne 0) {
@@ -5021,7 +5023,7 @@ if ($RuntimeOnly) {
     exit 0
 }
 
-# ── shim & PATH ───────────────────────────────────────────────────────────
+# -- shim & PATH -----------------------------------------------------------
 
 # Drop a small wrapper into $BinDir so a single, stable path on PATH
 # points at the venv's cremind.exe even after re-installs. In dev mode
@@ -5033,7 +5035,7 @@ if ($RuntimeOnly) {
 # in the app does: app/config/settings.py resolves its dotenv path relative
 # to the working directory, so a ``cremind serve`` typed in an arbitrary
 # folder sees none of the install's settings. That gap is invisible for a
-# local install (the defaults match the template) right up until it isn't —
+# local install (the defaults match the template) right up until it isn't -
 # under CREMIND_SSL=after-setup the wizard asks the operator to restart the
 # server by hand, and a restart that dropped CREMIND_SSL would come back on
 # plain HTTP and strand the wizard waiting for an https origin that never
@@ -5085,7 +5087,7 @@ $CremindPs1Body = @'
 # The removal is not optional. A .ps1 on PATH runs INSIDE the calling
 # PowerShell and the Env: provider is process-wide, so without it every
 # ``cremind`` left INSTALL_MODE, APP_URL, CREMIND_SSL, ... behind in the
-# session — and a later ``docker compose up -d`` there (compose reads the shell
+# session - and a later ``docker compose up -d`` there (compose reads the shell
 # before the project's .env) baked a native install's INSTALL_MODE=native into
 # a Docker container, which then showed the wrong HTTPS runbook and could not
 # switch itself.
@@ -5170,7 +5172,7 @@ if ($NoModifyPath) {
     Add-CremindPathEntry
 }
 
-# ── env file ──────────────────────────────────────────────────────────────
+# -- env file --------------------------------------------------------------
 
 if (-not (Test-Path $EnvFile)) {
     Write-Info "Generating $EnvFile"
@@ -5199,7 +5201,7 @@ if (-not (Test-Path $EnvFile)) {
         }
     }
     # TLS moves the public origin to https://, so APP_URL and
-    # CORS_ALLOWED_ORIGINS have to move with it — the local/server
+    # CORS_ALLOWED_ORIGINS have to move with it - the local/server
     # templates hard-code http://. No-op on a plain-HTTP install. Inside
     # the "file didn't exist" branch on purpose: a .env we're reusing is
     # the user's, and the installer doesn't rewrite it.
@@ -5212,7 +5214,7 @@ if (-not (Test-Path $EnvFile)) {
     }
     # Stamp the resolved TLS mode. This is what makes the choice outlive the
     # installing shell: the server start below copies this file into Env:, and
-    # the ``cremind`` shim does the same for every later run — including the
+    # the ``cremind`` shim does the same for every later run - including the
     # manual restart the wizard asks for under after-setup. Plain HTTP writes
     # nothing, leaving a fresh .env exactly as the template shipped it.
     if ($SslMode) {
@@ -5236,15 +5238,15 @@ if (-not (Test-Path $EnvFile)) {
         Add-Content -Path $EnvFile -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
     }
     # Record the boot-service choice so a re-install doesn't silently undo an
-    # opt-out. Nothing in the app reads this key — only the block above does.
+    # opt-out. Nothing in the app reads this key - only the block above does.
     Add-Content -Path $EnvFile -Value "CREMIND_BOOT_SERVICE=$BootMarker" -Encoding utf8
     Write-Ok "Wrote $EnvFile"
 } else {
-    Write-Info ".env already exists — keeping it. Edit $EnvFile if you need to."
+    Write-Info ".env already exists - keeping it. Edit $EnvFile if you need to."
     # ...with one exception: an explicit -Ssl is an instruction about THIS
     # install, and silently losing it to a stale line in a kept file would
     # make the flag a no-op on every re-install. Only an explicit flag
-    # reaches here — the resolution above already carried an unflagged
+    # reaches here - the resolution above already carried an unflagged
     # re-install's previous choice forward from this same file.
     if ($SslExplicit -or $SslEnvironmentExplicit) {
         Set-CremindEnvSslMode -Path $EnvFile -Mode $SslMode
@@ -5298,7 +5300,7 @@ switch ($Channel) {
         # the developer's checkout already satisfies the requirement, and
         # pinning to a release that hasn't been published to PyPI yet
         # fails at install time). ``cremind upgrade`` itself is still a
-        # footgun in dev — the dev path is ``git pull`` — but the
+        # footgun in dev - the dev path is ``git pull`` - but the
         # upgrader's no-op behavior on dev is preferable to it silently
         # treating dev as production.
         if (-not (Select-String -Path $EnvFile -Pattern '^CREMIND_UPGRADE_CHANNEL=' -Quiet)) {
@@ -5308,7 +5310,7 @@ switch ($Channel) {
         # so ``npm run dev`` (Vite at localhost:5173) and other ad-hoc dev
         # origins work without preflight failures. Idempotent: skip if
         # already wildcarded so re-runs don't churn the file. ``-Encoding
-        # utf8`` is critical on both read and write — Windows PowerShell
+        # utf8`` is critical on both read and write - Windows PowerShell
         # 5.1's default ``Get-Content`` decodes BOM-less UTF-8 as cp1252,
         # which would corrupt non-ASCII characters (em-dashes, etc.) on
         # roundtrip.
@@ -5320,10 +5322,10 @@ switch ($Channel) {
     }
 }
 
-# ── bootstrap.toml (DB selection) ─────────────────────────────────────────
+# -- bootstrap.toml (DB selection) -----------------------------------------
 
 # Skip the default-SQLite bootstrap.toml when the Electron app is driving
-# — the Setup Wizard will write the file once the user picks a backend,
+# - the Setup Wizard will write the file once the user picks a backend,
 # and the backend boots in deferred-storage mode until then so no DB is
 # materialised under $CremindSystemDir\storage before the user has chosen.
 # Native installs (curl | sh, no Electron) get the SQLite default here,
@@ -5333,7 +5335,7 @@ switch ($Channel) {
 # after-setup skips it for a different reason: bootstrap.toml existing is
 # precisely what the server reads as "setup is done, serve TLS now"
 # (app/config/tls_mode.py). Writing one here would collapse after-setup into
-# ``auto`` — the wizard's very first page would sit behind a certificate no
+# ``auto`` - the wizard's very first page would sit behind a certificate no
 # browser trusts yet, which is the one thing this mode exists to prevent. So
 # the file is left to the wizard, exactly as under Docker and Kubernetes, and
 # the server boots in deferred-storage mode until then.
@@ -5352,9 +5354,9 @@ db_provider = "sqlite"
     }
 }
 
-# ── credentials.toml (consolidated connect info) ──────────────────────────
+# -- credentials.toml (consolidated connect info) --------------------------
 #
-# Native installs have no VNC desktop — only [app] (and optionally
+# Native installs have no VNC desktop - only [app] (and optionally
 # [postgres] once the wizard provisions it). The Python writer at
 # app/config/credentials_file.py re-emits this file on every wizard
 # service provision.
@@ -5397,10 +5399,10 @@ setup_wizard_env = "$CredsWizardEnv"
 "@
 Write-Utf8NoBomFile -Path $CredsFile -Content $credsText
 
-# ── migrate ───────────────────────────────────────────────────────────────
+# -- migrate ---------------------------------------------------------------
 
 # Skip Alembic's ``upgrade head`` (and therefore creating the SQLite DB
-# file) when the Electron app is driving — the app starts the backend
+# file) when the Electron app is driving - the app starts the backend
 # only after the user clicks "Continue to Setup Wizard", and the backend
 # is what eventually creates the DB. Keeping this here means a stray
 # $CremindSystemDir\storage\cremind.db never shows up between the installer
@@ -5416,7 +5418,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and
     # Both results are checked, because this step used to report success for a
     # database it had never touched: ``Invoke-NativeLogged`` sends the migration's
     # own output to the log file, and an unreadable revision was printed as a
-    # bare "?" — which is what a server that cannot start looks like, one line
+    # bare "?" - which is what a server that cannot start looks like, one line
     # before it fails to start. ``cremind serve`` runs the same migrations, so
     # there is nothing to gain by continuing past a failure here.
     Invoke-NativeLogged { & $VenvCremind db upgrade }
@@ -5426,7 +5428,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and
     }
     # ``2>$null`` on a native command is what makes Windows PowerShell 5.1
     # materialise each stderr line as a NativeCommandError, and under
-    # ``$ErrorActionPreference = 'Stop'`` that terminates — on success. Cremind
+    # ``$ErrorActionPreference = 'Stop'`` that terminates - on success. Cremind
     # logs its startup lines to stderr, so the revision read threw on every
     # healthy install and was reported as the unreadable "?" this replaces.
     $Revision = ''
@@ -5442,16 +5444,16 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and
     }
 }
 
-# ── start the server ──────────────────────────────────────────────────────
+# -- start the server ------------------------------------------------------
 
 # Declared out here so the wizard handoff and the session restore can read them
-# under Set-StrictMode even on the paths that never reach the block below — the
+# under Set-StrictMode even on the paths that never reach the block below - the
 # Electron frontend skips it, and a restore reading an unset variable would end
 # an otherwise successful install with a terminating error.
 $BootRegistered = $false
 $SessionEnvBefore = @{}
 
-# Skip starting ``cremind serve`` when the Electron app is driving —
+# Skip starting ``cremind serve`` when the Electron app is driving -
 # the app spawns the backend itself once the user clicks Continue, and
 # that's also when the SQLite DB is created.
 if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
@@ -5491,7 +5493,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     # The PID is checked against the install before anything is killed:
     # install.pid outlives the process it names and Windows recycles PIDs, so
     # an unguarded Stop-Process could take out whatever unrelated program
-    # holds the number now. Refusing is always safe — the caller falls back to
+    # holds the number now. Refusing is always safe - the caller falls back to
     # registering the service without starting it.
     function Stop-CremindInstallerServer {
         param([Parameter(Mandatory)][int] $ServerPid)
@@ -5512,7 +5514,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
             if (-not $proc.HasExited) { return $false }
         }
         # Ask the HANDLE, not the PID. A process stays enumerable by PID while
-        # any handle to it is open — and $proc is one — so ``Get-Process -Id``
+        # any handle to it is open - and $proc is one - so ``Get-Process -Id``
         # keeps answering for a process that has already exited, reading a
         # successful stop as a failure. The caller gates the fallback spawn on
         # this answer, so that lie ends the install with nothing serving at
@@ -5527,7 +5529,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     $running = $false
     # PID of an unsupervised server left behind by an EARLIER run of this
     # installer. ``install.pid`` is written by the fallback spawn below and by
-    # nothing else, so a live PID in it means "ours, and unsupervised" — the
+    # nothing else, so a live PID in it means "ours, and unsupervised" - the
     # one server we may stop to hand its port to the boot service.
     $OurServerPid = 0
     if (Test-Path $PidFile) {
@@ -5548,11 +5550,11 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     # PORT is the INTERNAL api port, which stays plain HTTP even when
     # CREMIND_SSL puts TLS on the public origin (server.py keeps the
     # loopback bind on uvicorn without a cert, for the CLI and the skills).
-    # So this probe — and the one below — must NOT follow Get-CremindScheme.
+    # So this probe - and the one below - must NOT follow Get-CremindScheme.
     if (-not $running) {
         try {
             Invoke-WebRequest -UseBasicParsing -Uri "http://${ServerHost}:${ServerPort}/health" -TimeoutSec 2 | Out-Null
-            Write-Info "Cremind is already responding at http://${ServerHost}:${ServerPort} — skipping server start."
+            Write-Info "Cremind is already responding at http://${ServerHost}:${ServerPort} - skipping server start."
             $running = $true
         } catch { }
     }
@@ -5560,24 +5562,24 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     # Preferred path: register a logon Scheduled Task and let IT start the
     # server, so the process serving the wizard is the same one that comes
     # back after a logout, a reboot, or the restart the wizard itself asks
-    # for. ``cremind boot`` owns the task and the respawn loop — the installer
+    # for. ``cremind boot`` owns the task and the respawn loop - the installer
     # deliberately renders neither, so there is exactly one place that knows
     # what they look like.
     if ($BootServiceOn) {
         # Hand the port over first. An unsupervised server from an earlier
         # install is still running OUR process, and leaving it up means IT
-        # serves the Setup Wizard — without CREMIND_SUPERVISED, so the
+        # serves the Setup Wizard - without CREMIND_SUPERVISED, so the
         # wizard's after-setup switch to HTTPS would tell the user to restart
         # by hand. That is the exact experience the boot service exists to
         # remove, and it would otherwise greet every upgrade from a
         # pre-service install. A foreign server on the port (a dev
-        # ``cremind serve``) is never touched — it gets the register-only
+        # ``cremind serve``) is never touched - it gets the register-only
         # path below.
         if ($running -and $OurServerPid -gt 0) {
             if (Stop-CremindInstallerServer $OurServerPid) {
                 $running = $false
             } else {
-                Write-Warn2 "Could not stop the server at pid $OurServerPid — registering the boot service without starting it."
+                Write-Warn2 "Could not stop the server at pid $OurServerPid - registering the boot service without starting it."
             }
         }
         if ($running) {
@@ -5587,7 +5589,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
             Invoke-NativeLogged { & $VenvCremind boot enable --no-start --yes }
             if ($LASTEXITCODE -eq 0) {
                 $BootRegistered = $true
-                Write-Info "Boot service registered — it takes over when the running server stops."
+                Write-Info "Boot service registered - it takes over when the running server stops."
             }
         } else {
             Invoke-NativeLogged { & $VenvCremind boot enable --yes }
@@ -5598,7 +5600,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
             }
         }
         if (-not $BootRegistered) {
-            Write-Warn2 "Could not register a boot service (see $LogFile) — starting Cremind for this session only."
+            Write-Warn2 "Could not register a boot service (see $LogFile) - starting Cremind for this session only."
         }
     }
 
@@ -5627,7 +5629,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     }
 }
 
-# ── wizard handoff ────────────────────────────────────────────────────────
+# -- wizard handoff --------------------------------------------------------
 
 # 'custom' installs honour the public URL the user provided; 'server'
 # uses the host from -AppHost; 'local' is loopback. Custom URLs may
@@ -5638,17 +5640,17 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
 # from the .env we just wrote (or the environment the server inherits).
 # Re-checked against the file here because a pre-existing .env the
 # installer kept can carry an uncommented CREMIND_SSL the environment
-# doesn't — the unflagged re-install case, where the ssl-mode block above
+# doesn't - the unflagged re-install case, where the ssl-mode block above
 # already read the same value and set the environment to match, and the
 # certfile case, which no flag covers. Only consulted when the environment
-# hasn't already settled it, so this can only ever turn http into https —
+# hasn't already settled it, so this can only ever turn http into https -
 # never contradict the APP_URL / CORS_ALLOWED_ORIGINS this run wrote.
 if ($UrlScheme -ne 'https') {
     $UrlScheme = Get-CremindScheme -EnvPath $EnvFile
 }
 # The scheme the server is answering on right now. Identical to $UrlScheme
 # except under CREMIND_SSL=after-setup, which serves plain HTTP until the
-# wizard completes — the link below has to open, so it follows the listener,
+# wizard completes - the link below has to open, so it follows the listener,
 # not the steady state the .env describes.
 #
 # ...and after-setup stops deferring once the wizard HAS completed, which is
@@ -5667,7 +5669,7 @@ if ($Deployment -eq 'server') {
     $WizardUrl = "${BootScheme}://localhost:1515/#/setup"
 }
 
-# Suppress the human-handoff block when the Electron app is driving —
+# Suppress the human-handoff block when the Electron app is driving -
 # it navigates to the in-window wizard via vue-router and a "Wizard
 # URL: ..." instruction would mislead the user.
 if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
@@ -5687,15 +5689,15 @@ Open this URL in your browser to continue setup:
     # Same nudge the Docker path prints: with CREMIND_SSL=auto the
     # certificate is signed by a CA generated for this install, so the
     # first visit is an interstitial until that CA is trusted once.
-    # after-setup has no interstitial to warn about — the wizard hands the
+    # after-setup has no interstitial to warn about - the wizard hands the
     # user the CA while the origin is still plain HTTP.
     if ($SslDeferred) {
-        Write-Host "  Starts on http:// — the Setup Wizard walks you through trusting the certificate, then switches to https:// with no warning."
+        Write-Host "  Starts on http:// - the Setup Wizard walks you through trusting the certificate, then switches to https:// with no warning."
     } elseif ($UrlScheme -eq 'https') {
         Write-Host "  Browsers warn until you trust the local CA (one-time): cremind tls trust"
     }
 
-    # A service-run server ignores install.pid — telling the user to stop a
+    # A service-run server ignores install.pid - telling the user to stop a
     # PID that isn't there (or one the loop would immediately respawn) would
     # be the wrong instruction.
     if ($BootRegistered) {

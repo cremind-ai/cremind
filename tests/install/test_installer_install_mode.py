@@ -250,7 +250,7 @@ def test_native_start_block_restores_the_session() -> None:
     """
     ps1 = _ps1()
     # ``Start-Process $WizardUrl`` also appears in the Docker branch.
-    block = ps1.split("# ── start the server", 1)[1]
+    block = ps1.split("# -- start the server", 1)[1]
     gate = block.index("if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron')")
     restore = block.rindex("foreach ($k in @($SessionEnvBefore.Keys))")
 
@@ -265,7 +265,7 @@ def test_the_native_start_block_restore_survives_the_electron_path(tmp_path) -> 
     """The Electron front-end never loads the .env, so the restore must be a
     no-op there rather than a terminating error."""
     ps1 = _ps1()
-    block = ps1.split("# ── start the server", 1)[1]
+    block = ps1.split("# -- start the server", 1)[1]
     loop = re.search(
         r"(?s)(    \$ParsedEnv = @\{\}\r?\n    Get-Content \$EnvFile \| ForEach-Object \{.*?\r?\n    \})",
         block)

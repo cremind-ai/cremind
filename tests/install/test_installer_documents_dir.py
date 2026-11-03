@@ -222,7 +222,7 @@ def test_the_questions_are_docker_only_and_never_asked_unattended() -> None:
     assert 'if [ -z "$DOCUMENTS_DIR_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then' in block
     assert 'if [ -z "$DOCUMENTS_ACCESS_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then' in block
     ps1 = _ps1()
-    block = _between(ps1, "# ── documents folder (docker mode only)", "# ── kubernetes questions")
+    block = _between(ps1, "# -- documents folder (docker mode only)", "# -- kubernetes questions")
     assert "if ($Mode -eq 'docker') {" in block
     assert ("$docsCanAsk = (-not $Unattended) -and [Environment]::UserInteractive "
             "-and -not [Console]::IsInputRedirected") in block
@@ -716,9 +716,9 @@ def test_ps1_read_back_restores_an_apostrophe(tmp_path) -> None:
 
 
 def _run_ps_docs_block(tmp_path: Path, assignments: str) -> tuple[int, str, dict[str, str]]:
-    """The real ``── documents folder ──`` block of install.ps1, unattended,
+    """The real ``-- documents folder --`` block of install.ps1, unattended,
     with the real catalog include and validator. ``$Root`` is tmp_path."""
-    block = _between(_ps1(), "# ── documents folder (docker mode only)", "# ── kubernetes questions")
+    block = _between(_ps1(), "# -- documents folder (docker mode only)", "# -- kubernetes questions")
 
     def quoted(path: Path) -> str:
         return "'" + str(path).replace("'", "''") + "'"

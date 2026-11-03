@@ -99,7 +99,7 @@ def test_registration_is_skipped_under_the_desktop_app_in_both() -> None:
     assert "BOOT_SERVICE=0" in electron_block
 
     ps1 = _ps1()
-    ps1_block = ps1.split("# ── boot service ──", 1)[1].split("$BootMarker =", 1)[0]
+    ps1_block = ps1.split("# -- boot service --", 1)[1].split("$BootMarker =", 1)[0]
     assert "CREMIND_INSTALLER_FRONTEND -eq 'electron'" in ps1_block
     assert "$BootServiceOn = $false" in ps1_block
 
@@ -109,7 +109,7 @@ def test_docker_mode_forces_it_off_in_both() -> None:
     sh_block = _sh().split("# ── boot service ──", 1)[1].split("BOOT_MARKER", 1)[0]
     assert '"$MODE" = "docker"' in sh_block
 
-    ps1_block = _ps1().split("# ── boot service ──", 1)[1].split("$BootMarker =", 1)[0]
+    ps1_block = _ps1().split("# -- boot service --", 1)[1].split("$BootMarker =", 1)[0]
     assert "$Mode -eq 'docker'" in ps1_block
 
 
@@ -146,7 +146,7 @@ def test_a_running_server_gets_registration_without_a_start() -> None:
         r'SERVER_RUNNING" -eq 1 \].*?boot enable --no-start', start_block, re.S
     )
 
-    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    ps1_block = _ps1().split("# -- start the server", 1)[1]
     assert re.search(r"if \(\$running\).*?boot enable --no-start", ps1_block, re.S)
 
 
@@ -161,7 +161,7 @@ def test_a_running_server_gets_registration_without_a_start() -> None:
 
 def test_an_installer_started_server_is_stopped_before_registering() -> None:
     """Otherwise the upgrade registers a service around a server it never owns."""
-    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    ps1_block = _ps1().split("# -- start the server", 1)[1]
     assert re.search(
         r"if \(\$running -and \$OurServerPid -gt 0\).*?"
         r"if \(Stop-CremindInstallerServer \$OurServerPid\).*?"
@@ -186,7 +186,7 @@ def test_only_a_server_this_installer_started_is_a_candidate() -> None:
     is the only evidence that the process is ours to stop. A server found by
     the health probe alone leaves the variable empty and keeps --no-start.
     """
-    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    ps1_block = _ps1().split("# -- start the server", 1)[1]
     # Set only inside the install.pid branch, never from the health probe.
     assert ps1_block.count("$OurServerPid = [int] $existingPid") == 1
     assert "$OurServerPid = 0" in ps1_block
@@ -272,7 +272,7 @@ def test_nothing_is_stopped_when_no_service_will_be_registered() -> None:
     The hand-over only makes sense as the first half of "the service owns the
     port now"; without a registration it would just be a kill.
     """
-    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    ps1_block = _ps1().split("# -- start the server", 1)[1]
     assert ps1_block.index("if ($BootServiceOn) {") < ps1_block.index(
         "if (Stop-CremindInstallerServer $OurServerPid)"
     )
@@ -290,7 +290,7 @@ def test_a_failed_registration_falls_back_to_the_old_spawn() -> None:
     assert "starting Cremind for this session only" in sh_block
     assert "nohup" in sh_block
 
-    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    ps1_block = _ps1().split("# -- start the server", 1)[1]
     assert "starting Cremind for this session only" in ps1_block
     assert "Start-Process -FilePath $VenvCremind" in ps1_block
 
@@ -306,7 +306,7 @@ def test_a_service_run_server_is_not_written_to_install_pid() -> None:
     fallback_guard = sh_block.index('if [ "$SERVER_RUNNING" -eq 0 ]; then\n        nohup')
     assert fallback_guard < pid_write
 
-    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    ps1_block = _ps1().split("# -- start the server", 1)[1]
     assert ps1_block.index("if (-not $running) {") < ps1_block.index(
         "$proc.Id | Set-Content -Path $PidFile"
     )

@@ -9,6 +9,9 @@ is only checkable by comparing their text.
 
 ``install.sh`` was never affected: a quoted heredoc copies bytes verbatim. So
 the parity assertion here doubles as the specification.
+
+The bytes of ``install.ps1`` itself matter as much: ``iwr | iex`` decodes the
+script as ASCII, so it must be pure ASCII, without even a BOM.
 """
 
 from __future__ import annotations
@@ -126,6 +129,62 @@ def test_the_helper_writes_bytes_python_can_parse(tmp_path) -> None:
     assert toml.loads(raw.decode("utf-8"))["db_provider"] == "sqlite"
     # And byte-identical to what install.sh's heredoc leaves behind.
     assert raw == (_sh_heredoc(_sh(), "BOOTSTRAP_FILE") + "\n").encode("utf-8")
+
+
+# ── the script's own bytes: pure ASCII ────────────────────────────────────
+
+
+def test_install_ps1_is_pure_ascii() -> None:
+    """``iwr -useb https://cremind.io/install.ps1 | iex`` hands ``iex`` the
+    response as ASCII on Windows PowerShell 5.1, so every byte above 0x7F
+    becomes ``?``. While this file began with a UTF-8 BOM, line 1 arrived as
+    ``???<#``: one bare word, so the help block never opened and its text was
+    parsed as code (``MissingExpressionAfterToken`` at line 21). The one-liner
+    never worked on 5.1. ``irm | iex`` keeps the BOM as U+FEFF, just as fatal.
+
+    Dropping only the BOM breaks the other delivery. The desktop app and
+    ``-OutFile`` run the file from disk, and 5.1 reads a BOM-less file in the
+    ANSI code page, where the UTF-8 bytes of an em dash or a box-drawing rule
+    include 0x94: a curly quote, which PowerShell treats as ``"``, so strings
+    end early. Pure ASCII reads the same under every decoder; build anything
+    fancier at runtime, as ``Write-Step`` does with ``[char]0x2500``.
+    """
+    raw = PS1.read_bytes()
+
+    assert not raw.startswith(b"\xef\xbb\xbf"), "install.ps1 starts with a UTF-8 BOM again"
+    offenders = [
+        f"line {number}: {line.decode('utf-8', 'replace').strip()[:100]}"
+        for number, line in enumerate(raw.splitlines(), start=1)
+        if not line.isascii()
+    ]
+    assert not offenders, "install.ps1 must stay pure ASCII:\n" + "\n".join(offenders[:20])
+
+
+def test_the_one_liner_parses_what_it_downloads(tmp_path) -> None:
+    """What ``iex`` receives from ``iwr | iex``: the bytes decoded as ASCII.
+
+    It must parse without a single error, and its first token must be the help
+    block (a comment), not a command named ``???<#``.
+    """
+    probe = tmp_path / "parse.ps1"
+    probe.write_text(
+        "$text = [System.Text.Encoding]::ASCII.GetString("
+        "[System.IO.File]::ReadAllBytes($args[0]))\n"
+        "$tokens = $null; $errors = $null\n"
+        "[void][System.Management.Automation.Language.Parser]::ParseInput("
+        "$text, [ref]$tokens, [ref]$errors)\n"
+        "'{0} {1}' -f $errors.Count, $tokens[0].Kind\n",
+        encoding="ascii", newline="\n",
+    )
+
+    result = subprocess.run(
+        [_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(probe), str(PS1)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["0", "Comment"], result.stdout
 
 
 # ── a failed migration is never reported as success ───────────────────────
